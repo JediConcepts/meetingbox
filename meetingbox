@@ -294,12 +294,20 @@ prime_permissions() {
 
   warn "the test recording came out empty, so a permission is still missing"
   [ -s "$tmp/log" ] && sed 's/^/           /' "$tmp/log" >&2
+  case "${TERM_PROGRAM:-}" in
+    Apple_Terminal) app="Terminal" ;;
+    iTerm.app)      app="iTerm" ;;
+    "")             app="your terminal app" ;;
+    *)              app="$TERM_PROGRAM" ;;
+  esac
   rule
   info "1. Opening Privacy settings now"
-  info "2. Tick your terminal under ${c_b}Screen Recording${c_0} and under ${c_b}Microphone${c_0}"
-  info "3. ${c_b}Quit your terminal completely${c_0} and reopen it. Screen Recording only"
+  info "2. Under ${c_b}Screen & System Audio Recording${c_0}, turn on ${c_b}$app${c_0} in the top list"
+  info "   (not the 'System Audio Recording Only' list below it)"
+  info "3. Under ${c_b}Microphone${c_0}, turn on ${c_b}$app${c_0} too"
+  info "4. ${c_b}Quit $app completely${c_0} (Cmd+Q) and reopen it. The permission only"
   info "   takes effect on a fresh launch, this trips everyone up."
-  info "4. Run: ${c_b}meetingbox setup${c_0}"
+  info "5. Run: ${c_b}meetingbox setup${c_0}"
   rule
   open_privacy ScreenCapture
   sleep 1
