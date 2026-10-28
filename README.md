@@ -25,7 +25,7 @@ Nothing to configure. No audio devices to create. No reboot.
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.2.1
+meetingbox setup v1.2.2
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
@@ -52,10 +52,15 @@ Say yes to both.
 
 The permissions are asked for, and listed in System Settings, as **meetingbox**, not
 Terminal. The recorder runs as its own small app, so one grant covers Terminal, a
-Shortcuts hotkey and Raycast alike. If the prompts are missed, setup opens Privacy
-& Security for you: turn on **meetingbox** under Screen & System Audio Recording (the
-top list, not "System Audio Recording Only") and under Microphone, press enter, and
-it tests again. No need to restart anything.
+Shortcuts hotkey and Raycast alike.
+
+macOS asks one at a time: Screen Recording first, and only once that is on does
+the recorder reach the microphone, so meetingbox cannot show up under Microphone
+before then. If a prompt is missed, setup opens Privacy & Security at the one
+still missing and tests again when you press enter. For Screen Recording, turn on
+**meetingbox** in the top list (not "System Audio Recording Only"). If it is not
+listed, drag in the meetingbox app from the Finder window setup opens. No need to
+restart anything.
 
 ## Use it
 

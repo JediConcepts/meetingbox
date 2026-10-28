@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 
 # --------------------------------------------------------------- configuration
 
@@ -430,28 +430,49 @@ clear_permcheck() {
   rmdir "$PERM_DIR" 2>/dev/null || true
 }
 
+# macOS asks for these one at a time, in the order the recorder uses them. The
+# recorder starts system audio first and stops there if Screen Recording is off,
+# so it never reaches the mic, and meetingbox cannot appear in the Microphone list
+# until Screen Recording works. So: test, read which one failed, fix that one,
+# test again.
 prime_permissions() {
   say "permissions"
   info "macOS will ask to let ${c_b}meetingbox${c_0} use Screen Recording (that is how the"
-  info "far side is captured) and the Microphone. Allow both."
-  if test_recording; then ok "recording works"; return 0; fi
-
-  warn "macOS has not allowed it yet"
-  rule
-  info "1. Opening Privacy settings now"
-  info "2. Under ${c_b}Screen & System Audio Recording${c_0}, turn on ${c_b}meetingbox${c_0} in the top list"
-  info "   (not the 'System Audio Recording Only' list below it)"
-  info "3. Under ${c_b}Microphone${c_0}, turn on ${c_b}meetingbox${c_0} too"
-  rule
-  open_privacy ScreenCapture
-  sleep 1
-  open_privacy Microphone
-  pause_for "press enter once both are on, and I will test again"
-
-  if test_recording; then ok "recording works"; return 0; fi
+  info "far side is captured), and then the Microphone. Allow both."
+  tries=0
+  while :; do
+    if test_recording; then ok "recording works"; return 0; fi
+    [ "$tries" -lt 3 ] || break
+    tries=$((tries + 1))
+    if grep -q 'start system audio' "$PERM_DIR/log" 2>/dev/null; then
+      warn "Screen Recording is not on for meetingbox yet"
+      rule
+      info "1. Opening Privacy settings at ${c_b}Screen & System Audio Recording${c_0}"
+      info "2. Turn on ${c_b}meetingbox${c_0} in the top list"
+      info "   (not the 'System Audio Recording Only' list below it)"
+      info "3. Not in the list? Drag the meetingbox app from the Finder window I am"
+      info "   opening into that list, then turn it on"
+      info "The Microphone comes after this. macOS asks for it on the next test."
+      rule
+      open_privacy ScreenCapture
+      open -R "$APP_DIR" >/dev/null 2>&1 || true
+    elif grep -q 'start microphone' "$PERM_DIR/log" 2>/dev/null; then
+      warn "the Microphone is not on for meetingbox yet"
+      rule
+      info "1. Opening Privacy settings at ${c_b}Microphone${c_0}"
+      info "2. Turn on ${c_b}meetingbox${c_0}"
+      rule
+      open_privacy Microphone
+    else
+      warn "the recorder did not start"
+      [ -s "$PERM_DIR/log" ] && sed 's/^/           /' "$PERM_DIR/log" >&2
+      break
+    fi
+    pause_for "press enter once it is on, and I will test again"
+  done
   warn "still not recording"
-  [ -s "$PERM_DIR/log" ] && sed 's/^/           /' "$PERM_DIR/log" >&2
-  info "check both switches are on for meetingbox, then run: ${c_b}meetingbox setup${c_0}"
+  info "check Screen & System Audio Recording and Microphone are both on for meetingbox,"
+  info "then run: ${c_b}meetingbox setup${c_0}"
   info "to start the permissions over: ${c_b}meetingbox reset${c_0}"
   return 1
 }
