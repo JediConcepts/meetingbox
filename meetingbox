@@ -222,14 +222,25 @@ install_speech_analyzer() {
       || { warn "could not clone $SPEECH_ANALYZER_REPO"; return 1; }
   fi
   ( cd "$SRC_DIR/speech-analyzer-cli" && chmod +x scripts/install.sh && ./scripts/install.sh ) \
-    || { warn "speech-analyzer build failed"; return 1; }
+    || {
+      warn "speech-analyzer build failed"
+      # Seen on macOS 27: the Command Line Tools ship a Swift package library that
+      # cannot link, so every Swift package fails with "Invalid manifest", however
+      # simple. The recorder still builds because it calls swiftc directly.
+      info "if the error above says 'Invalid manifest', the Command Line Tools are damaged."
+      info "reinstalling them fixes it: sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install"
+      return 1
+    }
   have speech-analyzer && ok "speech-analyzer" || { warn "built but not on PATH"; return 1; }
 }
 
 install_whisper() {
   say "the transcriber (whisper.cpp)"
   have brew || { warn "needs Homebrew first"; return 1; }
-  brew install whisper-cpp || { warn "brew install whisper-cpp failed"; return 1; }
+  # whisper-cli needs 16kHz wav, which comes from ffmpeg. Skip brew's cache
+  # cleanup, which otherwise deletes unrelated downloads as a side effect.
+  pkgs="whisper-cpp"; have ffmpeg || pkgs="$pkgs ffmpeg"
+  HOMEBREW_NO_INSTALL_CLEANUP=1 brew install $pkgs || { warn "brew install $pkgs failed"; return 1; }
   mkdir -p "$MODEL_DIR"
   if [ ! -s "$MODEL_DIR/ggml-large-v3-turbo.bin" ]; then
     info "downloading the model, about 1.6GB, this is the slow bit"
@@ -365,8 +376,11 @@ setup() {
     *" transcriber "*)
       if [ "${v:-0}" -ge 26 ] 2>/dev/null && confirm "use Apple's built in transcriber? (fast, no 1.6GB download)"; then
         install_speech_analyzer || {
-          warn "native build failed, trying whisper.cpp instead"
-          need_brew && install_brew
+          warn "the Apple transcriber did not build"
+          # The fallback is Homebrew plus a 1.6GB model, a different thing to what
+          # was agreed, so ask again rather than carry on.
+          confirm "use whisper.cpp instead? (Homebrew, about 1.6GB download)" || return 1
+          if need_brew; then install_brew || return 1; fi
           install_whisper || return 1
         }
       else
