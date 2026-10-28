@@ -25,7 +25,7 @@ Nothing to configure. No audio devices to create. No reboot.
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.1.0
+meetingbox setup v1.2.0
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
@@ -50,10 +50,12 @@ Then it does a four second test recording to make macOS throw its Screen Recordi
 and Microphone prompts now, in setup, rather than halfway through a real meeting.
 Say yes to both.
 
-**One thing trips everyone up:** Screen Recording permission only takes effect on a
-fresh launch. If the test recording comes back empty, grant the permission, **quit
-Terminal completely**, reopen it, and run `meetingbox setup` again. The script
-tells you this and opens the right settings pane for you.
+The permissions are asked for, and listed in System Settings, as **meetingbox**, not
+Terminal. The recorder runs as its own small app, so one grant covers Terminal, a
+Shortcuts hotkey and Raycast alike. If the prompts are missed, setup opens Privacy
+& Security for you: turn on **meetingbox** under Screen & System Audio Recording (the
+top list, not "System Audio Recording Only") and under Microphone, press enter, and
+it tests again. No need to restart anything.
 
 ## Use it
 
@@ -142,6 +144,9 @@ meetingbox start | stop | status
 meetingbox process <audio|txt>   run an existing file through the pipeline
 meetingbox doctor                what is installed and what is not
 meetingbox mics                  microphones the recorder can see
+meetingbox reset                 clear a stuck recording, ask for permissions again
+meetingbox reset --tools         also remove what setup built, to start setup afresh
+meetingbox uninstall             remove meetingbox (recordings are kept)
 meetingbox help
 ```
 
@@ -154,9 +159,10 @@ Start with `meetingbox doctor`.
 
 | Symptom | Cause |
 |---|---|
-| Recorder stops immediately | Screen Recording or Microphone not granted. Grant, **quit and reopen Terminal**, retry |
-| Test recording empty, permissions look granted | Terminal was not restarted after granting Screen Recording |
-| Transcript is only your voice | Screen Recording permission missing, so the far side was never captured |
+| Recorder stops immediately | Screen Recording or Microphone not granted to **meetingbox**. Turn it on in Privacy & Security, retry |
+| Permissions look granted but still fail | `meetingbox reset`, then `meetingbox setup` to be asked afresh |
+| Asked for permission again after an update | Setup rebuilt the recorder, and macOS treats the new build as new. Allow it once more |
+| `speech-analyzer` fails with "Invalid manifest" | The Command Line Tools are damaged. `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | `swiftc: command not found` | Command Line Tools still downloading. Let the Apple installer finish |
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
 | Minutes feel thin | `MB_CHUNK_WORDS=900 meetingbox process <file>`, more slices and more detail |

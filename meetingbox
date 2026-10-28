@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --------------------------------------------------------------- configuration
 
@@ -37,6 +37,15 @@ DIR_FILE="$STATE_DIR/recording.dir"
 BIN_DIR="${MB_BIN_DIR:-$HOME/.local/bin}"
 SRC_DIR="${MB_SRC_DIR:-$HOME/.local/share/meetingbox}"
 MODEL_DIR="${MB_MODEL_DIR:-$HOME/.local/share/whisper}"
+
+# The recorder runs inside its own small app so that macOS files the Screen
+# Recording and Microphone permissions under "meetingbox", not under whichever
+# app happened to start it (Terminal, Shortcuts, Raycast).
+APP_ID="com.jediconcepts.meetingbox"
+APP_DIR="${MB_APP_DIR:-$SRC_DIR/meetingbox.app}"
+APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+# Registering the app with LaunchServices is what lets tccutil find it by ID.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 AUDIO_CAPTURE_REPO="https://github.com/danySam/audio-capture"
 SPEECH_ANALYZER_REPO="https://github.com/simonw/speech-analyzer-cli"
@@ -89,16 +98,23 @@ tty_src() {
   return 1
 }
 
+#   confirm "question"       Enter means yes
+#   confirm "question" no    Enter means no, for anything that removes things
 confirm() {
   src="$(tty_src)" || {
     warn "no terminal to ask on, so leaving it alone: $1"
-    info "run 'meetingbox setup' in Terminal and it will ask properly"
+    info "run it in Terminal and it will ask properly"
     return 1
   }
-  printf '%s' "${c_c}         ? ${c_0}$1 ${c_dim}[Y/n]${c_0} " >&2
+  if [ "${2:-yes}" = no ]; then hint="[y/N]"; else hint="[Y/n]"; fi
+  printf '%s' "${c_c}         ? ${c_0}$1 ${c_dim}$hint${c_0} " >&2
   if [ "$src" = stdin ]; then read -r reply || return 1
   else read -r reply < /dev/tty || return 1; fi
-  case "$reply" in [nN]|[nN][oO]) return 1 ;; *) return 0 ;; esac
+  case "$reply" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    [nN]|[nN][oO])     return 1 ;;
+    *) [ "${2:-yes}" != no ] ;;
+  esac
 }
 
 pause_for() {
@@ -119,11 +135,30 @@ open_privacy() {
 
 on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 
-# A job started with `&` in a non-interactive shell inherits SIGINT as IGNORED,
-# which POSIX requires and which means `kill -INT` never reaches the recorder, so
-# it never runs its cleanup and you get a truncated m4a. `set -m` puts the child in
-# its own process group with its signals intact, so Ctrl+C semantics actually work.
-# Every background launch of the recorder is wrapped in it.
+recorder_ready() { [ -x "$APP_BIN" ]; }
+
+# Start the recorder through `open`, so it runs as meetingbox.app in its own
+# right rather than as a child of this shell. macOS grants Screen Recording and
+# Microphone to the app that launched a process, so a child of Terminal would be
+# Terminal's, and from a hotkey Shortcuts'. This way there is one grant, listed
+# as meetingbox, whatever starts it. Launched this way it also keeps a live
+# SIGINT, which a `&` job in a script does not, so stopping finalises the m4a.
+# stdout goes to /dev/null: audio-capture streams raw PCM to stdout whenever it
+# is not a terminal. Prints the new recorder's PID.
+launch_recorder() {
+  out="$1"; name="$2"; log="$3"; shift 3
+  before=" $(pgrep -f "$APP_BIN" | tr '\n' ' ') "
+  open -n -g --stdout /dev/null --stderr "$log" "$APP_DIR" --args -o "$out" -n "$name" "$@" \
+    >/dev/null 2>&1 || return 1
+  i=0
+  while [ "$i" -lt 30 ]; do
+    for p in $(pgrep -f "$APP_BIN"); do
+      case "$before" in *" $p "*) ;; *) printf '%s' "$p"; return 0 ;; esac
+    done
+    sleep 0.1; i=$((i + 1))
+  done
+  return 1
+}
 
 # Ask nicely, then insist, then stop asking. The shell's own job notices are
 # swallowed so the user never sees "line 215: 1952 Killed".
@@ -145,7 +180,7 @@ stop_proc() {
 # while the toolchain is still downloading, so test for the compiler itself.
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
-need_audio_capture()  { ! have audio-capture; }
+need_audio_capture()  { ! recorder_ready; }
 # fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
 # reports the licence missing on every machine.
 need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
@@ -206,8 +241,43 @@ install_audio_capture() {
     && swiftc -O -o audio-capture Sources/*.swift \
          -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia ) \
     || { warn "compile failed, see the output above"; return 1; }
-  install -m 755 "$SRC_DIR/audio-capture/audio-capture" "$BIN_DIR/audio-capture"
-  ok "audio-capture -> $BIN_DIR/audio-capture"
+  build_app "$SRC_DIR/audio-capture/audio-capture" || return 1
+  ok "recorder -> $APP_DIR"
+}
+
+# Wrap the recorder in an app bundle with its own identity. Signed ad hoc, which
+# is enough for macOS to remember the permissions against it. A rebuild changes
+# the signature, so macOS may ask once more after one.
+build_app() {
+  rm -rf "$APP_DIR"
+  mkdir -p "$APP_DIR/Contents/MacOS"
+  install -m 755 "$1" "$APP_BIN"
+  cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>$APP_ID</string>
+  <key>CFBundleName</key><string>meetingbox</string>
+  <key>CFBundleDisplayName</key><string>meetingbox</string>
+  <key>CFBundleExecutable</key><string>audio-capture</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>meetingbox records your side of the meeting.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>meetingbox records the other side of the meeting.</string>
+</dict>
+</plist>
+PLIST
+  codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
+    || { warn "could not sign the recorder app"; return 1; }
+  register_app
+}
+
+register_app() {
+  [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DIR" >/dev/null 2>&1 || true
 }
 
 install_speech_analyzer() {
@@ -271,47 +341,43 @@ add_to_path() {
 
 # One short recording to make macOS throw its permission prompts now, in setup,
 # rather than halfway through a real meeting.
-prime_permissions() {
-  say "permissions"
-  info "macOS wants Screen Recording (that is how the far side is captured) and Microphone"
-  info "a prompt or two should appear. Click Allow on each."
-  tmp="$STATE_DIR/permcheck"; rm -rf "$tmp"; mkdir -p "$tmp"
-
-  set -m
-  audio-capture -o "$tmp" -n permcheck >/dev/null 2>"$tmp/log" &
-  p=$!
-  set +m
+# The recorder gives up at once if Screen Recording is missing, so a non-empty
+# file means both sides are being captured.
+PERM_DIR="$STATE_DIR/permcheck"
+test_recording() {
+  rm -rf "$PERM_DIR"; mkdir -p "$PERM_DIR"
+  p="$(launch_recorder "$PERM_DIR" permcheck "$PERM_DIR/log")" || return 1
   sleep 4
   stop_proc "$p" 60
+  for f in "$PERM_DIR"/*.m4a; do
+    [ -s "$f" ] && { rm -rf "$PERM_DIR"; return 0; }
+  done
+  return 1
+}
 
-  got=""
-  for f in "$tmp"/*.m4a; do [ -e "$f" ] && got="$f" && break; done
-  if [ -n "$got" ] && [ -s "$got" ]; then
-    ok "recording works"
-    rm -rf "$tmp"
-    return 0
-  fi
+prime_permissions() {
+  say "permissions"
+  info "macOS will ask to let ${c_b}meetingbox${c_0} use Screen Recording (that is how the"
+  info "far side is captured) and the Microphone. Allow both."
+  if test_recording; then ok "recording works"; return 0; fi
 
-  warn "the test recording came out empty, so a permission is still missing"
-  [ -s "$tmp/log" ] && sed 's/^/           /' "$tmp/log" >&2
-  case "${TERM_PROGRAM:-}" in
-    Apple_Terminal) app="Terminal" ;;
-    iTerm.app)      app="iTerm" ;;
-    "")             app="your terminal app" ;;
-    *)              app="$TERM_PROGRAM" ;;
-  esac
+  warn "macOS has not allowed it yet"
   rule
   info "1. Opening Privacy settings now"
-  info "2. Under ${c_b}Screen & System Audio Recording${c_0}, turn on ${c_b}$app${c_0} in the top list"
+  info "2. Under ${c_b}Screen & System Audio Recording${c_0}, turn on ${c_b}meetingbox${c_0} in the top list"
   info "   (not the 'System Audio Recording Only' list below it)"
-  info "3. Under ${c_b}Microphone${c_0}, turn on ${c_b}$app${c_0} too"
-  info "4. ${c_b}Quit $app completely${c_0} (Cmd+Q) and reopen it. The permission only"
-  info "   takes effect on a fresh launch, this trips everyone up."
-  info "5. Run: ${c_b}meetingbox setup${c_0}"
+  info "3. Under ${c_b}Microphone${c_0}, turn on ${c_b}meetingbox${c_0} too"
   rule
   open_privacy ScreenCapture
   sleep 1
   open_privacy Microphone
+  pause_for "press enter once both are on, and I will test again"
+
+  if test_recording; then ok "recording works"; return 0; fi
+  warn "still not recording"
+  [ -s "$PERM_DIR/log" ] && sed 's/^/           /' "$PERM_DIR/log" >&2
+  info "check both switches are on for meetingbox, then run: ${c_b}meetingbox setup${c_0}"
+  info "to start the permissions over: ${c_b}meetingbox reset${c_0}"
   return 1
 }
 
@@ -411,7 +477,7 @@ setup() {
 doctor() {
   say "check"
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
-  have audio-capture  && ok "audio-capture"   || miss "audio-capture"
+  recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
   have speech-analyzer && ok "speech-analyzer" || info "speech-analyzer not installed"
   have whisper-cli    && ok "whisper-cli"     || info "whisper-cli not installed"
   transcriber_present || miss "no transcriber at all"
@@ -419,9 +485,9 @@ doctor() {
     need_fm_license && miss "fm licence not accepted (sudo fm license)" || ok "fm"
   else miss "fm"; fi
   on_path && ok "$BIN_DIR on PATH" || miss "$BIN_DIR not on PATH"
-  if have audio-capture; then
-    info "microphones audio-capture can see:"
-    audio-capture -l 2>&1 | sed 's/^/             /' >&2 || true
+  if recorder_ready; then
+    info "microphones the recorder can see:"
+    "$APP_BIN" -l 2>&1 | sed 's/^/             /' >&2 || true
   fi
   info "if anything is missing: meetingbox setup"
 }
@@ -452,7 +518,7 @@ newest_m4a() {
 }
 
 start_recording() {
-  have audio-capture || die "the recorder is not installed yet. Run: meetingbox setup"
+  recorder_ready || die "the recorder is not installed yet. Run: meetingbox setup"
   if is_recording; then
     warn "already recording in $(cat "$DIR_FILE" 2>/dev/null || true)"
     return 0
@@ -469,27 +535,21 @@ start_recording() {
   [ -e "$dir" ] && dir="$BASE_DIR/$(date +%Y-%m-%d_%H%M%S)"
   mkdir -p "$dir"
 
-  # Two traps in one launch:
-  #   stdout -> /dev/null, because audio-capture streams raw PCM to stdout
-  #     whenever stdout is not a terminal. Point it at a file and the log fills
-  #     with audio samples.
-  #   set -m, so the recorder keeps a live SIGINT and finalises the m4a on stop.
-  set -m
   if [ -n "$MIC" ]; then
-    audio-capture -o "$dir" -n meeting -d "$MIC" >/dev/null 2>"$dir/capture.log" &
+    pid="$(launch_recorder "$dir" meeting "$dir/capture.log" -d "$MIC")" || pid=""
   else
-    audio-capture -o "$dir" -n meeting >/dev/null 2>"$dir/capture.log" &
+    pid="$(launch_recorder "$dir" meeting "$dir/capture.log")" || pid=""
   fi
-  pid=$!
-  set +m
 
-  printf '%s' "$pid" > "$PID_FILE"
-  printf '%s' "$dir" > "$DIR_FILE"
-
-  sleep 2
-  if ! kill -0 "$pid" 2>/dev/null; then
+  if [ -n "$pid" ]; then
+    printf '%s' "$pid" > "$PID_FILE"
+    printf '%s' "$dir" > "$DIR_FILE"
+    sleep 2
+  fi
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     rm -f "$PID_FILE" "$DIR_FILE"
     [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
+    rmdir "$dir" 2>/dev/null || true
     die "the recorder stopped immediately. Usually a missing permission: meetingbox setup"
   fi
 
@@ -756,6 +816,86 @@ process() {
   fi
 }
 
+# ----------------------------------------------------------------------- reset
+#
+#   reset            stuck recording state, and meetingbox's macOS permissions
+#   reset --tools    also what setup built, so setup starts from scratch
+#   uninstall        also meetingbox itself
+#
+# Recordings are never touched. Only paths meetingbox made are removed, by name,
+# never a whole directory that an MB_* variable could have pointed elsewhere.
+
+SA_LINK="$HOME/.local/bin/speech-analyzer"
+SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
+WHISPER_FILE="$MODEL_DIR/ggml-large-v3-turbo.bin"
+
+reset_cmd() {
+  level="$1"   # state | tools | all
+  say "reset"
+  rule
+  info "this will:"
+  info "  stop any recorder left running and clear the recording state"
+  info "  reset the Screen Recording and Microphone permissions for meetingbox,"
+  info "  so macOS asks again next time"
+  if [ "$level" != state ]; then
+    info "  remove the recorder app and its source:   $SRC_DIR"
+    [ -L "$SA_LINK" ] && info "  remove speech-analyzer:                   $SA_APP"
+    [ -e "$WHISPER_FILE" ] && info "  remove the whisper model (1.6GB):         $WHISPER_FILE"
+  fi
+  [ "$level" = all ] && info "  remove meetingbox itself:                 $BIN_DIR/meetingbox"
+  info "your recordings in $BASE_DIR are not touched"
+  rule
+  confirm "go ahead?" no || { info "nothing changed"; return 1; }
+
+  # recorder and state
+  for p in $(pgrep -f "$APP_BIN" 2>/dev/null); do stop_proc "$p" 50; done
+  if has_session; then
+    info "an unfinished recording is still in $(cat "$DIR_FILE" 2>/dev/null || true)"
+  fi
+  rm -f "$PID_FILE" "$DIR_FILE"; rm -rf "$PERM_DIR"
+  ok "recording state cleared"
+
+  # permissions, only meetingbox's own
+  if [ -d "$APP_DIR" ]; then
+    register_app
+    if tccutil reset ScreenCapture "$APP_ID" >/dev/null 2>&1 \
+       && tccutil reset Microphone "$APP_ID" >/dev/null 2>&1; then
+      ok "permissions reset for meetingbox"
+    else
+      warn "could not reset permissions. Turn meetingbox off by hand in Privacy & Security"
+    fi
+  else
+    info "the recorder app is not installed, so there are no meetingbox permissions to reset"
+  fi
+
+  if [ "$level" != state ]; then
+    [ -d "$APP_DIR" ] && [ -x "$LSREGISTER" ] && "$LSREGISTER" -u "$APP_DIR" >/dev/null 2>&1 || true
+    rm -rf "$APP_DIR" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli"
+    rmdir "$SRC_DIR" 2>/dev/null || true
+    rm -f "$BIN_DIR/audio-capture"     # older versions installed it here
+    case "$(readlink "$SA_LINK" 2>/dev/null)" in
+      *SpeechAnalyzerCLI.app*) rm -f "$SA_LINK"; rm -rf "$SA_APP" ;;
+    esac
+    rm -f "$WHISPER_FILE" "$WHISPER_FILE.part"
+    rmdir "$MODEL_DIR" 2>/dev/null || true
+    ok "installed tools removed"
+    if have brew && brew list whisper-cpp >/dev/null 2>&1; then
+      info "Homebrew's whisper-cpp is left installed. To remove it: brew uninstall whisper-cpp"
+    fi
+  fi
+
+  if [ "$level" = all ]; then
+    rm -f "$BIN_DIR/meetingbox"
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    ok "meetingbox removed"
+    info "the PATH line in your shell profile stays, other tools use ~/.local/bin too"
+    return 0
+  fi
+
+  rule
+  say "done. Run ${c_b}meetingbox setup${c_0} to set it up again."
+}
+
 usage() {
   cat <<'USAGE'
 meetingbox: record, transcribe and summarise a meeting entirely on device.
@@ -766,6 +906,9 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox process <audio|txt>   run an existing file through the pipeline
   meetingbox doctor                what is installed and what is not
   meetingbox mics                  microphones the recorder can see
+  meetingbox reset                 clear a stuck recording, ask for permissions again
+  meetingbox reset --tools         also remove what setup built, to start setup afresh
+  meetingbox uninstall             remove meetingbox (recordings are kept)
   meetingbox help
 
 Options
@@ -785,6 +928,7 @@ USAGE
 
 cmd=""
 argfile=""
+RESET_TOOLS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --mic|--device) MIC="$2"; shift 2 ;;
@@ -795,6 +939,7 @@ while [ $# -gt 0 ]; do
     --native)  ENGINE="native"; shift ;;
     --keep-audio)    KEEP_AUDIO=1; shift ;;
     --no-keep-audio) KEEP_AUDIO=0; shift ;;
+    --tools)   RESET_TOOLS=1; shift ;;
     -v|--version) printf 'meetingbox %s\n' "$VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     -*) die "unknown option: $1" ;;
@@ -805,7 +950,7 @@ done
 case "${cmd:-toggle}" in
   toggle)
     if has_session; then stop_recording; process "$STOPPED_AUDIO"
-    elif ! have audio-capture; then
+    elif ! recorder_ready; then
       warn "not set up yet"
       confirm "run setup now?" && setup || info "run 'meetingbox setup' when you are ready"
     else start_recording; fi ;;
@@ -816,9 +961,12 @@ case "${cmd:-toggle}" in
   setup)   setup ;;
   doctor|check) doctor ;;
   mics|devices)
-    have audio-capture || die "the recorder is not installed. Run: meetingbox setup"
-    audio-capture -l ;;
+    recorder_ready || die "the recorder is not installed. Run: meetingbox setup"
+    "$APP_BIN" -l ;;
   status)  if is_recording; then ok "recording -> $(cat "$DIR_FILE")"; else info "idle"; fi ;;
+  reset)
+    if [ "$RESET_TOOLS" = 1 ]; then reset_cmd tools; else reset_cmd state; fi ;;
+  uninstall) reset_cmd all ;;
   help)    usage ;;
   *)       die "unknown command: $cmd (try: meetingbox help)" ;;
 esac
