@@ -25,7 +25,7 @@ Nothing to configure. No audio devices to create. No reboot.
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.2.0
+meetingbox setup v1.2.1
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
@@ -153,6 +153,12 @@ meetingbox help
 Options: `--mic "USB"`, `--dir`, `--locale`, `--whisper`, `--native`, `--model`,
 `--no-keep-audio`. Each has an `MB_*` environment equivalent.
 
+`reset --tools` and `uninstall` delete only what setup itself created. Setup keeps
+a list in `~/.meetingbox/installed` as it goes, so a whisper model, a
+speech-analyzer or a folder that was already on your Mac is left where it is.
+Both commands show the exact paths, and anything they are leaving alone, before
+asking.
+
 ## When it misbehaves
 
 Start with `meetingbox doctor`.
@@ -166,7 +172,7 @@ Start with `meetingbox doctor`.
 | `swiftc: command not found` | Command Line Tools still downloading. Let the Apple installer finish |
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
 | Minutes feel thin | `MB_CHUNK_WORDS=900 meetingbox process <file>`, more slices and more detail |
-| Want to see the working | `MB_DEBUG=1 meetingbox` keeps the `.work` directory |
+| Want to see the working | `MB_DEBUG=1 meetingbox` keeps the `.work.*` folder |
 
 Requires macOS 27 for the summary (`fm` arrived then). Recording and transcribing
 work on macOS 14 and up.

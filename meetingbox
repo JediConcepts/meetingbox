@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 # --------------------------------------------------------------- configuration
 
@@ -37,12 +37,16 @@ DIR_FILE="$STATE_DIR/recording.dir"
 BIN_DIR="${MB_BIN_DIR:-$HOME/.local/bin}"
 SRC_DIR="${MB_SRC_DIR:-$HOME/.local/share/meetingbox}"
 MODEL_DIR="${MB_MODEL_DIR:-$HOME/.local/share/whisper}"
+WHISPER_FILE="$MODEL_DIR/ggml-large-v3-turbo.bin"
+# where speech-analyzer's own install script puts itself
+SA_LINK="$HOME/.local/bin/speech-analyzer"
+SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
 
 # The recorder runs inside its own small app so that macOS files the Screen
 # Recording and Microphone permissions under "meetingbox", not under whichever
 # app happened to start it (Terminal, Shortcuts, Raycast).
 APP_ID="com.jediconcepts.meetingbox"
-APP_DIR="${MB_APP_DIR:-$SRC_DIR/meetingbox.app}"
+APP_DIR="$SRC_DIR/meetingbox.app"
 APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
 # Registering the app with LaunchServices is what lets tccutil find it by ID.
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
@@ -126,6 +130,51 @@ pause_for() {
 
 mkdir -p "$STATE_DIR"
 
+# ------------------------------------------------------------ what setup made
+#
+# Setup writes down every path it creates, at the moment it creates it. reset
+# and uninstall delete only paths on that list. So a folder that was already
+# there (your own clone, your own whisper model, whatever an MB_* setting points
+# at) is never deleted, and remove_installed is the only recursive delete of
+# anything setup installed.
+
+INSTALLED="$STATE_DIR/installed"
+
+record_install()  { installed_by_us "$1" || printf '%s\n' "$1" >> "$INSTALLED"; }
+installed_by_us() { grep -qxF -- "$1" "$INSTALLED" 2>/dev/null; }
+
+remove_installed() {
+  p="$1"
+  case "$p" in ""|/|"$HOME"|"$HOME"/) warn "refusing to remove '$p'"; return 1 ;; esac
+  installed_by_us "$p" || return 1
+  rm -rf -- "$p"
+  { grep -vxF -- "$p" "$INSTALLED" || true; } > "$INSTALLED.tmp"
+  mv -f "$INSTALLED.tmp" "$INSTALLED"
+}
+
+# Clear a path for setup to create. Something meetingbox made before is replaced;
+# anything else is left alone and setup stops.
+claim_path() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    installed_by_us "$1" || {
+      warn "$1 already exists and meetingbox did not create it, so I will not replace it"
+      info "move it somewhere else, then run: meetingbox setup"
+      return 1
+    }
+    remove_installed "$1"
+  fi
+  record_install "$1"
+}
+
+# A meetingbox.app from v1.2.0, built before setup kept its list, is still ours:
+# it carries meetingbox's bundle ID.
+adopt_own_app() {
+  [ -f "$APP_DIR/Contents/Info.plist" ] || return 0
+  id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+  [ "$id" = "$APP_ID" ] && record_install "$APP_DIR"
+  return 0
+}
+
 macos_major() { sw_vers -productVersion 2>/dev/null | cut -d. -f1; }
 
 open_privacy() {
@@ -145,20 +194,35 @@ recorder_ready() { [ -x "$APP_BIN" ]; }
 # SIGINT, which a `&` job in a script does not, so stopping finalises the m4a.
 # stdout goes to /dev/null: audio-capture streams raw PCM to stdout whenever it
 # is not a terminal. Prints the new recorder's PID.
+#
+# The first launch after a rebuild can be slow while macOS checks the new
+# signature, so it waits up to 10s. If the recorder still has not shown up, any
+# that turns up for this folder later is stopped, never left recording alone.
 launch_recorder() {
   out="$1"; name="$2"; log="$3"; shift 3
-  before=" $(pgrep -f "$APP_BIN" | tr '\n' ' ') "
   open -n -g --stdout /dev/null --stderr "$log" "$APP_DIR" --args -o "$out" -n "$name" "$@" \
     >/dev/null 2>&1 || return 1
   i=0
-  while [ "$i" -lt 30 ]; do
-    for p in $(pgrep -f "$APP_BIN"); do
-      case "$before" in *" $p "*) ;; *) printf '%s' "$p"; return 0 ;; esac
-    done
+  while [ "$i" -lt 100 ]; do
+    p="$(recorder_pids "$out" | head -n 1)"
+    [ -n "$p" ] && { printf '%s' "$p"; return 0; }
     sleep 0.1; i=$((i + 1))
   done
+  stop_recorders "$out"
   return 1
 }
+
+# PIDs of the recorders writing into one folder, or of every meetingbox recorder
+# when the folder is "". Every launch gets a folder of its own, so this names the
+# right process however late it started. Matched as a fixed string, since a
+# folder name is not a pattern.
+recorder_pids() {
+  ps -axo pid=,command= | NEEDLE="$APP_BIN -o ${1:+$1 -n }" awk '
+    { pid = $1; sub(/^ *[0-9]+ /, "") }
+    index($0, ENVIRON["NEEDLE"]) == 1 { print pid }'
+}
+
+stop_recorders() { for p in $(recorder_pids "$1"); do stop_proc "$p" "${2:-150}"; done; }
 
 # Ask nicely, then insist, then stop asking. The shell's own job notices are
 # swallowed so the user never sees "line 215: 1952 Killed".
@@ -226,7 +290,7 @@ install_audio_capture() {
   if [ -d "$SRC_DIR/audio-capture/.git" ]; then
     git -C "$SRC_DIR/audio-capture" pull -q --ff-only || true
   else
-    rm -rf "$SRC_DIR/audio-capture"
+    claim_path "$SRC_DIR/audio-capture" || return 1
     git clone -q --depth 1 "$AUDIO_CAPTURE_REPO" "$SRC_DIR/audio-capture" \
       || { warn "could not clone $AUDIO_CAPTURE_REPO"; return 1; }
   fi
@@ -249,7 +313,8 @@ install_audio_capture() {
 # is enough for macOS to remember the permissions against it. A rebuild changes
 # the signature, so macOS may ask once more after one.
 build_app() {
-  rm -rf "$APP_DIR"
+  adopt_own_app
+  claim_path "$APP_DIR" || return 1
   mkdir -p "$APP_DIR/Contents/MacOS"
   install -m 755 "$1" "$APP_BIN"
   cat > "$APP_DIR/Contents/Info.plist" <<PLIST
@@ -287,10 +352,13 @@ install_speech_analyzer() {
   if [ -d "$SRC_DIR/speech-analyzer-cli/.git" ]; then
     git -C "$SRC_DIR/speech-analyzer-cli" pull -q --ff-only || true
   else
-    rm -rf "$SRC_DIR/speech-analyzer-cli"
+    claim_path "$SRC_DIR/speech-analyzer-cli" || return 1
     git clone -q --depth 1 "$SPEECH_ANALYZER_REPO" "$SRC_DIR/speech-analyzer-cli" \
       || { warn "could not clone $SPEECH_ANALYZER_REPO"; return 1; }
   fi
+  # Its install script writes these two. Only ones it creates now count as ours.
+  [ -e "$SA_APP" ] || record_install "$SA_APP"
+  [ -e "$SA_LINK" ] || [ -L "$SA_LINK" ] || record_install "$SA_LINK"
   ( cd "$SRC_DIR/speech-analyzer-cli" && chmod +x scripts/install.sh && ./scripts/install.sh ) \
     || {
       warn "speech-analyzer build failed"
@@ -312,11 +380,12 @@ install_whisper() {
   pkgs="whisper-cpp"; have ffmpeg || pkgs="$pkgs ffmpeg"
   HOMEBREW_NO_INSTALL_CLEANUP=1 brew install $pkgs || { warn "brew install $pkgs failed"; return 1; }
   mkdir -p "$MODEL_DIR"
-  if [ ! -s "$MODEL_DIR/ggml-large-v3-turbo.bin" ]; then
+  if [ ! -s "$WHISPER_FILE" ]; then
     info "downloading the model, about 1.6GB, this is the slow bit"
-    curl -fL --progress-bar -o "$MODEL_DIR/ggml-large-v3-turbo.bin.part" "$WHISPER_MODEL_URL" \
-      || { warn "model download failed"; rm -f "$MODEL_DIR/ggml-large-v3-turbo.bin.part"; return 1; }
-    mv "$MODEL_DIR/ggml-large-v3-turbo.bin.part" "$MODEL_DIR/ggml-large-v3-turbo.bin"
+    record_install "$WHISPER_FILE"
+    curl -fL --progress-bar -o "$WHISPER_FILE.part" "$WHISPER_MODEL_URL" \
+      || { warn "model download failed"; rm -f "$WHISPER_FILE.part"; return 1; }
+    mv "$WHISPER_FILE.part" "$WHISPER_FILE"
   fi
   ok "whisper-cli + model"
 }
@@ -345,14 +414,20 @@ add_to_path() {
 # file means both sides are being captured.
 PERM_DIR="$STATE_DIR/permcheck"
 test_recording() {
-  rm -rf "$PERM_DIR"; mkdir -p "$PERM_DIR"
+  clear_permcheck; mkdir -p "$PERM_DIR"
   p="$(launch_recorder "$PERM_DIR" permcheck "$PERM_DIR/log")" || return 1
   sleep 4
   stop_proc "$p" 60
-  for f in "$PERM_DIR"/*.m4a; do
-    [ -s "$f" ] && { rm -rf "$PERM_DIR"; return 0; }
+  for f in "$PERM_DIR"/*_permcheck.m4a; do
+    [ -s "$f" ] && { clear_permcheck; return 0; }
   done
   return 1
+}
+
+# Only the files the test writes, then the folder if that leaves it empty.
+clear_permcheck() {
+  rm -f "$PERM_DIR"/*_permcheck.m4a "$PERM_DIR/log"
+  rmdir "$PERM_DIR" 2>/dev/null || true
 }
 
 prime_permissions() {
@@ -494,18 +569,31 @@ doctor() {
 
 # ------------------------------------------------------------------- recording
 
-is_recording() {
-  [ -f "$PID_FILE" ] || return 1
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
-  # After a crash or reboot the old PID can belong to an unrelated process, and
-  # stopping means INT, TERM and then -9. Only claim it if it is the recorder.
-  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in *audio-capture*) return 0 ;; *) return 1 ;; esac
-}
+# The recorder is found by the folder it writes to, not by a saved PID, so a
+# PID reused after a crash or reboot can never be mistaken for it.
+session_dir()  { cat "$DIR_FILE" 2>/dev/null || true; }
+is_recording() { d="$(session_dir)"; [ -n "$d" ] && [ -n "$(recorder_pids "$d")" ]; }
 
 # A session whose recorder died on its own (crash, sleep, force quit) still has
 # audio worth keeping, so the next press should finish it, not start a new one.
 has_session() { [ -f "$DIR_FILE" ]; }
+
+# Start and stop run one at a time. A double tap on the hotkey would otherwise
+# start two recorders, or try to stop one that is still starting.
+LOCK="$STATE_DIR/busy"
+take_lock() {
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
+      die "meetingbox is busy starting or stopping a recording, try again in a moment"
+    fi
+    release_lock   # left behind by a run that crashed
+    mkdir "$LOCK" 2>/dev/null || die "meetingbox is busy, try again in a moment"
+  fi
+  printf '%s' "$$" > "$LOCK/pid"
+  trap release_lock EXIT
+}
+release_lock() { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; }
 
 newest_m4a() {
   found=""
@@ -520,11 +608,11 @@ newest_m4a() {
 start_recording() {
   recorder_ready || die "the recorder is not installed yet. Run: meetingbox setup"
   if is_recording; then
-    warn "already recording in $(cat "$DIR_FILE" 2>/dev/null || true)"
+    warn "already recording in $(session_dir)"
     return 0
   fi
   if has_session; then
-    warn "an earlier recording was never finished: $(cat "$DIR_FILE" 2>/dev/null || true)"
+    warn "an earlier recording was never finished: $(session_dir)"
     info "it is still on disk. To get its minutes: meetingbox process <the .m4a in that folder>"
   fi
 
@@ -534,22 +622,17 @@ start_recording() {
   # second would overwrite the first meeting's audio and minutes.
   [ -e "$dir" ] && dir="$BASE_DIR/$(date +%Y-%m-%d_%H%M%S)"
   mkdir -p "$dir"
+  printf '%s' "$dir" > "$DIR_FILE"
 
-  if [ -n "$MIC" ]; then
-    pid="$(launch_recorder "$dir" meeting "$dir/capture.log" -d "$MIC")" || pid=""
-  else
-    pid="$(launch_recorder "$dir" meeting "$dir/capture.log")" || pid=""
-  fi
-
-  if [ -n "$pid" ]; then
-    printf '%s' "$pid" > "$PID_FILE"
-    printf '%s' "$dir" > "$DIR_FILE"
-    sleep 2
-  fi
+  pid="$(launch_recorder "$dir" meeting "$dir/capture.log" ${MIC:+-d "$MIC"})" || pid=""
+  [ -n "$pid" ] && sleep 2
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$PID_FILE" "$DIR_FILE"
+    rm -f "$DIR_FILE"
     [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
-    rmdir "$dir" 2>/dev/null || true
+    # nothing recorded, so drop the log just shown and the folder made above
+    if [ -z "$(newest_m4a "$dir")" ]; then
+      rm -f "$dir/capture.log"; rmdir "$dir" 2>/dev/null || true
+    fi
     die "the recorder stopped immediately. Usually a missing permission: meetingbox setup"
   fi
 
@@ -561,14 +644,14 @@ start_recording() {
 STOPPED_AUDIO=""
 stop_recording() {
   has_session || die "not recording"
-  dir="$(cat "$DIR_FILE" 2>/dev/null || true)"
+  dir="$(session_dir)"
 
   if is_recording; then
-    stop_proc "$(cat "$PID_FILE")" 150
+    stop_recorders "$dir"
   else
     warn "the recorder had already stopped, picking up what it wrote"
   fi
-  rm -f "$PID_FILE" "$DIR_FILE"
+  rm -f "$DIR_FILE"
 
   audio="$(newest_m4a "$dir")"
   if [ -z "$audio" ] || [ ! -s "$audio" ]; then
@@ -705,7 +788,8 @@ summarise() {
   transcript="$1"; dir="$2"
   have fm || die "fm not found. It ships with macOS 27. Run: meetingbox setup"
 
-  work="$dir/.work"; rm -rf "$work"; mkdir -p "$work"
+  # A fresh folder made here, so the clean up at the end can only delete that.
+  work="$(mktemp -d "${dir:?}/.work.XXXXXX")" || die "could not make a working folder in $dir"
   merged="$work/merged.txt"
 
   tokens="$(token_count "$transcript")"; tokens="${tokens:-0}"
@@ -822,15 +906,20 @@ process() {
 #   reset --tools    also what setup built, so setup starts from scratch
 #   uninstall        also meetingbox itself
 #
-# Recordings are never touched. Only paths meetingbox made are removed, by name,
-# never a whole directory that an MB_* variable could have pointed elsewhere.
+# Recordings are never touched. Only paths on setup's list (see remove_installed)
+# are deleted, so nothing that was already on the Mac is, wherever an MB_*
+# setting points.
 
-SA_LINK="$HOME/.local/bin/speech-analyzer"
-SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
-WHISPER_FILE="$MODEL_DIR/ggml-large-v3-turbo.bin"
+# The v1.1.0 recorder sat in $BIN_DIR. Only a byte for byte copy of the one
+# setup compiled counts as ours.
+old_recorder() {
+  [ -f "$BIN_DIR/audio-capture" ] && [ -f "$SRC_DIR/audio-capture/audio-capture" ] \
+    && cmp -s "$BIN_DIR/audio-capture" "$SRC_DIR/audio-capture/audio-capture"
+}
 
 reset_cmd() {
   level="$1"   # state | tools | all
+  [ "$level" = state ] || adopt_own_app
   say "reset"
   rule
   info "this will:"
@@ -838,21 +927,37 @@ reset_cmd() {
   info "  reset the Screen Recording and Microphone permissions for meetingbox,"
   info "  so macOS asks again next time"
   if [ "$level" != state ]; then
-    info "  remove the recorder app and its source:   $SRC_DIR"
-    [ -L "$SA_LINK" ] && info "  remove speech-analyzer:                   $SA_APP"
-    [ -e "$WHISPER_FILE" ] && info "  remove the whisper model (1.6GB):         $WHISPER_FILE"
+    ours="$(cat "$INSTALLED" 2>/dev/null || true)"
+    info "  delete what setup installed:"
+    n=0
+    while IFS= read -r p; do
+      if [ -n "$p" ] && { [ -e "$p" ] || [ -L "$p" ]; }; then info "    $p"; n=$((n + 1)); fi
+    done <<< "$ours"
+    if old_recorder; then info "    $BIN_DIR/audio-capture (from v1.1.0)"; n=$((n + 1)); fi
+    [ "$n" -gt 0 ] || info "    nothing, setup has no record of installing anything"
+    left=""
+    for p in "$APP_DIR" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
+             "$SA_APP" "$SA_LINK" "$WHISPER_FILE"; do
+      if { [ -e "$p" ] || [ -L "$p" ]; } && ! installed_by_us "$p"; then left="$left$p
+"; fi
+    done
+    if [ -n "$left" ]; then
+      info "  leave alone, meetingbox did not install these:"
+      printf '%s' "$left" | while IFS= read -r p; do info "    $p"; done
+    fi
   fi
-  [ "$level" = all ] && info "  remove meetingbox itself:                 $BIN_DIR/meetingbox"
+  [ "$level" = all ] && info "  delete meetingbox itself:                 $BIN_DIR/meetingbox"
   info "your recordings in $BASE_DIR are not touched"
   rule
   confirm "go ahead?" no || { info "nothing changed"; return 1; }
 
-  # recorder and state
-  for p in $(pgrep -f "$APP_BIN" 2>/dev/null); do stop_proc "$p" 50; done
+  # recorder and state. Same 15s as stop, so a long recording can finish its file.
+  stop_recorders ""
   if has_session; then
-    info "an unfinished recording is still in $(cat "$DIR_FILE" 2>/dev/null || true)"
+    info "the unfinished recording is kept in $(session_dir)"
   fi
-  rm -f "$PID_FILE" "$DIR_FILE"; rm -rf "$PERM_DIR"
+  rm -f "$PID_FILE" "$DIR_FILE"   # recording.pid is from v1.2.0 and earlier
+  clear_permcheck; release_lock
   ok "recording state cleared"
 
   # permissions, only meetingbox's own
@@ -869,15 +974,16 @@ reset_cmd() {
   fi
 
   if [ "$level" != state ]; then
-    [ -d "$APP_DIR" ] && [ -x "$LSREGISTER" ] && "$LSREGISTER" -u "$APP_DIR" >/dev/null 2>&1 || true
-    rm -rf "$APP_DIR" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli"
-    rmdir "$SRC_DIR" 2>/dev/null || true
-    rm -f "$BIN_DIR/audio-capture"     # older versions installed it here
-    case "$(readlink "$SA_LINK" 2>/dev/null)" in
-      *SpeechAnalyzerCLI.app*) rm -f "$SA_LINK"; rm -rf "$SA_APP" ;;
-    esac
-    rm -f "$WHISPER_FILE" "$WHISPER_FILE.part"
-    rmdir "$MODEL_DIR" 2>/dev/null || true
+    if installed_by_us "$APP_DIR" && [ -x "$LSREGISTER" ]; then
+      "$LSREGISTER" -u "$APP_DIR" >/dev/null 2>&1 || true
+    fi
+    old_recorder && rm -f "$BIN_DIR/audio-capture"
+    while IFS= read -r p; do
+      if [ -n "$p" ]; then remove_installed "$p" || true; fi
+    done <<< "$ours"
+    # a half finished download of the model setup was fetching
+    if printf '%s\n' "$ours" | grep -qxF -- "$WHISPER_FILE"; then rm -f "$WHISPER_FILE.part"; fi
+    rmdir "$SRC_DIR" "$MODEL_DIR" 2>/dev/null || true
     ok "installed tools removed"
     if have brew && brew list whisper-cpp >/dev/null 2>&1; then
       info "Homebrew's whisper-cpp is left installed. To remove it: brew uninstall whisper-cpp"
@@ -886,6 +992,7 @@ reset_cmd() {
 
   if [ "$level" = all ]; then
     rm -f "$BIN_DIR/meetingbox"
+    [ -s "$INSTALLED" ] || rm -f "$INSTALLED"
     rmdir "$STATE_DIR" 2>/dev/null || true
     ok "meetingbox removed"
     info "the PATH line in your shell profile stays, other tools use ~/.local/bin too"
@@ -949,13 +1056,16 @@ done
 
 case "${cmd:-toggle}" in
   toggle)
-    if has_session; then stop_recording; process "$STOPPED_AUDIO"
-    elif ! recorder_ready; then
+    if ! has_session && ! recorder_ready; then
       warn "not set up yet"
       confirm "run setup now?" && setup || info "run 'meetingbox setup' when you are ready"
-    else start_recording; fi ;;
-  start)   start_recording ;;
-  stop)    stop_recording; process "$STOPPED_AUDIO" ;;
+    else
+      take_lock
+      if has_session; then stop_recording; release_lock; process "$STOPPED_AUDIO"
+      else start_recording; fi
+    fi ;;
+  start)   take_lock; start_recording ;;
+  stop)    take_lock; stop_recording; release_lock; process "$STOPPED_AUDIO" ;;
   process) [ -n "$argfile" ] || die "usage: meetingbox process <audio-or-transcript>"
            process "$argfile" ;;
   setup)   setup ;;
