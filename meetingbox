@@ -1,0 +1,750 @@
+#!/usr/bin/env bash
+#
+# meetingbox: one key, whole meeting. Record, transcribe, summarise, all on device.
+#
+#   press once  -> records you and everyone else
+#   press again -> stops, transcribes, writes the minutes
+#
+# Nothing leaves the Mac. No account, no API key, no upload, no per seat fee.
+#
+#   audio-capture     ->  audio.m4a          ScreenCaptureKit + your mic, one clock
+#   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
+#     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
+#   fm respond        ->  notes.md + brief.json
+#
+# First run: meetingbox setup
+# It checks what is missing and offers to install it. Nothing to do by hand.
+#
+# Written for bash 3.2 and BSD userland, so it runs on a stock Mac.
+
+set -euo pipefail
+
+VERSION="1.1.0"
+
+# --------------------------------------------------------------- configuration
+
+BASE_DIR="${MB_DIR:-$HOME/Meetings}"
+ENGINE="${MB_ENGINE:-auto}"              # auto | native | whisper
+LOCALE="${MB_LOCALE:-en-GB}"
+MIC="${MB_MIC:-}"                        # substring match, empty = system default
+WHISPER_MODEL="${MB_WHISPER_MODEL:-}"
+KEEP_AUDIO="${MB_KEEP_AUDIO:-1}"
+
+STATE_DIR="${MB_STATE_DIR:-$HOME/.meetingbox}"
+PID_FILE="$STATE_DIR/recording.pid"
+DIR_FILE="$STATE_DIR/recording.dir"
+
+BIN_DIR="${MB_BIN_DIR:-$HOME/.local/bin}"
+SRC_DIR="${MB_SRC_DIR:-$HOME/.local/share/meetingbox}"
+MODEL_DIR="${MB_MODEL_DIR:-$HOME/.local/share/whisper}"
+
+AUDIO_CAPTURE_REPO="https://github.com/danySam/audio-capture"
+SPEECH_ANALYZER_REPO="https://github.com/simonw/speech-analyzer-cli"
+WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
+
+CHUNK_WORDS="${MB_CHUNK_WORDS:-1500}"    # ~2000 tokens, leaves room for the answer
+TOKEN_CEILING="${MB_TOKEN_CEILING:-2600}"
+
+MAP_INSTRUCTIONS='You are taking minutes. This is one slice of a longer meeting transcript, so write no introduction and no conclusion. Extract only what is actually in this text, under these headings, omitting any heading with nothing under it: DECISIONS, ACTIONS (name the owner if one was named), NUMBERS AND DATES, OPEN QUESTIONS, NOTABLE QUOTES. Be terse. Invent nothing. If a point is ambiguous, say so rather than resolving it.'
+
+REDUCE_INSTRUCTIONS='These are notes from consecutive slices of one meeting. Merge them into a single set of minutes. Drop duplicates, keep every distinct decision and action, keep the owner against each action, and preserve all numbers, dates and names exactly as written. Add nothing that is not in the notes. Same headings: DECISIONS, ACTIONS, NUMBERS AND DATES, OPEN QUESTIONS.'
+
+FINAL_INSTRUCTIONS='Write the final minutes of this meeting from the merged notes below. Open with a three line summary, then the headings DECISIONS, ACTIONS (one line each, owner first), OPEN QUESTIONS. Markdown. No preamble and no sign off. Add nothing that is not in the notes.'
+
+BRIEF_INSTRUCTIONS='Extract the structured record of this meeting from the notes below. Every item must come from the notes. Leave an array empty rather than guessing.'
+
+# -------------------------------------------------------------------- plumbing
+
+if [ -t 2 ]; then
+  c_dim=$'\033[2m'; c_b=$'\033[1m'; c_r=$'\033[0;31m'
+  c_g=$'\033[0;32m'; c_y=$'\033[0;33m'; c_c=$'\033[0;36m'; c_0=$'\033[0m'
+else
+  c_dim=; c_b=; c_r=; c_g=; c_y=; c_c=; c_0=
+fi
+
+say()  { printf '%s\n' "${c_b}meetingbox${c_0} $*" >&2; }
+info() { printf '%s\n' "${c_dim}           $*${c_0}" >&2; }
+ok()   { printf '%s\n' "${c_g}         +${c_0} $*" >&2; }
+miss() { printf '%s\n' "${c_y}         -${c_0} $*" >&2; }
+warn() { printf '%s\n' "${c_y}      warn${c_0} $*" >&2; }
+die()  { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit 1; }
+rule() { printf '%s\n' "${c_dim}           ------------------------------------------------${c_0}" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+notify() {
+  have osascript || return 0
+  osascript -e "display notification \"${2//\"/}\" with title \"${1//\"/}\"" >/dev/null 2>&1 || true
+}
+
+# yes/no, default yes. If stdin is not a terminal (piped, or `curl | bash`) it
+# falls back to /dev/tty, because a question about installing things on someone's
+# machine has to be answered by a person. With no terminal at all the answer is
+# NO: silently assuming yes would install software nobody agreed to.
+# `[ -r /dev/tty ]` is not good enough: the node can be readable while opening it
+# fails with ENXIO (no controlling terminal). The only honest test is to open it.
+tty_src() {
+  [ -t 0 ] && { printf 'stdin'; return 0; }
+  ( exec < /dev/tty ) 2>/dev/null && { printf '/dev/tty'; return 0; }
+  return 1
+}
+
+confirm() {
+  src="$(tty_src)" || {
+    warn "no terminal to ask on, so leaving it alone: $1"
+    info "run 'meetingbox setup' in Terminal and it will ask properly"
+    return 1
+  }
+  printf '%s' "${c_c}         ? ${c_0}$1 ${c_dim}[Y/n]${c_0} " >&2
+  if [ "$src" = stdin ]; then read -r reply || return 1
+  else read -r reply < /dev/tty || return 1; fi
+  case "$reply" in [nN]|[nN][oO]) return 1 ;; *) return 0 ;; esac
+}
+
+pause_for() {
+  src="$(tty_src)" || return 0
+  printf '%s' "${c_c}         > ${c_0}$1 ${c_dim}[enter]${c_0} " >&2
+  if [ "$src" = stdin ]; then read -r _ || true
+  else read -r _ < /dev/tty || true; fi
+}
+
+mkdir -p "$STATE_DIR"
+
+macos_major() { sw_vers -productVersion 2>/dev/null | cut -d. -f1; }
+
+open_privacy() {
+  have open || return 0
+  open "x-apple.systempreferences:com.apple.preference.security?Privacy_$1" >/dev/null 2>&1 || true
+}
+
+on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
+
+# A job started with `&` in a non-interactive shell inherits SIGINT as IGNORED,
+# which POSIX requires and which means `kill -INT` never reaches the recorder, so
+# it never runs its cleanup and you get a truncated m4a. `set -m` puts the child in
+# its own process group with its signals intact, so Ctrl+C semantics actually work.
+# Every background launch of the recorder is wrapped in it.
+
+# Ask nicely, then insist, then stop asking. The shell's own job notices are
+# swallowed so the user never sees "line 215: 1952 Killed".
+stop_proc() {
+  p="$1"; grace="${2:-150}"
+  kill -INT "$p" 2>/dev/null || true
+  i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt "$grace" ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$p" 2>/dev/null; then
+    kill -TERM "$p" 2>/dev/null || true
+    i=0; while kill -0 "$p" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+  fi
+  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null || true; fi
+  { wait "$p"; } 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ setup steps
+
+# swiftc is the thing actually needed, and `xcode-select -p` can report a path
+# while the toolchain is still downloading, so test for the compiler itself.
+need_xcode_clt()      { ! have swiftc; }
+need_brew()           { ! have brew; }
+need_audio_capture()  { ! have audio-capture; }
+need_fm_license()     { have fm && ! fm respond -i 'say ok' </dev/null >/dev/null 2>&1; }
+
+transcriber_present() { have speech-analyzer || have whisper-cli; }
+
+brew_bin() {
+  if [ -x /opt/homebrew/bin/brew ]; then printf '/opt/homebrew/bin/brew'
+  elif [ -x /usr/local/bin/brew ]; then printf '/usr/local/bin/brew'
+  else printf ''; fi
+}
+
+install_xcode_clt() {
+  say "Xcode Command Line Tools"
+  info "a one off Apple download, needed to compile the recorder"
+  xcode-select --install >/dev/null 2>&1 || true
+  info "an Apple installer window should have opened"
+  pause_for "click through it, then come back here and press enter"
+  if need_xcode_clt; then
+    warn "still not detected. Finish the Apple installer, then run: meetingbox setup"
+    return 1
+  fi
+  ok "Xcode Command Line Tools"
+}
+
+install_brew() {
+  say "Homebrew"
+  info "the package manager. It will ask for your Mac password."
+  if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+    warn "Homebrew install did not finish"
+    return 1
+  fi
+  b="$(brew_bin)"
+  [ -n "$b" ] && eval "$("$b" shellenv)"
+  have brew && ok "Homebrew" || { warn "Homebrew installed but not on PATH, reopen Terminal"; return 1; }
+}
+
+install_audio_capture() {
+  say "the recorder (audio-capture)"
+  info "captures the far side with ScreenCaptureKit and your mic together"
+  info "no virtual audio driver, no aggregate device, nothing to reboot"
+  mkdir -p "$SRC_DIR" "$BIN_DIR"
+  if [ -d "$SRC_DIR/audio-capture/.git" ]; then
+    git -C "$SRC_DIR/audio-capture" pull -q --ff-only || true
+  else
+    rm -rf "$SRC_DIR/audio-capture"
+    git clone -q --depth 1 "$AUDIO_CAPTURE_REPO" "$SRC_DIR/audio-capture" \
+      || { warn "could not clone $AUDIO_CAPTURE_REPO"; return 1; }
+  fi
+  have swiftc || {
+    warn "no Swift compiler, so the Command Line Tools are not ready yet"
+    info "finish the Apple installer window, then run: meetingbox setup"
+    return 1
+  }
+  ( cd "$SRC_DIR/audio-capture" \
+    && swiftc -O -o audio-capture Sources/*.swift \
+         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia ) \
+    || { warn "compile failed, see the output above"; return 1; }
+  install -m 755 "$SRC_DIR/audio-capture/audio-capture" "$BIN_DIR/audio-capture"
+  ok "audio-capture -> $BIN_DIR/audio-capture"
+}
+
+install_speech_analyzer() {
+  say "the transcriber (Apple SpeechAnalyzer)"
+  info "the same on device engine behind Notes transcription. Fast, no model to download."
+  mkdir -p "$SRC_DIR" "$BIN_DIR"
+  if [ -d "$SRC_DIR/speech-analyzer-cli/.git" ]; then
+    git -C "$SRC_DIR/speech-analyzer-cli" pull -q --ff-only || true
+  else
+    rm -rf "$SRC_DIR/speech-analyzer-cli"
+    git clone -q --depth 1 "$SPEECH_ANALYZER_REPO" "$SRC_DIR/speech-analyzer-cli" \
+      || { warn "could not clone $SPEECH_ANALYZER_REPO"; return 1; }
+  fi
+  ( cd "$SRC_DIR/speech-analyzer-cli" && chmod +x scripts/install.sh && ./scripts/install.sh ) \
+    || { warn "speech-analyzer build failed"; return 1; }
+  have speech-analyzer && ok "speech-analyzer" || { warn "built but not on PATH"; return 1; }
+}
+
+install_whisper() {
+  say "the transcriber (whisper.cpp)"
+  have brew || { warn "needs Homebrew first"; return 1; }
+  brew install whisper-cpp || { warn "brew install whisper-cpp failed"; return 1; }
+  mkdir -p "$MODEL_DIR"
+  if [ ! -s "$MODEL_DIR/ggml-large-v3-turbo.bin" ]; then
+    info "downloading the model, about 1.6GB, this is the slow bit"
+    curl -fL --progress-bar -o "$MODEL_DIR/ggml-large-v3-turbo.bin.part" "$WHISPER_MODEL_URL" \
+      || { warn "model download failed"; rm -f "$MODEL_DIR/ggml-large-v3-turbo.bin.part"; return 1; }
+    mv "$MODEL_DIR/ggml-large-v3-turbo.bin.part" "$MODEL_DIR/ggml-large-v3-turbo.bin"
+  fi
+  ok "whisper-cli + model"
+}
+
+accept_fm_license() {
+  say "Apple model licence"
+  info "one command, machine wide, asks for your Mac password"
+  sudo fm license || { warn "licence not accepted"; return 1; }
+  ok "fm licence accepted"
+}
+
+add_to_path() {
+  on_path && return 0
+  line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+  for rc in "$HOME/.zshrc" "$HOME/.bash_profile"; do
+    [ -e "$rc" ] || [ "$rc" = "$HOME/.zshrc" ] || continue
+    grep -qF '.local/bin' "$rc" 2>/dev/null || printf '\n# meetingbox\n%s\n' "$line" >> "$rc"
+  done
+  export PATH="$BIN_DIR:$PATH"
+  ok "added $BIN_DIR to your PATH"
+}
+
+# One short recording to make macOS throw its permission prompts now, in setup,
+# rather than halfway through a real meeting.
+prime_permissions() {
+  say "permissions"
+  info "macOS wants Screen Recording (that is how the far side is captured) and Microphone"
+  info "a prompt or two should appear. Click Allow on each."
+  tmp="$STATE_DIR/permcheck"; rm -rf "$tmp"; mkdir -p "$tmp"
+
+  set -m
+  audio-capture -o "$tmp" -n permcheck >/dev/null 2>"$tmp/log" &
+  p=$!
+  set +m
+  sleep 4
+  stop_proc "$p" 60
+
+  got=""
+  for f in "$tmp"/*.m4a; do [ -e "$f" ] && got="$f" && break; done
+  if [ -n "$got" ] && [ -s "$got" ]; then
+    ok "recording works"
+    rm -rf "$tmp"
+    return 0
+  fi
+
+  warn "the test recording came out empty, so a permission is still missing"
+  [ -s "$tmp/log" ] && sed 's/^/           /' "$tmp/log" >&2
+  rule
+  info "1. Opening Privacy settings now"
+  info "2. Tick your terminal under ${c_b}Screen Recording${c_0} and under ${c_b}Microphone${c_0}"
+  info "3. ${c_b}Quit your terminal completely${c_0} and reopen it. Screen Recording only"
+  info "   takes effect on a fresh launch, this trips everyone up."
+  info "4. Run: ${c_b}meetingbox setup${c_0}"
+  rule
+  open_privacy ScreenCapture
+  sleep 1
+  open_privacy Microphone
+  return 1
+}
+
+make_shortcut_hint() {
+  rule
+  say "want it on a hotkey?"
+  info "Shortcuts app, new shortcut, add a ${c_b}Run Shell Script${c_0} action, shell /bin/bash:"
+  printf '\n' >&2
+  printf '%s\n' "${c_c}             export PATH=\"\$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:\$PATH\"${c_0}" >&2
+  printf '%s\n' "${c_c}             meetingbox${c_0}" >&2
+  printf '\n' >&2
+  info "then set a keyboard shortcut in the details pane and tick Pin in Menu Bar."
+  info "First press records, second press writes the minutes."
+  rule
+}
+
+setup() {
+  printf '\n' >&2
+  say "setup ${c_dim}v$VERSION${c_0}"
+  rule
+
+  v="$(macos_major)"
+  if [ -z "$v" ]; then
+    die "this only runs on macOS"
+  elif [ "$v" -lt 27 ] 2>/dev/null; then
+    miss "macOS $v. The on device model (fm) arrived in macOS 27."
+    info "Recording and transcribing will still work, the summary will not."
+  else
+    ok "macOS $v"
+  fi
+
+  # --- survey, before asking for anything ---
+  todo=""
+  need_xcode_clt      && { miss "Xcode Command Line Tools";    todo="$todo clt"; }      || ok "Xcode Command Line Tools"
+  need_audio_capture  && { miss "audio-capture (the recorder)"; todo="$todo capture"; }  || ok "audio-capture (the recorder)"
+  transcriber_present && ok "a transcriber" || { miss "a transcriber"; todo="$todo transcriber"; }
+  if have fm; then
+    if need_fm_license; then miss "Apple model licence not accepted"; todo="$todo license"
+    else ok "fm, licence accepted"; fi
+  else
+    miss "fm not found (ships with macOS 27)"
+  fi
+  on_path || { miss "$BIN_DIR is not on your PATH"; todo="$todo path"; }
+
+  rule
+  if [ -z "$todo" ]; then
+    say "everything is already in place"
+    prime_permissions || return 1
+    install -m 755 "$0" "$BIN_DIR/meetingbox" 2>/dev/null || true
+    make_shortcut_hint
+    say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
+    return 0
+  fi
+
+  n="$(printf '%s' "$todo" | wc -w | tr -d ' ')"
+  if [ "$n" = 1 ]; then say "one thing to install. I can do it from here."
+  else say "$n things to install. I can do all of them from here."; fi
+  info "some steps may ask for your Mac password, and Apple may open an installer window."
+  confirm "go ahead?" || { info "nothing changed. Run 'meetingbox setup' when you are ready."; return 1; }
+  rule
+
+  case " $todo " in *" path "*) add_to_path ;; esac
+  case " $todo " in *" clt "*)  install_xcode_clt || return 1 ;; esac
+
+  case " $todo " in
+    *" capture "*) install_audio_capture || return 1 ;;
+  esac
+
+  case " $todo " in
+    *" transcriber "*)
+      if [ "${v:-0}" -ge 26 ] 2>/dev/null && confirm "use Apple's built in transcriber? (fast, no 1.6GB download)"; then
+        install_speech_analyzer || {
+          warn "native build failed, trying whisper.cpp instead"
+          need_brew && install_brew
+          install_whisper || return 1
+        }
+      else
+        need_brew && { confirm "whisper.cpp needs Homebrew, install it?" && install_brew || return 1; }
+        install_whisper || return 1
+      fi ;;
+  esac
+
+  case " $todo " in *" license "*) accept_fm_license || true ;; esac
+
+  rule
+  install -m 755 "$0" "$BIN_DIR/meetingbox" 2>/dev/null \
+    && ok "meetingbox -> $BIN_DIR/meetingbox" || true
+
+  prime_permissions || return 1
+  make_shortcut_hint
+  say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
+}
+
+doctor() {
+  say "check"
+  v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
+  have audio-capture  && ok "audio-capture"   || miss "audio-capture"
+  have speech-analyzer && ok "speech-analyzer" || info "speech-analyzer not installed"
+  have whisper-cli    && ok "whisper-cli"     || info "whisper-cli not installed"
+  transcriber_present || miss "no transcriber at all"
+  if have fm; then
+    need_fm_license && miss "fm licence not accepted (sudo fm license)" || ok "fm"
+  else miss "fm"; fi
+  on_path && ok "$BIN_DIR on PATH" || miss "$BIN_DIR not on PATH"
+  if have audio-capture; then
+    info "microphones audio-capture can see:"
+    audio-capture -l 2>&1 | sed 's/^/             /' >&2 || true
+  fi
+  info "if anything is missing: meetingbox setup"
+}
+
+# ------------------------------------------------------------------- recording
+
+is_recording() {
+  [ -f "$PID_FILE" ] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+newest_m4a() {
+  found=""
+  for f in "$1"/*.m4a; do
+    [ -e "$f" ] || continue
+    [ -z "$found" ] && found="$f" && continue
+    [ "$f" -nt "$found" ] && found="$f"
+  done
+  printf '%s' "$found"
+}
+
+start_recording() {
+  have audio-capture || die "the recorder is not installed yet. Run: meetingbox setup"
+  if is_recording; then
+    warn "already recording in $(cat "$DIR_FILE" 2>/dev/null || true)"
+    return 0
+  fi
+
+  stamp="$(date +%Y-%m-%d_%H%M)"
+  dir="$BASE_DIR/$stamp"
+  mkdir -p "$dir"
+
+  # Two traps in one launch:
+  #   stdout -> /dev/null, because audio-capture streams raw PCM to stdout
+  #     whenever stdout is not a terminal. Point it at a file and the log fills
+  #     with audio samples.
+  #   set -m, so the recorder keeps a live SIGINT and finalises the m4a on stop.
+  set -m
+  if [ -n "$MIC" ]; then
+    audio-capture -o "$dir" -n meeting -d "$MIC" >/dev/null 2>"$dir/capture.log" &
+  else
+    audio-capture -o "$dir" -n meeting >/dev/null 2>"$dir/capture.log" &
+  fi
+  pid=$!
+  set +m
+
+  printf '%s' "$pid" > "$PID_FILE"
+  printf '%s' "$dir" > "$DIR_FILE"
+
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE" "$DIR_FILE"
+    [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
+    die "the recorder stopped immediately. Usually a missing permission: meetingbox setup"
+  fi
+
+  say "recording ${c_dim}->${c_0} $dir"
+  info "press the key again, or run 'meetingbox stop', to finish"
+  notify "meetingbox" "Recording"
+}
+
+STOPPED_AUDIO=""
+stop_recording() {
+  is_recording || die "not recording"
+  pid="$(cat "$PID_FILE")"
+  dir="$(cat "$DIR_FILE" 2>/dev/null || true)"
+
+  stop_proc "$pid" 150
+  rm -f "$PID_FILE" "$DIR_FILE"
+
+  audio="$(newest_m4a "$dir")"
+  if [ -z "$audio" ] || [ ! -s "$audio" ]; then
+    [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
+    die "no recording was written in $dir"
+  fi
+  [ "$audio" = "$dir/audio.m4a" ] || { mv -f "$audio" "$dir/audio.m4a"; audio="$dir/audio.m4a"; }
+
+  secs=""
+  have ffprobe && secs="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio" 2>/dev/null || true)"
+  if [ -n "$secs" ]; then ok "stopped, ${secs%.*}s captured"; else ok "stopped"; fi
+  notify "meetingbox" "Transcribing"
+  STOPPED_AUDIO="$audio"
+}
+
+# ----------------------------------------------------------------- transcribing
+
+pick_engine() {
+  case "$ENGINE" in
+    native)  have speech-analyzer || die "speech-analyzer not installed. Run: meetingbox setup"; printf 'native' ;;
+    whisper) have whisper-cli     || die "whisper-cli not installed. Run: meetingbox setup";     printf 'whisper' ;;
+    auto)
+      if have speech-analyzer; then printf 'native'
+      elif have whisper-cli;   then printf 'whisper'
+      else die "no transcriber installed. Run: meetingbox setup"; fi ;;
+    *) die "unknown engine: $ENGINE" ;;
+  esac
+}
+
+find_whisper_model() {
+  [ -n "$WHISPER_MODEL" ] && { printf '%s' "$WHISPER_MODEL"; return; }
+  for c in \
+    "$MODEL_DIR/ggml-large-v3-turbo.bin" \
+    "$HOME/Models/ggml-large-v3-turbo.bin" \
+    "$HOME/.whisper-models/ggml-large-v3-turbo.bin"
+  do
+    [ -f "$c" ] && { printf '%s' "$c"; return; }
+  done
+  printf ''
+}
+
+transcribe() {
+  audio="$1"; out="$2"
+  engine="$(pick_engine)"
+
+  case "$engine" in
+    native)
+      say "transcribing on device (Apple SpeechAnalyzer)"
+      speech-analyzer --locale "$LOCALE" "$audio" > "$out" \
+        || die "transcription failed. Check Speech Recognition in Privacy settings, or run: meetingbox setup"
+      ;;
+    whisper)
+      model="$(find_whisper_model)"
+      [ -n "$model" ] || die "no whisper model found. Run: meetingbox setup"
+      have ffmpeg || die "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"
+      wav="${audio%.*}.16k.wav"
+      say "transcribing on device (whisper.cpp, $(basename "$model"))"
+      ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav"
+      whisper-cli -m "$model" -f "$wav" --no-timestamps \
+        --output-txt --output-file "${out%.txt}" >/dev/null || die "whisper-cli failed"
+      rm -f "$wav"
+      ;;
+  esac
+
+  [ -s "$out" ] || die "the transcript came out empty. Was there any sound?"
+  ok "transcript: $(wc -w < "$out" | tr -d ' ') words"
+}
+
+# ------------------------------------------------------------------ summarising
+
+token_count() {
+  if have fm; then
+    n="$(fm count-tokens < "$1" 2>/dev/null | tr -dc '0-9\n' | grep -m1 '[0-9]' || true)"
+    [ -n "$n" ] && { printf '%s' "$n"; return; }
+  fi
+  awk '{n += NF} END {printf "%d", n * 1.35}' "$1"
+}
+
+# fm ignores stdin if given a positional prompt, so the prompt goes in -i and
+# the content arrives on stdin.
+fm_run() {
+  instr="$1"; input="$2"; shift 2
+  fm respond -i "$instr" "$@" < "$input"
+}
+
+# Fold by word count, not by line: a transcript can arrive as one long paragraph.
+# Break at a sentence end once past the target, with a hard cap so text without
+# punctuation still splits.
+split_chunks() {
+  infile="$1"; outdir="$2"; n="$3"
+  mkdir -p "$outdir"
+  awk -v n="$n" -v dir="$outdir" '
+    function newfile() { part++; w = 0; file = sprintf("%s/chunk-%03d.txt", dir, part) }
+    BEGIN { part = 0; newfile() }
+    {
+      for (i = 1; i <= NF; i++) {
+        printf "%s%s", (w > 0 ? " " : ""), $i > (file)
+        w++
+        if ((w >= n && $i ~ /[.!?]["'"'"')]?$/) || w >= n * 1.5) {
+          printf "\n" > (file); close(file); newfile()
+        }
+      }
+    }
+    END { printf "\n" > (file); close(file) }
+  ' "$infile"
+
+  for f in "$outdir"/chunk-*.txt; do
+    [ -e "$f" ] || continue
+    if [ -s "$f" ] && grep -q '[^[:space:]]' "$f"; then printf '%s\n' "$f"; else rm -f "$f"; fi
+  done
+}
+
+summarise() {
+  transcript="$1"; dir="$2"
+  have fm || die "fm not found. It ships with macOS 27. Run: meetingbox setup"
+
+  work="$dir/.work"; rm -rf "$work"; mkdir -p "$work"
+  merged="$work/merged.txt"
+
+  tokens="$(token_count "$transcript")"; tokens="${tokens:-0}"
+  info "transcript is ~$tokens tokens, the on device window is ~4000"
+
+  if [ "$tokens" -le "$TOKEN_CEILING" ]; then
+    info "fits in one pass"
+    cp "$transcript" "$merged"
+  else
+    # Chunk lists go through files, not bash arrays: stock macOS bash is 3.2,
+    # where `mapfile` is missing and an empty array trips `set -u`.
+    list="$work/chunks.list"
+    split_chunks "$transcript" "$work/chunks" "$CHUNK_WORDS" > "$list"
+    total="$(grep -c . "$list" 2>/dev/null || true)"
+    [ "${total:-0}" -gt 0 ] || die "chunking produced nothing, the transcript may be unreadable"
+    say "summarising in $total slices"
+
+    : > "$merged"
+    i=0
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      i=$((i + 1))
+      info "slice $i/$total"
+      {
+        printf '\n## slice %d of %d\n\n' "$i" "$total"
+        fm_run "$MAP_INSTRUCTIONS" "$c" || printf '(slice %d failed)\n' "$i"
+      } >> "$merged"
+    done < "$list"
+
+    round=0
+    while [ "$(token_count "$merged")" -gt "$TOKEN_CEILING" ]; do
+      round=$((round + 1))
+      if [ "$round" -gt 4 ]; then warn "still over the window after 4 rounds, going with what we have"; break; fi
+      info "folding, round $round"
+      rlist="$work/reduce-$round.list"
+      split_chunks "$merged" "$work/reduce-$round" "$CHUNK_WORDS" > "$rlist"
+      next="$work/merged.r$round.txt"
+      : > "$next"
+      while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        fm_run "$REDUCE_INSTRUCTIONS" "$c" >> "$next" || true
+        printf '\n' >> "$next"
+      done < "$rlist"
+      merged="$next"
+    done
+  fi
+
+  cp "$merged" "$dir/notes-raw.md"
+
+  say "writing the minutes"
+  fm_run "$FINAL_INSTRUCTIONS" "$merged" > "$dir/notes.md" || die "fm failed on the final pass"
+
+  # Structured record beside the prose, so downstream tooling gets something it
+  # can parse rather than something it has to interpret.
+  schema="$work/schema.json"
+  if fm schema object --name MeetingBrief \
+       --string summary \
+       --string decisions --array \
+       --string actions --array \
+       --string open_questions --array \
+       --string numbers_and_dates --array > "$schema" 2>/dev/null
+  then
+    if fm_run "$BRIEF_INSTRUCTIONS" "$merged" --schema "$schema" > "$dir/brief.json" 2>/dev/null; then
+      ok "brief.json"
+    else
+      warn "structured pass failed, the prose minutes are still good"
+      rm -f "$dir/brief.json"
+    fi
+  fi
+
+  [ "${MB_DEBUG:-0}" = "1" ] || rm -rf "$work"
+  ok "minutes: $dir/notes.md"
+}
+
+# ------------------------------------------------------------------- processing
+
+process() {
+  input="$1"
+  [ -e "$input" ] || die "no such file: $input"
+  dir="$(cd "$(dirname "$input")" && pwd)"
+  transcript="$dir/transcript.txt"
+
+  case "${input##*.}" in
+    txt|md|vtt|srt)
+      [ "$input" = "$transcript" ] || cp "$input" "$transcript" ;;
+    *)
+      transcribe "$input" "$transcript"
+      [ "$KEEP_AUDIO" = "1" ] || rm -f "$input" ;;
+  esac
+
+  summarise "$transcript" "$dir"
+  notify "meetingbox" "Minutes ready"
+
+  if [ -t 1 ]; then
+    printf '\n'; cat "$dir/notes.md"; printf '\n'
+    have open && open "$dir/notes.md" 2>/dev/null || true
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+meetingbox: record, transcribe and summarise a meeting entirely on device.
+
+  meetingbox setup                 install what is missing, next next next
+  meetingbox                       toggle: start, or stop and write the minutes
+  meetingbox start | stop | status
+  meetingbox process <audio|txt>   run an existing file through the pipeline
+  meetingbox doctor                what is installed and what is not
+  meetingbox mics                  microphones the recorder can see
+  meetingbox help
+
+Options
+  --mic "USB"            microphone, substring match   (MB_MIC)
+  --dir ~/Meetings       where recordings land         (MB_DIR)
+  --locale en-GB         transcription locale          (MB_LOCALE)
+  --whisper | --native   pick the transcriber          (MB_ENGINE)
+  --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
+  --no-keep-audio        bin the m4a once transcribed
+
+Output lands in ~/Meetings/<date>_<time>/
+  audio.m4a  transcript.txt  notes.md  notes-raw.md  brief.json
+USAGE
+}
+
+# ------------------------------------------------------------------------ main
+
+cmd=""
+argfile=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mic|--device) MIC="$2"; shift 2 ;;
+    --dir)     BASE_DIR="$2"; shift 2 ;;
+    --locale)  LOCALE="$2"; shift 2 ;;
+    --model)   WHISPER_MODEL="$2"; ENGINE="whisper"; shift 2 ;;
+    --whisper) ENGINE="whisper"; shift ;;
+    --native)  ENGINE="native"; shift ;;
+    --keep-audio)    KEEP_AUDIO=1; shift ;;
+    --no-keep-audio) KEEP_AUDIO=0; shift ;;
+    -v|--version) printf 'meetingbox %s\n' "$VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *)  if [ -z "$cmd" ]; then cmd="$1"; else argfile="$1"; fi; shift ;;
+  esac
+done
+
+case "${cmd:-toggle}" in
+  toggle)
+    if is_recording; then stop_recording; process "$STOPPED_AUDIO"
+    elif ! have audio-capture; then
+      warn "not set up yet"
+      confirm "run setup now?" && setup || info "run 'meetingbox setup' when you are ready"
+    else start_recording; fi ;;
+  start)   start_recording ;;
+  stop)    stop_recording; process "$STOPPED_AUDIO" ;;
+  process) [ -n "$argfile" ] || die "usage: meetingbox process <audio-or-transcript>"
+           process "$argfile" ;;
+  setup)   setup ;;
+  doctor|check) doctor ;;
+  mics|devices)
+    have audio-capture || die "the recorder is not installed. Run: meetingbox setup"
+    audio-capture -l ;;
+  status)  if is_recording; then ok "recording -> $(cat "$DIR_FILE")"; else info "idle"; fi ;;
+  help)    usage ;;
+  *)       die "unknown command: $cmd (try: meetingbox help)" ;;
+esac

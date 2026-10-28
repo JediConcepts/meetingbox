@@ -1,0 +1,21 @@
+# meetingbox records real meetings. Recordings, transcripts and minutes are the
+# content of real conversations, so none of them belong in git. Do not replace
+# this with a stock template, which would catch *.m4a and miss the rest.
+
+# meeting output
+Meetings/
+*.m4a
+*.wav
+transcript.txt
+notes.md
+notes-raw.md
+brief.json
+.work/
+capture.log
+
+# models
+*.bin
+Models/
+
+# macOS
+.DS_Store
