@@ -146,7 +146,9 @@ stop_proc() {
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
 need_audio_capture()  { ! have audio-capture; }
-need_fm_license()     { have fm && ! fm respond -i 'say ok' </dev/null >/dev/null 2>&1; }
+# fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
+# reports the licence missing on every machine.
+need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
 
 transcriber_present() { have speech-analyzer || have whisper-cli; }
 
@@ -198,6 +200,8 @@ install_audio_capture() {
     info "finish the Apple installer window, then run: meetingbox setup"
     return 1
   }
+  info "compiling. The first Swift build on a Mac caches Apple's frameworks and can"
+  info "sit silent for a few minutes. It has not hung, leave it be."
   ( cd "$SRC_DIR/audio-capture" \
     && swiftc -O -o audio-capture Sources/*.swift \
          -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia ) \
@@ -405,8 +409,15 @@ doctor() {
 is_recording() {
   [ -f "$PID_FILE" ] || return 1
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  # After a crash or reboot the old PID can belong to an unrelated process, and
+  # stopping means INT, TERM and then -9. Only claim it if it is the recorder.
+  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in *audio-capture*) return 0 ;; *) return 1 ;; esac
 }
+
+# A session whose recorder died on its own (crash, sleep, force quit) still has
+# audio worth keeping, so the next press should finish it, not start a new one.
+has_session() { [ -f "$DIR_FILE" ]; }
 
 newest_m4a() {
   found=""
@@ -424,9 +435,16 @@ start_recording() {
     warn "already recording in $(cat "$DIR_FILE" 2>/dev/null || true)"
     return 0
   fi
+  if has_session; then
+    warn "an earlier recording was never finished: $(cat "$DIR_FILE" 2>/dev/null || true)"
+    info "it is still on disk. To get its minutes: meetingbox process <the .m4a in that folder>"
+  fi
 
   stamp="$(date +%Y-%m-%d_%H%M)"
   dir="$BASE_DIR/$stamp"
+  # Two recordings in the same minute would otherwise share a folder, and the
+  # second would overwrite the first meeting's audio and minutes.
+  [ -e "$dir" ] && dir="$BASE_DIR/$(date +%Y-%m-%d_%H%M%S)"
   mkdir -p "$dir"
 
   # Two traps in one launch:
@@ -460,11 +478,14 @@ start_recording() {
 
 STOPPED_AUDIO=""
 stop_recording() {
-  is_recording || die "not recording"
-  pid="$(cat "$PID_FILE")"
+  has_session || die "not recording"
   dir="$(cat "$DIR_FILE" 2>/dev/null || true)"
 
-  stop_proc "$pid" 150
+  if is_recording; then
+    stop_proc "$(cat "$PID_FILE")" 150
+  else
+    warn "the recorder had already stopped, picking up what it wrote"
+  fi
   rm -f "$PID_FILE" "$DIR_FILE"
 
   audio="$(newest_m4a "$dir")"
@@ -551,6 +572,26 @@ fm_run() {
   fm respond -i "$instr" "$@" < "$input"
 }
 
+# A dense slice can need more answer than the window has room for, and fm then
+# fails with "exceeded the model's context size". Dropping it would quietly lose
+# decisions, so halve the slice and try again, down to a floor. Output is held
+# until the call succeeds, because fm streams and a failed call prints half an answer.
+fm_fold() {
+  local instr="$1" input="$2" words="$3" sub c
+  if fm_run "$instr" "$input" > "$input.out" 2>/dev/null; then
+    cat "$input.out"; return 0
+  fi
+  [ "$words" -gt 200 ] || return 1
+  info "  too dense for one pass, splitting it"
+  sub="$input.split"
+  split_chunks "$input" "$sub" $((words / 2)) > "$sub.list"
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    fm_fold "$instr" "$c" $((words / 2)) || return 1
+    printf '\n'
+  done < "$sub.list"
+}
+
 # Fold by word count, not by line: a transcript can arrive as one long paragraph.
 # Break at a sentence end once past the target, with a hard cap so text without
 # punctuation still splits.
@@ -608,7 +649,9 @@ summarise() {
       info "slice $i/$total"
       {
         printf '\n## slice %d of %d\n\n' "$i" "$total"
-        fm_run "$MAP_INSTRUCTIONS" "$c" || printf '(slice %d failed)\n' "$i"
+        fm_fold "$MAP_INSTRUCTIONS" "$c" "$CHUNK_WORDS" || {
+          warn "slice $i could not be summarised, its text is kept verbatim in notes-raw.md"
+          cat "$c"; }
       } >> "$merged"
     done < "$list"
 
@@ -618,12 +661,15 @@ summarise() {
       if [ "$round" -gt 4 ]; then warn "still over the window after 4 rounds, going with what we have"; break; fi
       info "folding, round $round"
       rlist="$work/reduce-$round.list"
-      split_chunks "$merged" "$work/reduce-$round" "$CHUNK_WORDS" > "$rlist"
+      # Merging keeps every item, so the answer is about as long as the input.
+      # Half size slices leave room for both inside the window.
+      split_chunks "$merged" "$work/reduce-$round" $((CHUNK_WORDS / 2)) > "$rlist"
       next="$work/merged.r$round.txt"
       : > "$next"
       while IFS= read -r c; do
         [ -n "$c" ] || continue
-        fm_run "$REDUCE_INSTRUCTIONS" "$c" >> "$next" || true
+        # On failure carry the notes forward unmerged rather than drop them.
+        fm_fold "$REDUCE_INSTRUCTIONS" "$c" $((CHUNK_WORDS / 2)) >> "$next" || cat "$c" >> "$next"
         printf '\n' >> "$next"
       done < "$rlist"
       merged="$next"
@@ -633,7 +679,13 @@ summarise() {
   cp "$merged" "$dir/notes-raw.md"
 
   say "writing the minutes"
-  fm_run "$FINAL_INSTRUCTIONS" "$merged" > "$dir/notes.md" || die "fm failed on the final pass"
+  # fm streams, so a failed pass would leave half a file. Write aside, then move.
+  # If the notes are still too big for the window, ship them whole rather than nothing.
+  if ! fm_run "$FINAL_INSTRUCTIONS" "$merged" > "$work/final.md" 2>/dev/null; then
+    warn "too much in this meeting for one final pass, so notes.md holds the merged notes in full"
+    cp "$merged" "$work/final.md"
+  fi
+  mv "$work/final.md" "$dir/notes.md"
 
   # Structured record beside the prose, so downstream tooling gets something it
   # can parse rather than something it has to interpret.
@@ -730,7 +782,7 @@ done
 
 case "${cmd:-toggle}" in
   toggle)
-    if is_recording; then stop_recording; process "$STOPPED_AUDIO"
+    if has_session; then stop_recording; process "$STOPPED_AUDIO"
     elif ! have audio-capture; then
       warn "not set up yet"
       confirm "run setup now?" && setup || info "run 'meetingbox setup' when you are ready"

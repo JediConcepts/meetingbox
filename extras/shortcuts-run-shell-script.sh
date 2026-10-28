@@ -4,5 +4,5 @@
 #
 # Shortcuts hands the script a bare PATH, so it has to be rebuilt here or
 # meetingbox will not find ffmpeg, fm or the transcriber.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
-/usr/local/bin/meetingbox
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+meetingbox
