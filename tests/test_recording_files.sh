@@ -34,6 +34,19 @@ if ! test_recording; then pass "test_recording fails without audio.m4a"
 else fail "test_recording fails without audio.m4a"; fi
 rm -f "$PERM_DIR/1_permcheck.m4a"; clear_permcheck
 
+# --- prime_permissions: a switch already on from v1.2.2 can still fail, so say what to do ---
+for which in 'start system audio' 'start microphone'; do
+  out="$(
+    test_recording() { mkdir -p "$PERM_DIR"; echo "could not $which" > "$PERM_DIR/log"; return 1; }
+    pause_for() { :; }; open_privacy() { :; }; open() { :; }
+    prime_permissions 2>&1
+  )"
+  if printf '%s\n' "$out" | grep -q 'Already on? Turn it off and on again, or select it, remove it with the minus button and test again.'; then
+    pass "prime_permissions: already-on hint ($which)"
+  else fail "prime_permissions: already-on hint ($which)"; fi
+done
+rm -f "$PERM_DIR/log"; rmdir "$PERM_DIR" 2>/dev/null
+
 # --- stop_recording takes audio.m4a, whatever else is in the folder ---
 dir="$HOME/meeting"
 has_session() { return 0; }

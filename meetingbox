@@ -644,6 +644,7 @@ prime_permissions() {
       info "   (not the 'System Audio Recording Only' list below it)"
       info "3. Not in the list? Drag the meetingbox app from the Finder window I am"
       info "   opening into that list, then turn it on"
+      info "Already on? Turn it off and on again, or select it, remove it with the minus button and test again."
       info "The Microphone comes after this. macOS asks for it on the next test."
       rule
       open_privacy ScreenCapture
@@ -653,6 +654,7 @@ prime_permissions() {
       rule
       info "1. Opening Privacy settings at ${c_b}Microphone${c_0}"
       info "2. Turn on ${c_b}meetingbox${c_0}"
+      info "Already on? Turn it off and on again, or select it, remove it with the minus button and test again."
       rule
       open_privacy Microphone
     else

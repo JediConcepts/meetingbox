@@ -7,7 +7,9 @@
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REAL_HOME="$HOME"
-HOME="$(mktemp -d)"
+HOME="$(mktemp -d)" || exit 1
+# never the real HOME, and never empty: every test path is built from it
+[ -n "$HOME" ] && [ "$HOME" != "$REAL_HOME" ] || exit 1
 export HOME
 LSREGISTER=/usr/bin/true
 : > "$HOME/calls.log"

@@ -23,10 +23,18 @@ else fail "recorded path removed and dropped from record"; fi
 remove_installed "$HOME/b" 2>/dev/null
 if [ -d "$HOME/b" ]; then pass "unrecorded path kept"; else fail "unrecorded path kept"; fi
 
+# Each is on the record first, so the case guard itself is what refuses. rm is a
+# stub here, so a broken guard fails the check instead of deleting anything.
+rm() { echo "rm $*" >> "$HOME/calls.log"; }
 for bad in "" / "$HOME"; do
+  record_install "$bad"; : > "$HOME/calls.log"
   remove_installed "$bad" 2>/dev/null
-  if [ $? -ne 0 ] && [ -d "$HOME" ]; then pass "refused '$bad'"; else fail "refused '$bad'"; fi
+  if [ $? -ne 0 ] && [ -d "$HOME" ] && ! grep -q '^rm ' "$HOME/calls.log" && installed_by_us "$bad"; then
+    pass "refused '$bad', though recorded"
+  else fail "refused '$bad', though recorded"; fi
+  forget_install "$bad"
 done
+unset -f rm
 
 # --- the recorder is built from meetingbox's own source ---
 mkdir -p "$HOME/fake/native/recorder"
