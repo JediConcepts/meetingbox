@@ -726,7 +726,7 @@ start_recording() {
   fi
   if has_session; then
     warn "an earlier recording was never finished: $(session_dir)"
-    info "it is still on disk. To get its minutes: meetingbox process <the .m4a in that folder>"
+    info "it is still on disk. To get its minutes: meetingbox process $(session_dir)/audio.m4a"
   fi
 
   stamp="$(date +%Y-%m-%d_%H%M)"
