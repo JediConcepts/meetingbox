@@ -87,7 +87,7 @@
 - Produces: `recorder_ready` is true only when `$APP_BIN` is executable and the app's `CFBundleShortVersionString` (read with PlistBuddy) equals `$VERSION`, so updating meetingbox makes setup rebuild the recorder. Today an update never rebuilds it.
 - `install.sh`: when it uses the local copy and `$here/native/recorder` exists, it runs setup with `MB_SOURCE_DIR="$here"` in the environment.
 
-- [ ] **Step 1: Write the failing tests:** with `MB_SOURCE_DIR` pointing at a fake tree containing `native/recorder/main.swift`, `fetch_source` succeeds, makes no clone, and `installed_by_us "$MB_SOURCE_DIR"` is false. Without it and with a stub `git` that creates the folder, `$SRC_DIR/meetingbox` is recorded and `git` was called with `--branch v$VERSION`.
+- [ ] **Step 1: Write the failing tests:** with `MB_SOURCE_DIR` pointing at a fake tree containing `native/recorder/main.swift`, `fetch_source` succeeds, makes no clone, and `installed_by_us "$MB_SOURCE_DIR"` is false. Without it and with a stub `git` that creates the folder, `$SRC_DIR/meetingbox` is recorded and `git` was called with `--branch v$VERSION`. `recorder_ready` is false for an app whose Info.plist says `1.2.2` and true once it says `$VERSION`.
 - [ ] **Step 2: Run** `bash tests/run.sh`. Expected: FAIL, `fetch_source` not defined.
 - [ ] **Step 3: Copy the sources and implement** `fetch_source`, `install_recorder`, and the `install.sh` change. Add `native/recorder/README.md` (two lines: where it came from, the commit, MIT).
 - [ ] **Step 4: Run** `bash tests/run.sh` (PASS), then a real build: `swiftc -O -o "$(mktemp -d)/rec" native/recorder/*.swift -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia` and run the result with `-h`. Expected: compiles, help text prints.
@@ -132,7 +132,6 @@ rm -rf "$tmp"
 
 - [ ] **Step 1: Spike on this Mac (manual, before the tests).** Run the recipe by hand into the login keychain, then `codesign --force --sign "meetingbox local signing" --identifier com.jediconcepts.meetingbox` on a copy of the current app. If codesign refuses the certificate as untrusted, add `security add-trusted-cert -r trustRoot -p codeSign -k "$SIGN_KEYCHAIN" "$tmp/cert.pem"` to the recipe (this is the one password prompt the spec warns of) and note it in the README. Then sign a second build and compare `codesign -d -r- APP 2>&1 | grep designated` across both. Expected: identical designated requirements containing `certificate leaf = H"…"`. Delete the spike identity with `security delete-identity -c "meetingbox local signing"`.
 - [ ] **Step 2: Write the failing tests** in `tests/test_signing.sh` (stubs from lib.sh; make the `security find-certificate` stub fail until `security import` has been called):
-  - (Task 2 test) `recorder_ready` is false for an app whose Info.plist says `1.2.2`.
   - fresh: `ensure_signing_identity` calls `openssl` and `security import`, records `keychain:meetingbox local signing`, and leaves no temporary folder behind in `$TMPDIR` named by it;
   - existing but not ours: no `import`, nothing recorded;
   - `reset_cmd tools` with it recorded: calls `security delete-identity -c meetingbox local signing`, record line gone, and nothing named `keychain:*` was passed to `rm`;
