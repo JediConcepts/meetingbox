@@ -19,9 +19,7 @@ func findDevice(matching name: String) -> AVCaptureDevice? {
 
 var outputDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Recordings")
-var label: String? = nil
 var deviceQuery: String? = nil
-var pipeRate = 16000.0
 
 var args = CommandLine.arguments.dropFirst().makeIterator()
 while let arg = args.next() {
@@ -33,23 +31,18 @@ while let arg = args.next() {
         }
         outputDir = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
     case "--name", "-n":
-        guard let name = args.next() else {
+        // Still accepted: meetingbox finds its recorders by "-o DIR -n NAME".
+        // The files are always audio.m4a, mic.m4a and call.m4a.
+        guard args.next() != nil else {
             eprint("Error: --name requires a label")
             exit(1)
         }
-        label = name
     case "--device", "-d":
         guard let name = args.next() else {
             eprint("Error: --device requires a device name")
             exit(1)
         }
         deviceQuery = name
-    case "--pipe-rate", "-r":
-        guard let value = args.next(), let rate = Double(value), rate >= 8000, rate <= 192000 else {
-            eprint("Error: --pipe-rate requires a sample rate in Hz (e.g. 16000)")
-            exit(1)
-        }
-        pipeRate = rate
     case "--list-devices", "-l":
         let devices = discoverInputDevices()
         let defaultDevice = AVCaptureDevice.default(for: .audio)
@@ -66,24 +59,22 @@ while let arg = args.next() {
         print("""
         audio-capture — Record system audio and microphone
 
-        Usage: audio-capture [options] [| other-command]
+        Usage: audio-capture [options]
 
         Options:
-          -n, --name <label>    Label for the recording (e.g. "standup", "1on1-with-alex")
+          -n, --name <label>    Label for the recording (accepted, not used in file names)
           -d, --device <name>   Microphone to use (substring match, see --list-devices)
           -l, --list-devices    List available microphones
           -o, --output <dir>    Output directory (default: ~/Recordings)
-          -r, --pipe-rate <hz>  Sample rate of piped audio (default: 16000)
           -h, --help            Show this help
 
-        Saves a single mixed .m4a file with both system audio and mic:
-          <timestamp>[_label].m4a
+        Saves three aligned files in the output directory, and refuses to start
+        if any of them is already there:
+          audio.m4a   the mix of both
+          mic.m4a     your microphone only
+          call.m4a    system audio only
 
-        When stdout is piped, the mixed audio is also streamed live as raw PCM
-        (signed 16-bit little-endian, mono, --pipe-rate Hz). Status goes to stderr.
-          audio-capture -n standup | transcribe -o standup.txt
-
-        Press Ctrl+C to stop recording.
+        Status goes to stderr. Press Ctrl+C to stop recording.
         First run will prompt for Screen Recording and Microphone permissions.
         """)
         exit(0)
@@ -92,8 +83,6 @@ while let arg = args.next() {
         exit(1)
     }
 }
-
-let piping = isatty(STDOUT_FILENO) == 0
 
 // MARK: - Resolve mic device
 
@@ -120,29 +109,23 @@ if let query = deviceQuery {
 
 try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
 
-let formatter = DateFormatter()
-formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-let timestamp = formatter.string(from: Date())
-let sanitizedLabel = label.map { $0.replacingOccurrences(of: "[^a-zA-Z0-9_-]", with: "-", options: .regularExpression) }
-let prefix = [timestamp, sanitizedLabel].compactMap({ $0 }).joined(separator: "_")
-let outputURL = outputDir.appendingPathComponent("\(prefix).m4a")
-
 let output: RecordingOutput
 do {
-    output = try RecordingOutput(fileURL: outputURL, pipeSampleRate: piping ? pipeRate : nil)
+    output = try RecordingOutput(directory: outputDir)
 } catch {
-    eprint("Failed to create output file: \(error.localizedDescription)")
+    eprint("Failed to create output files: \(error.localizedDescription)")
     exit(1)
 }
 
-let mixer = AudioMixer { output.write($0) }
+let mixer = AudioMixer { mic, system in output.write(mic: mic, system: system) }
 let systemExtractor = SampleExtractor()
 let micExtractor = SampleExtractor()
 
 func abort(_ message: String) -> Never {
     eprint(message)
     output.close()
-    try? FileManager.default.removeItem(at: outputURL)
+    // Only what this run created: never a file that was there before.
+    output.created.forEach { try? FileManager.default.removeItem(at: $0) }
     exit(1)
 }
 
@@ -203,17 +186,12 @@ do {
 let startTime = Date()
 eprint("Recording started at \(DateFormatter.localizedString(from: startTime, dateStyle: .none, timeStyle: .short))")
 eprint("  Microphone: \(micDevice.localizedName)")
-eprint("  File:       \(outputURL.path)")
-if piping {
-    eprint("  Stdout:     s16le mono \(Int(pipeRate)) Hz")
-}
+eprint("  Folder:     \(outputDir.path)")
 eprint("Press Ctrl+C to stop.")
 
 for await _ in stopSignal { break }
 
 // MARK: - Stop
-
-let elapsed = Int(Date().timeIntervalSince(startTime))
 
 eprint("\nStopping...")
 micRecorder.stop()
@@ -221,10 +199,14 @@ try? await systemRecorder.stop()
 mixer.finish()
 output.close()
 
+// What was actually written, not wall-clock time, so a stalled source shows.
+let elapsed = Int(output.secondsWritten)
 let h = elapsed / 3600
 let m = (elapsed % 3600) / 60
 let s = elapsed % 60
 let duration = h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 
 eprint("Saved (\(duration))")
-eprint("  \(outputURL.path)")
+for name in RecordingOutput.names {
+    eprint("  \(outputDir.appendingPathComponent(name).path)")
+}

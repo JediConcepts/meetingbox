@@ -7,24 +7,29 @@ enum AudioSource: Int {
     case mic = 1
 }
 
-/// Mixes the sources onto a shared host-time timeline and emits contiguous 48kHz mono chunks.
+/// Places each source on its own host-time timeline, both sharing one origin, and emits
+/// contiguous 48kHz mono chunks of the two side by side (always the same length).
 final class AudioMixer: @unchecked Sendable {
     static let sampleRate = 48000.0
     static let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false)!
 
     private let lock = NSLock()
-    private let startTime = CMClockGetTime(CMClockGetHostTimeClock())
+    private let now: () -> CMTime
+    private let startTime: CMTime
     // How long to wait for a lagging (or silent) source before emitting without it.
     private let maxLag = Int64(0.5 * sampleRate)
     // Buffers are placed back-to-back unless their timestamp drifts further than this, which avoids clicks from jitter.
     private let resyncThreshold = Int64(0.03 * sampleRate)
-    private var timeline: [Float] = []
+    private var timelines: [[Float]] = [[], []]
     private var baseFrame: Int64 = 0
     private var cursors: [Int64?] = [nil, nil]
     private var clockOffsets: [Int64?] = [nil, nil]
-    private let emit: ([Float]) -> Void
+    private let emit: (_ mic: [Float], _ system: [Float]) -> Void
 
-    init(emit: @escaping ([Float]) -> Void) {
+    init(now: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) },
+         emit: @escaping (_ mic: [Float], _ system: [Float]) -> Void) {
+        self.now = now
+        self.startTime = now()
         self.emit = emit
     }
 
@@ -37,8 +42,8 @@ final class AudioMixer: @unchecked Sendable {
         let raw = frame(at: hostTime)
         if clockOffsets[i] == nil {
             // Fall back to arrival time if a source's timestamps aren't on the host clock.
-            let now = frame(at: CMClockGetTime(CMClockGetHostTimeClock()))
-            clockOffsets[i] = abs(raw - now) > Int64(2 * Self.sampleRate) ? now - raw : 0
+            let arrival = frame(at: now())
+            clockOffsets[i] = abs(raw - arrival) > Int64(2 * Self.sampleRate) ? arrival - raw : 0
         }
         let placed = raw + clockOffsets[i]!
         var start = placed
@@ -51,11 +56,11 @@ final class AudioMixer: @unchecked Sendable {
         guard skip < samples.count else { return }
         let index = Int(max(start, baseFrame) - baseFrame)
         let count = samples.count - skip
-        if timeline.count < index + count {
-            timeline.append(contentsOf: repeatElement(0, count: index + count - timeline.count))
+        if timelines[i].count < index + count {
+            timelines[i].append(contentsOf: repeatElement(0, count: index + count - timelines[i].count))
         }
         for j in 0..<count {
-            timeline[index + j] += samples[skip + j]
+            timelines[i][index + j] += samples[skip + j]
         }
         drain(final: false)
     }
@@ -71,7 +76,7 @@ final class AudioMixer: @unchecked Sendable {
     }
 
     private func drain(final: Bool) {
-        let end = baseFrame + Int64(timeline.count)
+        let end = baseFrame + Int64(timelines.map(\.count).max()!)
         var ready = end
         if !final {
             ready = cursors.map { $0 ?? baseFrame }.min()!
@@ -79,10 +84,17 @@ final class AudioMixer: @unchecked Sendable {
         }
         let n = Int(ready - baseFrame)
         guard n > 0 else { return }
-        let chunk = timeline[0..<n].map { min(max($0, -1), 1) }
-        timeline.removeFirst(n)
+        // A source that is behind (or silent) is padded with silence so both stay aligned.
+        var chunks: [[Float]] = [[], []]
+        for i in timelines.indices {
+            if timelines[i].count < n {
+                timelines[i].append(contentsOf: repeatElement(0, count: n - timelines[i].count))
+            }
+            chunks[i] = timelines[i][0..<n].map { min(max($0, -1), 1) }
+            timelines[i].removeFirst(n)
+        }
         baseFrame = ready
-        emit(chunk)
+        emit(chunks[AudioSource.mic.rawValue], chunks[AudioSource.system.rawValue])
     }
 }
 

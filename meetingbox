@@ -8,6 +8,7 @@
 # Nothing leaves the Mac. No account, no API key, no upload, no per seat fee.
 #
 #   audio-capture     ->  audio.m4a          ScreenCaptureKit + your mic, one clock
+#                         (+ mic.m4a, call.m4a: each side on its own)
 #   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
 #     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
 #   fm respond        ->  notes.md + brief.json
@@ -502,22 +503,20 @@ add_to_path() {
 # One short recording to make macOS throw its permission prompts now, in setup,
 # rather than halfway through a real meeting.
 # The recorder gives up at once if Screen Recording is missing, so a non-empty
-# file means both sides are being captured.
+# audio.m4a means both sides are being captured.
 PERM_DIR="$STATE_DIR/permcheck"
 test_recording() {
   clear_permcheck; mkdir -p "$PERM_DIR"
   p="$(launch_recorder "$PERM_DIR" permcheck "$PERM_DIR/log")" || return 1
   sleep 4
   stop_proc "$p" 60
-  for f in "$PERM_DIR"/*_permcheck.m4a; do
-    [ -s "$f" ] && { clear_permcheck; return 0; }
-  done
+  [ -s "$PERM_DIR/audio.m4a" ] && { clear_permcheck; return 0; }
   return 1
 }
 
 # Only the files the test writes, then the folder if that leaves it empty.
 clear_permcheck() {
-  rm -f "$PERM_DIR"/*_permcheck.m4a "$PERM_DIR/log"
+  rm -f "$PERM_DIR/audio.m4a" "$PERM_DIR/mic.m4a" "$PERM_DIR/call.m4a" "$PERM_DIR/log"
   rmdir "$PERM_DIR" 2>/dev/null || true
 }
 
@@ -767,12 +766,12 @@ stop_recording() {
   fi
   rm -f "$DIR_FILE"
 
-  audio="$(newest_m4a "$dir")"
-  if [ -z "$audio" ] || [ ! -s "$audio" ]; then
+  # the recorder writes the mix as audio.m4a, beside mic.m4a and call.m4a
+  audio="$dir/audio.m4a"
+  if [ ! -s "$audio" ]; then
     [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
     die "no recording was written in $dir"
   fi
-  [ "$audio" = "$dir/audio.m4a" ] || { mv -f "$audio" "$dir/audio.m4a"; audio="$dir/audio.m4a"; }
 
   secs=""
   have ffprobe && secs="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio" 2>/dev/null || true)"
