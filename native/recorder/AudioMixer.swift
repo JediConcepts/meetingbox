@@ -29,6 +29,15 @@ final class AudioMixer: @unchecked Sendable {
     private var paused = false
     private let emit: (_ mic: [Float], _ system: [Float]) -> Void
 
+    /// The mix of the two sides, as audio.m4a holds it: their sum, clipped to -1...1.
+    /// A shorter side counts as silence where it has run out.
+    static func mix(_ mic: [Float], _ system: [Float]) -> [Float] {
+        (0..<max(mic.count, system.count)).map { i in
+            let sum = (i < mic.count ? mic[i] : 0) + (i < system.count ? system[i] : 0)
+            return min(max(sum, -1), 1)
+        }
+    }
+
     init(now: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) },
          emit: @escaping (_ mic: [Float], _ system: [Float]) -> Void) {
         self.now = now

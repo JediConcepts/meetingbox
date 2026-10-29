@@ -5,55 +5,63 @@ func eprint(_ message: String) {
     fputs(message + "\n", stderr)
 }
 
-/// Writes the mix (audio.m4a), the mic (mic.m4a) and the call (call.m4a) side by side.
-/// Encoding happens off the capture threads, on one serial queue.
+/// Records the mic and the call side by side into working files, mic.caf and
+/// call.caf: 16-bit PCM, which keeps every sample written even if the recorder is
+/// killed. `finish()` turns them into audio.m4a (the mix), mic.m4a and call.m4a.
+/// Writing happens off the capture threads, on one serial queue.
 final class RecordingOutput: @unchecked Sendable {
-    static let names = ["audio.m4a", "mic.m4a", "call.m4a"]
+    static let names = Finaliser.finals
+    static let workingNames = Finaliser.working
+    static let workingSettings: [String: Any] = [
+        AVFormatIDKey: kAudioFormatLinearPCM,
+        AVSampleRateKey: AudioMixer.sampleRate,
+        AVNumberOfChannelsKey: 1,
+        AVLinearPCMBitDepthKey: 16,
+        AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsBigEndianKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+    ]
 
+    private let directory: URL
     private let queue = DispatchQueue(label: "audio-capture.writer")
-    private var mix: AVAudioFile?
     private var mic: AVAudioFile?
     private var call: AVAudioFile?
     private var reportedFileError = false
     private let lock = NSLock()
     private var framesWritten: Int64 = 0
+    // Held while recording, so recovery cannot finalise a folder still being written.
+    private let folderLock: FolderLock
 
     /// The files this output created, so a failed start can remove exactly those.
     private(set) var created: [URL] = []
 
     init(directory: URL) throws {
-        let urls = Self.names.map { directory.appendingPathComponent($0) }
-        for url in urls where FileManager.default.fileExists(atPath: url.path) {
-            throw NSError(domain: "AudioCapture", code: 5, userInfo: [NSLocalizedDescriptionKey: "\(url.path) already exists"])
+        self.directory = directory
+        for name in Self.names + Self.workingNames + [Finaliser.marker] {
+            let url = directory.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: url.path) {
+                throw RecordingError("\(url.path) already exists")
+            }
         }
+        folderLock = try FolderLock(directory)
         var files: [AVAudioFile] = []
         do {
-            for url in urls {
-                files.append(try Self.open(url))
+            for name in Self.workingNames {
+                let url = directory.appendingPathComponent(name)
+                files.append(try AVAudioFile(forWriting: url, settings: Self.workingSettings,
+                                             commonFormat: .pcmFormatFloat32, interleaved: false))
                 created.append(url)
+                try Finaliser.makePrivate(url)
             }
         } catch {
             files.removeAll()
             created.forEach { try? FileManager.default.removeItem(at: $0) }
             throw error
         }
-        (mix, mic, call) = (files[0], files[1], files[2])
+        (mic, call) = (files[0], files[1])
     }
 
-    private static func open(_ url: URL) throws -> AVAudioFile {
-        try AVAudioFile(
-            forWriting: url,
-            settings: [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: AudioMixer.sampleRate,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 96000,
-            ],
-            commonFormat: .pcmFormatFloat32,
-            interleaved: false)
-    }
-
-    /// Seconds of audio handed to the encoder so far. Safe to read from any thread.
+    /// Seconds of audio written so far. Safe to read from any thread.
     var secondsWritten: Double {
         lock.lock()
         defer { lock.unlock() }
@@ -61,13 +69,11 @@ final class RecordingOutput: @unchecked Sendable {
     }
 
     func write(mic micSamples: [Float], system systemSamples: [Float]) {
-        let mixed = zip(micSamples, systemSamples).map { min(max($0 + $1, -1), 1) }
         queue.async { [self] in
             write(micSamples, to: mic)
             write(systemSamples, to: call)
-            write(mixed, to: mix)
             lock.lock()
-            framesWritten += Int64(mixed.count)
+            framesWritten += Int64(max(micSamples.count, systemSamples.count))
             lock.unlock()
         }
     }
@@ -88,14 +94,28 @@ final class RecordingOutput: @unchecked Sendable {
         } catch {}
     }
 
+    /// Closes the working files. They stay on disk.
     func close() {
         queue.sync {
             if #available(macOS 15.0, *) {
-                mix?.close()
                 mic?.close()
                 call?.close()
             }
-            (mix, mic, call) = (nil, nil, nil)
+            (mic, call) = (nil, nil)
         }
     }
+
+    /// Closes the working files and finalises the folder: encodes, verifies and
+    /// publishes the three .m4a, writes the completion marker, and only then
+    /// removes the working files. On failure they are kept for recovery.
+    func finish() throws {
+        close()
+        try Finaliser.finaliseLocked(directory: directory)
+    }
+}
+
+struct RecordingError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
 }

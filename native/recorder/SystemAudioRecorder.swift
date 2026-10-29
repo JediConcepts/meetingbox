@@ -5,9 +5,11 @@ import CoreMedia
 final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "audio-capture.system")
     private let onBuffer: (CMSampleBuffer, CMTime) -> Void
+    private let onError: () -> Void
     private var stream: SCStream?
 
-    init(onBuffer: @escaping (CMSampleBuffer, CMTime) -> Void) {
+    init(onError: @escaping () -> Void = {}, onBuffer: @escaping (CMSampleBuffer, CMTime) -> Void) {
+        self.onError = onError
         self.onBuffer = onBuffer
     }
 
@@ -53,6 +55,7 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         eprint("System audio error: \(error.localizedDescription)")
+        onError()
     }
 }
 

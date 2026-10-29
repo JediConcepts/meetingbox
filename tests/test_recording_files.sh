@@ -6,7 +6,8 @@
 # --- clear_permcheck removes exactly what the permission check writes ---
 PERM_DIR="$HOME/permcheck"
 mkdir -p "$PERM_DIR"
-for f in audio.m4a mic.m4a call.m4a log; do echo x > "$PERM_DIR/$f"; done
+for f in audio.m4a mic.m4a call.m4a log mic.caf call.caf .recording-complete \
+         .tmp-audio.m4a .tmp-mic.m4a .tmp-call.m4a .tmp-recording-complete; do echo x > "$PERM_DIR/$f"; done
 clear_permcheck
 if [ ! -e "$PERM_DIR" ]; then pass "clear_permcheck removes its files and the folder"
 else fail "clear_permcheck removes its files and the folder"; fi
@@ -78,5 +79,94 @@ if [ "$got" = "$dir/audio.m4a" ] && [ "$(cat "$dir/audio.m4a" 2>/dev/null)" = ol
    && [ ! -e "$dir/2026-10-27_1430_meeting.m4a" ] && [ -s "$dir/mic.m4a" ]; then
   pass "stop_recording adopts a v1.2.2 *_meeting.m4a"
 else fail "stop_recording adopts a v1.2.2 *_meeting.m4a ($got)"; fi
+
+# --- crash-safe recordings: the recorder writes mic.caf and call.caf, then the .m4a ---
+# A stand-in recorder: --recover turns the .caf into the three .m4a and the marker,
+# or fails (FAKE_RECOVER_FAIL=1) and leaves everything in place.
+APP_BIN="$HOME/fake-recorder"
+cat > "$APP_BIN" <<'SH'
+#!/bin/bash
+echo "recorder $*" >> "$HOME/calls.log"
+[ "$1" = "--recover" ] || exit 2
+[ "${FAKE_RECOVER_FAIL:-0}" = 1 ] && { echo "could not read mic.caf" >&2; exit 1; }
+for f in audio mic call; do printf 'aac' > "$2/$f.m4a"; done
+: > "$2/.recording-complete"; rm -f "$2/mic.caf" "$2/call.caf"
+SH
+chmod +x "$APP_BIN"
+export FAKE_RECOVER_FAIL=0
+
+new_session() {
+  rm -rf "$dir"; mkdir -p "$dir"; printf '%s' "$dir" > "$DIR_FILE"; : > "$HOME/calls.log"
+}
+# The recorder would not stop when asked, so it was killed: its .caf are left as they were.
+is_recording() { return 0; }
+stop_recorders() { echo "stop_recorders $1 (kill -9)" >> "$HOME/calls.log"; }
+
+new_session; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
+STOPPED_AUDIO=""
+out="$(stop_recording 2>&1; printf '\nAUDIO=%s' "$STOPPED_AUDIO")"
+if grep -qxF "recorder --recover $dir" "$HOME/calls.log" && printf '%s' "$out" | grep -q 'recovered' \
+   && printf '%s' "$out" | grep -qxF "AUDIO=$dir/audio.m4a" && [ -e "$dir/.recording-complete" ]; then
+  pass "stop_recording: a killed recorder's .caf are recovered, then processed"
+else fail "stop_recording: a killed recorder's .caf are recovered, then processed ($out)"; fi
+
+new_session; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
+out="$(FAKE_RECOVER_FAIL=1; (stop_recording; printf 'AUDIO=%s' "$STOPPED_AUDIO") 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "this recording was not finished. Run: meetingbox recover $dir" \
+   && ! printf '%s' "$out" | grep -q 'AUDIO=' && [ -e "$dir/mic.caf" ] && [ -e "$dir/call.caf" ]; then
+  pass "stop_recording: recovery that fails keeps the .caf and processes nothing"
+else fail "stop_recording: recovery that fails keeps the .caf and processes nothing ($rc: $out)"; fi
+
+new_session; for f in audio mic call; do printf 'aac' > "$dir/$f.m4a"; done; : > "$dir/.recording-complete"
+STOPPED_AUDIO=""
+stop_recording 2>/dev/null
+if ! grep -q -- '--recover' "$HOME/calls.log" && [ "$STOPPED_AUDIO" = "$dir/audio.m4a" ]; then
+  pass "stop_recording: a recording the recorder finished is not recovered"
+else fail "stop_recording: a recording the recorder finished is not recovered"; fi
+is_recording() { return 1; }
+
+# --- process refuses a recording that was never finished ---
+transcribe_channels() { echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2"; }
+transcribe() { echo "transcribe $*" >> "$HOME/calls.log"; printf 'hi\n' > "$2"; }
+summarise() { echo "summarise $*" >> "$HOME/calls.log"; printf '# notes\n' > "$2/notes.md"; }
+chime() { :; }
+
+new_session; rm -f "$DIR_FILE"; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
+for arg in "$dir" "$dir/audio.m4a"; do
+  out="$( (process "$arg") 2>&1 )"; rc=$?
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "this recording was not finished. Run: meetingbox recover $dir" \
+     && ! grep -q 'transcribe\|summarise' "$HOME/calls.log"; then
+    pass "process refuses a folder holding only .caf ($(basename "$arg"))"
+  else fail "process refuses a folder holding only .caf ($(basename "$arg"): $out)"; fi
+done
+
+# --- meetingbox recover <dir> calls the same recovery mode ---
+out="$( (recover_cmd "$dir") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && grep -qxF "recorder --recover $dir" "$HOME/calls.log" && printf '%s' "$out" | grep -q 'recovered' \
+   && [ -e "$dir/.recording-complete" ]; then
+  pass "recover_cmd runs the recorder's --recover on the folder"
+else fail "recover_cmd runs the recorder's --recover on the folder ($rc: $out)"; fi
+
+new_session; rm -f "$DIR_FILE"; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
+out="$(FAKE_RECOVER_FAIL=1; (recover_cmd "$dir") 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'could not read mic.caf' && [ -e "$dir/mic.caf" ]; then
+  pass "recover_cmd: a failed recovery says why and keeps the .caf"
+else fail "recover_cmd: a failed recovery says why and keeps the .caf ($rc: $out)"; fi
+
+recorder_pids() { [ "$1" = "$dir" ] && printf '4242\n'; }
+: > "$HOME/calls.log"
+out="$( (recover_cmd "$dir") 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ] && ! grep -q -- '--recover' "$HOME/calls.log" && [ -e "$dir/mic.caf" ]; then
+  pass "recover_cmd will not touch a folder that is still recording"
+else fail "recover_cmd will not touch a folder that is still recording ($rc: $out)"; fi
+recorder_pids() { :; }
+
+# --- process writes private files (umask 077) ---
+new_session; rm -f "$DIR_FILE"; for f in audio mic call; do printf 'aac' > "$dir/$f.m4a"; done
+: > "$dir/.recording-complete"
+( umask 022; process "$dir/audio.m4a" >/dev/null 2>&1 )
+m1="$(stat -f %Lp "$dir/transcript.txt" 2>/dev/null)"; m2="$(stat -f %Lp "$dir/notes.md" 2>/dev/null)"
+if [ "$m1" = 600 ] && [ "$m2" = 600 ]; then pass "process writes transcript and minutes 0600"
+else fail "process writes transcript and minutes 0600 ($m1 $m2)"; fi
 
 finish

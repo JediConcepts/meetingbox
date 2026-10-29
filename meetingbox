@@ -657,10 +657,13 @@ test_recording() {
   return 1
 }
 
-# Only the files the test writes (and the one v1.2.2's test wrote), then the
-# folder if that leaves it empty.
+# Only the files the test writes (the recorder's working files among them, and
+# the one v1.2.2's test wrote), then the folder if that leaves it empty.
 clear_permcheck() {
   rm -f "$PERM_DIR/audio.m4a" "$PERM_DIR/mic.m4a" "$PERM_DIR/call.m4a" "$PERM_DIR/log" \
+        "$PERM_DIR/mic.caf" "$PERM_DIR/call.caf" "$PERM_DIR/.recording-complete" \
+        "$PERM_DIR/.tmp-audio.m4a" "$PERM_DIR/.tmp-mic.m4a" "$PERM_DIR/.tmp-call.m4a" \
+        "$PERM_DIR/.tmp-recording-complete" \
         "$PERM_DIR"/*_permcheck.m4a
   rmdir "$PERM_DIR" 2>/dev/null || true
 }
@@ -982,6 +985,31 @@ status_cmd() {
   else ok "recording -> $(session_dir)"; fi
 }
 
+# The recorder writes mic.caf and call.caf while recording, and on stop turns them
+# into the three .m4a, then writes .recording-complete, then removes them. Working
+# files without the marker mean it was killed or crashed before it finished.
+recording_unfinished() {
+  [ ! -e "$1/.recording-complete" ] && { [ -e "$1/mic.caf" ] || [ -e "$1/call.caf" ]; }
+}
+
+# Finishes such a recording from its working files, with the recorder's own
+# --recover (the same finalising it runs at stop). Says why if it cannot.
+recover_dir() {
+  if rec_out="$("$APP_BIN" --recover "$1" 2>&1)"; then return 0; fi
+  [ -n "$rec_out" ] && printf '%s\n' "$rec_out" | sed 's/^/           /' >&2
+  return 1
+}
+
+recover_cmd() {
+  [ -d "$1" ] || die "no such folder: $1"
+  rdir="$(cd "$1" && pwd)"
+  [ -z "$(recorder_pids "$rdir")" ] || die "$rdir is still recording. To finish it: meetingbox stop"
+  [ -x "$APP_BIN" ] || die "the recorder is not installed. Run: meetingbox setup"
+  recover_dir "$rdir" || die "could not recover $rdir. Its files are left as they were"
+  ok "recovered $rdir"
+  info "to get its minutes: meetingbox process $rdir"
+}
+
 STOPPED_AUDIO=""
 stop_recording() {
   has_session || die "not recording"
@@ -993,6 +1021,12 @@ stop_recording() {
     warn "the recorder had already stopped, picking up what it wrote"
   fi
   rm -f "$DIR_FILE" "$PAUSE_FILE"
+
+  # killed before it could finish (it would not stop, or it crashed): finish it now
+  if recording_unfinished "$dir"; then
+    recover_dir "$dir" || die "this recording was not finished. Run: meetingbox recover $dir"
+    ok "recovered the recording from its working files"
+  fi
 
   # the recorder writes the mix as audio.m4a, beside mic.m4a and call.m4a
   audio="$dir/audio.m4a"
@@ -1334,7 +1368,17 @@ summarise() {
 # ------------------------------------------------------------------- processing
 
 process() {
+  # transcripts and minutes are as private as the recording
+  umask 077
   input="$1"
+  # a meeting folder stands for its recording
+  [ -d "$input" ] && input="${input%/}/audio.m4a"
+  case "${input##*.}" in
+    txt|md|vtt|srt) ;;
+    *) if [ -d "$(dirname "$input")" ] && recording_unfinished "$(dirname "$input")"; then
+         die "this recording was not finished. Run: meetingbox recover $(cd "$(dirname "$input")" && pwd)"
+       fi ;;
+  esac
   [ -e "$input" ] || die "no such file: $input"
   dir="$(cd "$(dirname "$input")" && pwd)"
   transcript="$dir/transcript.txt"
@@ -1479,6 +1523,7 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox start | stop | status
   meetingbox pause | resume
   meetingbox process <audio|txt>   run an existing file through the pipeline
+  meetingbox recover <folder>      finish a recording that was interrupted
   meetingbox doctor                what is installed and what is not
   meetingbox mics                  microphones the recorder can see
   meetingbox reset                 clear a stuck recording, ask for permissions again
@@ -1538,6 +1583,8 @@ case "${cmd:-toggle}" in
   stop)    take_lock; stop_recording; release_lock; process "$STOPPED_AUDIO" ;;
   process) [ -n "$argfile" ] || die "usage: meetingbox process <audio-or-transcript>"
            process "$argfile" ;;
+  recover) [ -n "$argfile" ] || die "usage: meetingbox recover <folder>"
+           recover_cmd "$argfile" ;;
   setup)   setup ;;
   doctor|check) doctor ;;
   mics|devices)

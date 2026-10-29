@@ -10,6 +10,9 @@ signal(SIGPIPE, SIG_IGN)
 signal(SIGUSR1, SIG_IGN)
 signal(SIGUSR2, SIG_IGN)
 
+// Recordings are private: every file the recorder or recovery writes is 0600.
+umask(0o077)
+
 // MARK: - Helpers
 
 func discoverInputDevices() -> [AVCaptureDevice] {
@@ -52,6 +55,21 @@ while let arg = args.next() {
             exit(1)
         }
         deviceQuery = name
+    case "--recover":
+        // Finishes a recording whose recorder was killed or crashed, from its working files.
+        guard let path = args.next() else {
+            eprint("Error: --recover requires a folder")
+            exit(1)
+        }
+        let dir = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
+        do {
+            try recover(directory: dir)
+            eprint("Recovered \(dir.path)")
+            exit(0)
+        } catch {
+            eprint("Could not recover \(dir.path): \(error.localizedDescription)")
+            exit(1)
+        }
     case "--list-devices", "-l":
         let devices = discoverInputDevices()
         let defaultDevice = AVCaptureDevice.default(for: .audio)
@@ -75,15 +93,20 @@ while let arg = args.next() {
           -d, --device <name>   Microphone to use (substring match, see --list-devices)
           -l, --list-devices    List available microphones
           -o, --output <dir>    Output directory (default: ~/Recordings)
+              --recover <dir>   Finish a recording that was interrupted, from its working files
           -h, --help            Show this help
 
-        Saves three aligned files in the output directory, and refuses to start
-        if any of them is already there:
+        While recording, writes mic.caf and call.caf (16-bit PCM, about 0.7 GB
+        an hour together), which survive the recorder being killed. On stop they
+        become three aligned files, and are removed once those are verified:
           audio.m4a   the mix of both
           mic.m4a     your microphone only
           call.m4a    system audio only
+        Refuses to start if any of them is already in the output directory.
 
-        Status goes to stderr. Press Ctrl+C to stop recording.
+        Status goes to stderr, with a health line every 2 s:
+          health mic=<ok|stalled|error> system=<ok|stalled|error>
+        Press Ctrl+C to stop recording.
         First run will prompt for Screen Recording and Microphone permissions.
         """)
         exit(0)
@@ -127,13 +150,15 @@ do {
 }
 
 let mixer = AudioMixer { mic, system in output.write(mic: mic, system: system) }
+let health = HealthMonitor()
 let systemExtractor = SampleExtractor()
 let micExtractor = SampleExtractor()
 
 func abort(_ message: String) -> Never {
     eprint(message)
     output.close()
-    // Only what this run created: never a file that was there before.
+    // Capture never started, so there is no recording to keep. Only what this
+    // run created: never a file that was there before.
     output.created.forEach { try? FileManager.default.removeItem(at: $0) }
     exit(1)
 }
@@ -169,7 +194,8 @@ let stopSignal = AsyncStream<Void> { continuation in
 
 eprint("Starting recording...")
 
-let systemRecorder = SystemAudioRecorder { buffer, hostTime in
+let systemRecorder = SystemAudioRecorder(onError: { health.error(from: .system) }) { buffer, hostTime in
+    health.buffer(from: .system)
     if let samples = systemExtractor.samples(from: buffer) {
         mixer.append(samples, from: .system, at: hostTime)
     }
@@ -183,7 +209,8 @@ do {
     """)
 }
 
-let micRecorder = MicRecorder { buffer, hostTime in
+let micRecorder = MicRecorder(onError: { health.error(from: .mic) }) { buffer, hostTime in
+    health.buffer(from: .mic)
     if let samples = micExtractor.samples(from: buffer) {
         mixer.append(samples, from: .mic, at: hostTime)
     }
@@ -206,15 +233,27 @@ eprint("  Microphone: \(micDevice.localizedName)")
 eprint("  Folder:     \(outputDir.path)")
 eprint("Press Ctrl+C to stop.")
 
+let healthTimer = DispatchSource.makeTimerSource(queue: .global())
+healthTimer.schedule(deadline: .now() + 2, repeating: 2)
+healthTimer.setEventHandler { eprint(health.line()) }
+healthTimer.resume()
+
 for await _ in stopSignal { break }
 
 // MARK: - Stop
 
 eprint("\nStopping...")
+healthTimer.cancel()
 micRecorder.stop()
 try? await systemRecorder.stop()
 mixer.finish()
-output.close()
+do {
+    try output.finish()
+} catch {
+    eprint("Could not finish the recording: \(error.localizedDescription)")
+    eprint("Its working files are kept. Run: meetingbox recover \(outputDir.path)")
+    exit(1)
+}
 
 // What was actually written, not wall-clock time, so a stalled source shows.
 let elapsed = Int(output.secondsWritten)

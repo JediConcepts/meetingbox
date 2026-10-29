@@ -5,10 +5,13 @@ import CoreMedia
 final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "audio-capture.mic")
     private let onBuffer: (CMSampleBuffer, CMTime) -> Void
+    private let onError: () -> Void
     private var session: AVCaptureSession?
     private var clock: CMClock?
+    private var errorObserver: NSObjectProtocol?
 
-    init(onBuffer: @escaping (CMSampleBuffer, CMTime) -> Void) {
+    init(onError: @escaping () -> Void = {}, onBuffer: @escaping (CMSampleBuffer, CMTime) -> Void) {
+        self.onError = onError
         self.onBuffer = onBuffer
     }
 
@@ -22,10 +25,19 @@ final class MicRecorder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate,
 
         clock = captureSession.synchronizationClock
         session = captureSession
+        errorObserver = NotificationCenter.default.addObserver(
+            forName: AVCaptureSession.runtimeErrorNotification, object: captureSession, queue: nil
+        ) { [onError] note in
+            let error = note.userInfo?[AVCaptureSessionErrorKey] as? Error
+            eprint("Microphone error: \(error?.localizedDescription ?? "unknown")")
+            onError()
+        }
         captureSession.startRunning()
     }
 
     func stop() {
+        if let errorObserver { NotificationCenter.default.removeObserver(errorObserver) }
+        errorObserver = nil
         session?.stopRunning()
         session = nil
         audioQueue.sync {}

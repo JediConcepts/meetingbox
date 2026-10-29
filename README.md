@@ -84,6 +84,22 @@ meetingbox resume   # carry on
 The recorded length counts recorded time only, and `meetingbox status` shows
 when a recording is paused.
 
+### If the recorder is interrupted
+
+While it records, meetingbox writes uncompressed working files, `mic.caf` and
+`call.caf`, which keep every second captured even if the recorder is killed or the
+Mac crashes. They take about 0.7 GB an hour together, so leave that much free.
+When you stop, they become the three `.m4a` files below and are removed once those
+are checked and readable. A stop that finds a recorder which was interrupted
+finishes the recording from its working files. To do it by hand for any folder:
+
+```bash
+meetingbox recover ~/Meetings/2026-10-27_1430
+```
+
+`meetingbox process` refuses a folder that was never finished, and says to run this.
+Files meetingbox writes in a meeting folder are readable by you only.
+
 ### On a hotkey
 
 Shortcuts app, new shortcut, add a **Run Shell Script** action, shell `/bin/bash`:
