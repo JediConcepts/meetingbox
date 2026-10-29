@@ -43,6 +43,7 @@ WHISPER_FILE="$MODEL_DIR/ggml-large-v3-turbo.bin"
 # where speech-analyzer's own install script puts itself
 SA_LINK="$HOME/.local/bin/speech-analyzer"
 SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
+SAY_BIN="/usr/bin/say"   # macOS text to speech; `say` here is meetingbox's own logger
 
 # The recorder runs inside its own small app so that macOS files the Screen
 # Recording and Microphone permissions under "meetingbox", not under whichever
@@ -653,6 +654,39 @@ clear_permcheck() {
   rmdir "$PERM_DIR" 2>/dev/null || true
 }
 
+# Speech Recognition for Apple's transcriber, asked for with a short spoken clip
+# so macOS prompts now, during setup, not in the middle of the first meeting.
+# whisper does not need it, so giving up here never fails setup.
+prime_speech() {
+  have speech-analyzer || return 0
+  local tmp tries=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/mb-speech.XXXXXX")" || return 0
+  if ! "$SAY_BIN" -o "$tmp/check.aiff" "meetingbox speech check" 2>/dev/null; then
+    rm -rf -- "$tmp"; return 0
+  fi
+  say "Speech Recognition"
+  info "macOS will ask to let ${c_b}speech-analyzer${c_0} (Apple's transcriber) use Speech Recognition. Allow it."
+  while :; do
+    if sa_run "$tmp/check.txt" "$tmp/check.aiff" 2>/dev/null; then ok "Speech Recognition works"; break; fi
+    if [ "$tries" -ge 3 ]; then
+      warn "Apple's transcriber still cannot run, so meetingbox will use whisper if it is installed"
+      info "to try again later: turn on speech-analyzer under Speech Recognition, then run: ${c_b}meetingbox setup${c_0}"
+      break
+    fi
+    tries=$((tries + 1))
+    warn "Speech Recognition is not on for speech-analyzer yet"
+    rule
+    info "1. Opening Privacy settings at ${c_b}Speech Recognition${c_0}"
+    info "2. Turn on ${c_b}speech-analyzer${c_0}"
+    info "Already on? Turn it off and on again."
+    rule
+    open_privacy SpeechRecognition
+    pause_for "press enter once it is on, and I will test again"
+  done
+  rm -rf -- "$tmp"
+  return 0
+}
+
 # macOS asks for these one at a time, in the order the recorder uses them. The
 # recorder starts system audio first and stops there if Screen Recording is off,
 # so it never reaches the mic, and meetingbox cannot appear in the Microphone list
@@ -754,6 +788,7 @@ setup() {
   if [ -z "$todo" ]; then
     say "everything is already in place"
     prime_permissions || return 1
+    prime_speech
     install -m 755 "$0" "$BIN_DIR/meetingbox" 2>/dev/null || true
     make_shortcut_hint
     say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
@@ -800,6 +835,7 @@ setup() {
     && ok "meetingbox -> $BIN_DIR/meetingbox" || true
 
   prime_permissions || return 1
+  prime_speech
   make_shortcut_hint
   say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
 }
@@ -999,8 +1035,13 @@ transcribe() {
   case "$engine" in
     native)
       say "transcribing on device (Apple SpeechAnalyzer)"
-      speech-analyzer --locale "$LOCALE" "$audio" > "$out" \
-        || die "transcription failed. Check Speech Recognition in Privacy settings, or run: meetingbox setup"
+      if ! sa_run "$out" "$audio"; then
+        have whisper-cli || die "transcription failed. Check Speech Recognition in Privacy settings, or run: meetingbox setup"
+        warn "Apple's transcriber failed, trying whisper. To use Apple's again, check Speech Recognition is on for speech-analyzer"
+        ENGINE=whisper
+        transcribe "$audio" "$out"
+        return
+      fi
       ;;
     whisper)
       model="$(find_whisper_model)"
@@ -1019,6 +1060,36 @@ transcribe() {
   ok "transcript: $(wc -w < "$out" | tr -d ' ') words"
 }
 
+# Apple's transcriber, started as its own app through `open` (as the recorder is),
+# so macOS asks for Speech Recognition in its name. Run as a child of this shell,
+# the request belongs to whatever started meetingbox, and one from a Shortcuts
+# hotkey is refused without a prompt. A speech-analyzer meetingbox did not build
+# has no app of ours, so it is run directly.
+# Usage: sa_run OUT AUDIO [speech-analyzer options]
+sa_run() {
+  local out="$1" audio="$2" err; shift 2
+  case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+  case "$audio" in /*) ;; *) audio="$PWD/$audio" ;; esac
+  if [ ! -d "$SA_APP" ]; then
+    speech-analyzer --locale "$LOCALE" "$@" "$audio" > "$out"
+    return
+  fi
+  err="$(mktemp)" || return 1
+  rm -f "$out"
+  open -W -n -g --stdout /dev/null --stderr "$err" "$SA_APP" \
+    --args --locale "$LOCALE" "$@" -o "$out" "$audio" >/dev/null 2>&1 || true
+  # open -W cannot always latch on (it says "Unable to block" when the app
+  # finished first), so also wait until no transcriber is writing this file.
+  # Matched through awk and the environment, so the search never finds itself.
+  while ps -axo command= | NEEDLE="-o $out $audio" awk 'index($0, ENVIRON["NEEDLE"]) { f = 1 } END { exit !f }'; do
+    sleep 0.2
+  done
+  if [ -e "$out" ] && ! grep -q '^Error' "$err"; then rm -f "$err"; return 0; fi
+  grep '^Error' "$err" >&2 || true   # its usage text after the error is noise here
+  rm -f "$err"
+  return 1
+}
+
 # One side of the call to word timed JSON, for mb-transcript. A side that will
 # not transcribe is left empty with a warning, and returns 1: one side is better
 # than none, but both failing is a different problem.
@@ -1027,7 +1098,7 @@ transcribe_words() {
   engine="$(pick_engine)"
   case "$engine" in
     native)
-      speech-analyzer --locale "$LOCALE" -f json "$audio" > "$out" \
+      sa_run "$out" "$audio" -f json \
         || { warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"; return 1; }
       ;;
     whisper)
@@ -1059,6 +1130,12 @@ transcribe_channels() {
   transcribe_words "$dir/mic.m4a" "$dir/mic.words.json" || failed=$((failed + 1))
   transcribe_words "$dir/call.m4a" "$dir/call.words.json" || failed=$((failed + 1))
   # Both failing is rarely a silent meeting: usually the engine cannot run at all.
+  if [ "$failed" -eq 2 ] && [ "$engine" = native ] && have whisper-cli; then
+    warn "Apple's transcriber failed on both sides, trying whisper. To use Apple's again, check Speech Recognition is on for speech-analyzer"
+    ENGINE=whisper; engine=whisper; failed=0
+    transcribe_words "$dir/mic.m4a" "$dir/mic.words.json" || failed=$((failed + 1))
+    transcribe_words "$dir/call.m4a" "$dir/call.words.json" || failed=$((failed + 1))
+  fi
   if [ "$failed" -eq 2 ]; then
     case "$engine" in
       native)  die "transcription failed on both sides. Check Speech Recognition in Privacy settings, or run: meetingbox setup" ;;

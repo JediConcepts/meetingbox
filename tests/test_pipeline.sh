@@ -104,6 +104,27 @@ if [ -s "$d/audio.m4a" ] && [ -s "$d/mic.m4a" ] && [ -s "$d/call.m4a" ] && [ ! -
 else fail "both sides failing leaves the audio and writes no transcript"; fi
 SA_FAIL=""
 
+# --- Apple's transcriber refused on both sides, whisper there: use whisper instead ---
+d="$(meeting m3b audio.m4a mic.m4a call.m4a)"
+SA_FAIL=both
+have() { case "$1" in speech-analyzer|fm|whisper-cli|ffmpeg) return 0 ;; *) return 1 ;; esac; }
+find_whisper_model() { echo "$HOME/model.bin"; }
+ffmpeg() { for a in "$@"; do :; done; printf 'wav' > "$a"; }
+whisper-cli() {
+  echo "whisper-cli $*" >> "$HOME/calls.log"
+  local prev="" a o=""
+  for a in "$@"; do [ "$prev" = --output-file ] && o="$a"; prev="$a"; done
+  cp "$FIX/whisper.json" "$o.json"
+}
+: > "$HOME/calls.log"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ -s "$d/transcript.txt" ] && [ "$(grep -c '^whisper-cli' "$HOME/calls.log")" = 2 ] \
+   && printf '%s' "$out" | grep -q 'trying whisper'; then
+  pass "Apple's transcriber failing on both sides falls back to whisper"
+else fail "Apple's transcriber failing on both sides falls back to whisper (rc $rc): $out"; fi
+SA_FAIL=""
+have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+
 # --- only audio.m4a: the v1.2 path, one plain speech-analyzer call ---
 d="$(meeting m4 audio.m4a)"
 : > "$HOME/calls.log"
