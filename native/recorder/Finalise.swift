@@ -5,8 +5,22 @@ import AVFoundation
 /// call.caf. Used by the recorder's own stop and by `--recover` after a crash.
 /// Waits up to 5 s for the folder's lock: a recorder just killed with -9, or that
 /// crashed a moment ago, can hold it until the kernel has finished with it.
-func recover(directory: URL) throws {
-    try Finaliser.finalise(directory: directory, lockWait: 5)
+func recover(directory: URL, lockWait: TimeInterval = 5) throws {
+    try Finaliser.finalise(directory: directory, lockWait: lockWait)
+}
+
+/// `--recover`'s exit status: 0 when the folder ends complete; 75 (EX_TEMPFAIL) when
+/// another process still holds the folder's lock after the wait (a recorder still
+/// recording, or another finalise), so the caller knows it is busy rather than lost;
+/// 1 when it cannot be finished. The message says what happened.
+func recoverStatus(directory: URL, lockWait: TimeInterval = 5) -> (status: Int32, message: String) {
+    do {
+        try recover(directory: directory, lockWait: lockWait)
+        return (0, "Recovered \(directory.path)")
+    } catch {
+        let message = "Could not recover \(directory.path): \(error.localizedDescription)"
+        return (error is FolderBusyError ? 75 : 1, message)
+    }
 }
 
 /// A point in finalising that a test can interrupt, to stand in for a crash there.
@@ -222,10 +236,16 @@ final class FolderLock {
         }
         guard locked else {
             Darwin.close(fd)
-            throw RecordingError("\(directory.path) is still being recorded or saved")
+            throw FolderBusyError(message: "\(directory.path) is still being recorded or saved")
         }
         self.fd = fd
     }
 
     deinit { Darwin.close(fd) }
+}
+
+/// Another process holds a folder's lock: busy for now, not broken.
+struct FolderBusyError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }

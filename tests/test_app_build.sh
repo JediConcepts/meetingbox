@@ -41,6 +41,18 @@ if command -v swiftc >/dev/null 2>&1; then
     if [ "$rc" -eq 1 ] && printf '%s\n' "$out" | grep -q -- '--recover requires a folder'; then
       pass "--recover without a folder exits 1"
     else fail "--recover without a folder exits 1 (rc $rc): $out"; fi
+    # Another process holds the folder lock (a recorder or a CLI finalise): busy is 75, not 1.
+    mkdir "$out_dir/held"
+    perl -e 'use Fcntl qw(:flock O_RDONLY); sysopen(my $fh, $ARGV[0], O_RDONLY) or die; flock($fh, LOCK_EX) or die;
+             open(my $r, ">", $ARGV[1]) or die; close $r; sleep 20;' "$out_dir/held" "$out_dir/held.ready" &
+    holder=$!
+    for _ in $(seq 1 100); do [ -e "$out_dir/held.ready" ] && break; sleep 0.05; done
+    out="$("$out_dir/meetingbox" --recover "$out_dir/held" 2>&1)"; rc=$?
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    if [ "$rc" -eq 75 ] && printf '%s\n' "$out" | grep -q "is still being recorded or saved" \
+       && [ -z "$(ls -A "$out_dir/held")" ]; then
+      pass "--recover exits 75 while another process holds the folder lock, and changes nothing"
+    else fail "--recover exits 75 while another process holds the folder lock, and changes nothing (rc $rc): $out"; fi
   else
     fail "recorder and app compile as one executable: $(tail -n 20 "$out_dir/build.log")"
   fi

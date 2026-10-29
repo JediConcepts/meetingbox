@@ -5,17 +5,30 @@ import Foundation
 protocol RecorderControl {
     /// Starts `--record` into `dir` and returns its pid. Each `health ...` line it prints goes to `onHealthLine`.
     func launch(dir: URL, mic: String?, onHealthLine: @escaping (String) -> Void) throws -> Int32
+    /// Follows the capture.log of a recorder this app did not start, from its current end.
+    func attach(dir: URL, onHealthLine: @escaping (String) -> Void)
+    /// Reads what the recorder in `dir` has logged since the last call and passes on its health lines.
+    func pollLog(dir: URL)
+    /// The last line the recorder in `dir` logged that is not a health line.
+    func lastMessage(dir: URL) -> String?
     func signal(_ pid: Int32, _ sig: Int32)
     func isRunning(_ pid: Int32) -> Bool
-    /// The pid of a recorder writing into `dir`, found by its command line, even one this app did not start.
-    func find(dir: URL) -> Int32?
+    /// A recorder writing into `dir`, found by its command line, even one this app did not start;
+    /// `unknown` when that cannot be told.
+    func find(dir: URL) -> FindResult
     /// The exit status of a recorder this process started and that has exited, else nil.
     func exitStatus(_ pid: Int32) -> Int32?
-    /// Runs `--recover dir`: true when the folder ends complete.
-    func recover(dir: URL) -> Bool
-    /// True when `.recording-complete` exists and the three `.m4a` open with matching durations.
-    func verify(dir: URL) -> Bool
+    /// Runs `--recover dir`.
+    func recover(dir: URL) -> RecoverResult
+    /// The duration of `audio.m4a` when `.recording-complete` exists and the three `.m4a` open with
+    /// matching durations; nil when they do not verify.
+    func verify(dir: URL) -> Double?
 }
+
+enum FindResult: Equatable { case found(Int32), notFound, unknown }
+
+/// `busy`: another process holds the folder (`--recover` exited 75), so nothing is known about it.
+enum RecoverResult: Equatable { case recovered, failed, busy }
 
 struct SessionError: LocalizedError {
     let message: String
@@ -27,7 +40,9 @@ struct SessionError: LocalizedError {
 /// Writes the state files the command line reads (`recording.dir`, `paused`), adopts a recorder
 /// left running by a crashed app, recovers dead and orphaned recordings, and queues a meeting only
 /// once its audio verifies. Call it from one queue (the main queue in the app); a 1 s timer on that
-/// queue drives `tick()`. Health lines may arrive on any thread.
+/// queue drives `tick()`, which also reads the recorder's capture.log for health lines.
+/// When it cannot tell whether a recorder is alive (`find` is unknown) or another process holds a
+/// folder (`recover` is busy), it changes nothing and tries again later.
 final class Session {
     enum Phase: Equatable {
         case idle, recording(URL), paused(URL), finalising(URL)
@@ -57,6 +72,7 @@ final class Session {
     static let killGrace: TimeInterval = 10
     static let interrupted = "the recording was interrupted; its files are kept"
     static let diskStopped = "recording stopped because the disk was nearly full (under 200 MB free)"
+    static let diskStoppedFailed = "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
 
     private(set) var phase: Phase = .idle
     var onChange: ((Phase) -> Void)?
@@ -74,6 +90,10 @@ final class Session {
 
     // The current recording.
     private var pid: Int32 = 0
+    /// The recorder was found running, not started here: its pid is not our child.
+    private var adopted = false
+    /// The session stopped itself for lack of disk space.
+    private var diskStop = false
     private var started = Date()
     private var pausedSeconds = 0
     private var pausedAt: Date?
@@ -89,11 +109,16 @@ final class Session {
     private var system = StreamHealth.ok
     private var disk = DiskHealth.ok
     private var lastLine = Date()
-    /// Off for an adopted recorder, whose stderr went with the app that started it.
-    private var watchSilence = true
     /// Bumped per recording, so a late line from an earlier recorder is ignored.
     private var generation = 0
 
+    /// `adopt` could not tell whether a recorder was alive; the tick tries again.
+    private var needsAdopt = false
+    /// Orphans whose recovery is running, so a second `adopt` does not start another.
+    private var orphansInFlight: Set<String> = []
+
+    /// What finalising came to. `busy`: another process holds the folder, so nothing is written.
+    private enum Outcome: Equatable { case verified(seconds: Int?), failed, busy }
     /// `tickQueue` runs the 1 s timer and receives finished background work; nil means no timer
     /// (tests call `tick()`). `workQueue` runs recovery and verification off that queue; nil runs
     /// them inline.
@@ -123,6 +148,10 @@ final class Session {
     @discardableResult
     func start(root: URL, mic: String?) throws -> URL {
         if let dir = phase.folder { throw SessionError("already recording in \(dir.path)") }
+        // A recorder this session has not adopted (yet) may still be writing where recording.dir points.
+        if let named = namedFolder(), recorder.find(dir: named) != .notFound {
+            throw SessionError("already recording in \(named.path)")
+        }
         guard freeBytes() >= Session.startFloor else {
             throw SessionError("not enough free disk space to record (2 GB needed)")
         }
@@ -143,7 +172,7 @@ final class Session {
             clearStateFiles()
             throw error
         }
-        let gen = resetHealth(watchSilence: true)
+        let gen = resetHealth()
         let newPid: Int32
         do {
             newPid = try recorder.launch(dir: dir, mic: mic) { [weak self] line in self?.healthLine(line, gen) }
@@ -154,6 +183,8 @@ final class Session {
             throw error
         }
         pid = newPid
+        adopted = false
+        diskStop = false
         started = t
         pausedSeconds = 0
         pausedAt = nil
@@ -165,8 +196,7 @@ final class Session {
         guard case .recording(let dir) = phase else { return }
         let t = now()
         recorder.signal(pid, SIGUSR1)
-        FileManager.default.createFile(atPath: pausedFile.path, contents: Data(),
-                                       attributes: [.posixPermissions: 0o600])
+        try? MeetingStore.writePrivately(Data(), to: pausedFile)
         pausedAt = t
         try? store.update(dir) { $0.pausedAt = t }
         set(.paused(dir))
@@ -219,28 +249,46 @@ final class Session {
     /// recording any more.
     func adopt() {
         guard phase == .idle else { return }
-        var named: URL? = nil
-        if let path = try? String(contentsOf: dirFile, encoding: .utf8),
-           !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let dir = Session.folderURL(path.trimmingCharacters(in: .newlines))
-            named = dir
-            adoptNamed(dir)
-        }
+        needsAdopt = false
+        let named = namedFolder()
+        if let dir = named { adoptNamed(dir) }
         for meeting in store.scan() where meeting.state == .recording || meeting.state == .finalising {
             // Spelt from the store's root, as `start` spelt it for the recorder's command line
             // (a directory listing may resolve /var to /private/var).
             let dir = Session.folderURL(store.root.appendingPathComponent(meeting.folder.url.lastPathComponent).path)
             if let n = named, Session.same(n, dir) { continue }
-            if recorder.find(dir: dir) != nil { continue }
+            if orphansInFlight.contains(dir.path) { continue }
+            switch recorder.find(dir: dir) {
+            case .found: continue
+            case .unknown: needsAdopt = true; continue
+            case .notFound: break
+            }
+            orphansInFlight.insert(dir.path)
             let rec = recorder
-            offQueue({ rec.recover(dir: dir) && rec.verify(dir: dir) }) { [weak self] ok in
-                self?.record(dir, verified: ok, seconds: nil)
-                self?.onFinished?(dir, ok)
+            offQueue({ Session.finalise(rec, dir, tryClean: false) }) { [weak self] outcome in
+                guard let self = self else { return }
+                self.orphansInFlight.remove(dir.path)
+                switch outcome {
+                case .busy:
+                    return // someone else is finalising it; a later adopt looks again
+                case .verified(let seconds):
+                    self.record(dir, verified: true, seconds: seconds, reason: nil)
+                    self.onFinished?(dir, true)
+                case .failed:
+                    self.record(dir, verified: false, seconds: nil, reason: Session.interrupted)
+                    self.onFinished?(dir, false)
+                }
             }
         }
+        updateTimer()
     }
 
     private func adoptNamed(_ dir: URL) {
+        // Only a meeting folder in the store is ever recovered or written to.
+        guard MeetingFolder.parse(dir) != nil, Session.same(dir.deletingLastPathComponent(), store.root) else {
+            clearStateFiles()
+            return
+        }
         let record = Session.readRecord(dir)
         if let state = record?.state, state != .recording && state != .finalising {
             // Already settled before the app went away; only the state files were left behind.
@@ -248,53 +296,73 @@ final class Session {
             return
         }
         let t = now()
-        if let found = recorder.find(dir: dir) {
-            pid = found
-            started = record?.started ?? MeetingFolder.parse(dir)?.date ?? t
-            pausedSeconds = record?.pausedSeconds ?? 0
-            _ = resetHealth(watchSilence: false)
-            if record?.state == .finalising {
-                // The app went away after SIGINT; the recorder is still finalising.
-                pausedAt = nil
-                frozenSeconds = record?.seconds ?? 0
-                wait = .exiting(since: t)
-                set(.finalising(dir))
-                return
-            }
-            let paused = FileManager.default.fileExists(atPath: pausedFile.path)
-            pausedAt = paused ? (record?.pausedAt ?? t) : nil
-            let (s, ps, pa) = (started, pausedSeconds, pausedAt)
-            try? store.update(dir) { r in
-                r.state = .recording
-                r.started = s
-                r.pausedSeconds = ps
-                r.pausedAt = pa
-            }
-            set(paused ? .paused(dir) : .recording(dir))
-        } else {
+        let found: Int32
+        switch recorder.find(dir: dir) {
+        case .unknown:
+            needsAdopt = true // cannot tell: change nothing, try again on the next tick
+            return
+        case .notFound:
             // The recorder died with the app: rebuild from the working files, or fail keeping them.
+            adopted = true
+            diskStop = record?.error == Session.diskStopped
             frozenSeconds = record?.seconds ?? 0
             wait = nil
             set(.finalising(dir))
-            settle(dir, tryClean: false)
+            settle(dir, tryClean: false, exitStatus: nil)
+            return
+        case .found(let p):
+            found = p
         }
+        pid = found
+        adopted = true
+        diskStop = record?.error == Session.diskStopped
+        started = record?.started ?? MeetingFolder.parse(dir)?.date ?? t
+        pausedSeconds = record?.pausedSeconds ?? 0
+        let gen = resetHealth()
+        recorder.attach(dir: dir) { [weak self] line in self?.healthLine(line, gen) }
+        if record?.state == .finalising {
+            // The app went away after SIGINT; the recorder is still finalising.
+            pausedAt = nil
+            frozenSeconds = record?.seconds ?? 0
+            wait = .exiting(since: t)
+            set(.finalising(dir))
+            return
+        }
+        let paused = FileManager.default.fileExists(atPath: pausedFile.path)
+        pausedAt = paused ? (record?.pausedAt ?? t) : nil
+        let (s, ps, pa) = (started, pausedSeconds, pausedAt)
+        try? store.update(dir) { r in
+            r.state = .recording
+            r.started = s
+            r.pausedSeconds = ps
+            r.pausedAt = pa
+        }
+        set(paused ? .paused(dir) : .recording(dir))
     }
 
     // MARK: the 1 s tick
 
     /// Drives the finalising wait, health, the disk floor, and a recorder that died on its own.
     func tick() {
+        guard let folder = phase.folder else {
+            if needsAdopt { adopt() }
+            return
+        }
+        // Liveness first: a recorder already gone has written all it will, so the read below has it.
+        let alive = recorder.isRunning(pid)
+        recorder.pollLog(dir: folder)
         switch phase {
         case .idle:
             return
         case .recording(let dir), .paused(let dir):
-            if !recorder.isRunning(pid) {
+            if !alive {
                 beginFinalising(dir) // died on its own: handled as a stop
-                advanceFinalising(dir)
+                advanceFinalising(dir, alive: false)
                 return
             }
             let free = freeBytes()
             if free < Session.stopFloor {
+                diskStop = true
                 try? store.update(dir) { $0.error = Session.diskStopped }
                 stop()
                 return
@@ -302,19 +370,22 @@ final class Session {
             let t = now()
             healthLock.lock()
             disk = free < Session.lowFloor ? .low : .ok
-            if watchSilence && t.timeIntervalSince(lastLine) >= Session.silenceLimit {
+            if t.timeIntervalSince(lastLine) >= Session.silenceLimit {
                 if mic != .error { mic = .stalled }
                 if system != .error { system = .stalled }
             }
             healthLock.unlock()
         case .finalising(let dir):
-            advanceFinalising(dir)
+            advanceFinalising(dir, alive: alive)
         }
     }
 
     // MARK: finalising
 
     /// 60 s plus 1 s per recorded minute: finalise encodes at about 37 s per recorded hour.
+    /// After it, SIGTERM, 10 s, SIGKILL, then recovery. The real recorder ignores SIGTERM once it is
+    /// finalising (its stop handlers are gone and the signal stays ignored), so the step that ends a
+    /// stuck finalise is SIGKILL; recovery then redoes the work, which is safe to repeat.
     private var exitLimit: TimeInterval { TimeInterval(60 + frozenSeconds / 60) }
 
     private func beginFinalising(_ dir: URL) {
@@ -332,55 +403,111 @@ final class Session {
         set(.finalising(dir))
     }
 
-    private func advanceFinalising(_ dir: URL) {
+    private func advanceFinalising(_ dir: URL, alive: Bool) {
         guard let w = wait else { return }
-        if !recorder.isRunning(pid) {
+        if !alive {
             let status = recorder.exitStatus(pid)
-            settle(dir, tryClean: status == nil || status == 0)
+            settle(dir, tryClean: status == nil || status == 0, exitStatus: status)
             return
         }
         let t = now()
         switch w {
         case .exiting(let since):
-            if t.timeIntervalSince(since) >= exitLimit {
+            guard t.timeIntervalSince(since) >= exitLimit else { return }
+            switch stillOurs(dir) {
+            case true?:
                 recorder.signal(pid, SIGTERM)
                 wait = .terminating(since: t)
+            case false?:
+                settle(dir, tryClean: true, exitStatus: nil)
+            case nil:
+                break // cannot tell: try again on the next tick
             }
         case .terminating(let since):
-            if t.timeIntervalSince(since) >= Session.killGrace {
+            guard t.timeIntervalSince(since) >= Session.killGrace else { return }
+            switch stillOurs(dir) {
+            case true?:
                 recorder.signal(pid, SIGKILL)
-                settle(dir, tryClean: false) // recovery waits for the dying recorder's folder lock
+                settle(dir, tryClean: false, exitStatus: nil) // recovery waits for the dying recorder's folder lock
+            case false?:
+                settle(dir, tryClean: true, exitStatus: nil)
+            case nil:
+                break
             }
+        }
+    }
+
+    /// Before SIGTERM or SIGKILL: our own child is ours; an adopted pid must still be the recorder
+    /// writing into `dir`, or it has exited and the pid may belong to something else. Nil: cannot tell.
+    private func stillOurs(_ dir: URL) -> Bool? {
+        guard adopted else { return true }
+        switch recorder.find(dir: dir) {
+        case .found(let p): return p == pid
+        case .notFound: return false
+        case .unknown: return nil
         }
     }
 
     /// Verified audio is queued; anything else goes through recovery, then is queued only if it
-    /// verifies, else failed with every file kept.
-    private func settle(_ dir: URL, tryClean: Bool) {
+    /// verifies, else failed with every file kept. A busy folder is left to whoever holds it.
+    private func settle(_ dir: URL, tryClean: Bool, exitStatus: Int32?) {
         wait = nil
         let rec = recorder
-        offQueue({ (tryClean && rec.verify(dir: dir)) || (rec.recover(dir: dir) && rec.verify(dir: dir)) }) {
-            [weak self] ok in self?.finish(dir, verified: ok)
+        let failedExit = exitStatus.map { $0 != 0 } ?? false
+        offQueue({ Session.finalise(rec, dir, tryClean: tryClean) }) { [weak self] outcome in
+            self?.finish(dir, outcome, failedExit: failedExit)
         }
     }
 
-    private func finish(_ dir: URL, verified: Bool) {
-        guard phase == .finalising(dir) else { return }
-        record(dir, verified: verified, seconds: frozenSeconds)
-        clearStateFiles()
-        _ = resetHealth(watchSilence: true)
-        set(.idle)
-        onFinished?(dir, verified)
+    /// Runs on the work queue. The only route to `verified` is a `verify` that ran last.
+    private static func finalise(_ rec: RecorderControl, _ dir: URL, tryClean: Bool) -> Outcome {
+        if tryClean, rec.verify(dir: dir) != nil { return .verified(seconds: nil) }
+        switch rec.recover(dir: dir) {
+        case .busy: return .busy
+        case .failed: return .failed
+        case .recovered:
+            // Recovered audio is the truth about how long the recording is (pauses are not in it).
+            guard let duration = rec.verify(dir: dir) else { return .failed }
+            return .verified(seconds: Int(duration.rounded()))
+        }
     }
 
-    private func record(_ dir: URL, verified: Bool, seconds: Int?) {
+    private func finish(_ dir: URL, _ outcome: Outcome, failedExit: Bool) {
+        guard phase == .finalising(dir) else { return }
+        switch outcome {
+        case .busy:
+            break // another process owns the folder now: write nothing, keep no claim on it
+        case .verified(let seconds):
+            record(dir, verified: true, seconds: seconds ?? frozenSeconds, reason: nil)
+        case .failed:
+            record(dir, verified: false, seconds: frozenSeconds, reason: failureReason(dir, failedExit: failedExit))
+        }
+        clearStateFiles()
+        _ = resetHealth()
+        adopted = false
+        diskStop = false
+        set(.idle)
+        if outcome != .busy { onFinished?(dir, outcome != .failed) }
+    }
+
+    /// The disk stop if that is what ended it; else what a recorder that failed said last; else the
+    /// generic reason.
+    private func failureReason(_ dir: URL, failedExit: Bool) -> String {
+        if diskStop { return Session.diskStoppedFailed }
+        if failedExit, let message = recorder.lastMessage(dir: dir) { return message }
+        return Session.interrupted
+    }
+
+    /// Queued carries no error; failed carries the reason.
+    private func record(_ dir: URL, verified: Bool, seconds: Int?, reason: String?) {
         try? store.update(dir) { r in
             if let s = seconds { r.seconds = s }
             if verified {
                 r.state = .queued
+                r.error = nil
             } else {
                 r.state = .failed
-                r.error = Session.interrupted
+                r.error = reason ?? Session.interrupted
             }
         }
     }
@@ -389,7 +516,13 @@ final class Session {
 
     private func set(_ p: Phase) {
         phase = p
-        if p == .idle {
+        updateTimer()
+        onChange?(p)
+    }
+
+    /// The timer runs while there is a recording, or an adopt to try again.
+    private func updateTimer() {
+        if phase == .idle && !needsAdopt {
             timer?.cancel()
             timer = nil
         } else if timer == nil, let q = tickQueue {
@@ -399,7 +532,6 @@ final class Session {
             source.resume()
             timer = source
         }
-        onChange?(p)
     }
 
     private func foldPause(at t: Date) {
@@ -417,7 +549,7 @@ final class Session {
     }
 
     /// Resets health to ok for a new recording and returns its generation.
-    private func resetHealth(watchSilence watch: Bool) -> Int {
+    private func resetHealth() -> Int {
         healthLock.lock()
         defer { healthLock.unlock() }
         generation += 1
@@ -425,7 +557,6 @@ final class Session {
         system = .ok
         disk = .ok
         lastLine = now()
-        watchSilence = watch
         return generation
     }
 
@@ -455,12 +586,20 @@ final class Session {
     private var pausedFile: URL { stateDir.appendingPathComponent("paused") }
 
     /// `recording.dir` holds the folder's path with no newline, as the command line writes it.
+    /// Written 0600 from the start, through a temp file renamed into place.
     private func writeStateFiles(_ dir: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: stateDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         try? fm.removeItem(at: pausedFile)
-        try Data(dir.path.utf8).write(to: dirFile, options: .atomic)
-        try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: dirFile.path)
+        try MeetingStore.writePrivately(Data(dir.path.utf8), to: dirFile)
+    }
+
+    /// The folder `recording.dir` names, if it names one.
+    private func namedFolder() -> URL? {
+        guard let text = try? String(contentsOf: dirFile, encoding: .utf8) else { return nil }
+        let path = text.trimmingCharacters(in: .newlines)
+        guard !path.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return Session.folderURL(path)
     }
 
     /// Removes only the two fixed state files.

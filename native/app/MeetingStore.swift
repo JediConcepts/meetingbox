@@ -164,13 +164,13 @@ final class MeetingStore {
         change(&current)
         current.apply(to: &json)
         let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-        try writePrivately(data, to: file)
+        try MeetingStore.writePrivately(data, to: file)
     }
 
     /// Writes through a temp file created 0600, then renames it into place, so the file is never
-    /// readable by others and a reader never sees half of it.
-    private func writePrivately(_ data: Data, to file: URL) throws {
-        let tmp = file.deletingLastPathComponent().appendingPathComponent(".meeting.json.tmp-\(UUID().uuidString)")
+    /// readable by others and a reader never sees half of it. Session writes its state files with it too.
+    static func writePrivately(_ data: Data, to file: URL) throws {
+        let tmp = file.deletingLastPathComponent().appendingPathComponent(".\(file.lastPathComponent).tmp-\(UUID().uuidString)")
         let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
         guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         var failure: Int32 = 0

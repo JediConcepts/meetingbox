@@ -256,6 +256,7 @@ for (label, files) in [("nothing", [String]()), ("an unreadable audio.m4a", ["au
     for name in files { fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: Data("x".utf8)) }
     let before = snapshot(dir)
     check((try? recover(directory: dir)) == nil && snapshot(dir) == before, "\(label): recover fails and changes nothing")
+    check(recoverStatus(directory: dir).status == 1, "\(label): --recover exits 1")
 }
 
 // Another process holding the folder's lock: a recorder still dying after kill -9.
@@ -290,6 +291,10 @@ do {
     let waited = Date().timeIntervalSince(started)
     check(message.contains("is still being recorded or saved") && snapshot(dir) == before && waited >= 4.5 && waited < 6.5,
           "a lock held past 5 s: recover fails after about 5 s and changes nothing (\(String(format: "%.1f", waited)) s)")
+    // The same lock seen by --recover's exit status: 75 (EX_TEMPFAIL), busy, not 1.
+    let quick = recoverStatus(directory: dir, lockWait: 0)
+    check(quick.status == 75 && quick.message.contains("is still being recorded or saved") && snapshot(dir) == before,
+          "--recover exits 75 while another process holds the folder lock")
     holder.terminate()
     holder.waitUntilExit()
 }

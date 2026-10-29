@@ -40,8 +40,9 @@ private func finishOffThePool(_ output: RecordingOutput) async throws {
 // MARK: - Recovery
 
 /// `meetingbox --recover <dir>`: finishes a recording whose recorder was killed
-/// or crashed, from its working files. Exit 0 when the folder ends complete, 1
-/// with everything left in place when it cannot. Main calls it on the main
+/// or crashed, from its working files. Exit 0 when the folder ends complete, 75
+/// (EX_TEMPFAIL) when another process still holds the folder's lock, 1 with
+/// everything left in place when it cannot. Main calls it on the main
 /// thread, never on the concurrency pool, so finalising may block there.
 func runRecover(_ arguments: [String]) -> Never {
     // As before the recorder became one mode of the app: a stop signal must not
@@ -58,14 +59,9 @@ func runRecover(_ arguments: [String]) -> Never {
         exit(1)
     }
     let dir = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-    do {
-        try recover(directory: dir)
-        eprint("Recovered \(dir.path)")
-        exit(0)
-    } catch {
-        eprint("Could not recover \(dir.path): \(error.localizedDescription)")
-        exit(1)
-    }
+    let result = recoverStatus(directory: dir)
+    eprint(result.message)
+    exit(result.status)
 }
 
 // MARK: - Recording
