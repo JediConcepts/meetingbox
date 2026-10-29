@@ -25,7 +25,7 @@ Nothing to configure. No audio devices to create. No reboot.
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.3.0
+meetingbox setup v1.3.1
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
@@ -189,6 +189,14 @@ meetingbox help
 
 Options: `--mic "USB"`, `--dir`, `--locale`, `--whisper`, `--native`, `--model`,
 `--no-keep-audio`. Each has an `MB_*` environment equivalent.
+
+meetingbox plays a short sound when a recording starts (Tink), when it stops (Pop)
+and when the minutes are ready (Glass), so a hotkey press is heard to work.
+`MB_SOUNDS=0` turns them off.
+
+In the minutes, each decision and action ends with the words from the transcript
+that show it, so you can check it. Apple's on device model is small and can still
+mistake a story about the past for a decision; the quote makes that easy to spot.
 
 `reset --tools` and `uninstall` delete only what setup itself created. Setup keeps
 a list in `~/.meetingbox/installed` as it goes, so a whisper model, a

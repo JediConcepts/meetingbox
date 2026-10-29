@@ -18,6 +18,7 @@ SA_FAIL=""      # none | call | both | garbled
 
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
 notify() { :; }
+chime() { echo "chime $1" >> "$HOME/calls.log"; }
 speech-analyzer() {
   echo "speech-analyzer $*" >> "$HOME/calls.log"
   for a in "$@"; do :; done   # the audio is the last argument
@@ -67,6 +68,8 @@ if [ -s "$HOME/fm-input.txt" ] && ! grep -q '\[00:' "$HOME/fm-input.txt" \
    && grep -q '^Me: ' "$HOME/fm-input.txt"; then
   pass "fm gets the transcript without timestamps, labels kept"
 else fail "fm gets the transcript without timestamps, labels kept: $(cat "$HOME/fm-input.txt")"; fi
+if grep -q '^chime done$' "$HOME/calls.log"; then pass "minutes ready plays the done sound"
+else fail "minutes ready plays the done sound"; fi
 if [ -n "$(cat "$d/notes.md" 2>/dev/null)" ] && ! ls -a "$d" | grep -q '^\.work'; then
   pass "minutes written, working folder cleaned up"
 else fail "minutes written, working folder cleaned up"; fi
