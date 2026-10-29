@@ -229,6 +229,38 @@ echo "$OTHER" > "$HOME/signed"
 if ! app_signed_by_us; then pass "app_signed_by_us: another certificate is not ours"
 else fail "app_signed_by_us: another certificate is not ours"; fi
 
+# --- moving an existing app onto the certificate clears its old approvals, once ---
+# macOS ties Screen Recording and the Microphone to the signature, so approvals
+# given to the ad hoc app still show as on but no longer apply.
+resets() { grep -c "^tccutil reset \(ScreenCapture\|Microphone\) $APP_ID\$" "$HOME/calls.log"; }
+
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(build_app "$HOME/rec" 2>&1)"
+if app_signed_by_us && [ "$(resets)" = 2 ] && printf '%s\n' "$out" | grep -q 'ask for Screen Recording and the Microphone once more'; then
+  pass "rebuilding an ad hoc app onto the certificate clears its old approvals and says so"
+else fail "rebuilding an ad hoc app onto the certificate clears its old approvals and says so: $out $(cat "$HOME/calls.log")"; fi
+
+: > "$HOME/calls.log"
+build_app "$HOME/rec" >/dev/null 2>&1
+if app_signed_by_us && [ "$(resets)" = 0 ]; then pass "rebuilding an app already on the certificate keeps its approvals"
+else fail "rebuilding an app already on the certificate keeps its approvals"; fi
+
+rm -rf -- "$HOME/meetingbox.app"; rm -f "$HOME/signed"; : > "$HOME/calls.log"
+build_app "$HOME/rec" >/dev/null 2>&1
+if app_signed_by_us && [ "$(resets)" = 0 ]; then pass "a first build has no approvals to clear"
+else fail "a first build has no approvals to clear"; fi
+
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+resign_app >/dev/null 2>&1
+if app_signed_by_us && [ "$(resets)" = 2 ]; then pass "re-signing an ad hoc app clears its old approvals"
+else fail "re-signing an ad hoc app clears its old approvals"; fi
+
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+CODESIGN_FAILS="$HASH" build_app "$HOME/rec" >/dev/null 2>&1
+if ! app_signed_by_us && [ "$(resets)" = 0 ]; then pass "falling back to ad hoc clears nothing"
+else fail "falling back to ad hoc clears nothing"; fi
+echo "$HASH" > "$HOME/signed"
+
 # doctor: certificate there but the app ad hoc
 mkdir -p "$APP_DIR"; echo - > "$HOME/signed"
 out="$(doctor 2>&1)"

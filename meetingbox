@@ -372,6 +372,8 @@ install_recorder() {
 # meetingbox certificate so the permissions survive a rebuild. Without it the
 # app is signed ad hoc, and macOS asks again after each update.
 build_app() {
+  local had_ad_hoc=0
+  [ -d "$APP_DIR" ] && ! app_signed_by_us && had_ad_hoc=1
   adopt_own_app
   claim_path "$APP_DIR" || return 1
   mkdir -p "$APP_DIR/Contents/MacOS"
@@ -395,12 +397,25 @@ build_app() {
 </dict>
 </plist>
 PLIST
-  if ! sign_app; then
+  if sign_app; then
+    register_app
+    if [ "$had_ad_hoc" = 1 ]; then forget_old_approvals; fi
+  else
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
     codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
       || { warn "could not sign the recorder app"; return 1; }
+    register_app
   fi
-  register_app
+}
+
+# macOS ties Screen Recording and the Microphone to the app's signature. Once an
+# app that was signed ad hoc is signed with the certificate, its old approvals
+# still show as on in Privacy settings but no longer apply, and turning them off
+# and on does not help. Clear them so macOS asks afresh, this one last time.
+forget_old_approvals() {
+  tccutil reset ScreenCapture "$APP_ID" >/dev/null 2>&1 || true
+  tccutil reset Microphone "$APP_ID" >/dev/null 2>&1 || true
+  info "meetingbox now has its own signature, so macOS will ask for Screen Recording and the Microphone once more"
 }
 
 # The one way the app is signed with the certificate: after a build, and by
@@ -418,6 +433,7 @@ resign_app() {
   say "the signing certificate"
   if sign_app; then
     register_app
+    forget_old_approvals
     ok "meetingbox.app signed with the meetingbox certificate"
   else
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
