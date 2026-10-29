@@ -205,7 +205,7 @@ Start with `meetingbox doctor`.
 | Recorder stops immediately | Screen Recording or Microphone not granted to **meetingbox**. Turn it on in Privacy & Security, retry |
 | Permissions look granted but still fail | `meetingbox reset`, then `meetingbox setup` to be asked afresh |
 | Asked for permission again after an update | Expected once, on the move from 1.2 to 1.3 (Screen Recording and Microphone). Setup clears the old 1.2 approvals first, because they still show as on in Privacy settings but no longer apply to the newly signed app. From then on the signing certificate keeps the grants across rebuilds. If it keeps happening, run `meetingbox doctor`. If the 'signing certificate' line is missing, run `meetingbox setup`, which makes it and re-signs the app |
-| `speech-analyzer` fails with "Invalid manifest" | The Command Line Tools are damaged. `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
+| Apple's transcriber did not build | Setup builds it with `swiftc` directly, so a broken SwiftPM ("Invalid manifest") no longer matters. If `swiftc` itself fails, reinstall the Command Line Tools: `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install`. meetingbox carries on with whisper meanwhile |
 | `swiftc: command not found` | Command Line Tools still downloading. Let the Apple installer finish |
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
 | Minutes feel thin | `MB_CHUNK_WORDS=900 meetingbox process <file>`, more slices and more detail |

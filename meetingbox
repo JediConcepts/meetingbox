@@ -555,29 +555,43 @@ remove_signing_identity() {
 }
 
 install_speech_analyzer() {
+  local sa build
   say "the transcriber (Apple SpeechAnalyzer)"
   info "the same on device engine behind Notes transcription. Fast, no model to download."
   mkdir -p "$SRC_DIR" "$BIN_DIR"
-  if [ -d "$SRC_DIR/speech-analyzer-cli/.git" ]; then
-    git -C "$SRC_DIR/speech-analyzer-cli" pull -q --ff-only || true
+  sa="$SRC_DIR/speech-analyzer-cli"
+  if [ -d "$sa/.git" ]; then
+    git -C "$sa" pull -q --ff-only || true
   else
-    claim_path "$SRC_DIR/speech-analyzer-cli" || return 1
-    git clone -q --depth 1 "$SPEECH_ANALYZER_REPO" "$SRC_DIR/speech-analyzer-cli" \
+    claim_path "$sa" || return 1
+    git clone -q --depth 1 "$SPEECH_ANALYZER_REPO" "$sa" \
       || { warn "could not clone $SPEECH_ANALYZER_REPO"; return 1; }
   fi
-  # Its install script writes these two. Only ones it creates now count as ours.
-  [ -e "$SA_APP" ] || record_install "$SA_APP"
-  [ -e "$SA_LINK" ] || [ -L "$SA_LINK" ] || record_install "$SA_LINK"
-  ( cd "$SRC_DIR/speech-analyzer-cli" && chmod +x scripts/install.sh && ./scripts/install.sh ) \
-    || {
-      warn "speech-analyzer build failed"
-      # Seen on macOS 27: the Command Line Tools ship a Swift package library that
-      # cannot link, so every Swift package fails with "Invalid manifest", however
-      # simple. The recorder still builds because it calls swiftc directly.
-      info "if the error above says 'Invalid manifest', the Command Line Tools are damaged."
-      info "reinstalling them fixes it: sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install"
-      return 1
-    }
+  # Built with swiftc, as the recorder is, not with its install script: that runs
+  # `swift build`, and on some macOS 27 Command Line Tools SwiftPM cannot link at
+  # all ("Invalid manifest"). The core library is its own module, so it goes first.
+  build="$(mktemp -d "${TMPDIR:-/tmp}/mb-sa.XXXXXX")" || return 1
+  if ! { swiftc -O -suppress-warnings -parse-as-library -module-name SpeechAnalyzerCore \
+           -emit-module -emit-module-path "$build/SpeechAnalyzerCore.swiftmodule" \
+           -emit-library -static -o "$build/libSpeechAnalyzerCore.a" "$sa"/Sources/SpeechAnalyzerCore/*.swift \
+         && swiftc -O -suppress-warnings -parse-as-library -module-name SpeechAnalyzerCLI \
+           -I "$build" -L "$build" -lSpeechAnalyzerCore \
+           -o "$build/speech-analyzer" "$sa"/Sources/SpeechAnalyzerCLI/*.swift; }; then
+    rm -rf -- "$build"
+    warn "Apple's transcriber did not build, see the output above"
+    return 1
+  fi
+  if ! { claim_path "$SA_APP" && claim_path "$SA_LINK"; }; then
+    rm -rf -- "$build"
+    return 1
+  fi
+  mkdir -p "$SA_APP/Contents/MacOS" "$(dirname "$SA_LINK")"
+  cp "$sa/Resources/Info.plist" "$SA_APP/Contents/Info.plist"
+  install -m 755 "$build/speech-analyzer" "$SA_APP/Contents/MacOS/speech-analyzer"
+  rm -rf -- "$build"
+  # An app bundle, so macOS can ask for Speech Recognition by name.
+  codesign --force --sign - "$SA_APP" >/dev/null 2>&1 || warn "could not sign $SA_APP"
+  ln -sfn "$SA_APP/Contents/MacOS/speech-analyzer" "$SA_LINK"
   have speech-analyzer && ok "speech-analyzer" || { warn "built but not on PATH"; return 1; }
 }
 
@@ -721,6 +735,10 @@ setup() {
   need_xcode_clt      && { miss "Xcode Command Line Tools"; todo="$todo clt"; }     || ok "Xcode Command Line Tools"
   need_recorder       && { miss "the recorder";             todo="$todo capture"; } || ok "the recorder"
   transcriber_present && ok "a transcriber" || { miss "a transcriber"; todo="$todo transcriber"; }
+  # whisper alone works, but Apple's is faster and needs no model; offer it beside it
+  if transcriber_present && ! have speech-analyzer && [ "${v:-0}" -ge 26 ] 2>/dev/null; then
+    miss "Apple's transcriber (faster than whisper, which is used until then)"; todo="$todo native"
+  fi
   # a build signs the app, so this matters for an app that is already built
   have_signing_identity && app_signed_by_us && ok "signing certificate" \
     || { miss "a signing certificate"; todo="$todo sign"; }
@@ -774,6 +792,7 @@ setup() {
       fi ;;
   esac
 
+  case " $todo " in *" native "*) install_speech_analyzer || info "carrying on with whisper" ;; esac
   case " $todo " in *" license "*) accept_fm_license || true ;; esac
 
   rule
