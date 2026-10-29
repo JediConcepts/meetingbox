@@ -51,6 +51,12 @@ APP_DIR="$SRC_DIR/meetingbox.app"
 # builds it from a clone of the release tag, or from MB_SOURCE_DIR if set.
 SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
 APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+# The app is signed with a certificate setup makes in the login keychain. macOS
+# ties the permissions to that certificate, so they survive a rebuild.
+SIGN_NAME="meetingbox local signing"
+SIGN_KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
+# macOS's own openssl: Homebrew's OpenSSL 3 writes .p12 files security cannot read.
+OPENSSL="/usr/bin/openssl"
 # Registering the app with LaunchServices is what lets tccutil find it by ID.
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
@@ -155,7 +161,11 @@ remove_installed() {
   esac
   installed_by_us "$p" || return 1
   rm -rf -- "$p"
-  { grep -vxF -- "$p" "$INSTALLED" || true; } > "$INSTALLED.tmp"
+  forget_install "$p"
+}
+
+forget_install() {
+  { grep -vxF -- "$1" "$INSTALLED" || true; } > "$INSTALLED.tmp"
   mv -f "$INSTALLED.tmp" "$INSTALLED"
 }
 
@@ -341,9 +351,9 @@ install_recorder() {
   ok "recorder -> $APP_DIR"
 }
 
-# Wrap the recorder in an app bundle with its own identity. Signed ad hoc, which
-# is enough for macOS to remember the permissions against it. A rebuild changes
-# the signature, so macOS may ask once more after one.
+# Wrap the recorder in an app bundle with its own identity, signed with the
+# meetingbox certificate so the permissions survive a rebuild. Without it the
+# app is signed ad hoc, and macOS asks again after each update.
 build_app() {
   adopt_own_app
   claim_path "$APP_DIR" || return 1
@@ -368,13 +378,62 @@ build_app() {
 </dict>
 </plist>
 PLIST
-  codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
-    || { warn "could not sign the recorder app"; return 1; }
+  if ! { ensure_signing_identity \
+         && codesign --force --sign "$SIGN_NAME" --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1; }; then
+    warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
+    codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
+      || { warn "could not sign the recorder app"; return 1; }
+  fi
   register_app
 }
 
 register_app() {
   [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DIR" >/dev/null 2>&1 || true
+}
+
+have_signing_identity() {
+  security find-certificate -c "$SIGN_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1
+}
+
+# A certificate with this name that setup did not make is used as it is and
+# never deleted. A self-signed one is enough: codesign does not need it trusted.
+ensure_signing_identity() {
+  have_signing_identity && return 0
+  # an explicit template: macOS's mktemp -d on its own ignores TMPDIR
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/meetingbox-sign.XXXXXX")" || return 1
+  pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24)" || true
+  cat > "$tmp/cnf" <<CNF
+[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $SIGN_NAME
+[ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+CNF
+  made=0
+  "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$tmp/cnf" \
+      -keyout "$tmp/key.pem" -out "$tmp/cert.pem" >/dev/null 2>&1 \
+    && "$OPENSSL" pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+      -name "$SIGN_NAME" -passout "pass:$pw" -out "$tmp/id.p12" >/dev/null 2>&1 \
+    && security import "$tmp/id.p12" -k "$SIGN_KEYCHAIN" -P "$pw" -T /usr/bin/codesign >/dev/null 2>&1 \
+    && made=1
+  rm -rf -- "$tmp"
+  [ "$made" -eq 1 ] || return 1
+  record_install "keychain:$SIGN_NAME"
+}
+
+remove_signing_identity() {
+  installed_by_us "keychain:$SIGN_NAME" || return 0
+  if security delete-identity -c "$SIGN_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || ! have_signing_identity; then
+    forget_install "keychain:$SIGN_NAME"
+  else
+    warn "could not delete \"$SIGN_NAME\" from your login keychain. Delete it in Keychain Access"
+    return 1
+  fi
 }
 
 install_speech_analyzer() {
@@ -606,6 +665,8 @@ doctor() {
   say "check"
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
+  have_signing_identity && ok "signing certificate" \
+    || miss "signing certificate (permissions will be asked again after updates)"
   have speech-analyzer && ok "speech-analyzer" || info "speech-analyzer not installed"
   have whisper-cli    && ok "whisper-cli"     || info "whisper-cli not installed"
   transcriber_present || miss "no transcriber at all"
@@ -984,7 +1045,11 @@ reset_cmd() {
     info "  delete what setup installed:"
     n=0
     while IFS= read -r p; do
-      if [ -n "$p" ] && { [ -e "$p" ] || [ -L "$p" ]; }; then info "    $p"; n=$((n + 1)); fi
+      case "$p" in
+        "keychain:$SIGN_NAME")
+          info "    the meetingbox signing certificate in your login keychain"; n=$((n + 1)) ;;
+        /*) if [ -e "$p" ] || [ -L "$p" ]; then info "    $p"; n=$((n + 1)); fi ;;
+      esac
     done <<< "$ours"
     if old_recorder; then info "    $BIN_DIR/audio-capture (from v1.1.0)"; n=$((n + 1)); fi
     [ "$n" -gt 0 ] || info "    nothing, setup has no record of installing anything"
@@ -1032,8 +1097,9 @@ reset_cmd() {
     fi
     old_recorder && rm -f "$BIN_DIR/audio-capture"
     while IFS= read -r p; do
-      if [ -n "$p" ]; then remove_installed "$p" || true; fi
+      case "$p" in /*) remove_installed "$p" || true ;; esac
     done <<< "$ours"
+    remove_signing_identity || true
     # a half finished download of the model setup was fetching
     if printf '%s\n' "$ours" | grep -qxF -- "$WHISPER_FILE"; then rm -f "$WHISPER_FILE.part"; fi
     rmdir "$SRC_DIR" "$MODEL_DIR" 2>/dev/null || true
