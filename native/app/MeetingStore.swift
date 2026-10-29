@@ -1,8 +1,10 @@
+import Darwin
 import Foundation
 
 enum MeetingState: String {
     case recording, finalising, queued, processing, done, failed
-    /// Inferred by `scan` for a folder with no usable record; never written.
+    /// Never processed and not queued. Inferred by `scan` for a folder with no usable record, and
+    /// written by `update` when it starts a record for an old folder. The queue never picks it up.
     case unprocessed
 }
 
@@ -21,7 +23,7 @@ struct MeetingRecord {
     var attempt: String?
 
     init(id: String = UUID().uuidString, title: String? = nil, started: Date = Date(), seconds: Int = 0,
-         state: MeetingState = .queued) {
+         state: MeetingState) {
         self.id = id
         self.title = title
         self.started = started
@@ -41,8 +43,8 @@ struct MeetingRecord {
     init?(json: [String: Any]) {
         guard let id = json["id"] as? String, !id.isEmpty,
               let startedText = json["started"] as? String, let started = MeetingRecord.parseDate(startedText),
-              let stateText = json["state"] as? String, let state = MeetingState(rawValue: stateText),
-              state != .unprocessed else { return nil }
+              let stateText = json["state"] as? String, let state = MeetingState(rawValue: stateText)
+              else { return nil }
         self.id = id
         self.started = started
         self.state = state
@@ -155,12 +157,38 @@ final class MeetingStore {
                 try backUpBad(file)
             }
         }
-        var current = record ?? MeetingRecord(started: MeetingFolder.parse(folder)?.date ?? Date())
+        // A fresh record is never queued as a side effect: it starts as the state a scan would infer.
+        let inferred: MeetingState = fm.fileExists(atPath: folder.appendingPathComponent("notes.md").path)
+            ? .done : .unprocessed
+        var current = record ?? MeetingRecord(started: MeetingFolder.parse(folder)?.date ?? Date(), state: inferred)
         change(&current)
         current.apply(to: &json)
         let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: file, options: .atomic)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        try writePrivately(data, to: file)
+    }
+
+    /// Writes through a temp file created 0600, then renames it into place, so the file is never
+    /// readable by others and a reader never sees half of it.
+    private func writePrivately(_ data: Data, to file: URL) throws {
+        let tmp = file.deletingLastPathComponent().appendingPathComponent(".meeting.json.tmp-\(UUID().uuidString)")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard fd >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        var failure: Int32 = 0
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < raw.count {
+                let n = write(fd, raw.baseAddress! + offset, raw.count - offset)
+                if n < 0 { failure = errno; return }
+                offset += n
+            }
+        }
+        if failure == 0 && fsync(fd) != 0 { failure = errno }
+        close(fd)
+        if failure == 0 && rename(tmp.path, file.path) != 0 { failure = errno }
+        if failure != 0 {
+            unlink(tmp.path) // our own temp file, created just above
+            throw POSIXError(POSIXErrorCode(rawValue: failure) ?? .EIO)
+        }
     }
 
     private func backUpBad(_ file: URL) throws {

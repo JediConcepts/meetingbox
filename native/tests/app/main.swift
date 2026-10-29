@@ -201,6 +201,30 @@ do {
     check(names(k).filter { $0.hasPrefix("meeting.json.bad-") }.count == 1, "non-object meeting.json is backed up")
 }
 
+// update never queues an old folder
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    func state(_ f: URL) -> String? {
+        ((try? JSONSerialization.jsonObject(with: Data(contentsOf: f.appendingPathComponent("meeting.json")))) as? [String: Any])?["state"] as? String
+    }
+    func scanned(_ f: URL) -> MeetingState? { store.scan().first { $0.folder.url.lastPathComponent == f.lastPathComponent }?.state }
+    let withNotes = make(root, "2026-10-20_0900", files: ["notes.md": "hand edited"])
+    let without = make(root, "2026-10-20_1000", files: ["2026-10-20_1000_meeting.m4a": "x"])
+    try! store.update(withNotes) { $0.title = "Retitled" }
+    try! store.update(without) { $0.title = "Retitled" }
+    check(state(withNotes) == "done" && scanned(withNotes) == .done, "update on old folder with notes.md stays done")
+    check(state(without) == "unprocessed" && scanned(without) == .unprocessed, "update on old folder without notes.md is unprocessed")
+    let badNotes = make(root, "2026-10-20_1100", files: ["notes.md": "n", "meeting.json": "{oops"])
+    let badNone = make(root, "2026-10-20_1200", files: ["meeting.json": "{oops"])
+    try! store.update(badNotes) { $0.title = "T" }
+    try! store.update(badNone) { $0.title = "T" }
+    check(state(badNotes) == "done" && scanned(badNotes) == .done, "undecodable meeting.json with notes.md becomes done")
+    check(state(badNone) == "unprocessed" && scanned(badNone) == .unprocessed, "undecodable meeting.json without notes.md becomes unprocessed")
+    check(names(badNotes).contains { $0.hasPrefix("meeting.json.bad-") } && names(badNone).contains { $0.hasPrefix("meeting.json.bad-") }, "backups kept")
+    check(mode(withNotes.appendingPathComponent("meeting.json")) == 0o600 && !names(withNotes).contains { $0.hasPrefix(".meeting.json.tmp") }, "private file, no temp left")
+}
+
 // matches
 do {
     let root = freshRoot()
