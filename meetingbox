@@ -614,9 +614,11 @@ test_recording() {
   return 1
 }
 
-# Only the files the test writes, then the folder if that leaves it empty.
+# Only the files the test writes (and the one v1.2.2's test wrote), then the
+# folder if that leaves it empty.
 clear_permcheck() {
-  rm -f "$PERM_DIR/audio.m4a" "$PERM_DIR/mic.m4a" "$PERM_DIR/call.m4a" "$PERM_DIR/log"
+  rm -f "$PERM_DIR/audio.m4a" "$PERM_DIR/mic.m4a" "$PERM_DIR/call.m4a" "$PERM_DIR/log" \
+        "$PERM_DIR"/*_permcheck.m4a
   rmdir "$PERM_DIR" 2>/dev/null || true
 }
 
@@ -903,6 +905,12 @@ stop_recording() {
 
   # the recorder writes the mix as audio.m4a, beside mic.m4a and call.m4a
   audio="$dir/audio.m4a"
+  # a recording started by v1.2.2 wrote <stamp>_meeting.m4a: take that one, and only that
+  if [ ! -e "$audio" ]; then
+    for f in "$dir"/*_meeting.m4a; do
+      if [ -s "$f" ]; then mv -n "$f" "$audio" || true; break; fi
+    done
+  fi
   if [ ! -s "$audio" ]; then
     [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
     die "no recording was written in $dir"
@@ -969,14 +977,15 @@ transcribe() {
 }
 
 # One side of the call to word timed JSON, for mb-transcript. A side that will
-# not transcribe is left empty with a warning: one side is better than none.
+# not transcribe is left empty with a warning, and returns 1: one side is better
+# than none, but both failing is a different problem.
 transcribe_words() {
   local audio="$1" out="$2" engine model wav
   engine="$(pick_engine)"
   case "$engine" in
     native)
       speech-analyzer --locale "$LOCALE" -f json "$audio" > "$out" \
-        || { warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"; }
+        || { warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"; return 1; }
       ;;
     whisper)
       model="$(find_whisper_model)"
@@ -986,6 +995,7 @@ transcribe_words() {
       if ! { ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
              && whisper-cli -m "$model" -f "$wav" -oj -ml 1 -sow --output-file "${out%.json}" >/dev/null; }; then
         warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"
+        rm -f "$wav"; return 1
       fi
       rm -f "$wav"
       ;;
@@ -995,15 +1005,23 @@ transcribe_words() {
 # Your side and the other side transcribed on their own, then merged by
 # mb-transcript into lines labelled Me and Them.
 transcribe_channels() {
-  local dir="$1" out="$2" engine tmp err msg
+  local dir="$1" out="$2" engine tmp err msg failed=0
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
   engine="$(pick_engine)"
   case "$engine" in
     native)  say "transcribing each side on device (Apple SpeechAnalyzer)" ;;
     whisper) say "transcribing each side on device (whisper.cpp)" ;;
   esac
-  transcribe_words "$dir/mic.m4a" "$dir/mic.words.json"
-  transcribe_words "$dir/call.m4a" "$dir/call.words.json"
+  # through ||, so set -e does not end the run on the first side that fails
+  transcribe_words "$dir/mic.m4a" "$dir/mic.words.json" || failed=$((failed + 1))
+  transcribe_words "$dir/call.m4a" "$dir/call.words.json" || failed=$((failed + 1))
+  # Both failing is rarely a silent meeting: usually the engine cannot run at all.
+  if [ "$failed" -eq 2 ]; then
+    case "$engine" in
+      native)  die "transcription failed on both sides. Check Speech Recognition in Privacy settings, or run: meetingbox setup" ;;
+      whisper) die "whisper-cli failed on both sides, see its output above" ;;
+    esac
+  fi
 
   # Written aside and moved, so a failure leaves no half transcript behind.
   tmp="$(mktemp)"; err="$(mktemp)"

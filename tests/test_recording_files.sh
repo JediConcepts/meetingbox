@@ -15,10 +15,10 @@ mkdir -p "$PERM_DIR"
 for f in audio.m4a mic.m4a call.m4a log other.m4a 2026-01-01_permcheck.m4a; do echo x > "$PERM_DIR/$f"; done
 clear_permcheck
 left="$(cd "$PERM_DIR" 2>/dev/null && ls | tr '\n' ' ')"
-if [ "$left" = "2026-01-01_permcheck.m4a other.m4a " ]; then
-  pass "clear_permcheck leaves anything else, and the folder"
-else fail "clear_permcheck leaves anything else, and the folder (left: $left)"; fi
-rm -f "$PERM_DIR/other.m4a" "$PERM_DIR/2026-01-01_permcheck.m4a"; rmdir "$PERM_DIR"
+if [ "$left" = "other.m4a " ]; then
+  pass "clear_permcheck takes a v1.2.2 *_permcheck.m4a too, leaves anything else and the folder"
+else fail "clear_permcheck takes a v1.2.2 *_permcheck.m4a too, leaves anything else and the folder (left: $left)"; fi
+rm -f "$PERM_DIR/other.m4a"; rmdir "$PERM_DIR"
 
 # --- test_recording passes on a non-empty audio.m4a ---
 sleep() { :; }
@@ -57,5 +57,13 @@ out="$( (stop_recording) 2>&1 )"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no recording was written' && [ -s "$dir/mic.m4a" ]; then
   pass "stop_recording without audio.m4a: no recording, mic.m4a not taken"
 else fail "stop_recording without audio.m4a: no recording, mic.m4a not taken"; fi
+
+# a recording started by v1.2.2 wrote <stamp>_meeting.m4a: that one is taken as audio.m4a
+printf 'old' > "$dir/2026-10-27_1430_meeting.m4a"
+got="$( (stop_recording 2>/dev/null; printf '%s' "$STOPPED_AUDIO") )"
+if [ "$got" = "$dir/audio.m4a" ] && [ "$(cat "$dir/audio.m4a" 2>/dev/null)" = old ] \
+   && [ ! -e "$dir/2026-10-27_1430_meeting.m4a" ] && [ -s "$dir/mic.m4a" ]; then
+  pass "stop_recording adopts a v1.2.2 *_meeting.m4a"
+else fail "stop_recording adopts a v1.2.2 *_meeting.m4a ($got)"; fi
 
 finish

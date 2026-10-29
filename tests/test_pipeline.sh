@@ -79,13 +79,14 @@ else fail "call side failing: transcript is all Me (rc $rc): $out"; fi
 if printf '%s' "$out" | grep -q 'warn.*call.m4a'; then pass "call side failing: a warning names it"
 else fail "call side failing: a warning names it: $out"; fi
 
-# --- both fail: die with mb-transcript's message, audio left alone ---
+# --- both fail: most likely Speech Recognition is off, so say so; audio left alone ---
 d="$(meeting m3 audio.m4a mic.m4a call.m4a)"
 SA_FAIL=both
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no speech found on either channel'; then
-  pass "both sides failing dies with no speech found"
-else fail "both sides failing dies with no speech found (rc $rc): $out"; fi
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'failed on both sides. Check Speech Recognition in Privacy settings' \
+   && ! printf '%s' "$out" | grep -q 'no speech found'; then
+  pass "both sides failing points at Speech Recognition"
+else fail "both sides failing points at Speech Recognition (rc $rc): $out"; fi
 if [ -s "$d/audio.m4a" ] && [ -s "$d/mic.m4a" ] && [ -s "$d/call.m4a" ] && [ ! -e "$d/transcript.txt" ]; then
   pass "both sides failing leaves the audio and writes no transcript"
 else fail "both sides failing leaves the audio and writes no transcript"; fi
