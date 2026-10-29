@@ -145,7 +145,11 @@ installed_by_us() { grep -qxF -- "$1" "$INSTALLED" 2>/dev/null; }
 
 remove_installed() {
   p="$1"
-  case "$p" in ""|/|"$HOME"|"$HOME"/) warn "refusing to remove '$p'"; return 1 ;; esac
+  case "$p" in
+    ""|/|"$HOME"|"$HOME"/) warn "refusing to remove '$p'"; return 1 ;;
+    /*) ;;
+    *) warn "refusing to remove '$p': not a path"; return 1 ;;
+  esac
   installed_by_us "$p" || return 1
   rm -rf -- "$p"
   { grep -vxF -- "$p" "$INSTALLED" || true; } > "$INSTALLED.tmp"
