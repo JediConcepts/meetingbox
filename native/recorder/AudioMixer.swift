@@ -24,6 +24,9 @@ final class AudioMixer: @unchecked Sendable {
     private var baseFrame: Int64 = 0
     private var cursors: [Int64?] = [nil, nil]
     private var clockOffsets: [Int64?] = [nil, nil]
+    // Frames of paused time taken out of the timeline, so audio after a resume joins the audio before it.
+    private var shift: Int64 = 0
+    private var paused = false
     private let emit: (_ mic: [Float], _ system: [Float]) -> Void
 
     init(now: @escaping () -> CMTime = { CMClockGetTime(CMClockGetHostTimeClock()) },
@@ -37,6 +40,7 @@ final class AudioMixer: @unchecked Sendable {
         guard !samples.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
+        guard !paused else { return }
 
         let i = source.rawValue
         let raw = frame(at: hostTime)
@@ -71,8 +75,28 @@ final class AudioMixer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Emits everything buffered, then drops what arrives until `resume()`.
+    func pause() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !paused else { return }
+        drain(final: true)
+        paused = true
+    }
+
+    /// The next samples from each source land straight after the last emitted frame.
+    func resume() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard paused else { return }
+        let end = baseFrame + Int64(timelines.map(\.count).max()!)
+        shift += frame(at: now()) - end
+        cursors = [nil, nil]
+        paused = false
+    }
+
     private func frame(at time: CMTime) -> Int64 {
-        Int64((time - startTime).seconds * Self.sampleRate)
+        Int64((time - startTime).seconds * Self.sampleRate) - shift
     }
 
     private func drain(final: Bool) {

@@ -694,6 +694,7 @@ has_session() { [ -f "$DIR_FILE" ]; }
 # Start and stop run one at a time. A double tap on the hotkey would otherwise
 # start two recorders, or try to stop one that is still starting.
 LOCK="$STATE_DIR/busy"
+PAUSE_FILE="$STATE_DIR/paused"
 take_lock() {
   if ! mkdir "$LOCK" 2>/dev/null; then
     holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
@@ -736,6 +737,7 @@ start_recording() {
   [ -e "$dir" ] && dir="$BASE_DIR/$(date +%Y-%m-%d_%H%M%S)"
   mkdir -p "$dir"
   printf '%s' "$dir" > "$DIR_FILE"
+  rm -f "$PAUSE_FILE"
 
   pid="$(launch_recorder "$dir" meeting "$dir/capture.log" ${MIC:+-d "$MIC"})" || pid=""
   [ -n "$pid" ] && sleep 2
@@ -754,6 +756,29 @@ start_recording() {
   notify "meetingbox" "Recording"
 }
 
+# Pause and resume only signal the recorder; it keeps its files open throughout.
+pause_recording() {
+  is_recording || die "not recording"
+  if [ -e "$PAUSE_FILE" ]; then info "already paused"; return 0; fi
+  for p in $(recorder_pids "$(session_dir)"); do kill -USR1 "$p" 2>/dev/null || true; done
+  : > "$PAUSE_FILE"
+  say "paused"
+}
+
+resume_recording() {
+  is_recording || die "not recording"
+  if [ ! -e "$PAUSE_FILE" ]; then info "not paused"; return 0; fi
+  for p in $(recorder_pids "$(session_dir)"); do kill -USR2 "$p" 2>/dev/null || true; done
+  rm -f "$PAUSE_FILE"
+  say "resumed"
+}
+
+status_cmd() {
+  if ! is_recording; then info "idle"
+  elif [ -e "$PAUSE_FILE" ]; then ok "paused -> $(session_dir)"
+  else ok "recording -> $(session_dir)"; fi
+}
+
 STOPPED_AUDIO=""
 stop_recording() {
   has_session || die "not recording"
@@ -764,7 +789,7 @@ stop_recording() {
   else
     warn "the recorder had already stopped, picking up what it wrote"
   fi
-  rm -f "$DIR_FILE"
+  rm -f "$DIR_FILE" "$PAUSE_FILE"
 
   # the recorder writes the mix as audio.m4a, beside mic.m4a and call.m4a
   audio="$dir/audio.m4a"
@@ -1073,7 +1098,7 @@ reset_cmd() {
   if has_session; then
     info "the unfinished recording is kept in $(session_dir)"
   fi
-  rm -f "$PID_FILE" "$DIR_FILE"   # recording.pid is from v1.2.0 and earlier
+  rm -f "$PID_FILE" "$DIR_FILE" "$PAUSE_FILE"   # recording.pid is from v1.2.0 and earlier
   clear_permcheck; release_lock
   ok "recording state cleared"
 
@@ -1128,6 +1153,7 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox setup                 install what is missing, next next next
   meetingbox                       toggle: start, or stop and write the minutes
   meetingbox start | stop | status
+  meetingbox pause | resume
   meetingbox process <audio|txt>   run an existing file through the pipeline
   meetingbox doctor                what is installed and what is not
   meetingbox mics                  microphones the recorder can see
@@ -1191,7 +1217,9 @@ case "${cmd:-toggle}" in
   mics|devices)
     recorder_ready || die "the recorder is not installed. Run: meetingbox setup"
     "$APP_BIN" -l ;;
-  status)  if is_recording; then ok "recording -> $(cat "$DIR_FILE")"; else info "idle"; fi ;;
+  pause)   take_lock; pause_recording ;;
+  resume)  take_lock; resume_recording ;;
+  status)  status_cmd ;;
   reset)
     if [ "$RESET_TOOLS" = 1 ]; then reset_cmd tools; else reset_cmd state; fi ;;
   uninstall) reset_cmd all ;;

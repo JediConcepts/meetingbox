@@ -93,4 +93,35 @@ do {
     check(c.mic.count == c.system.count && !c.unequal, "late mic: equal lengths")
 }
 
+// Pause drops what arrives while paused, and resume lands the next audio straight after the last
+// emitted frame, so the join has no gap. Pausing or resuming twice changes nothing.
+for twice in [false, true] {
+    t = 0
+    let c = Capture()
+    func second(from start: Double, _ value: Float) {
+        for k in 0..<(rate / chunk) {
+            let when = start + Double(k * chunk) / Double(rate)
+            t = when + 0.01
+            c.mixer.append([Float](repeating: value, count: chunk), from: .mic, at: at(when))
+            c.mixer.append([Float](repeating: value, count: chunk), from: .system, at: at(when))
+        }
+    }
+    let label = twice ? "pause and resume twice" : "pause and resume"
+    second(from: 0, 0.1)
+    t = 1
+    c.mixer.pause()
+    if twice { c.mixer.pause() }
+    c.mixer.append([Float](repeating: 0.9, count: chunk), from: .mic, at: at(1.5))
+    c.mixer.append([Float](repeating: 0.9, count: chunk), from: .system, at: at(1.5))
+    t = 3
+    c.mixer.resume()
+    if twice { c.mixer.resume() }
+    second(from: 3, 0.2)
+    c.mixer.finish()
+    check(c.mic.count == 2 * rate && c.system.count == 2 * rate, "\(label): 96000 frames per channel")
+    check(!c.unequal, "\(label): every emit has equal-length slices")
+    check(c.mic[rate - 1] != 0 && c.mic[rate] != 0 && c.system[rate] != 0, "\(label): no zero gap at the join")
+    check(c.mic.allSatisfy { $0 == Float(0.1) || $0 == Float(0.2) }, "\(label): nothing from the paused stretch")
+}
+
 exit(failures == 0 ? 0 : 1)

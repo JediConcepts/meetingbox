@@ -134,6 +134,19 @@ func abort(_ message: String) -> Never {
 signal(SIGINT, SIG_IGN)
 signal(SIGTERM, SIG_IGN)
 signal(SIGPIPE, SIG_IGN)
+signal(SIGUSR1, SIG_IGN)
+signal(SIGUSR2, SIG_IGN)
+
+// SIGUSR1 pauses, SIGUSR2 resumes. The files keep recording; the mixer drops the paused stretch.
+let pauseSources = [(SIGUSR1, "Paused"), (SIGUSR2, "Resumed")].map { sig, message -> DispatchSourceSignal in
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+    source.setEventHandler {
+        if sig == SIGUSR1 { mixer.pause() } else { mixer.resume() }
+        eprint(message)
+    }
+    source.resume()
+    return source
+}
 
 let stopSignal = AsyncStream<Void> { continuation in
     let sources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
