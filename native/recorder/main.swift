@@ -1,6 +1,15 @@
 import Foundation
 import AVFoundation
 
+// Ignore these before anything else, so a pause or stop that arrives while the
+// devices are still being set up cannot kill the recorder with its files half
+// made. Dispatch sources further down take them over.
+signal(SIGINT, SIG_IGN)
+signal(SIGTERM, SIG_IGN)
+signal(SIGPIPE, SIG_IGN)
+signal(SIGUSR1, SIG_IGN)
+signal(SIGUSR2, SIG_IGN)
+
 // MARK: - Helpers
 
 func discoverInputDevices() -> [AVCaptureDevice] {
@@ -57,7 +66,7 @@ while let arg = args.next() {
         exit(0)
     case "--help", "-h":
         print("""
-        audio-capture — Record system audio and microphone
+        audio-capture: record system audio and microphone
 
         Usage: audio-capture [options]
 
@@ -130,12 +139,7 @@ func abort(_ message: String) -> Never {
 }
 
 // MARK: - Signal handling (Ctrl+C / kill)
-
-signal(SIGINT, SIG_IGN)
-signal(SIGTERM, SIG_IGN)
-signal(SIGPIPE, SIG_IGN)
-signal(SIGUSR1, SIG_IGN)
-signal(SIGUSR2, SIG_IGN)
+// The signals are ignored at the very top of this file; the sources below handle them.
 
 // SIGUSR1 pauses, SIGUSR2 resumes. The files keep recording; the mixer drops the paused stretch.
 let pauseSources = [(SIGUSR1, "Paused"), (SIGUSR2, "Resumed")].map { sig, message -> DispatchSourceSignal in
