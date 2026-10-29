@@ -78,6 +78,31 @@ V_SAVE="$VERSION"; VERSION=9.9.9
 if ! recorder_ready; then pass "recorder_ready false for an older app"; else fail "recorder_ready false for an older app"; fi
 VERSION="$V_SAVE"
 writeplist "$VERSION"
+TRANSCRIPT_BIN="$HOME/t-mb-transcript"
+if ! recorder_ready; then pass "recorder_ready false without mb-transcript"; else fail "recorder_ready false without mb-transcript"; fi
+printf '#!/bin/sh\n' > "$TRANSCRIPT_BIN"; chmod +x "$TRANSCRIPT_BIN"
 if recorder_ready; then pass "recorder_ready true when the app matches VERSION"; else fail "recorder_ready true when the app matches VERSION"; fi
+
+# install_recorder builds mb-transcript beside the app and records it
+SRC_DIR="$HOME/src2"; SOURCE_DIR="$SRC_DIR/meetingbox"; BIN_DIR="$HOME/bin2"
+TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
+fetch_source() { return 0; }
+build_app() { echo "build_app $1" >> "$HOME/calls.log"; }
+swiftc() {
+  echo "swiftc $*" >> "$HOME/calls.log"
+  while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'bin' > "$2"; return 0; }; shift; done
+}
+: > "$HOME/calls.log"
+install_recorder >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && [ -x "$TRANSCRIPT_BIN" ] && installed_by_us "$TRANSCRIPT_BIN" \
+   && grep -q -- "swiftc -O -o .*/mb-transcript $SOURCE_DIR/native/transcript/\*.swift" "$HOME/calls.log"; then
+  pass "install_recorder builds mb-transcript and records it"
+else fail "install_recorder builds mb-transcript and records it: $(cat "$HOME/calls.log")"; fi
+
+forget_install "$TRANSCRIPT_BIN"
+install_recorder >/dev/null 2>&1; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(cat "$TRANSCRIPT_BIN")" = bin ]; then
+  pass "install_recorder will not replace an mb-transcript it did not make"
+else fail "install_recorder will not replace an mb-transcript it did not make"; fi
 
 finish

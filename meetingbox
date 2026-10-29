@@ -11,6 +11,7 @@
 #                         (+ mic.m4a, call.m4a: each side on its own)
 #   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
 #     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
+#   mb-transcript     ->  transcript.txt     each side transcribed alone, labelled Me and Them
 #   fm respond        ->  notes.md + brief.json
 #
 # First run: meetingbox setup
@@ -52,6 +53,9 @@ APP_DIR="$SRC_DIR/meetingbox.app"
 # builds it from a clone of the release tag, or from MB_SOURCE_DIR if set.
 SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
 APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+# Merges the mic and call transcripts into one labelled Me and Them. Built from
+# native/transcript alongside the app.
+TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 # The app is signed with a certificate setup makes in the login keychain. macOS
 # ties the permissions to that certificate, so they survive a rebuild.
 SIGN_NAME="meetingbox local signing"
@@ -68,11 +72,11 @@ WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggm
 CHUNK_WORDS="${MB_CHUNK_WORDS:-1500}"    # ~2000 tokens, leaves room for the answer
 TOKEN_CEILING="${MB_TOKEN_CEILING:-2600}"
 
-MAP_INSTRUCTIONS='You are taking minutes. This is one slice of a longer meeting transcript, so write no introduction and no conclusion. Extract only what is actually in this text, under these headings, omitting any heading with nothing under it: DECISIONS, ACTIONS (name the owner if one was named), NUMBERS AND DATES, OPEN QUESTIONS, NOTABLE QUOTES. Be terse. Invent nothing. If a point is ambiguous, say so rather than resolving it.'
+MAP_INSTRUCTIONS='You are taking minutes. This is one slice of a longer meeting transcript, so write no introduction and no conclusion. Extract only what is actually in this text, under these headings, omitting any heading with nothing under it: DECISIONS, ACTIONS (name the owner if one was named), NUMBERS AND DATES, OPEN QUESTIONS, NOTABLE QUOTES. Be terse. Invent nothing. If a point is ambiguous, say so rather than resolving it. Lines may start with the speaker: "Me" is the person who recorded the meeting, "Them" is everyone on the other end of the call. Keep those labels when naming who said or owns something.'
 
-REDUCE_INSTRUCTIONS='These are notes from consecutive slices of one meeting. Merge them into a single set of minutes. Drop duplicates, keep every distinct decision and action, keep the owner against each action, and preserve all numbers, dates and names exactly as written. Add nothing that is not in the notes. Same headings: DECISIONS, ACTIONS, NUMBERS AND DATES, OPEN QUESTIONS.'
+REDUCE_INSTRUCTIONS='These are notes from consecutive slices of one meeting. Merge them into a single set of minutes. Drop duplicates, keep every distinct decision and action, keep the owner against each action, and preserve all numbers, dates and names exactly as written. Add nothing that is not in the notes. Same headings: DECISIONS, ACTIONS, NUMBERS AND DATES, OPEN QUESTIONS. Lines may start with the speaker: "Me" is the person who recorded the meeting, "Them" is everyone on the other end of the call. Keep those labels when naming who said or owns something.'
 
-FINAL_INSTRUCTIONS='Write the final minutes of this meeting from the merged notes below. Open with a three line summary, then the headings DECISIONS, ACTIONS (one line each, owner first), OPEN QUESTIONS. Markdown. No preamble and no sign off. Add nothing that is not in the notes.'
+FINAL_INSTRUCTIONS='Write the final minutes of this meeting from the merged notes below. Open with a three line summary, then the headings DECISIONS, ACTIONS (one line each, owner first, using Me or Them where no name was said), OPEN QUESTIONS. Markdown. No preamble and no sign off. Add nothing that is not in the notes.'
 
 BRIEF_INSTRUCTIONS='Extract the structured record of this meeting from the notes below. Every item must come from the notes. Leave an array empty rather than guessing.'
 
@@ -205,6 +209,7 @@ on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 # Ready means built, and built by this version, so updating meetingbox rebuilds it.
 recorder_ready() {
   [ -x "$APP_BIN" ] || return 1
+  [ -x "$TRANSCRIPT_BIN" ] || return 1
   have="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
   [ "$have" = "$VERSION" ]
 }
@@ -347,9 +352,19 @@ install_recorder() {
     warn "compile failed, see the output above"
     return 1
   fi
+  if ! swiftc -O -o "$build_dir/mb-transcript" "$SOURCE_DIR"/native/transcript/*.swift; then
+    rm -rf -- "$build_dir"
+    warn "compile failed, see the output above"
+    return 1
+  fi
   build_app "$build_dir/audio-capture" || { rm -rf -- "$build_dir"; return 1; }
+  if ! { claim_path "$TRANSCRIPT_BIN" && install -m 755 "$build_dir/mb-transcript" "$TRANSCRIPT_BIN"; }; then
+    rm -rf -- "$build_dir"
+    return 1
+  fi
   rm -rf -- "$build_dir"
   ok "recorder -> $APP_DIR"
+  ok "transcript helper -> $TRANSCRIPT_BIN"
 }
 
 # Wrap the recorder in an app bundle with its own identity, signed with the
@@ -664,6 +679,7 @@ doctor() {
   say "check"
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
+  [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels Me and Them)" || miss "mb-transcript (labels Me and Them)"
   have_signing_identity && ok "signing certificate" \
     || miss "signing certificate (permissions will be asked again after updates)"
   have speech-analyzer && ok "speech-analyzer" || info "speech-analyzer not installed"
@@ -858,6 +874,54 @@ transcribe() {
   ok "transcript: $(wc -w < "$out" | tr -d ' ') words"
 }
 
+# One side of the call to word timed JSON, for mb-transcript. A side that will
+# not transcribe is left empty with a warning: one side is better than none.
+transcribe_words() {
+  local audio="$1" out="$2" engine model wav
+  engine="$(pick_engine)"
+  case "$engine" in
+    native)
+      speech-analyzer --locale "$LOCALE" -f json "$audio" > "$out" \
+        || { warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"; }
+      ;;
+    whisper)
+      model="$(find_whisper_model)"
+      [ -n "$model" ] || die "no whisper model found. Run: meetingbox setup"
+      have ffmpeg || die "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"
+      wav="${audio%.*}.16k.wav"
+      if ! { ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
+             && whisper-cli -m "$model" -f "$wav" -oj -ml 1 -sow --output-file "${out%.json}" >/dev/null; }; then
+        warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"
+      fi
+      rm -f "$wav"
+      ;;
+  esac
+}
+
+# Your side and the other side transcribed on their own, then merged by
+# mb-transcript into lines labelled Me and Them.
+transcribe_channels() {
+  local dir="$1" out="$2" engine tmp err msg
+  [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
+  engine="$(pick_engine)"
+  case "$engine" in
+    native)  say "transcribing each side on device (Apple SpeechAnalyzer)" ;;
+    whisper) say "transcribing each side on device (whisper.cpp)" ;;
+  esac
+  transcribe_words "$dir/mic.m4a" "$dir/mic.words.json"
+  transcribe_words "$dir/call.m4a" "$dir/call.words.json"
+
+  # Written aside and moved, so a failure leaves no half transcript behind.
+  tmp="$(mktemp)"; err="$(mktemp)"
+  if ! "$TRANSCRIPT_BIN" --mic "$dir/mic.words.json" --call "$dir/call.words.json" > "$tmp" 2> "$err"; then
+    msg="$(cat "$err")"; rm -f "$tmp" "$err"
+    die "${msg:-mb-transcript failed}"
+  fi
+  rm -f "$err"
+  mv -f "$tmp" "$out"
+  ok "transcript: $(wc -l < "$out" | tr -d ' ') turns, as Me and Them"
+}
+
 # ------------------------------------------------------------------ summarising
 
 token_count() {
@@ -895,9 +959,9 @@ fm_fold() {
   done < "$sub.list"
 }
 
-# Fold by word count, not by line: a transcript can arrive as one long paragraph.
-# Break at a sentence end once past the target, with a hard cap so text without
-# punctuation still splits.
+# Fold by word count, keeping the lines: each line of a transcript is one
+# speaker's turn. Break at a line end once past the target, with a hard cap so a
+# transcript that arrives as one long paragraph still splits.
 split_chunks() {
   infile="$1"; outdir="$2"; n="$3"
   mkdir -p "$outdir"
@@ -905,15 +969,18 @@ split_chunks() {
     function newfile() { part++; w = 0; file = sprintf("%s/chunk-%03d.txt", dir, part) }
     BEGIN { part = 0; newfile() }
     {
+      sep = ""
       for (i = 1; i <= NF; i++) {
-        printf "%s%s", (w > 0 ? " " : ""), $i > (file)
-        w++
-        if ((w >= n && $i ~ /[.!?]["'"'"')]?$/) || w >= n * 1.5) {
-          printf "\n" > (file); close(file); newfile()
+        printf "%s%s", sep, $i > (file)
+        sep = " "; w++
+        if (w >= n * 1.5 && i < NF) {
+          printf "\n" > (file); close(file); newfile(); sep = ""
         }
       }
+      printf "\n" > (file)
+      if (w >= n) { close(file); newfile() }
     }
-    END { printf "\n" > (file); close(file) }
+    END { close(file) }
   ' "$infile"
 
   for f in "$outdir"/chunk-*.txt; do
@@ -930,17 +997,21 @@ summarise() {
   work="$(mktemp -d "${dir:?}/.work.XXXXXX")" || die "could not make a working folder in $dir"
   merged="$work/merged.txt"
 
-  tokens="$(token_count "$transcript")"; tokens="${tokens:-0}"
+  # fm reads the words and the speakers. The times are for people, and only cost tokens.
+  text="$work/transcript.txt"
+  sed -E 's/^\[[0-9:]+\] //' "$transcript" > "$text"
+
+  tokens="$(token_count "$text")"; tokens="${tokens:-0}"
   info "transcript is ~$tokens tokens, the on device window is ~4000"
 
   if [ "$tokens" -le "$TOKEN_CEILING" ]; then
     info "fits in one pass"
-    cp "$transcript" "$merged"
+    cp "$text" "$merged"
   else
     # Chunk lists go through files, not bash arrays: stock macOS bash is 3.2,
     # where `mapfile` is missing and an empty array trips `set -u`.
     list="$work/chunks.list"
-    split_chunks "$transcript" "$work/chunks" "$CHUNK_WORDS" > "$list"
+    split_chunks "$text" "$work/chunks" "$CHUNK_WORDS" > "$list"
     total="$(grep -c . "$list" 2>/dev/null || true)"
     [ "${total:-0}" -gt 0 ] || die "chunking produced nothing, the transcript may be unreadable"
     say "summarising in $total slices"
@@ -1025,8 +1096,13 @@ process() {
     txt|md|vtt|srt)
       [ "$input" = "$transcript" ] || cp "$input" "$transcript" ;;
     *)
-      transcribe "$input" "$transcript"
-      [ "$KEEP_AUDIO" = "1" ] || rm -f "$input" ;;
+      if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
+        transcribe_channels "$dir" "$transcript"
+        [ "$KEEP_AUDIO" = "1" ] || rm -f "$input" "$dir/mic.m4a" "$dir/call.m4a"
+      else
+        transcribe "$input" "$transcript"
+        [ "$KEEP_AUDIO" = "1" ] || rm -f "$input"
+      fi ;;
   esac
 
   summarise "$transcript" "$dir"
@@ -1078,7 +1154,7 @@ reset_cmd() {
     if old_recorder; then info "    $BIN_DIR/audio-capture (from v1.1.0)"; n=$((n + 1)); fi
     [ "$n" -gt 0 ] || info "    nothing, setup has no record of installing anything"
     left=""
-    for p in "$APP_DIR" "$SRC_DIR/meetingbox" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
+    for p in "$APP_DIR" "$TRANSCRIPT_BIN" "$SRC_DIR/meetingbox" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
              "$SA_APP" "$SA_LINK" "$WHISPER_FILE"; do
       if { [ -e "$p" ] || [ -L "$p" ]; } && ! installed_by_us "$p"; then left="$left$p
 "; fi
@@ -1168,10 +1244,12 @@ Options
   --locale en-GB         transcription locale          (MB_LOCALE)
   --whisper | --native   pick the transcriber          (MB_ENGINE)
   --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
-  --no-keep-audio        bin the m4a once transcribed
+  --no-keep-audio        bin the m4a files once transcribed
 
 Output lands in ~/Meetings/<date>_<time>/
-  audio.m4a  transcript.txt  notes.md  notes-raw.md  brief.json
+  audio.m4a  mic.m4a  call.m4a       the mix, your side, the other side
+  transcript.txt                     who said what, as Me and Them
+  notes.md  notes-raw.md  brief.json
 USAGE
 }
 
