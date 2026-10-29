@@ -1,0 +1,9 @@
+{"transcription":[
+{"offsets":{"from":0,"to":400},"text":" Hello"},
+{"offsets":{"from":400,"to":900},"text":" there"},
+{"offsets":{"from":900,"to":1500},"text":" [BLANK_AUDIO]"},
+{"offsets":{"from":1500,"to":1800},"text":" "},
+{"offsets":{"from":2500,"to":2900},"text":" thanks"},
+{"offsets":{"from":2900,"to":3250},"text":" for"},
+{"offsets":{"from":3250,"to":3600},"text":" coming"}
+]}

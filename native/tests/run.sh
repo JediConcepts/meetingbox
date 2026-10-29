@@ -27,4 +27,12 @@ for t in "$here"/*/main.swift; do
   fi
   rm -rf "$out"
 done
+# The bash tests run the real mb-transcript when MB_TEST_BIN names a folder for it.
+if [ -n "${MB_TEST_BIN:-}" ]; then
+  echo "== build mb-transcript"
+  if ! swiftc -suppress-warnings -o "$MB_TEST_BIN/mb-transcript" "$here"/../transcript/*.swift; then
+    echo "FAIL mb-transcript: does not compile"
+    rc=1
+  fi
+fi
 exit $rc

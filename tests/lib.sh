@@ -23,7 +23,9 @@ finish() {
 }
 
 # A user's own MB_* settings must never point a test at real folders.
-for v in $(compgen -e | grep '^MB_'); do unset "$v"; done
+# MB_TEST_BIN is the exception: it names the folder tests/run.sh built mb-transcript into,
+# and holds no user setting.
+for v in $(compgen -e | grep '^MB_' | grep -v '^MB_TEST_BIN$'); do unset "$v"; done
 
 # Everything from the main marker onwards is left out, so only functions load.
 # shellcheck disable=SC1090
