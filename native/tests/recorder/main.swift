@@ -20,6 +20,15 @@ if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--child" {
     while true { sleep(60) }
 }
 
+// Child mode: hold the folder lock for a while from another process, as a dying recorder would.
+if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--hold" {
+    let fd = open(CommandLine.arguments[2], O_RDONLY)
+    flock(fd, LOCK_EX)
+    FileManager.default.createFile(atPath: CommandLine.arguments[4], contents: nil)
+    usleep(useconds_t(Double(CommandLine.arguments[3])! * 1_000_000))
+    exit(0)
+}
+
 // MARK: - Helpers
 
 var failures = 0
@@ -249,14 +258,51 @@ for (label, files) in [("nothing", [String]()), ("an unreadable audio.m4a", ["au
     check((try? recover(directory: dir)) == nil && snapshot(dir) == before, "\(label): recover fails and changes nothing")
 }
 
-// A folder still being written (its lock held) is not touched.
+// Another process holding the folder's lock: a recorder still dying after kill -9.
+/// Starts a process that holds the lock on `dir` for `seconds`, once it has the lock.
+func holdLock(_ dir: URL, for seconds: Double) -> Process {
+    let ready = scratch.appendingPathComponent("held-\(dir.lastPathComponent)")
+    let holder = Process()
+    holder.executableURL = Bundle.main.executableURL
+    holder.arguments = ["--hold", dir.path, String(seconds), ready.path]
+    try! holder.run()
+    while !fm.fileExists(atPath: ready.path) { usleep(10_000) }
+    return holder
+}
+
 do {
     let dir = cafFolder()
-    let fd = open(dir.path, O_RDONLY)
-    flock(fd, LOCK_EX)
+    let holder = holdLock(dir, for: 1.5)
+    let started = Date()
+    let recovered = (try? recover(directory: dir)) != nil
+    check(recovered && complete(dir) && Date().timeIntervalSince(started) >= 1,
+          "recover waits for a lock released 1.5 s later, then succeeds")
+    holder.waitUntilExit()
+}
+
+do {
+    let dir = cafFolder()
+    let holder = holdLock(dir, for: 7)
     let before = snapshot(dir)
-    check((try? recover(directory: dir)) == nil && snapshot(dir) == before, "a folder still being recorded is not recovered")
-    close(fd)
+    let started = Date()
+    var message = ""
+    do { try recover(directory: dir) } catch { message = error.localizedDescription }
+    let waited = Date().timeIntervalSince(started)
+    check(message.contains("is still being recorded or saved") && snapshot(dir) == before && waited >= 4.5 && waited < 6.5,
+          "a lock held past 5 s: recover fails after about 5 s and changes nothing (\(String(format: "%.1f", waited)) s)")
+    holder.terminate()
+    holder.waitUntilExit()
+}
+
+// The recorder itself never waits: a second recorder in a locked folder fails at once.
+do {
+    let dir = newFolder()
+    let holder = holdLock(dir, for: 3)
+    let started = Date()
+    check((try? RecordingOutput(directory: dir)) == nil && Date().timeIntervalSince(started) < 0.5,
+          "a recorder does not wait for a locked folder")
+    holder.terminate()
+    holder.waitUntilExit()
 }
 
 // MARK: - Health

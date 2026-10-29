@@ -3,8 +3,10 @@ import AVFoundation
 
 /// Rebuilds a recording folder's three .m4a from its working files, mic.caf and
 /// call.caf. Used by the recorder's own stop and by `--recover` after a crash.
+/// Waits up to 5 s for the folder's lock: a recorder just killed with -9, or that
+/// crashed a moment ago, can hold it until the kernel has finished with it.
 func recover(directory: URL) throws {
-    try Finaliser.finalise(directory: directory)
+    try Finaliser.finalise(directory: directory, lockWait: 5)
 }
 
 /// A point in finalising that a test can interrupt, to stand in for a crash there.
@@ -35,9 +37,10 @@ enum Finaliser {
     ]
 
     /// Takes the folder's lock first, so it never runs beside a recorder still
-    /// writing there, or beside another finalise.
-    static func finalise(directory: URL, afterStep: (FinaliseStep) throws -> Void = { _ in }) throws {
-        let lock = try FolderLock(directory)
+    /// writing there, or beside another finalise. Waits up to `lockWait` seconds for it.
+    static func finalise(directory: URL, lockWait: TimeInterval = 0,
+                         afterStep: (FinaliseStep) throws -> Void = { _ in }) throws {
+        let lock = try FolderLock(directory, wait: lockWait)
         try withExtendedLifetime(lock) {
             try finaliseLocked(directory: directory, afterStep: afterStep)
         }
@@ -203,14 +206,21 @@ enum Finaliser {
 }
 
 /// An exclusive lock on a folder, held for as long as this object lives. A process
-/// that dies releases it, so a crash never leaves a folder locked.
+/// that dies releases it, so a crash never leaves a folder locked. By default it
+/// fails at once if the lock is taken; with `wait`, it tries again for that long.
 final class FolderLock {
     private let fd: Int32
 
-    init(_ directory: URL) throws {
+    init(_ directory: URL, wait: TimeInterval = 0) throws {
         let fd = open(directory.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else { throw RecordingError("could not open \(directory.path)") }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+        let deadline = Date().addingTimeInterval(wait)
+        var locked = flock(fd, LOCK_EX | LOCK_NB) == 0
+        while !locked && Date() < deadline {
+            usleep(50_000)
+            locked = flock(fd, LOCK_EX | LOCK_NB) == 0
+        }
+        guard locked else {
             Darwin.close(fd)
             throw RecordingError("\(directory.path) is still being recorded or saved")
         }
