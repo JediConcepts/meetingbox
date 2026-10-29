@@ -32,7 +32,10 @@ trap 'rm -f "$tmp"' EXIT
 # Prefer the copy sitting next to this script. If you cloned the repo or
 # downloaded both files, there is nothing to fetch.
 here="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+# With a full checkout, build the recorder from it rather than cloning a tag.
+local_src=""
 if [ -n "$here" ] && [ -f "$here/meetingbox" ]; then
+  [ -d "$here/native/recorder" ] && local_src="$here"
   say "using the local copy"
   cp "$here/meetingbox" "$tmp"
 else
@@ -65,10 +68,10 @@ esac
 # test, since the node can be readable while opening it fails, so open it.
 if [ -t 0 ]; then
   say "handing over to setup"
-  exec "$BIN_DIR/meetingbox" setup
+  exec env ${local_src:+"MB_SOURCE_DIR=$local_src"} "$BIN_DIR/meetingbox" setup
 elif ( exec < /dev/tty ) 2>/dev/null; then
   say "handing over to setup"
-  exec "$BIN_DIR/meetingbox" setup < /dev/tty
+  exec env ${local_src:+"MB_SOURCE_DIR=$local_src"} "$BIN_DIR/meetingbox" setup < /dev/tty
 else
   say "installed. Now run:"
   printf '\n             %smeetingbox setup%s\n\n' "$b" "$z" >&2

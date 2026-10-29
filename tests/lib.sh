@@ -22,6 +22,9 @@ finish() {
   exit $?
 }
 
+# A user's own MB_* settings must never point a test at real folders.
+for v in $(compgen -e | grep '^MB_'); do unset "$v"; done
+
 # Everything from the main marker onwards is left out, so only functions load.
 # shellcheck disable=SC1090
 sed '/^# -* main$/,$d' "$ROOT/meetingbox" > "$HOME/meetingbox.functions"

@@ -47,11 +47,14 @@ SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
 # app happened to start it (Terminal, Shortcuts, Raycast).
 APP_ID="com.jediconcepts.meetingbox"
 APP_DIR="$SRC_DIR/meetingbox.app"
+# The recorder's Swift source lives in this repo, under native/recorder. setup
+# builds it from a clone of the release tag, or from MB_SOURCE_DIR if set.
+SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
 APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
 # Registering the app with LaunchServices is what lets tccutil find it by ID.
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
-AUDIO_CAPTURE_REPO="https://github.com/danySam/audio-capture"
+MEETINGBOX_REPO="https://github.com/JediConcepts/meetingbox"
 SPEECH_ANALYZER_REPO="https://github.com/simonw/speech-analyzer-cli"
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 
@@ -188,7 +191,12 @@ open_privacy() {
 
 on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 
-recorder_ready() { [ -x "$APP_BIN" ]; }
+# Ready means built, and built by this version, so updating meetingbox rebuilds it.
+recorder_ready() {
+  [ -x "$APP_BIN" ] || return 1
+  have="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+  [ "$have" = "$VERSION" ]
+}
 
 # Start the recorder through `open`, so it runs as meetingbox.app in its own
 # right rather than as a child of this shell. macOS grants Screen Recording and
@@ -248,7 +256,7 @@ stop_proc() {
 # while the toolchain is still downloading, so test for the compiler itself.
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
-need_audio_capture()  { ! recorder_ready; }
+need_recorder()  { ! recorder_ready; }
 # fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
 # reports the licence missing on every machine.
 need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
@@ -286,30 +294,50 @@ install_brew() {
   have brew && ok "Homebrew" || { warn "Homebrew installed but not on PATH, reopen Terminal"; return 1; }
 }
 
-install_audio_capture() {
-  say "the recorder (audio-capture)"
+# Make sure the recorder's source is on disk. MB_SOURCE_DIR is used as it is and
+# never recorded or deleted. Otherwise it is a clone of this version's tag.
+fetch_source() {
+  if [ -n "${MB_SOURCE_DIR:-}" ]; then
+    [ -f "$SOURCE_DIR/native/recorder/main.swift" ] \
+      || { warn "no recorder source in $SOURCE_DIR/native/recorder"; return 1; }
+    return 0
+  fi
+  mkdir -p "$SRC_DIR"
+  if [ -d "$SOURCE_DIR/.git" ] && installed_by_us "$SOURCE_DIR"; then
+    git -C "$SOURCE_DIR" fetch --depth 1 origin tag "v$VERSION" >/dev/null 2>&1 \
+      && git -C "$SOURCE_DIR" checkout -q "v$VERSION" \
+      || { warn "could not fetch v$VERSION of meetingbox"; return 1; }
+  else
+    claim_path "$SOURCE_DIR" || return 1
+    git clone -q --depth 1 --branch "v$VERSION" "$MEETINGBOX_REPO" "$SOURCE_DIR" \
+      || { warn "could not clone $MEETINGBOX_REPO at v$VERSION"; return 1; }
+  fi
+  [ -f "$SOURCE_DIR/native/recorder/main.swift" ] \
+    || { warn "no recorder source in $SOURCE_DIR/native/recorder"; return 1; }
+}
+
+install_recorder() {
+  say "the recorder"
   info "captures the far side with ScreenCaptureKit and your mic together"
   info "no virtual audio driver, no aggregate device, nothing to reboot"
   mkdir -p "$SRC_DIR" "$BIN_DIR"
-  if [ -d "$SRC_DIR/audio-capture/.git" ]; then
-    git -C "$SRC_DIR/audio-capture" pull -q --ff-only || true
-  else
-    claim_path "$SRC_DIR/audio-capture" || return 1
-    git clone -q --depth 1 "$AUDIO_CAPTURE_REPO" "$SRC_DIR/audio-capture" \
-      || { warn "could not clone $AUDIO_CAPTURE_REPO"; return 1; }
-  fi
   have swiftc || {
     warn "no Swift compiler, so the Command Line Tools are not ready yet"
     info "finish the Apple installer window, then run: meetingbox setup"
     return 1
   }
+  fetch_source || return 1
+  build_dir="$(mktemp -d)" || return 1
   info "compiling. The first Swift build on a Mac caches Apple's frameworks and can"
   info "sit silent for a few minutes. It has not hung, leave it be."
-  ( cd "$SRC_DIR/audio-capture" \
-    && swiftc -O -o audio-capture Sources/*.swift \
-         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia ) \
-    || { warn "compile failed, see the output above"; return 1; }
-  build_app "$SRC_DIR/audio-capture/audio-capture" || return 1
+  if ! swiftc -O -o "$build_dir/audio-capture" "$SOURCE_DIR"/native/recorder/*.swift \
+         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia; then
+    rm -rf -- "$build_dir"
+    warn "compile failed, see the output above"
+    return 1
+  fi
+  build_app "$build_dir/audio-capture" || { rm -rf -- "$build_dir"; return 1; }
+  rm -rf -- "$build_dir"
   ok "recorder -> $APP_DIR"
 }
 
@@ -512,7 +540,7 @@ setup() {
   # --- survey, before asking for anything ---
   todo=""
   need_xcode_clt      && { miss "Xcode Command Line Tools";    todo="$todo clt"; }      || ok "Xcode Command Line Tools"
-  need_audio_capture  && { miss "audio-capture (the recorder)"; todo="$todo capture"; }  || ok "audio-capture (the recorder)"
+  need_recorder  && { miss "audio-capture (the recorder)"; todo="$todo capture"; }  || ok "audio-capture (the recorder)"
   transcriber_present && ok "a transcriber" || { miss "a transcriber"; todo="$todo transcriber"; }
   if have fm; then
     if need_fm_license; then miss "Apple model licence not accepted"; todo="$todo license"
@@ -543,7 +571,7 @@ setup() {
   case " $todo " in *" clt "*)  install_xcode_clt || return 1 ;; esac
 
   case " $todo " in
-    *" capture "*) install_audio_capture || return 1 ;;
+    *" capture "*) install_recorder || return 1 ;;
   esac
 
   case " $todo " in
@@ -961,7 +989,7 @@ reset_cmd() {
     if old_recorder; then info "    $BIN_DIR/audio-capture (from v1.1.0)"; n=$((n + 1)); fi
     [ "$n" -gt 0 ] || info "    nothing, setup has no record of installing anything"
     left=""
-    for p in "$APP_DIR" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
+    for p in "$APP_DIR" "$SRC_DIR/meetingbox" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
              "$SA_APP" "$SA_LINK" "$WHISPER_FILE"; do
       if { [ -e "$p" ] || [ -L "$p" ]; } && ! installed_by_us "$p"; then left="$left$p
 "; fi

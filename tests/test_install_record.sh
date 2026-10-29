@@ -28,4 +28,56 @@ for bad in "" / "$HOME"; do
   if [ $? -ne 0 ] && [ -d "$HOME" ]; then pass "refused '$bad'"; else fail "refused '$bad'"; fi
 done
 
+# --- the recorder is built from meetingbox's own source ---
+mkdir -p "$HOME/fake/native/recorder"
+: > "$HOME/fake/native/recorder/main.swift"
+MB_SOURCE_DIR="$HOME/fake"; SOURCE_DIR="$MB_SOURCE_DIR"
+fetch_source
+rc=$?
+if [ "$rc" -eq 0 ] && ! installed_by_us "$MB_SOURCE_DIR" && [ ! -d "$MB_SOURCE_DIR/.git" ]; then
+  pass "fetch_source uses MB_SOURCE_DIR as is, no clone, not recorded"
+else fail "fetch_source uses MB_SOURCE_DIR as is, no clone, not recorded"; fi
+unset MB_SOURCE_DIR
+
+SRC_DIR="$HOME/src"; SOURCE_DIR="$SRC_DIR/meetingbox"
+mkdir -p "$SRC_DIR"
+git() {
+  echo "git $*" >> "$HOME/calls.log"
+  if [ "$1" = clone ]; then
+    for last in "$@"; do :; done
+    mkdir -p "$last/native/recorder" "$last/.git"
+    : > "$last/native/recorder/main.swift"
+  fi
+  return 0
+}
+fetch_source
+rc=$?
+if [ "$rc" -eq 0 ] && installed_by_us "$SRC_DIR/meetingbox" \
+   && grep -q -- "git clone -q --depth 1 --branch v$VERSION " "$HOME/calls.log"; then
+  pass "fetch_source clones tag v$VERSION and records the clone"
+else fail "fetch_source clones tag v$VERSION and records the clone"; fi
+
+: > "$HOME/calls.log"
+fetch_source
+if grep -q -- "fetch --depth 1 origin tag v$VERSION" "$HOME/calls.log" \
+   && grep -q -- "checkout -q v$VERSION" "$HOME/calls.log" \
+   && ! grep -q -- "clone" "$HOME/calls.log"; then
+  pass "a recorded clone is fetched and checked out, not recloned"
+else fail "a recorded clone is fetched and checked out, not recloned"; fi
+unset -f git
+
+# recorder_ready also checks the app is the current version
+APP_DIR="$HOME/t.app"; APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+mkdir -p "$APP_DIR/Contents/MacOS"
+printf '#!/bin/sh\n' > "$APP_BIN"; chmod +x "$APP_BIN"
+writeplist() {
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>%s</string></dict></plist>\n' "$1" > "$APP_DIR/Contents/Info.plist"
+}
+writeplist 1.2.2
+V_SAVE="$VERSION"; VERSION=9.9.9
+if ! recorder_ready; then pass "recorder_ready false for an older app"; else fail "recorder_ready false for an older app"; fi
+VERSION="$V_SAVE"
+writeplist "$VERSION"
+if recorder_ready; then pass "recorder_ready true when the app matches VERSION"; else fail "recorder_ready true when the app matches VERSION"; fi
+
 finish
