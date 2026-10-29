@@ -403,35 +403,37 @@ install_recorder() {
 # the icon and the Info.plist, signed with the meetingbox certificate so the
 # permissions survive a rebuild. Without it the app is signed ad hoc, and macOS
 # asks again after each update.
+#
+# The whole bundle is made in a temporary folder first. The installed app is
+# replaced only once the new one is complete, so a failed build leaves the user
+# with the app they had, still able to record.
 build_app() {
-  local had_ad_hoc=0 icon_tmp iconset s
+  local had_ad_hoc=0 build_tmp bundle iconset s
+  # from the app being replaced, before it is
   [ -d "$APP_DIR" ] && ! app_signed_by_us && had_ad_hoc=1
   adopt_own_app
-  # ~/Applications is the user's own folder, so it is made if missing but never recorded.
-  mkdir -p "$(dirname "$APP_DIR")"
-  claim_path "$APP_DIR" || return 1
-  mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+  build_tmp="$(mktemp -d)" || return 1
+  bundle="$build_tmp/meetingbox.app"
+  iconset="$build_tmp/meetingbox.iconset"
+  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$iconset"
   # Apple deprecates names each macOS release; warnings are noise here, errors still show.
-  if ! swiftc -O -parse-as-library -o "$APP_BIN" \
+  if ! swiftc -O -parse-as-library -o "$bundle/Contents/MacOS/meetingbox" \
          "$SOURCE_DIR"/native/recorder/*.swift "$SOURCE_DIR"/native/app/*.swift \
          -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
          -framework AppKit -framework SwiftUI -suppress-warnings; then
+    rm -rf -- "$build_tmp"
     warn "compile failed, see the output above"
     return 1
   fi
   # The icon: every size macOS asks for, from the one 1024 px png.
-  icon_tmp="$(mktemp -d)" || return 1
-  iconset="$icon_tmp/meetingbox.iconset"
-  mkdir "$iconset"
   for s in 16 32 128 256 512; do
     sips -z "$s" "$s" "$SOURCE_DIR/native/app/icon.png" --out "$iconset/icon_${s}x${s}.png" >/dev/null 2>&1 \
       && sips -z "$((s * 2))" "$((s * 2))" "$SOURCE_DIR/native/app/icon.png" --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null 2>&1 \
-      || { rm -rf -- "$icon_tmp"; warn "could not make the app icon"; return 1; }
+      || { rm -rf -- "$build_tmp"; warn "could not make the app icon"; return 1; }
   done
-  iconutil -c icns "$iconset" -o "$APP_DIR/Contents/Resources/meetingbox.icns" >/dev/null 2>&1 \
-    || { rm -rf -- "$icon_tmp"; warn "could not make the app icon"; return 1; }
-  rm -rf -- "$icon_tmp"
-  cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+  iconutil -c icns "$iconset" -o "$bundle/Contents/Resources/meetingbox.icns" >/dev/null 2>&1 \
+    || { rm -rf -- "$build_tmp"; warn "could not make the app icon"; return 1; }
+  cat > "$bundle/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -453,6 +455,16 @@ build_app() {
 </dict>
 </plist>
 PLIST
+  # Complete: now, and only now, replace the installed app.
+  # ~/Applications is the user's own folder, so it is made if missing but never recorded.
+  mkdir -p "$(dirname "$APP_DIR")"
+  claim_path "$APP_DIR" || { rm -rf -- "$build_tmp"; return 1; }
+  if ! mv "$bundle" "$APP_DIR"; then
+    rm -rf -- "$build_tmp"
+    warn "could not put meetingbox.app in $(dirname "$APP_DIR")"
+    return 1
+  fi
+  rm -rf -- "$build_tmp"
   if sign_app; then
     register_app
     if [ "$had_ad_hoc" = 1 ]; then forget_old_approvals; fi

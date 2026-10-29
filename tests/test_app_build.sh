@@ -63,6 +63,7 @@ sips() {
 # iconutil -c icns DIR -o OUT
 iconutil() {
   echo "iconutil $*" >> "$HOME/calls.log"
+  [ -n "${ICONUTIL_FAILS:-}" ] && return 1
   while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'icns' > "$2"; return 0; }; shift; done
 }
 
@@ -75,16 +76,19 @@ for f in "$ROOT"/native/recorder/*.swift "$ROOT"/native/app/*.swift; do
   case " $line " in *" $f "*) ;; *) all=0 ;; esac
 done
 [ -e "$ROOT/native/app/Main.swift" ] || all=0
+# compiled inside a bundle in a temporary folder, moved into place once it is whole
 case "$line" in
-  *" -o $APP_BIN "*) ;; *) all=0 ;;
+  *" -o $APP_BIN "*) all=0 ;;
+  *" -o "*"/meetingbox.app/Contents/MacOS/meetingbox "*) ;;
+  *) all=0 ;;
 esac
 for flag in -parse-as-library "-framework ScreenCaptureKit" "-framework AVFoundation" \
             "-framework CoreMedia" "-framework AppKit" "-framework SwiftUI"; do
   case "$line " in *" $flag "*) ;; *) all=0 ;; esac
 done
 if [ "$rc" -eq 0 ] && [ "$calls" = 1 ] && [ "$all" = 1 ] && [ -x "$APP_BIN" ]; then
-  pass "build_app compiles the recorder and the app in one swiftc call into \$APP_BIN"
-else fail "build_app compiles the recorder and the app in one swiftc call into \$APP_BIN (rc $rc): $(cat "$HOME/calls.log")"; fi
+  pass "build_app compiles the recorder and the app in one swiftc call, then \$APP_BIN is in place"
+else fail "build_app compiles the recorder and the app in one swiftc call, then \$APP_BIN is in place (rc $rc): $(cat "$HOME/calls.log")"; fi
 
 plist="$APP_DIR/Contents/Info.plist"
 pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist" 2>/dev/null; }
@@ -113,12 +117,31 @@ if installed_by_us "$APP_DIR" && grep -q -- "^codesign --force .* --identifier $
   pass "the new app is on the install record and signed"
 else fail "the new app is on the install record and signed"; fi
 
-# a failed compile signs nothing and says so
+# A failed build must leave the installed app exactly as it was, so the user can
+# still record until the toolchain is fixed.
+snapshot() { (cd "$APP_DIR" && find . -type f -exec cksum {} \; | sort); }
+printf 'still here' > "$APP_DIR/marker"
+before="$(snapshot)"
 : > "$HOME/calls.log"
 out="$(SWIFTC_FAILS=1 build_app 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && ! grep -q '^codesign --force' "$HOME/calls.log" && printf '%s\n' "$out" | grep -q 'compile failed'; then
-  pass "a failed compile stops the build before signing"
-else fail "a failed compile stops the build before signing (rc $rc): $out"; fi
+if [ "$rc" -ne 0 ] && ! grep -q '^codesign --force' "$HOME/calls.log" && printf '%s\n' "$out" | grep -q 'compile failed' \
+   && [ "$(snapshot)" = "$before" ] && [ "$(cat "$APP_DIR/marker")" = 'still here' ] && installed_by_us "$APP_DIR"; then
+  pass "a failed compile leaves the installed app untouched and signs nothing"
+else fail "a failed compile leaves the installed app untouched and signs nothing (rc $rc): $out"; fi
+
+: > "$HOME/calls.log"
+out="$(ICONUTIL_FAILS=1 build_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && ! grep -q '^codesign --force' "$HOME/calls.log" && printf '%s\n' "$out" | grep -q 'could not make the app icon' \
+   && [ "$(snapshot)" = "$before" ] && [ "$(cat "$APP_DIR/marker")" = 'still here' ] && installed_by_us "$APP_DIR"; then
+  pass "a failed icon leaves the installed app untouched and signs nothing"
+else fail "a failed icon leaves the installed app untouched and signs nothing (rc $rc): $out"; fi
+
+# and a good build replaces it whole
+build_app >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$APP_DIR/marker" ] && [ -x "$APP_BIN" ] && installed_by_us "$APP_DIR" \
+   && [ -s "$APP_DIR/Contents/Resources/meetingbox.icns" ] && plutil -lint "$plist" >/dev/null 2>&1; then
+  pass "a good build replaces the installed app whole"
+else fail "a good build replaces the installed app whole (rc $rc)"; fi
 
 # --- the old app stays, and stays on the record, until the acceptance step ---
 SRC_DIR="$HOME/src"; TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
