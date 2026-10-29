@@ -46,6 +46,34 @@ let oks = removeEcho(mic: [w(1.0, 1.2, "ok"), w(1.3, 1.5, "OK.")], call: [w(1.1,
 check(oks.count == 1, "removeEcho: one call 'ok' cancels only one of two mic 'ok's")
 check(removeEcho(mic: [w(1, 1, ",")], call: [w(1, 1, ",")]).count == 1, "removeEcho: empty normalised text never matches")
 
+// Echo through the speakers, as whisper times it on a real call: the same words in the
+// same order, but each side's timings drift by up to a few seconds.
+func timed(_ text: String, from start: Double, step: Double = 0.4, jitter: [Double] = [0]) -> [Word] {
+    text.split(separator: " ").enumerated().map { k, t in
+        let s = start + Double(k) * step + jitter[k % jitter.count]
+        return w(s, s + 0.3, String(t))
+    }
+}
+let farSide = timed("it trains you to organise your thoughts before you speak", from: 10)
+let echoed = timed("it trains you to organise your thoughts before you speak", from: 11.2, step: 0.65)
+let mine = timed("really nine minutes is that what you are saying", from: 20)
+let drift = removeEcho(mic: echoed + mine, call: farSide)
+check(drift.map(\.text) == mine.map(\.text), "removeEcho: a run of echo drifting 1 to 3.5 s is all dropped, my own words kept (\(drift.map(\.text)))")
+
+let saidNine = timed("nine minutes", from: 30)
+let nineEcho = timed("nine minutes", from: 30.3)
+let nineMine = timed("nine minutes", from: 32.5)
+let nine = removeEcho(mic: nineEcho + nineMine, call: saidNine)
+check(nine == nineMine, "removeEcho: repeating what they said keeps my copy, each of theirs cancels one")
+
+let heard = timed("so we are gonna need four aces", from: 40)
+let misheard = timed("so we are going to need four aces", from: 41)
+check(removeEcho(mic: misheard, call: heard).isEmpty, "removeEcho: one or two misheard words inside the echo go too")
+
+let around = timed("every promotion every raise", from: 50) + timed("and every room", from: 55)
+let between = timed("every promotion every raise", from: 50.5) + [w(52.5, 52.8, "yes")] + timed("and every room", from: 55.5)
+check(removeEcho(mic: between, call: around).map(\.text) == ["yes"], "removeEcho: my 'yes' in a pause between echoes is kept")
+
 // mergeTurns
 let alt = mergeTurns([("Me", [w(0, 1, "Hello"), w(1.2, 2, "there")]), ("Them", [w(2.5, 3, "Hi"), w(3, 3.5, "back")])])
 check(alt == [Turn(label: "Me", start: 0, text: "Hello there"), Turn(label: "Them", start: 2.5, text: "Hi back")], "mergeTurns: alternates by label")

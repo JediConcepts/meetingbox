@@ -56,23 +56,81 @@ func normalised(_ s: String) -> String {
     String(s.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
 }
 
-/// Drops a mic word when a call word with the same non-empty text starts within `window`
-/// seconds of it. Each call word can cancel at most one mic word.
-func removeEcho(mic: [Word], call: [Word], window: Double = 0.6) -> [Word] {
-    var used = [Bool](repeating: false, count: call.count)
-    let callKeys = call.map { normalised($0.text) }
-    return mic.filter { m in
-        let key = normalised(m.text)
-        if key.isEmpty { return true }
-        var best: Int?
-        for (i, c) in call.enumerated() where !used[i] && callKeys[i] == key {
-            let d = abs(c.start - m.start)
-            if d <= window, best == nil || d < abs(call[best!].start - m.start) { best = i }
+/// Drops the mic words that are the call coming back through the speakers.
+///
+/// Echo is the far side's words again, in the same order, but the transcriber times each
+/// side separately and the two drift by a few seconds. So the mic and call words are lined
+/// up as the longest common sequence of equal words (each call word cancels at most one mic
+/// word), pairing only words that start within `runWindow` seconds of each other. A pair in
+/// a run of two or more mic words counts as echo; a pair on its own only within `window`
+/// seconds, so a lone "yes" just after theirs is kept. Then a gap of one or two mic words
+/// with echo on both sides, each no more than `bridge` seconds away, counts as echo too:
+/// that is the transcriber hearing the echo slightly differently ("going to" for "gonna").
+func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
+                runWindow: Double = 4.0, bridge: Double = 1.5) -> [Word] {
+    let m = mic.indices.sorted { mic[$0].start != mic[$1].start ? mic[$0].start < mic[$1].start : $0 < $1 }
+    let c = call.indices.sorted { call[$0].start != call[$1].start ? call[$0].start < call[$1].start : $0 < $1 }
+    let mk = m.map { normalised(mic[$0].text) }
+    let ck = c.map { normalised(call[$0].text) }
+
+    // Candidate pairs (position in m, position in c): for each mic word, the call words
+    // with the same text in reach. Built from the last mic word back, so that among equally
+    // long chains the earliest words win: echo comes straight away, a repeat comes later.
+    var pairs: [(i: Int, j: Int)] = []
+    var hi = c.count
+    for i in m.indices.reversed() where !mk[i].isEmpty {
+        let t = mic[m[i]].start
+        while hi > 0 && call[c[hi - 1]].start > t + runWindow { hi -= 1 }
+        var j = hi - 1
+        var found: [Int] = []
+        while j >= 0 && call[c[j]].start >= t - runWindow {
+            if ck[j] == mk[i] { found.append(j) }
+            j -= 1
         }
-        guard let hit = best else { return true }
-        used[hit] = true
-        return false
+        // lowest j first, so the chain below can take only one per mic word
+        for j in found.reversed() { pairs.append((i, j)) }
     }
+
+    // Longest chain falling in both i and j as built (rising in time): patience sorting on -j.
+    var tails: [Int] = []          // index into pairs ending the best chain of each length
+    var parent = [Int](repeating: -1, count: pairs.count)
+    for (p, pair) in pairs.enumerated() {
+        var a = 0, b = tails.count
+        while a < b {
+            let mid = (a + b) / 2
+            if pairs[tails[mid]].j > pair.j { a = mid + 1 } else { b = mid }
+        }
+        if a > 0 { parent[p] = tails[a - 1] }
+        if a == tails.count { tails.append(p) } else { tails[a] = p }
+    }
+    var chain: [(i: Int, j: Int)] = []
+    var p = tails.last ?? -1
+    while p >= 0 { chain.append(pairs[p]); p = parent[p] }   // comes out earliest first
+
+    var echo = [Bool](repeating: false, count: m.count)
+    for (k, pair) in chain.enumerated() {
+        let inRun = (k > 0 && chain[k - 1].i == pair.i - 1) || (k + 1 < chain.count && chain[k + 1].i == pair.i + 1)
+        let dt = abs(mic[m[pair.i]].start - call[c[pair.j]].start)
+        if inRun || dt <= window { echo[pair.i] = true }
+    }
+
+    // Bridge short gaps inside echo.
+    var i = 0
+    while i < m.count {
+        if echo[i] { i += 1; continue }
+        var j = i
+        while j < m.count && !echo[j] { j += 1 }
+        if j - i <= 2, i > 0, j < m.count,
+           mic[m[i]].start - mic[m[i - 1]].start <= bridge,
+           mic[m[j]].start - mic[m[j - 1]].start <= bridge {
+            for k in i..<j { echo[k] = true }
+        }
+        i = j
+    }
+
+    var drop = Set<Int>()
+    for (i, e) in echo.enumerated() where e { drop.insert(m[i]) }
+    return mic.indices.filter { !drop.contains($0) }.map { mic[$0] }
 }
 
 /// The one place that decides spacing: none before , . ! ? ; : % ) ] } and closing quotes,
