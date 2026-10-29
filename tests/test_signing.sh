@@ -168,11 +168,15 @@ if installed_by_us "$ENTRY" && printf '%s\n' "$out" | grep -q 'Keychain Access';
 else fail "certificate that will not delete stays recorded, with a warning"; fi
 
 # --- build_app signs with the certificate's hash in the login keychain, or falls back to ad hoc ---
-APP_DIR="$HOME/meetingbox.app"; APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
-printf '#!/bin/sh\n' > "$HOME/rec"
+APP_DIR="$HOME/meetingbox.app"; APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
+# build_app compiles and makes the icon itself; these stand in for the tools.
+SOURCE_DIR="$ROOT"
+swiftc() { while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'bin' > "$2"; return 0; }; shift; done; }
+sips() { while [ $# -gt 0 ]; do [ "$1" = --out ] && { printf 'png' > "$2"; return 0; }; shift; done; }
+iconutil() { while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'icns' > "$2"; return 0; }; shift; done; }
 
 : > "$HOME/calls.log"
-build_app "$HOME/rec" 2>/dev/null
+build_app 2>/dev/null
 rc=$?
 if [ "$rc" -eq 0 ] \
    && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID " "$HOME/calls.log" \
@@ -186,7 +190,7 @@ codesign() {
   return 0
 }
 : > "$HOME/calls.log"
-out="$(build_app "$HOME/rec" 2>&1)"
+out="$(build_app 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && grep -q -- "^codesign --force --sign - --identifier $APP_ID " "$HOME/calls.log" \
    && printf '%s\n' "$out" | grep -q 'could not use the meetingbox signing certificate'; then
@@ -217,7 +221,7 @@ security() { kc_security "$@"; }
 SIGN_TOLD=0   # one run, one notice: earlier checks in this shell have already given it
 
 : > "$HOME/calls.log"
-out="$(build_app "$HOME/rec" 2>&1)"
+out="$(build_app 2>&1)"
 if app_signed_by_us && [ "$(printf '%s\n' "$out" | grep -c 'may ask for your login password')" = 1 ]; then
   pass "a fresh build is signed by our certificate, with one password notice"
 else fail "a fresh build is signed by our certificate, with one password notice: $out"; fi
@@ -235,18 +239,18 @@ else fail "app_signed_by_us: another certificate is not ours"; fi
 resets() { grep -c "^tccutil reset \(ScreenCapture\|Microphone\) $APP_ID\$" "$HOME/calls.log"; }
 
 echo - > "$HOME/signed"; : > "$HOME/calls.log"
-out="$(build_app "$HOME/rec" 2>&1)"
+out="$(build_app 2>&1)"
 if app_signed_by_us && [ "$(resets)" = 2 ] && printf '%s\n' "$out" | grep -q 'ask for Screen Recording and the Microphone once more'; then
   pass "rebuilding an ad hoc app onto the certificate clears its old approvals and says so"
 else fail "rebuilding an ad hoc app onto the certificate clears its old approvals and says so: $out $(cat "$HOME/calls.log")"; fi
 
 : > "$HOME/calls.log"
-build_app "$HOME/rec" >/dev/null 2>&1
+build_app >/dev/null 2>&1
 if app_signed_by_us && [ "$(resets)" = 0 ]; then pass "rebuilding an app already on the certificate keeps its approvals"
 else fail "rebuilding an app already on the certificate keeps its approvals"; fi
 
 rm -rf -- "$HOME/meetingbox.app"; rm -f "$HOME/signed"; : > "$HOME/calls.log"
-build_app "$HOME/rec" >/dev/null 2>&1
+build_app >/dev/null 2>&1
 if app_signed_by_us && [ "$(resets)" = 0 ]; then pass "a first build has no approvals to clear"
 else fail "a first build has no approvals to clear"; fi
 
@@ -256,7 +260,7 @@ if app_signed_by_us && [ "$(resets)" = 2 ]; then pass "re-signing an ad hoc app 
 else fail "re-signing an ad hoc app clears its old approvals"; fi
 
 echo - > "$HOME/signed"; : > "$HOME/calls.log"
-CODESIGN_FAILS="$HASH" build_app "$HOME/rec" >/dev/null 2>&1
+CODESIGN_FAILS="$HASH" build_app >/dev/null 2>&1
 if ! app_signed_by_us && [ "$(resets)" = 0 ]; then pass "falling back to ad hoc clears nothing"
 else fail "falling back to ad hoc clears nothing"; fi
 echo "$HASH" > "$HOME/signed"

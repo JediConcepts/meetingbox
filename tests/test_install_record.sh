@@ -37,8 +37,8 @@ done
 unset -f rm
 
 # --- the recorder is built from meetingbox's own source ---
-mkdir -p "$HOME/fake/native/recorder"
-: > "$HOME/fake/native/recorder/main.swift"
+mkdir -p "$HOME/fake/native/app"
+: > "$HOME/fake/native/app/Main.swift"
 MB_SOURCE_DIR="$HOME/fake"; SOURCE_DIR="$MB_SOURCE_DIR"
 fetch_source
 rc=$?
@@ -53,8 +53,8 @@ git() {
   echo "git $*" >> "$HOME/calls.log"
   if [ "$1" = clone ]; then
     for last in "$@"; do :; done
-    mkdir -p "$last/native/recorder" "$last/.git"
-    : > "$last/native/recorder/main.swift"
+    mkdir -p "$last/native/app" "$last/.git"
+    : > "$last/native/app/Main.swift"
   fi
   return 0
 }
@@ -75,7 +75,7 @@ else fail "a recorded clone is fetched and checked out, not recloned"; fi
 unset -f git
 
 # recorder_ready also checks the app is the current version
-APP_DIR="$HOME/t.app"; APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+APP_DIR="$HOME/t.app"; APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
 mkdir -p "$APP_DIR/Contents/MacOS"
 printf '#!/bin/sh\n' > "$APP_BIN"; chmod +x "$APP_BIN"
 writeplist() {
@@ -95,7 +95,7 @@ if recorder_ready; then pass "recorder_ready true when the app matches VERSION";
 SRC_DIR="$HOME/src2"; SOURCE_DIR="$SRC_DIR/meetingbox"; BIN_DIR="$HOME/bin2"
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 fetch_source() { return 0; }
-build_app() { echo "build_app $1" >> "$HOME/calls.log"; }
+build_app() { echo "build_app" >> "$HOME/calls.log"; }
 swiftc() {
   echo "swiftc $*" >> "$HOME/calls.log"
   while [ $# -gt 0 ]; do [ "$1" = -o ] && { printf 'bin' > "$2"; return 0; }; shift; done
@@ -103,7 +103,8 @@ swiftc() {
 : > "$HOME/calls.log"
 install_recorder >/dev/null 2>&1; rc=$?
 if [ "$rc" -eq 0 ] && [ -x "$TRANSCRIPT_BIN" ] && installed_by_us "$TRANSCRIPT_BIN" \
-   && grep -q -- "swiftc -O -o .*/mb-transcript $SOURCE_DIR/native/transcript/\*.swift" "$HOME/calls.log"; then
+   && grep -q -- "swiftc -O -o .*/mb-transcript $SOURCE_DIR/native/transcript/\*.swift" "$HOME/calls.log" \
+   && grep -qx build_app "$HOME/calls.log" && ! grep -q 'native/recorder' "$HOME/calls.log"; then
   pass "install_recorder builds mb-transcript and records it"
 else fail "install_recorder builds mb-transcript and records it: $(cat "$HOME/calls.log")"; fi
 

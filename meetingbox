@@ -7,7 +7,7 @@
 #
 # Nothing leaves the Mac. No account, no API key, no upload, no per seat fee.
 #
-#   audio-capture     ->  audio.m4a          ScreenCaptureKit + your mic, one clock
+#   meetingbox.app    ->  audio.m4a          ScreenCaptureKit + your mic, one clock
 #                         (+ mic.m4a, call.m4a: each side on its own)
 #   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
 #     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
@@ -46,15 +46,17 @@ SA_LINK="$HOME/.local/bin/speech-analyzer"
 SA_APP="$HOME/.local/libexec/SpeechAnalyzerCLI.app"
 SAY_BIN="/usr/bin/say"   # macOS text to speech; `say` here is meetingbox's own logger
 
-# The recorder runs inside its own small app so that macOS files the Screen
+# The recorder runs inside meetingbox.app so that macOS files the Screen
 # Recording and Microphone permissions under "meetingbox", not under whichever
-# app happened to start it (Terminal, Shortcuts, Raycast).
+# app happened to start it (Terminal, Shortcuts, Raycast). One executable, three
+# modes: `--record` is the recorder, `--recover DIR` finishes an interrupted
+# recording, and with neither it is the app.
 APP_ID="com.jediconcepts.meetingbox"
-APP_DIR="$SRC_DIR/meetingbox.app"
-# The recorder's Swift source lives in this repo, under native/recorder. setup
+APP_DIR="$HOME/Applications/meetingbox.app"
+# The Swift source lives in this repo, under native/recorder and native/app. setup
 # builds it from a clone of the release tag, or from MB_SOURCE_DIR if set.
 SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
-APP_BIN="$APP_DIR/Contents/MacOS/audio-capture"
+APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
 # Merges the mic and call transcripts into one labelled Me and Them. Built from
 # native/transcript alongside the app.
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
@@ -233,15 +235,15 @@ recorder_ready() {
 # Terminal's, and from a hotkey Shortcuts'. This way there is one grant, listed
 # as meetingbox, whatever starts it. Launched this way it also keeps a live
 # SIGINT, which a `&` job in a script does not, so stopping finalises the m4a.
-# stdout goes to /dev/null: audio-capture streams raw PCM to stdout whenever it
-# is not a terminal. Prints the new recorder's PID.
+# stdout goes to /dev/null: the recorder once streamed raw PCM there whenever it
+# was not a terminal. Prints the new recorder's PID.
 #
 # The first launch after a rebuild can be slow while macOS checks the new
 # signature, so it waits up to 10s. If the recorder still has not shown up, any
 # that turns up for this folder later is stopped, never left recording alone.
 launch_recorder() {
   out="$1"; name="$2"; log="$3"; shift 3
-  open -n -g --stdout /dev/null --stderr "$log" "$APP_DIR" --args -o "$out" -n "$name" "$@" \
+  open -n -g --stdout /dev/null --stderr "$log" "$APP_DIR" --args --record -o "$out" -n "$name" "$@" \
     >/dev/null 2>&1 || return 1
   i=0
   while [ "$i" -lt 100 ]; do
@@ -257,10 +259,26 @@ launch_recorder() {
 # when the folder is "". Every launch gets a folder of its own, so this names the
 # right process however late it started. Matched as a fixed string, since a
 # folder name is not a pattern.
-recorder_pids() {
-  ps -axo pid=,command= | NEEDLE="$APP_BIN -o ${1:+$1 -n }" awk '
+recorder_pids() { pids_with_prefix "$APP_BIN --record -o ${1:+$1 -n }"; }
+
+# PIDs of the processes whose command line starts with $1, a fixed string.
+pids_with_prefix() {
+  ps -axo pid=,command= | NEEDLE="$1" awk '
     { pid = $1; sub(/^ *[0-9]+ /, "") }
     index($0, ENVIRON["NEEDLE"]) == 1 { print pid }'
+}
+
+# A recording is being made or saved: a recorder or a recovery is running, or a
+# meeting's meeting.json says recording or finalising. Rebuilding or re-signing
+# the app underneath it could cost the meeting.
+recording_busy() {
+  [ -n "$(recorder_pids "")" ] && return 0
+  [ -n "$(pids_with_prefix "$APP_BIN --recover ")" ] && return 0
+  for j in "$BASE_DIR"/*/meeting.json; do
+    [ -f "$j" ] || continue
+    grep -Eq '"state"[[:space:]]*:[[:space:]]*"(recording|finalising)"' "$j" && return 0
+  done
+  return 1
 }
 
 stop_recorders() { for p in $(recorder_pids "$1"); do stop_proc "$p" "${2:-150}"; done; }
@@ -333,8 +351,8 @@ install_brew() {
 # never recorded or deleted. Otherwise it is a clone of this version's tag.
 fetch_source() {
   if [ -n "${MB_SOURCE_DIR:-}" ]; then
-    [ -f "$SOURCE_DIR/native/recorder/main.swift" ] \
-      || { warn "no recorder source in $SOURCE_DIR/native/recorder"; return 1; }
+    [ -f "$SOURCE_DIR/native/app/Main.swift" ] \
+      || { warn "no app source in $SOURCE_DIR/native/app"; return 1; }
     return 0
   fi
   mkdir -p "$SRC_DIR"
@@ -347,8 +365,8 @@ fetch_source() {
     git clone -q --depth 1 --branch "v$VERSION" "$MEETINGBOX_REPO" "$SOURCE_DIR" \
       || { warn "could not clone $MEETINGBOX_REPO at v$VERSION"; return 1; }
   fi
-  [ -f "$SOURCE_DIR/native/recorder/main.swift" ] \
-    || { warn "no recorder source in $SOURCE_DIR/native/recorder"; return 1; }
+  [ -f "$SOURCE_DIR/native/app/Main.swift" ] \
+    || { warn "no app source in $SOURCE_DIR/native/app"; return 1; }
 }
 
 install_recorder() {
@@ -366,18 +384,12 @@ install_recorder() {
   info "compiling. The first Swift build on a Mac caches Apple's frameworks and can"
   info "sit silent for a few minutes. It has not hung, leave it be."
   # Apple deprecates names each macOS release; warnings are noise here, errors still show.
-  if ! swiftc -O -o "$build_dir/audio-capture" "$SOURCE_DIR"/native/recorder/*.swift \
-         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -suppress-warnings; then
-    rm -rf -- "$build_dir"
-    warn "compile failed, see the output above"
-    return 1
-  fi
   if ! swiftc -O -o "$build_dir/mb-transcript" "$SOURCE_DIR"/native/transcript/*.swift -suppress-warnings; then
     rm -rf -- "$build_dir"
     warn "compile failed, see the output above"
     return 1
   fi
-  build_app "$build_dir/audio-capture" || { rm -rf -- "$build_dir"; return 1; }
+  build_app || { rm -rf -- "$build_dir"; return 1; }
   if ! { claim_path "$TRANSCRIPT_BIN" && install -m 755 "$build_dir/mb-transcript" "$TRANSCRIPT_BIN"; }; then
     rm -rf -- "$build_dir"
     return 1
@@ -387,16 +399,38 @@ install_recorder() {
   ok "transcript helper -> $TRANSCRIPT_BIN"
 }
 
-# Wrap the recorder in an app bundle with its own identity, signed with the
-# meetingbox certificate so the permissions survive a rebuild. Without it the
-# app is signed ad hoc, and macOS asks again after each update.
+# Build meetingbox.app: the recorder and the app compiled into one executable,
+# the icon and the Info.plist, signed with the meetingbox certificate so the
+# permissions survive a rebuild. Without it the app is signed ad hoc, and macOS
+# asks again after each update.
 build_app() {
-  local had_ad_hoc=0
+  local had_ad_hoc=0 icon_tmp iconset s
   [ -d "$APP_DIR" ] && ! app_signed_by_us && had_ad_hoc=1
   adopt_own_app
+  # ~/Applications is the user's own folder, so it is made if missing but never recorded.
+  mkdir -p "$(dirname "$APP_DIR")"
   claim_path "$APP_DIR" || return 1
-  mkdir -p "$APP_DIR/Contents/MacOS"
-  install -m 755 "$1" "$APP_BIN"
+  mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+  # Apple deprecates names each macOS release; warnings are noise here, errors still show.
+  if ! swiftc -O -parse-as-library -o "$APP_BIN" \
+         "$SOURCE_DIR"/native/recorder/*.swift "$SOURCE_DIR"/native/app/*.swift \
+         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
+         -framework AppKit -framework SwiftUI -suppress-warnings; then
+    warn "compile failed, see the output above"
+    return 1
+  fi
+  # The icon: every size macOS asks for, from the one 1024 px png.
+  icon_tmp="$(mktemp -d)" || return 1
+  iconset="$icon_tmp/meetingbox.iconset"
+  mkdir "$iconset"
+  for s in 16 32 128 256 512; do
+    sips -z "$s" "$s" "$SOURCE_DIR/native/app/icon.png" --out "$iconset/icon_${s}x${s}.png" >/dev/null 2>&1 \
+      && sips -z "$((s * 2))" "$((s * 2))" "$SOURCE_DIR/native/app/icon.png" --out "$iconset/icon_${s}x${s}@2x.png" >/dev/null 2>&1 \
+      || { rm -rf -- "$icon_tmp"; warn "could not make the app icon"; return 1; }
+  done
+  iconutil -c icns "$iconset" -o "$APP_DIR/Contents/Resources/meetingbox.icns" >/dev/null 2>&1 \
+    || { rm -rf -- "$icon_tmp"; warn "could not make the app icon"; return 1; }
+  rm -rf -- "$icon_tmp"
   cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -405,12 +439,15 @@ build_app() {
   <key>CFBundleIdentifier</key><string>$APP_ID</string>
   <key>CFBundleName</key><string>meetingbox</string>
   <key>CFBundleDisplayName</key><string>meetingbox</string>
-  <key>CFBundleExecutable</key><string>audio-capture</string>
+  <key>CFBundleExecutable</key><string>meetingbox</string>
+  <key>CFBundleIconFile</key><string>meetingbox</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>MBScriptPath</key><string>$BIN_DIR/meetingbox</string>
   <key>NSMicrophoneUsageDescription</key><string>meetingbox records your side of the meeting.</string>
   <key>NSAudioCaptureUsageDescription</key><string>meetingbox records the other side of the meeting.</string>
 </dict>
@@ -774,6 +811,11 @@ setup() {
   say "setup ${c_dim}v$VERSION${c_0}"
   rule
 
+  if recording_busy; then
+    warn "a recording is still being saved. Wait for it, or run: meetingbox stop"
+    return 1
+  fi
+
   v="$(macos_major)"
   if [ -z "$v" ]; then
     die "this only runs on macOS"
@@ -881,7 +923,7 @@ doctor() {
   on_path && ok "$BIN_DIR on PATH" || miss "$BIN_DIR not on PATH"
   if recorder_ready; then
     info "microphones the recorder can see:"
-    "$APP_BIN" -l 2>&1 | sed 's/^/             /' >&2 || true
+    "$APP_BIN" --record -l 2>&1 | sed 's/^/             /' >&2 || true
   fi
   info "if anything is missing: meetingbox setup"
 }
@@ -1595,7 +1637,7 @@ case "${cmd:-toggle}" in
   doctor|check) doctor ;;
   mics|devices)
     recorder_ready || die "the recorder is not installed. Run: meetingbox setup"
-    "$APP_BIN" -l ;;
+    "$APP_BIN" --record -l ;;
   pause)   take_lock; pause_recording ;;
   resume)  take_lock; resume_recording ;;
   status)  status_cmd ;;
