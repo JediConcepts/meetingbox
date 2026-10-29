@@ -70,6 +70,15 @@ let heard = timed("so we are gonna need four aces", from: 40)
 let misheard = timed("so we are going to need four aces", from: 41)
 check(removeEcho(mic: misheard, call: heard).isEmpty, "removeEcho: one or two misheard words inside the echo go too")
 
+// One side hears one word where the other hears two ("chitchat" and "chit chat").
+let joined = timed("most people think communication is just chitchat", from: 60)
+let split = timed("most people think communication is just chit chat.", from: 60.3) + timed("really just chitty bing bong", from: 64)
+check(removeEcho(mic: split, call: joined).map(\.text) == ["really", "just", "chitty", "bing", "bong"],
+      "removeEcho: two mic words matching one call word are echo")
+let apart = timed("no setup card trick", from: 70)
+let together = timed("no-setup card trick", from: 70.4)
+check(removeEcho(mic: together, call: apart).isEmpty, "removeEcho: one mic word matching two call words is echo")
+
 let around = timed("every promotion every raise", from: 50) + timed("and every room", from: 55)
 let between = timed("every promotion every raise", from: 50.5) + [w(52.5, 52.8, "yes")] + timed("and every room", from: 55.5)
 check(removeEcho(mic: between, call: around).map(\.text) == ["yes"], "removeEcho: my 'yes' in a pause between echoes is kept")

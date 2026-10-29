@@ -66,6 +66,7 @@ func normalised(_ s: String) -> String {
 /// seconds, so a lone "yes" just after theirs is kept. Then a gap of one or two mic words
 /// with echo on both sides, each no more than `bridge` seconds away, counts as echo too:
 /// that is the transcriber hearing the echo slightly differently ("going to" for "gonna").
+/// One word on one side matching two on the other ("chitchat", "chit chat") is echo too.
 func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
                 runWindow: Double = 4.0, bridge: Double = 1.5) -> [Word] {
     let m = mic.indices.sorted { mic[$0].start != mic[$1].start ? mic[$0].start < mic[$1].start : $0 < $1 }
@@ -112,6 +113,30 @@ func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
         let inRun = (k > 0 && chain[k - 1].i == pair.i - 1) || (k + 1 < chain.count && chain[k + 1].i == pair.i + 1)
         let dt = abs(mic[m[pair.i]].start - call[c[pair.j]].start)
         if inRun || dt <= window { echo[pair.i] = true }
+    }
+
+    // One side hearing one word where the other hears two ("chitchat" and "chit chat",
+    // "no-setup" and "no setup"): matched on the words the chain left, within runWindow.
+    var used = Set(chain.filter { echo[$0.i] }.map(\.j))
+    func callNear(_ t: Double) -> Range<Int> {
+        var a = 0, b = c.count
+        while a < b { let mid = (a + b) / 2; if call[c[mid]].start < t - runWindow { a = mid + 1 } else { b = mid } }
+        var e = a
+        while e < c.count && call[c[e]].start <= t + runWindow { e += 1 }
+        return a..<e
+    }
+    for i in 0..<max(m.count - 1, 0) where !echo[i] && !echo[i + 1] && !mk[i].isEmpty && !mk[i + 1].isEmpty {
+        let both = mk[i] + mk[i + 1]
+        if let j = callNear(mic[m[i]].start).first(where: { !used.contains($0) && ck[$0] == both }) {
+            echo[i] = true; echo[i + 1] = true; used.insert(j)
+        }
+    }
+    for i in m.indices where !echo[i] && !mk[i].isEmpty {
+        let near = callNear(mic[m[i]].start)
+        if let j = near.first(where: { $0 + 1 < near.upperBound && !used.contains($0) && !used.contains($0 + 1)
+                                        && !ck[$0].isEmpty && !ck[$0 + 1].isEmpty && ck[$0] + ck[$0 + 1] == mk[i] }) {
+            echo[i] = true; used.insert(j); used.insert(j + 1)
+        }
     }
 
     // Bridge short gaps inside echo.
