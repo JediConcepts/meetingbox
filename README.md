@@ -25,15 +25,16 @@ Nothing to configure. No audio devices to create. No reboot.
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.2.2
+meetingbox setup v1.3.0
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
-         - audio-capture (the recorder)
+         - the recorder
          - a transcriber
+         - a signing certificate
          + fm, licence accepted
            ------------------------------------------------
-meetingbox 3 things to install. I can do all of them from here.
+meetingbox 4 things to install. I can do all of them from here.
            some steps may ask for your Mac password, and Apple may open an installer window.
          ? go ahead? [Y/n]
 ```
@@ -41,10 +42,16 @@ meetingbox 3 things to install. I can do all of them from here.
 | It installs | Why | Cost |
 |---|---|---|
 | Xcode Command Line Tools | compiles the recorder | one Apple installer window |
-| [audio-capture](https://github.com/danySam/audio-capture) | records you and the far side together | a few seconds to compile |
+| the recorder, built from meetingbox's own source (`native/recorder`), plus `mb-transcript` (`native/transcript`) | records you and the far side, and merges the two transcripts | a few seconds to compile |
+| a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, no password |
 | [speech-analyzer](https://github.com/simonw/speech-analyzer-cli) | Apple's on device transcriber | a few seconds, no model download |
 | or whisper.cpp instead | if you would rather run your own model | 1.6GB download |
 | `sudo fm license` | accepts Apple's model licence, once | your Mac password |
+
+The certificate is self-signed and lives in your login keychain. Setup records it in
+`~/.meetingbox/installed`, and `meetingbox reset --tools` and `meetingbox uninstall`
+remove it. If it cannot be made, setup falls back to an ad hoc signature and warns
+you, and macOS will then ask for permissions again after each rebuild.
 
 Then it does a four second test recording to make macOS throw its Screen Recording
 and Microphone prompts now, in setup, rather than halfway through a real meeting.
@@ -67,7 +74,12 @@ restart anything.
 ```bash
 meetingbox          # start
 meetingbox          # stop, transcribe, write the minutes
+meetingbox pause    # stop recording for a bit, same file
+meetingbox resume   # carry on
 ```
+
+The recorded length counts recorded time only, and `meetingbox status` shows
+when a recording is paused.
 
 ### On a hotkey
 
@@ -92,12 +104,28 @@ and bind a hotkey.
 
 ```
 ~/Meetings/2026-10-27_1430/
-  audio.m4a         the recording
+  audio.m4a         the recording, both sides mixed
+  mic.m4a           your side only
+  call.m4a          the other side only
+  mic.words.json    your words, with timings
+  call.words.json   their words, with timings
   transcript.txt    full text, your source of truth
   notes.md          the minutes
   notes-raw.md      per slice notes, before the final pass
   brief.json        {summary, decisions, actions, open_questions, numbers_and_dates}
 ```
+
+Each side is transcribed on its own and the two are merged by time, so the
+transcript says who spoke:
+
+```
+[00:03:12] Me: Can you send me the numbers after this?
+[00:03:15] Them: Yes, I will email them this afternoon.
+```
+
+Your microphone also picks up the far side coming out of your speakers. That echo
+is dropped, so nothing is counted twice. The minutes name Me or Them as the owner
+of an action where no name was said.
 
 ## How it captures both sides without a virtual audio driver
 
@@ -107,9 +135,9 @@ Aggregate Device, three things to create by hand in Audio MIDI Setup, plus a
 reboot, plus changing the output device inside Zoom, and getting any of it wrong
 gives you a recording of yourself talking into a void.
 
-None of that here. `audio-capture` takes the far side through **ScreenCaptureKit**,
+None of that here. The recorder takes the far side through **ScreenCaptureKit**,
 which is the same API screen recording uses, and your microphone through
-AVCaptureSession, and mixes them on a shared clock straight into one m4a. No new
+AVCaptureSession, and mixes them on a shared clock into one mix, and keeps each side as its own file too. No new
 audio devices appear on your system. Zoom, Teams and Meet need no settings
 changed. Nothing to reboot.
 
@@ -146,6 +174,7 @@ record out, transcript kept.
 meetingbox setup                 install what is missing
 meetingbox                       toggle
 meetingbox start | stop | status
+meetingbox pause | resume
 meetingbox process <audio|txt>   run an existing file through the pipeline
 meetingbox doctor                what is installed and what is not
 meetingbox mics                  microphones the recorder can see
@@ -172,7 +201,7 @@ Start with `meetingbox doctor`.
 |---|---|
 | Recorder stops immediately | Screen Recording or Microphone not granted to **meetingbox**. Turn it on in Privacy & Security, retry |
 | Permissions look granted but still fail | `meetingbox reset`, then `meetingbox setup` to be asked afresh |
-| Asked for permission again after an update | Setup rebuilt the recorder, and macOS treats the new build as new. Allow it once more |
+| Asked for permission again after an update | Expected once, on the move from 1.2 to 1.3 (Screen Recording and Microphone). From then on the signing certificate keeps the grants across rebuilds. If it keeps happening, setup fell back to an ad hoc signature, so run `meetingbox setup` again and read its warnings |
 | `speech-analyzer` fails with "Invalid manifest" | The Command Line Tools are damaged. `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | `swiftc: command not found` | Command Line Tools still downloading. Let the Apple installer finish |
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
@@ -192,8 +221,9 @@ better position to be in, but it is not a substitute for telling people.
 
 ## Credits
 
-- [audio-capture](https://github.com/danySam/audio-capture) by danySam, the
-  ScreenCaptureKit recorder that makes the whole thing painless
+- [audio-capture](https://github.com/danySam/audio-capture) by danySam (MIT), the
+  ScreenCaptureKit recorder that makes the whole thing painless. It is vendored
+  and extended in `native/recorder`, with its licence kept alongside
 - [speech-analyzer-cli](https://github.com/simonw/speech-analyzer-cli) by Simon
   Willison, a CLI over Apple's SpeechAnalyzer
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) by Georgi Gerganov
