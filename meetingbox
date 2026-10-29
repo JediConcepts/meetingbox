@@ -395,7 +395,8 @@ build_app() {
 </plist>
 PLIST
   if ! { ensure_signing_identity \
-         && codesign --force --sign "$SIGN_NAME" --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1; }; then
+         && codesign --force --sign "$(signing_hash)" --keychain "$SIGN_KEYCHAIN" \
+              --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1; }; then
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
     codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
       || { warn "could not sign the recorder app"; return 1; }
@@ -407,16 +408,46 @@ register_app() {
   [ -x "$LSREGISTER" ] && "$LSREGISTER" -f "$APP_DIR" >/dev/null 2>&1 || true
 }
 
-have_signing_identity() {
-  security find-certificate -c "$SIGN_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1
+# The certificate is known by its SHA-1 only, as recorded when setup made it.
+# Its name is never used to find, sign with or delete it: security and codesign
+# match a name as a substring, which could reach a certificate the user made.
+is_sha1() {
+  [ "${#1}" -eq 40 ] || return 1
+  case "$1" in *[!0123456789ABCDEF]*) return 1 ;; esac
+}
+signing_hash() {
+  sed -n '/^keychain:sha1:/{s/^keychain:sha1://;p;q;}' "$INSTALLED" 2>/dev/null || true
 }
 
-# A certificate with this name that setup did not make is used as it is and
-# never deleted. A self-signed one is enough: codesign does not need it trusted.
+# Listed as an identity, so the private key is there too. Read into a variable
+# first: grep -q closing a pipe early would kill security under pipefail. No -v,
+# which hides a self-signed certificate that is not trusted.
+identity_listed() {
+  local ids
+  is_sha1 "$1" || return 1
+  ids="$(security find-identity -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null)" || return 1
+  case "$ids" in *" $1 "*) return 0 ;; esac
+  return 1
+}
+have_signing_identity() { identity_listed "$(signing_hash)"; }
+
+# A certificate setup did not make is never used or deleted, whatever its name.
+# A self-signed one is enough: codesign does not need it trusted.
 ensure_signing_identity() {
+  local h tmp pw made=0
+  # a development build recorded the name, not a particular certificate:
+  # forget that line, and never delete by it
+  if installed_by_us "keychain:$SIGN_NAME"; then forget_install "keychain:$SIGN_NAME"; fi
   have_signing_identity && return 0
+  h="$(signing_hash)"
+  if [ -n "$h" ]; then forget_install "keychain:sha1:$h"; fi
   # an explicit template: macOS's mktemp -d on its own ignores TMPDIR
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/meetingbox-sign.XXXXXX")" || return 1
+  # the private key is in $tmp until the import, so do not leave it on a Ctrl-C
+  trap 'rm -rf -- "$tmp"; exit 130' INT
+  trap 'rm -rf -- "$tmp"; exit 143' TERM
+  # || true: head closing the pipe sends tr a SIGPIPE; the length check below
+  # is what catches a short or empty password
   pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24)" || true
   cat > "$tmp/cnf" <<CNF
 [req]
@@ -430,26 +461,37 @@ basicConstraints = critical, CA:false
 keyUsage = critical, digitalSignature
 extendedKeyUsage = critical, codeSigning
 CNF
-  made=0
-  "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$tmp/cnf" \
-      -keyout "$tmp/key.pem" -out "$tmp/cert.pem" >/dev/null 2>&1 \
-    && "$OPENSSL" pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
-      -name "$SIGN_NAME" -passout "pass:$pw" -out "$tmp/id.p12" >/dev/null 2>&1 \
-    && security import "$tmp/id.p12" -k "$SIGN_KEYCHAIN" -P "$pw" -T /usr/bin/codesign >/dev/null 2>&1 \
-    && made=1
+  if [ "${#pw}" -eq 24 ] \
+     && "$OPENSSL" req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$tmp/cnf" \
+          -keyout "$tmp/key.pem" -out "$tmp/cert.pem" >/dev/null 2>&1 \
+     && h="$("$OPENSSL" x509 -in "$tmp/cert.pem" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g')" \
+     && is_sha1 "$h" \
+     && "$OPENSSL" pkcs12 -export -inkey "$tmp/key.pem" -in "$tmp/cert.pem" \
+          -name "$SIGN_NAME" -passout "pass:$pw" -out "$tmp/id.p12" >/dev/null 2>&1 \
+     && security import "$tmp/id.p12" -k "$SIGN_KEYCHAIN" -P "$pw" -T /usr/bin/codesign >/dev/null 2>&1; then
+    made=1
+  fi
   rm -rf -- "$tmp"
+  trap - INT TERM
   [ "$made" -eq 1 ] || return 1
-  record_install "keychain:$SIGN_NAME"
+  record_install "keychain:sha1:$h"
 }
 
+# Deletes only certificates recorded by hash. One already gone is forgotten.
 remove_signing_identity() {
-  installed_by_us "keychain:$SIGN_NAME" || return 0
-  if security delete-identity -c "$SIGN_NAME" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || ! have_signing_identity; then
-    forget_install "keychain:$SIGN_NAME"
-  else
-    warn "could not delete \"$SIGN_NAME\" from your login keychain. Delete it in Keychain Access"
-    return 1
-  fi
+  local h rc=0
+  if installed_by_us "keychain:$SIGN_NAME"; then forget_install "keychain:$SIGN_NAME"; fi
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    if ! is_sha1 "$h"; then forget_install "keychain:sha1:$h"; continue; fi
+    if security delete-identity -Z "$h" "$SIGN_KEYCHAIN" >/dev/null 2>&1 || ! identity_listed "$h"; then
+      forget_install "keychain:sha1:$h"
+    else
+      warn "could not delete \"$SIGN_NAME\" ($h) from your login keychain. Delete it in Keychain Access"
+      rc=1
+    fi
+  done <<< "$(sed -n 's/^keychain:sha1://p' "$INSTALLED" 2>/dev/null || true)"
+  return "$rc"
 }
 
 install_speech_analyzer() {
@@ -1146,7 +1188,7 @@ reset_cmd() {
     n=0
     while IFS= read -r p; do
       case "$p" in
-        "keychain:$SIGN_NAME")
+        keychain:sha1:*)
           info "    the meetingbox signing certificate in your login keychain"; n=$((n + 1)) ;;
         /*) if [ -e "$p" ] || [ -L "$p" ]; then info "    $p"; n=$((n + 1)); fi ;;
       esac
