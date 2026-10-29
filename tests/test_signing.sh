@@ -23,7 +23,7 @@ openssl() {
 # security stub: the keychain is $HOME/kc, one identity hash per line, all named
 # "meetingbox local signing". import adds $HASH; delete-identity -Z removes one.
 : > "$HOME/kc"
-security() {
+kc_security() {
   echo "security $*" >> "$HOME/calls.log"; echo "security $*" >> "$HOME/security-all.log"
   case "$1" in
     find-identity)
@@ -40,6 +40,7 @@ security() {
     *) return 0 ;;
   esac
 }
+security() { kc_security "$@"; }
 security_named() { grep '^security ' "$HOME/calls.log" | grep -q -- "$1"; }
 
 # --- fresh: no certificate yet, so one is made and recorded by its hash ---
@@ -196,5 +197,84 @@ else fail "build_app falls back to ad hoc and warns"; fi
 if grep -q 'delete-identity -Z' "$HOME/security-all.log" \
    && ! grep -q 'delete-identity -c' "$HOME/security-all.log"; then pass "no delete-identity -c call"
 else fail "no delete-identity -c call"; fi
+
+# --- the app is ours only when its designated requirement names our hash ---
+# codesign stub: --sign records the identity in $HOME/signed; -d -r- prints the
+# requirement codesign writes for it (lower case hex, as the Task 3 spike showed).
+codesign() {
+  echo "codesign $*" >> "$HOME/calls.log"
+  case "$1" in
+    --force) [ "${CODESIGN_FAILS:-}" = "$3" ] && return 1; echo "$3" > "$HOME/signed" ;;
+    -d) [ -f "$HOME/signed" ] || return 1
+        s="$(cat "$HOME/signed")"
+        if [ "$s" = - ]; then echo "designated => cdhash H\"0123456789abcdef0123456789abcdef01234567\""
+        else echo "designated => identifier \"$APP_ID\" and certificate leaf = H\"$(printf '%s' "$s" | tr 'A-F' 'a-f')\""; fi ;;
+  esac
+  return 0
+}
+security() { kc_security "$@"; }
+: > "$HOME/kc"; forget_install "$ENTRY"; rm -f "$HOME/signed"
+SIGN_TOLD=0   # one run, one notice: earlier checks in this shell have already given it
+
+: > "$HOME/calls.log"
+out="$(build_app "$HOME/rec" 2>&1)"
+if app_signed_by_us && [ "$(printf '%s\n' "$out" | grep -c 'may ask for your login password')" = 1 ]; then
+  pass "a fresh build is signed by our certificate, with one password notice"
+else fail "a fresh build is signed by our certificate, with one password notice: $out"; fi
+
+echo - > "$HOME/signed"
+if ! app_signed_by_us; then pass "app_signed_by_us: ad hoc is not ours"
+else fail "app_signed_by_us: ad hoc is not ours"; fi
+echo "$OTHER" > "$HOME/signed"
+if ! app_signed_by_us; then pass "app_signed_by_us: another certificate is not ours"
+else fail "app_signed_by_us: another certificate is not ours"; fi
+
+# doctor: certificate there but the app ad hoc
+mkdir -p "$APP_DIR"; echo - > "$HOME/signed"
+out="$(doctor 2>&1)"
+if printf '%s\n' "$out" | grep -q -- '-.* meetingbox.app is signed ad hoc' \
+   && ! printf '%s\n' "$out" | grep -q '+.* signing certificate'; then
+  pass "doctor: an ad hoc app is reported, with the way to fix it"
+else fail "doctor: an ad hoc app is reported, with the way to fix it: $out"; fi
+echo "$HASH" > "$HOME/signed"
+out="$(doctor 2>&1)"
+if printf '%s\n' "$out" | grep -q '+.* signing certificate'; then pass "doctor: ok when the app is signed by ours"
+else fail "doctor: ok when the app is signed by ours"; fi
+
+# --- setup re-signs an app that is built but not signed by us, without rebuilding ---
+macos_major() { echo 27; }
+recorder_ready() { return 0; }
+on_path() { return 0; }
+have() { case "$1" in swiftc|speech-analyzer) return 0 ;; *) return 1 ;; esac; }
+prime_permissions() { echo "prime_permissions" >> "$HOME/calls.log"; return 0; }
+install_recorder() { echo "install_recorder" >> "$HOME/calls.log"; return 0; }
+make_shortcut_hint() { :; }
+BIN_DIR="$HOME/bin"; mkdir -p "$BIN_DIR"
+
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q -- '-.* a signing certificate' \
+   && printf '%s\n' "$out" | grep -q '+.* the recorder$' \
+   && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID " "$HOME/calls.log" \
+   && ! grep -q '^install_recorder' "$HOME/calls.log" && grep -q '^prime_permissions' "$HOME/calls.log" \
+   && app_signed_by_us; then
+  pass "setup re-signs an ad hoc app, without a rebuild"
+else fail "setup re-signs an ad hoc app, without a rebuild (rc $rc): $out"; fi
+
+# the certificate deleted by hand: setup makes a new one and re-signs
+: > "$HOME/kc"; SIGN_TOLD=0; : > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '^security import' "$HOME/calls.log" && app_signed_by_us \
+   && printf '%s\n' "$out" | grep -q 'may ask for your login password'; then
+  pass "setup remakes a missing certificate and re-signs"
+else fail "setup remakes a missing certificate and re-signs (rc $rc): $out"; fi
+
+# all in place: nothing signed
+: > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'everything is already in place' \
+   && printf '%s\n' "$out" | grep -q '+.* signing certificate' && ! grep -q '^codesign --force' "$HOME/calls.log"; then
+  pass "setup with a signed app signs nothing"
+else fail "setup with a signed app signs nothing (rc $rc): $out"; fi
 
 finish

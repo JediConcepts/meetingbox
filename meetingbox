@@ -210,8 +210,9 @@ on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 recorder_ready() {
   [ -x "$APP_BIN" ] || return 1
   [ -x "$TRANSCRIPT_BIN" ] || return 1
-  have="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
-  [ "$have" = "$VERSION" ]
+  local built
+  built="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+  [ "$built" = "$VERSION" ]
 }
 
 # Start the recorder through `open`, so it runs as meetingbox.app in its own
@@ -272,7 +273,7 @@ stop_proc() {
 # while the toolchain is still downloading, so test for the compiler itself.
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
-need_recorder()  { ! recorder_ready; }
+need_recorder()       { ! recorder_ready; }
 # fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
 # reports the licence missing on every machine.
 need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
@@ -394,14 +395,55 @@ build_app() {
 </dict>
 </plist>
 PLIST
-  if ! { ensure_signing_identity \
-         && codesign --force --sign "$(signing_hash)" --keychain "$SIGN_KEYCHAIN" \
-              --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1; }; then
+  if ! sign_app; then
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
     codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
       || { warn "could not sign the recorder app"; return 1; }
   fi
   register_app
+}
+
+# The one way the app is signed with the certificate: after a build, and by
+# setup when the app is not signed by it (an earlier ad hoc fallback, or a
+# certificate deleted since).
+sign_app() {
+  ensure_signing_identity || return 1
+  tell_signing_prompt
+  codesign --force --sign "$(signing_hash)" --keychain "$SIGN_KEYCHAIN" \
+    --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1
+}
+
+# setup's step for an app that is built but not signed by the certificate
+resign_app() {
+  say "the signing certificate"
+  if sign_app; then
+    register_app
+    ok "meetingbox.app signed with the meetingbox certificate"
+  else
+    warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
+  fi
+}
+
+# Adding the certificate to the keychain, and the first codesign with it, can
+# each open a macOS dialog behind Terminal. Say so once, before either.
+tell_signing_prompt() {
+  [ "${SIGN_TOLD:-0}" = 1 ] && return 0
+  info "macOS may ask for your login password so meetingbox can sign itself. Choose Always Allow."
+  SIGN_TOLD=1
+}
+
+# Signed by the recorded certificate. For a self-signed certificate, codesign
+# writes a designated requirement naming its SHA-1 (certificate leaf = H"..."),
+# so this checks the very certificate, not a name.
+app_signed_by_us() {
+  local h req
+  h="$(signing_hash)"
+  is_sha1 "$h" || return 1
+  req="$(codesign -d -r- "$APP_DIR" 2>&1)" || return 1
+  h="$(printf '%s' "$h" | tr 'ABCDEF' 'abcdef')"
+  req="$(printf '%s' "$req" | tr 'ABCDEF' 'abcdef')"
+  case "$req" in *"H\"$h\""*) return 0 ;; esac
+  return 1
 }
 
 register_app() {
@@ -441,6 +483,7 @@ ensure_signing_identity() {
   have_signing_identity && return 0
   h="$(signing_hash)"
   if [ -n "$h" ]; then forget_install "keychain:sha1:$h"; fi
+  tell_signing_prompt
   # an explicit template: macOS's mktemp -d on its own ignores TMPDIR
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/meetingbox-sign.XXXXXX")" || return 1
   # the private key is in $tmp until the import, so do not leave it on a Ctrl-C
@@ -654,9 +697,12 @@ setup() {
 
   # --- survey, before asking for anything ---
   todo=""
-  need_xcode_clt      && { miss "Xcode Command Line Tools";    todo="$todo clt"; }      || ok "Xcode Command Line Tools"
-  need_recorder  && { miss "audio-capture (the recorder)"; todo="$todo capture"; }  || ok "audio-capture (the recorder)"
+  need_xcode_clt      && { miss "Xcode Command Line Tools"; todo="$todo clt"; }     || ok "Xcode Command Line Tools"
+  need_recorder       && { miss "the recorder";             todo="$todo capture"; } || ok "the recorder"
   transcriber_present && ok "a transcriber" || { miss "a transcriber"; todo="$todo transcriber"; }
+  # a build signs the app, so this matters for an app that is already built
+  have_signing_identity && app_signed_by_us && ok "signing certificate" \
+    || { miss "a signing certificate"; todo="$todo sign"; }
   if have fm; then
     if need_fm_license; then miss "Apple model licence not accepted"; todo="$todo license"
     else ok "fm, licence accepted"; fi
@@ -687,6 +733,7 @@ setup() {
 
   case " $todo " in
     *" capture "*) install_recorder || return 1 ;;
+    *" sign "*)    resign_app ;;
   esac
 
   case " $todo " in
@@ -722,8 +769,13 @@ doctor() {
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
   [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels Me and Them)" || miss "mb-transcript (labels Me and Them)"
-  have_signing_identity && ok "signing certificate" \
-    || miss "signing certificate (permissions will be asked again after updates)"
+  if ! have_signing_identity; then
+    miss "signing certificate (permissions will be asked again after updates)"
+  elif [ -d "$APP_DIR" ] && ! app_signed_by_us; then
+    miss "meetingbox.app is signed ad hoc, so permissions will be asked again after updates. Run: meetingbox setup"
+  else
+    ok "signing certificate"
+  fi
   have speech-analyzer && ok "speech-analyzer" || info "speech-analyzer not installed"
   have whisper-cli    && ok "whisper-cli"     || info "whisper-cli not installed"
   transcriber_present || miss "no transcriber at all"

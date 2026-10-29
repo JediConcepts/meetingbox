@@ -43,15 +43,18 @@ meetingbox 4 things to install. I can do all of them from here.
 |---|---|---|
 | Xcode Command Line Tools | compiles the recorder | one Apple installer window |
 | the recorder, built from meetingbox's own source (`native/recorder`), plus `mb-transcript` (`native/transcript`) | records you and the far side, and merges the two transcripts | a few seconds to compile |
-| a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, no password |
+| a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, and macOS may ask for your login password once |
 | [speech-analyzer](https://github.com/simonw/speech-analyzer-cli) | Apple's on device transcriber | a few seconds, no model download |
 | or whisper.cpp instead | if you would rather run your own model | 1.6GB download |
 | `sudo fm license` | accepts Apple's model licence, once | your Mac password |
 
-The certificate is self-signed and lives in your login keychain. Setup records it in
+The certificate is self-signed and lives in your login keychain. Setup records its SHA-1 in
 `~/.meetingbox/installed`, and `meetingbox reset --tools` and `meetingbox uninstall`
 remove it. If it cannot be made, setup falls back to an ad hoc signature and warns
-you, and macOS will then ask for permissions again after each rebuild.
+you, and macOS will then ask for permissions again after each rebuild. Running
+`meetingbox setup` again retries: it makes the certificate if it is missing and
+re-signs the app, without a rebuild. If macOS asks for your login password while
+setup signs the app, choose Always Allow.
 
 Then it does a four second test recording to make macOS throw its Screen Recording
 and Microphone prompts now, in setup, rather than halfway through a real meeting.
@@ -201,7 +204,7 @@ Start with `meetingbox doctor`.
 |---|---|
 | Recorder stops immediately | Screen Recording or Microphone not granted to **meetingbox**. Turn it on in Privacy & Security, retry |
 | Permissions look granted but still fail | `meetingbox reset`, then `meetingbox setup` to be asked afresh |
-| Asked for permission again after an update | Expected once, on the move from 1.2 to 1.3 (Screen Recording and Microphone). From then on the signing certificate keeps the grants across rebuilds. If it keeps happening, setup fell back to an ad hoc signature, so run `meetingbox setup` again and read its warnings |
+| Asked for permission again after an update | Expected once, on the move from 1.2 to 1.3 (Screen Recording and Microphone). From then on the signing certificate keeps the grants across rebuilds. If it keeps happening, run `meetingbox doctor`. If the 'signing certificate' line is missing, run `meetingbox setup`, which makes it and re-signs the app |
 | `speech-analyzer` fails with "Invalid manifest" | The Command Line Tools are damaged. `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install` |
 | `swiftc: command not found` | Command Line Tools still downloading. Let the Apple installer finish |
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
