@@ -347,13 +347,14 @@ install_recorder() {
   build_dir="$(mktemp -d)" || return 1
   info "compiling. The first Swift build on a Mac caches Apple's frameworks and can"
   info "sit silent for a few minutes. It has not hung, leave it be."
+  # Apple deprecates names each macOS release; warnings are noise here, errors still show.
   if ! swiftc -O -o "$build_dir/audio-capture" "$SOURCE_DIR"/native/recorder/*.swift \
-         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia; then
+         -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -suppress-warnings; then
     rm -rf -- "$build_dir"
     warn "compile failed, see the output above"
     return 1
   fi
-  if ! swiftc -O -o "$build_dir/mb-transcript" "$SOURCE_DIR"/native/transcript/*.swift; then
+  if ! swiftc -O -o "$build_dir/mb-transcript" "$SOURCE_DIR"/native/transcript/*.swift -suppress-warnings; then
     rm -rf -- "$build_dir"
     warn "compile failed, see the output above"
     return 1
