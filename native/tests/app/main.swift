@@ -1,6 +1,6 @@
-// sources: ../../app/MeetingFolder.swift ../../app/MeetingStore.swift
-// Meeting folders and the library store. Everything runs in temporary folders.
-import Foundation
+// sources: ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift
+// Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
+import AVFoundation
 
 var failures = 0
 func check(_ cond: Bool, _ name: String) {
@@ -245,6 +245,569 @@ do {
     check(store.matches(m("Café planning"), query: "cafe"), "cafe matches Café")
     check(store.matches(m("Standup"), query: "  "), "blank query matches everything")
     check(!store.matches(m("1100"), query: "roadmap"), "folder without transcript has no transcript match")
+}
+
+
+// MARK: - Session (Task 4)
+
+/// An error whose text is what a caller sees.
+struct FakeError: LocalizedError {
+    let text: String
+    var errorDescription: String? { text }
+}
+
+/// Stands in for the recorder child. Processes are numbers; a test decides when one exits.
+final class FakeRecorder: RecorderControl {
+    var launches: [(dir: URL, mic: String?)] = []
+    var launchError: Error? = nil
+    var signals: [(pid: Int32, sig: Int32)] = []
+    var alive: Set<Int32> = []
+    var exitCodes: [Int32: Int32] = [:]
+    var running: [String: Int32] = [:]   // folder path -> pid, as `find` would see it
+    var recoverResult = true
+    var recoverLies = false              // recover says yes without making anything verify
+    var recovered: [URL] = []
+    var verified: Set<String> = []       // folders whose audio verifies
+    var healthLine: ((String) -> Void)? = nil
+    var nextPid: Int32 = 1000
+
+    func launch(dir: URL, mic: String?, onHealthLine: @escaping (String) -> Void) throws -> Int32 {
+        if let e = launchError { throw e }
+        launches.append((dir, mic))
+        nextPid += 1
+        alive.insert(nextPid)
+        running[dir.path] = nextPid
+        healthLine = onHealthLine
+        return nextPid
+    }
+    func signal(_ pid: Int32, _ sig: Int32) { signals.append((pid, sig)) }
+    func isRunning(_ pid: Int32) -> Bool { alive.contains(pid) }
+    func find(dir: URL) -> Int32? { running[dir.path].flatMap { alive.contains($0) ? $0 : nil } }
+    func exitStatus(_ pid: Int32) -> Int32? { alive.contains(pid) ? nil : exitCodes[pid] }
+    func recover(dir: URL) -> Bool {
+        recovered.append(dir)
+        if recoverLies { return true }
+        if recoverResult { verified.insert(dir.path) }
+        return recoverResult
+    }
+    func verify(dir: URL) -> Bool { verified.contains(dir.path) }
+
+    /// The recorder exits, as it would after finalising (0) or failing (1).
+    func exit(_ pid: Int32, _ code: Int32, verifies: Bool) {
+        alive.remove(pid)
+        exitCodes[pid] = code
+        if verifies, let dir = running.first(where: { $0.value == pid })?.key { verified.insert(dir) }
+    }
+    func sent(_ sig: Int32) -> Int { signals.filter { $0.sig == sig }.count }
+}
+
+final class FakeClock {
+    let base = local(2026, 10, 29, 10, 0)
+    var t: TimeInterval = 0
+    func now() -> Date { base.addingTimeInterval(t) }
+}
+
+let GB: Int64 = 1_000_000_000
+let MB: Int64 = 1_000_000
+
+/// A session over temp folders, a fake recorder, a fake clock and a settable free space.
+final class Rig {
+    let root = freshRoot()
+    let state: URL
+    let rec = FakeRecorder()
+    let clock = FakeClock()
+    var free: Int64 = 50 * GB
+    let store: MeetingStore
+    var session: Session!
+    var finished: [(URL, Bool)] = []
+    var changes: [Session.Phase] = []
+
+    init() {
+        state = root.appendingPathComponent("state")
+        store = MeetingStore(root: root.appendingPathComponent("Meetings"))
+        try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
+    }
+    @discardableResult
+    func make() -> Session {
+        session = Session(stateDir: state, recorder: rec, store: store, now: { [clock] in clock.now() },
+                          freeBytes: { [unowned self] in self.free }, tickQueue: nil, workQueue: nil)
+        session.onFinished = { [unowned self] in self.finished.append(($0, $1)) }
+        session.onChange = { [unowned self] in self.changes.append($0) }
+        return session
+    }
+    func at(_ t: TimeInterval) { clock.t = t; session.tick() }
+    var dirFile: URL { state.appendingPathComponent("recording.dir") }
+    var pausedFile: URL { state.appendingPathComponent("paused") }
+    func json(_ dir: URL) -> [String: Any] {
+        ((try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+    }
+    func stateOf(_ dir: URL) -> String? { json(dir)["state"] as? String }
+    /// A meeting folder on disk with the given meeting.json fields.
+    func meeting(_ name: String, _ change: (inout MeetingRecord) -> Void) -> URL {
+        let dir = Session.folderURL(store.root.appendingPathComponent(name).path)
+        try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try! store.update(dir, change)
+        return dir
+    }
+    func writeState(_ dir: URL, paused: Bool = false) {
+        try! fm.createDirectory(at: state, withIntermediateDirectories: true)
+        try! dir.path.write(to: dirFile, atomically: true, encoding: .utf8)
+        if paused { fm.createFile(atPath: pausedFile.path, contents: Data()) }
+    }
+}
+
+func errorText(_ body: () throws -> Void) -> String? {
+    do { try body(); return nil } catch { return error.localizedDescription }
+}
+
+// start
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: "USB Mic")
+    check(fm.fileExists(atPath: dir.path) && dir.deletingLastPathComponent().path == r.store.root.path, "start creates the meeting folder")
+    check((try? String(contentsOf: r.dirFile, encoding: .utf8)) == dir.path, "start writes recording.dir")
+    let j = r.json(dir)
+    check(j["state"] as? String == "recording" && UUID(uuidString: j["id"] as? String ?? "") != nil, "start sets meeting.json recording with an id")
+    check(s.phase == .recording(dir) && r.changes.last == .recording(dir), "start gives .recording")
+    check(r.rec.launches.count == 1 && r.rec.launches[0].dir == dir && r.rec.launches[0].mic == "USB Mic", "start launches the recorder once with the mic")
+    let second = errorText { _ = try s.start(root: r.store.root, mic: nil) }
+    check(second?.contains("already recording") ?? false, "a second start throws already recording")
+    check(r.rec.launches.count == 1 && s.phase == .recording(dir), "a second start launches nothing")
+}
+
+// start: launch throws
+do {
+    let r = Rig()
+    r.rec.launchError = FakeError(text: "the recorder could not be started")
+    let s = r.make()
+    let text = errorText { _ = try s.start(root: r.store.root, mic: nil) }
+    check(text == "the recorder could not be started", "the launch error text reaches the caller")
+    check(s.phase == .idle && !fm.fileExists(atPath: r.dirFile.path), "a failed launch leaves idle and removes recording.dir")
+    let folders = names(r.store.root)
+    check(folders.count == 1 && r.stateOf(r.store.root.appendingPathComponent(folders[0])) == "failed",
+          "a failed launch marks the meeting failed, never left as recording")
+}
+
+// start: disk floor
+do {
+    let r = Rig()
+    r.free = 2 * GB - 1
+    let s = r.make()
+    let text = errorText { _ = try s.start(root: r.store.root, mic: nil) }
+    check(text == "not enough free disk space to record (2 GB needed)", "start refuses below 2 GB")
+    check(r.rec.launches.isEmpty && names(r.store.root).isEmpty && s.phase == .idle, "a refused start makes nothing")
+}
+
+// pause and resume, and the clock
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    let pid = r.rec.nextPid
+    r.clock.t = 60
+    s.pause()
+    check(s.phase == .paused(dir) && fm.fileExists(atPath: r.pausedFile.path), "pause gives .paused and writes paused")
+    check(r.rec.signals.count == 1 && r.rec.signals[0].pid == pid && r.rec.signals[0].sig == SIGUSR1, "pause sends SIGUSR1")
+    s.pause()
+    check(r.rec.signals.count == 1, "a second pause is a no-op")
+    check(s.recordedSeconds(at: r.clock.base.addingTimeInterval(75)) == 60, "the clock stands still while paused")
+    r.clock.t = 90
+    s.resume()
+    check(s.phase == .recording(dir) && !fm.fileExists(atPath: r.pausedFile.path), "resume gives .recording and removes paused")
+    check(r.rec.signals.count == 2 && r.rec.signals[1].sig == SIGUSR2, "resume sends SIGUSR2")
+    s.resume()
+    check(r.rec.signals.count == 2, "a second resume is a no-op")
+    check(s.recordedSeconds(at: r.clock.base.addingTimeInterval(120)) == 90, "start 0, pause 60, resume 90, read 120 gives 90")
+}
+
+// stop: finalising before processing
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    let pid = r.rec.nextPid
+    r.clock.t = 45
+    check(s.stop() == dir, "stop returns the folder")
+    check(r.rec.sent(SIGINT) == 1 && s.phase == .finalising(dir), "stop sends SIGINT and moves to finalising at once")
+    check(r.stateOf(dir) == "finalising", "meeting.json says finalising")
+    check(s.stop() == dir && r.rec.sent(SIGINT) == 1, "a second stop while finalising sends nothing")
+    r.at(50)
+    check(r.stateOf(dir) == "finalising" && r.finished.isEmpty && s.phase == .finalising(dir), "nothing is queued while the recorder is alive")
+    check(s.recordedSeconds(at: r.clock.now()) == 45, "the clock stops at stop")
+    r.rec.exit(pid, 0, verifies: true)
+    r.at(51)
+    check(r.stateOf(dir) == "queued" && (r.json(dir)["seconds"] as? Int) == 45, "a clean exit that verifies is queued with seconds")
+    check(!fm.fileExists(atPath: r.dirFile.path) && !fm.fileExists(atPath: r.pausedFile.path), "state files are cleared")
+    check(r.finished.count == 1 && r.finished[0].0 == dir && r.finished[0].1, "onFinished(dir, true)")
+    check(s.phase == .idle && r.changes.last == .idle, "back to idle")
+    check(r.rec.recovered.isEmpty, "a clean exit needs no recovery")
+}
+
+// stop while paused counts recorded time only
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    let pid = r.rec.nextPid
+    r.clock.t = 30; s.pause()
+    r.clock.t = 100
+    _ = s.stop()
+    r.rec.exit(pid, 0, verifies: true)
+    r.at(101)
+    check((r.json(dir)["seconds"] as? Int) == 30, "stopping while paused stores recorded seconds only")
+}
+
+// stop: the recorder will not exit
+func stuckStop(recordFor seconds: TimeInterval, recovers: Bool) -> (Rig, URL) {
+    let r = Rig()
+    r.rec.recoverResult = recovers
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.clock.t = seconds
+    _ = s.stop()
+    return (r, dir)
+}
+do {
+    let (r, dir) = stuckStop(recordFor: 30, recovers: true)
+    r.at(30 + 59)
+    check(r.rec.sent(SIGTERM) == 0, "no SIGTERM before 60 s")
+    r.at(30 + 60)
+    check(r.rec.sent(SIGTERM) == 1, "SIGTERM after 60 s")
+    r.at(30 + 69)
+    check(r.rec.sent(SIGKILL) == 0 && r.rec.recovered.isEmpty, "no SIGKILL before a further 10 s")
+    r.at(30 + 70)
+    check(r.rec.sent(SIGKILL) == 1 && r.rec.recovered == [dir], "SIGKILL after 10 s, then recover")
+    check(r.stateOf(dir) == "queued" && r.finished.count == 1 && r.finished[0].1, "recovered means queued")
+    check(r.session.phase == .idle && !fm.fileExists(atPath: r.dirFile.path), "idle with state files cleared after recovery")
+    r.at(30 + 200)
+    check(r.rec.sent(SIGTERM) == 1 && r.rec.sent(SIGKILL) == 1 && r.rec.recovered.count == 1, "nothing more happens once finished")
+}
+do {
+    let (r, dir) = stuckStop(recordFor: 30, recovers: false)
+    for t in stride(from: 31.0, through: 110, by: 1) { r.at(t) }
+    check(r.stateOf(dir) == "failed" && r.json(dir)["error"] as? String == "the recording was interrupted; its files are kept",
+          "not recovered means failed with the reason")
+    check(r.finished.count == 1 && r.finished[0].0 == dir && !r.finished[0].1, "onFinished(dir, false)")
+    check(fm.fileExists(atPath: dir.path) && fm.fileExists(atPath: dir.appendingPathComponent("meeting.json").path), "every file is kept")
+}
+do {
+    // 60 s plus 1 s per recorded minute: ten minutes waits 70 s.
+    let (r, _) = stuckStop(recordFor: 600, recovers: true)
+    r.at(600 + 69)
+    check(r.rec.sent(SIGTERM) == 0, "a ten minute recording waits more than 60 s")
+    r.at(600 + 70)
+    check(r.rec.sent(SIGTERM) == 1, "a ten minute recording gets SIGTERM after 70 s")
+}
+
+// stop: a failed exit goes through recovery; unverified audio is never queued
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    let pid = r.rec.nextPid
+    _ = s.stop()
+    r.rec.exit(pid, 1, verifies: false)
+    r.at(1)
+    check(r.rec.recovered == [dir] && r.stateOf(dir) == "queued", "an exit of 1 is recovered, then queued")
+}
+do {
+    // recover claims success but the audio still does not verify
+    let r = Rig()
+    r.rec.recoverLies = true
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    _ = s.stop()
+    r.rec.exit(r.rec.nextPid, 0, verifies: false)
+    r.at(1)
+    check(r.rec.recovered == [dir] && r.stateOf(dir) == "failed" && r.finished.count == 1 && !r.finished[0].1,
+          "audio that does not verify is never queued, even after recover says yes")
+}
+
+// the recorder dies on its own while recording
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(20)
+    check(r.rec.sent(SIGINT) == 0 && r.rec.recovered == [dir], "a recorder that died on its own is recovered")
+    check(r.stateOf(dir) == "queued" && s.phase == .idle && r.finished.count == 1, "and handled as a stop")
+}
+
+// adopt: the recorder is still alive
+do {
+    let r = Rig()
+    let dir = r.meeting("2026-10-29_0955") {
+        $0.started = r.clock.base.addingTimeInterval(-300)
+        $0.pausedSeconds = 60
+        $0.state = .recording
+    }
+    r.writeState(dir)
+    r.rec.alive.insert(4242)
+    r.rec.running[dir.path] = 4242
+    let s = r.make()
+    s.adopt()
+    check(s.phase == .recording(dir), "adopt gives .recording for a live recorder")
+    check(s.recordedSeconds(at: r.clock.now()) == 240, "the timer continues from meeting.json")
+    check(r.rec.recovered.isEmpty && r.rec.launches.isEmpty, "adopting launches and recovers nothing")
+    r.clock.t = 10
+    _ = s.stop()
+    check(r.rec.signals.last?.pid == 4242 && r.rec.signals.last?.sig == SIGINT, "stop signals the adopted recorder")
+    r.rec.exit(4242, 0, verifies: true)
+    r.rec.exitCodes[4242] = nil // not our child: its exit status is unknown
+    r.at(11)
+    check(r.stateOf(dir) == "queued" && (r.json(dir)["seconds"] as? Int) == 250 && s.phase == .idle, "an adopted recording finishes and is queued")
+}
+do {
+    let r = Rig()
+    let dir = r.meeting("2026-10-29_0950") {
+        $0.started = r.clock.base.addingTimeInterval(-300)
+        $0.pausedSeconds = 60
+        $0.pausedAt = r.clock.base.addingTimeInterval(-100)
+        $0.state = .recording
+    }
+    r.writeState(dir, paused: true)
+    r.rec.alive.insert(4343)
+    r.rec.running[dir.path] = 4343
+    let s = r.make()
+    s.adopt()
+    check(s.phase == .paused(dir), "adopt gives .paused when paused exists")
+    check(s.recordedSeconds(at: r.clock.now()) == 140, "an adopted pause keeps its clock")
+    r.clock.t = 20
+    s.resume()
+    check(r.rec.signals.last?.sig == SIGUSR2 && s.recordedSeconds(at: r.clock.base.addingTimeInterval(30)) == 150, "an adopted pause resumes")
+}
+
+// adopt: the recorder died with the app
+for recovers in [true, false] {
+    let r = Rig()
+    r.rec.recoverResult = recovers
+    let dir = r.meeting("2026-10-29_0900") { $0.state = .recording }
+    r.writeState(dir, paused: true)
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered == [dir], "adopt recovers a dead recording (recovers: \(recovers))")
+    check(r.stateOf(dir) == (recovers ? "queued" : "failed"), "a dead recording is queued only when recovered (recovers: \(recovers))")
+    if !recovers {
+        check(r.json(dir)["error"] as? String == "the recording was interrupted; its files are kept", "an unrecoverable one says why")
+    }
+    check(s.phase == .idle && !fm.fileExists(atPath: r.dirFile.path) && !fm.fileExists(atPath: r.pausedFile.path), "state files are cleared after a dead adopt")
+    check(r.finished.count == 1 && r.finished[0].1 == recovers, "onFinished reports the result (recovers: \(recovers))")
+}
+
+// adopt: orphans
+do {
+    let r = Rig()
+    r.rec.recoverResult = true
+    let named = r.meeting("2026-10-29_0800") { $0.state = .recording }
+    let orphanRec = r.meeting("2026-10-28_0900") { $0.state = .recording }
+    let orphanFin = r.meeting("2026-10-28_1000") { $0.state = .finalising }
+    let queued = r.meeting("2026-10-28_1100") { $0.state = .queued }
+    let live = r.meeting("2026-10-28_1200") { $0.state = .recording }
+    r.rec.alive = [7, 8]
+    r.rec.running[named.path] = 7
+    r.rec.running[live.path] = 8
+    r.writeState(named)
+    let s = r.make()
+    s.adopt()
+    let recoveredNames = Set(r.rec.recovered.map { $0.lastPathComponent })
+    check(recoveredNames == [orphanRec.lastPathComponent, orphanFin.lastPathComponent], "orphans are recovered at launch, and only orphans")
+    check(r.stateOf(orphanRec) == "queued" && r.stateOf(orphanFin) == "queued", "recovered orphans are queued")
+    check(r.stateOf(queued) == "queued" && r.stateOf(live) == "recording" && r.stateOf(named) == "recording", "others are untouched")
+    check(s.phase == .recording(named), "the named recording is still adopted")
+}
+do {
+    let r = Rig()
+    r.rec.recoverResult = false
+    let orphan = r.meeting("2026-10-28_0900") { $0.state = .recording }
+    let s = r.make()
+    s.adopt()
+    check(r.stateOf(orphan) == "failed" && r.finished.count == 1 && !r.finished[0].1 && s.phase == .idle,
+          "an orphan that cannot be recovered is failed, with no recording.dir at all")
+}
+
+// adopt: recording.dir left behind by a meeting that had already settled
+for settled in [MeetingState.queued, .done] {
+    let r = Rig()
+    let dir = r.meeting("2026-10-29_0700") { $0.state = settled }
+    r.writeState(dir, paused: true)
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered.isEmpty && r.stateOf(dir) == settled.rawValue && s.phase == .idle,
+          "a settled meeting named by recording.dir is left as it is (\(settled.rawValue))")
+    check(!fm.fileExists(atPath: r.dirFile.path) && !fm.fileExists(atPath: r.pausedFile.path), "its stale state files are cleared (\(settled.rawValue))")
+}
+
+// adopt: the app went away after SIGINT and the recorder is still finalising
+do {
+    let r = Rig()
+    let dir = r.meeting("2026-10-29_0930") { $0.state = .finalising; $0.seconds = 1200 }
+    r.writeState(dir)
+    r.rec.alive.insert(5151)
+    r.rec.running[dir.path] = 5151
+    let s = r.make()
+    s.adopt()
+    check(s.phase == .finalising(dir) && s.recordedSeconds(at: r.clock.now()) == 1200, "a recorder still finalising is adopted as finalising")
+    r.at(79)
+    check(r.rec.sent(SIGTERM) == 0, "its wait counts from adoption: 60 s plus 20 s for 20 minutes")
+    r.at(80)
+    check(r.rec.sent(SIGTERM) == 1 && r.rec.signals.last?.pid == 5151, "then SIGTERM to the adopted recorder")
+    r.rec.exit(5151, 0, verifies: true)
+    r.rec.exitCodes[5151] = nil
+    r.at(81)
+    check(r.stateOf(dir) == "queued" && (r.json(dir)["seconds"] as? Int) == 1200 && s.phase == .idle, "and it is queued once it exits")
+}
+
+// the real 1 s timer and the work queue
+do {
+    let r = Rig()
+    let q = DispatchQueue(label: "test.session.tick")
+    let done = DispatchSemaphore(value: 0)
+    var result: (URL, Bool)? = nil
+    var s: Session! = nil
+    var dir: URL! = nil
+    q.sync {
+        s = Session(stateDir: r.state, recorder: r.rec, store: r.store, now: { Date() }, freeBytes: { 50 * GB },
+                    tickQueue: q, workQueue: DispatchQueue(label: "test.session.work"))
+        s.onFinished = { result = ($0, $1); done.signal() }
+        dir = try! s.start(root: r.store.root, mic: nil)
+        _ = s.stop()
+        r.rec.exit(r.rec.nextPid, 0, verifies: true)
+    }
+    check(done.wait(timeout: .now() + 5) == .success, "the timer finishes a stop on its own")
+    q.sync {
+        check(result?.0 == dir && result?.1 == true && s.phase == .idle && r.stateOf(dir) == "queued", "through the work queue, back on the tick queue")
+    }
+}
+
+// health
+do {
+    let r = Rig()
+    let s = r.make()
+    _ = try! s.start(root: r.store.root, mic: nil)
+    check(s.health == Session.Health(mic: .ok, system: .ok, disk: .ok), "health starts ok")
+    r.rec.healthLine?("Starting recording...")
+    r.rec.healthLine?("health mic=ok system=stalled")
+    check(s.health.mic == .ok && s.health.system == .stalled, "system stalled, mic ok, separately")
+    r.rec.healthLine?("health mic=error system=ok")
+    check(s.health.mic == .error && s.health.system == .ok, "mic error, system ok")
+    r.clock.t = 5
+    r.rec.healthLine?("health mic=ok system=ok")
+    r.at(14)
+    check(s.health.mic == .ok && s.health.system == .ok, "ok within 10 s of a health line")
+    r.at(15)
+    check(s.health.mic == .stalled && s.health.system == .stalled, "stalled after 10 s with no health line")
+    r.rec.healthLine?("health mic=ok system=ok")
+    check(s.health.mic == .ok, "a fresh line clears it")
+    r.free = 999 * MB
+    r.at(16)
+    check(s.health.disk == .low, "below 1 GB the disk is low")
+    r.free = 5 * GB
+    r.at(17)
+    check(s.health.disk == .ok, "disk ok again with space")
+}
+do {
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.free = 199 * MB
+    r.at(30)
+    check(s.phase == .finalising(dir) && r.rec.sent(SIGINT) == 1, "below 200 MB the session stops itself")
+    let err = r.json(dir)["error"] as? String ?? ""
+    check(err.contains("disk") && r.stateOf(dir) == "finalising", "the reason is in meeting.json error")
+    r.rec.exit(r.rec.nextPid, 0, verifies: true)
+    r.at(31)
+    check(r.stateOf(dir) == "queued" && (r.json(dir)["error"] as? String)?.contains("disk") == true, "it finalises and keeps the reason")
+}
+
+// ChildRecorder, against a fake executable (never the real recorder)
+do {
+    let bin = freshRoot()
+    let src = bin.appendingPathComponent("fake.c")
+    let exe = bin.appendingPathComponent("fake-recorder")
+    let code = """
+    #include <signal.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <unistd.h>
+    static volatile sig_atomic_t stop = 0;
+    static void on_int(int s) { (void)s; stop = 1; }
+    int main(int argc, char **argv) {
+        if (argc >= 3 && strcmp(argv[1], "--recover") == 0) {
+            char p[4096];
+            snprintf(p, sizeof p, "%s/can-recover", argv[2]);
+            fprintf(stderr, "recovering %s\\n", argv[2]);
+            return access(p, F_OK) == 0 ? 0 : 1;
+        }
+        signal(SIGINT, on_int);
+        if (getenv("FAKE_IGNORE_TERM")) signal(SIGTERM, SIG_IGN);
+        fprintf(stderr, "Starting recording...\\n");
+        for (int i = 0; i < argc; i++) fprintf(stderr, "arg %s\\n", argv[i]);
+        while (!stop) {
+            fprintf(stderr, "health mic=ok system=stalled\\n");
+            usleep(100000);
+        }
+        fprintf(stderr, "Stopping...\\n");
+        return 3;
+    }
+    """
+    try! code.write(to: src, atomically: true, encoding: .utf8)
+    let cc = Process()
+    cc.executableURL = URL(fileURLWithPath: "/usr/bin/cc")
+    cc.arguments = ["-o", exe.path, src.path]
+    try! cc.run()
+    cc.waitUntilExit()
+    check(cc.terminationStatus == 0, "fake recorder compiles")
+
+    let child = ChildRecorder(executable: exe)
+    let dir = try! MeetingFolder.create(in: freshRoot(), at: Date())
+    let lines = NSMutableArray()
+    let pid = try! child.launch(dir: dir, mic: "USB Mic") { line in
+        lines.add(line)
+    }
+    check(pid > 0 && child.isRunning(pid) && child.exitStatus(pid) == nil, "ChildRecorder launches and reports running")
+    func waitFor(_ seconds: Double, _ cond: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end { if cond() { return true }; usleep(20_000) }
+        return cond()
+    }
+    check(waitFor(5) { lines.count >= 2 }, "health lines reach onHealthLine")
+    check((lines as! [String]).allSatisfy { $0 == "health mic=ok system=stalled" }, "only health lines are passed on")
+    check(child.find(dir: dir) == pid, "find sees the recorder by its command line")
+    check(child.find(dir: dir.appendingPathComponent("other")) == nil, "find ignores other folders")
+    let log = dir.appendingPathComponent("capture.log")
+    check(mode(log) == 0o600, "capture.log is 0600")
+    child.signal(pid, SIGINT)
+    check(waitFor(5) { !child.isRunning(pid) }, "SIGINT stops it")
+    check(child.exitStatus(pid) == 3, "exitStatus reports the exit code")
+    check(child.find(dir: dir) == nil, "find no longer sees it")
+    let flushed = waitFor(2) { ((try? String(contentsOf: log, encoding: .utf8)) ?? "").contains("Stopping...") }
+    let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    check(flushed && text.contains("Starting recording...") && text.contains("health mic=ok"), "every stderr line goes to capture.log")
+    check(text.contains("arg --record\narg -o\narg \(dir.path)\narg -n\narg meeting\narg -d\narg USB Mic\n"),
+          "the recorder gets --record -o <dir> -n meeting -d <mic>")
+    check(!child.recover(dir: dir), "recover fails when --recover exits 1")
+    fm.createFile(atPath: dir.appendingPathComponent("can-recover").path, contents: Data())
+    check(child.recover(dir: dir), "recover succeeds when --recover exits 0")
+    check(!child.verify(dir: dir), "verify fails with no audio")
+
+    // Real audio: working files finalised in process, as the recorder would.
+    let audio = try! MeetingFolder.create(in: freshRoot(), at: Date())
+    for name in ["mic.caf", "call.caf"] {
+        let file = try! AVAudioFile(forWriting: audio.appendingPathComponent(name), settings: RecordingOutput.workingSettings,
+                                    commonFormat: .pcmFormatFloat32, interleaved: false)
+        let n = 48000
+        let buffer = AVAudioPCMBuffer(pcmFormat: AudioMixer.format, frameCapacity: AVAudioFrameCount(n))!
+        buffer.frameLength = AVAudioFrameCount(n)
+        for i in 0..<n { buffer.floatChannelData![0][i] = 0.3 * Float(sin(2 * Double.pi * 440 * Double(i) / 48000)) }
+        try! file.write(from: buffer)
+    }
+    try! recover(directory: audio)
+    check(child.verify(dir: audio), "verify passes with the marker and three matching .m4a")
+    try! fm.removeItem(at: audio.appendingPathComponent(".recording-complete"))
+    check(!child.verify(dir: audio), "verify fails without the marker")
 }
 
 try? fm.removeItem(at: scratch)
