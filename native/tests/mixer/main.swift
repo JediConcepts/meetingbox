@@ -124,4 +124,26 @@ for twice in [false, true] {
     check(c.mic.allSatisfy { $0 == Float(0.1) || $0 == Float(0.2) }, "\(label): nothing from the paused stretch")
 }
 
+// Two pauses: each resume adds to the time skipped, so the second join has no gap either.
+do {
+    t = 0
+    let c = Capture()
+    func second(from start: Double, _ value: Float) {
+        for k in 0..<(rate / chunk) {
+            let when = start + Double(k * chunk) / Double(rate)
+            t = when + 0.01
+            c.mixer.append([Float](repeating: value, count: chunk), from: .mic, at: at(when))
+            c.mixer.append([Float](repeating: value, count: chunk), from: .system, at: at(when))
+        }
+    }
+    second(from: 0, 0.1)
+    t = 1; c.mixer.pause(); t = 3; c.mixer.resume()
+    second(from: 3, 0.2)
+    t = 4; c.mixer.pause(); t = 7; c.mixer.resume()
+    second(from: 7, 0.3)
+    c.mixer.finish()
+    check(c.mic.count == 3 * rate && c.system.count == 3 * rate, "two pauses: 144000 frames per channel (\(c.mic.count))")
+    check(c.mic[2 * rate - 1] == Float(0.2) && c.mic[2 * rate] == Float(0.3), "two pauses: no gap at the second join")
+}
+
 exit(failures == 0 ? 0 : 1)

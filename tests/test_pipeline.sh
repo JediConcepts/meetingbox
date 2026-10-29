@@ -14,7 +14,7 @@ else
 fi
 
 FIX="$ROOT/tests/fixtures"
-SA_FAIL=""      # none | call | both
+SA_FAIL=""      # none | call | both | garbled
 
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
 notify() { :; }
@@ -25,7 +25,9 @@ speech-analyzer() {
     *" -f json "*)
       case "$a" in
         *mic.m4a)  [ "$SA_FAIL" = both ] && return 1; cat "$FIX/sa-mic.json" ;;
-        *call.m4a) [ "$SA_FAIL" = both ] || [ "$SA_FAIL" = call ] && return 1; cat "$FIX/sa-call.json" ;;
+        *call.m4a) [ "$SA_FAIL" = both ] || [ "$SA_FAIL" = call ] && return 1
+                   if [ "$SA_FAIL" = garbled ]; then printf '{"words":[{"start":1'; return 0; fi
+                   cat "$FIX/sa-call.json" ;;
         *) return 1 ;;
       esac ;;
     *) echo "a plain transcript of the whole mix" ;;
@@ -78,6 +80,16 @@ if [ "$rc" -eq 0 ] && [ -s "$t" ] && ! grep -qv '] Me: ' "$t"; then pass "call s
 else fail "call side failing: transcript is all Me (rc $rc): $out"; fi
 if printf '%s' "$out" | grep -q 'warn.*call.m4a'; then pass "call side failing: a warning names it"
 else fail "call side failing: a warning names it: $out"; fi
+
+# --- the call side writes broken JSON but says it worked: still Me only, and say so ---
+d="$(meeting m2b audio.m4a mic.m4a call.m4a)"
+SA_FAIL=garbled
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+t="$d/transcript.txt"
+if [ "$rc" -eq 0 ] && [ -s "$t" ] && ! grep -qv '] Me: ' "$t" && printf '%s' "$out" | grep -q 'call.words.json'; then
+  pass "a garbled call side still gives the Me transcript, with a warning"
+else fail "a garbled call side still gives the Me transcript, with a warning (rc $rc): $out"; fi
+SA_FAIL=""
 
 # --- both fail: most likely Speech Recognition is off, so say so; audio left alone ---
 d="$(meeting m3 audio.m4a mic.m4a call.m4a)"

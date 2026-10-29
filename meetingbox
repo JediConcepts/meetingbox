@@ -874,6 +874,11 @@ start_recording() {
 pause_recording() {
   is_recording || die "not recording"
   if [ -e "$PAUSE_FILE" ]; then info "already paused"; return 0; fi
+  # A recorder from meetingbox 1.2 writes <stamp>_meeting.m4a and has no pause:
+  # SIGUSR1 would kill it and leave the audio unplayable.
+  for f in "$(session_dir)"/*_meeting.m4a; do
+    [ -e "$f" ] && die "this recording was started by an older meetingbox and cannot pause. It is still recording; 'meetingbox stop' finishes it"
+  done
   for p in $(recorder_pids "$(session_dir)"); do kill -USR1 "$p" 2>/dev/null || true; done
   : > "$PAUSE_FILE"
   say "paused"
@@ -1031,6 +1036,8 @@ transcribe_channels() {
     msg="$(cat "$err")"; rm -f "$tmp" "$err"
     die "${msg:-mb-transcript failed}"
   fi
+  # a side it could not read is a warning, not a failure
+  while IFS= read -r msg; do warn "${msg#mb-transcript: }"; done < "$err"
   rm -f "$err"
   mv -f "$tmp" "$out"
   ok "transcript: $(wc -l < "$out" | tr -d ' ') turns, as Me and Them"

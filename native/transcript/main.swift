@@ -18,10 +18,14 @@ while !args.isEmpty {
     }
 }
 
-/// A missing or empty file counts as no words.
+/// A missing, empty or unreadable file counts as no words, so one bad side
+/// still leaves the other side's transcript.
 func words(_ path: String?) -> [Word] {
     guard let path = path, let data = FileManager.default.contents(atPath: path) else { return [] }
-    do { return try loadWords(data) } catch { fail("cannot read \(path): \(error)") }
+    do { return try loadWords(data) } catch {
+        FileHandle.standardError.write(Data("mb-transcript: cannot read \(path), carrying on without it: \(error)\n".utf8))
+        return []
+    }
 }
 
 let call = words(callPath)

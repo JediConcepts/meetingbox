@@ -49,6 +49,15 @@ if ! (pause_recording) >/dev/null 2>&1; then pass "pause needs a recording"
 else fail "pause needs a recording"; fi
 is_recording() { return 0; }
 
+# --- a recording started by meetingbox 1.2 has a recorder that SIGUSR1 would kill ---
+: > "$SIGLOG"
+printf 'old' > "$dir/2026-10-29_0900_meeting.m4a"
+out="$( (pause_recording) 2>&1)"; rc=$?; settle
+if [ "$rc" -ne 0 ] && [ ! -s "$SIGLOG" ] && [ ! -e "$PAUSE_FILE" ] && printf '%s' "$out" | grep -q 'older meetingbox'; then
+  pass "pause refuses a recording an older recorder is making, and signals nothing"
+else fail "pause refuses a recording an older recorder is making ($rc): $out"; fi
+rm -f "$dir/2026-10-29_0900_meeting.m4a"
+
 # --- the marker never outlives the recording ---
 kill "$trap_pid" 2>/dev/null; wait "$trap_pid" 2>/dev/null || true
 
