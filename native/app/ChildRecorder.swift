@@ -155,8 +155,10 @@ final class ChildRecorder: RecorderControl {
 }
 
 /// Follows a recorder's capture.log: each `poll()` reads what was appended since the last one,
-/// passes on every complete `health ...` line, and remembers the last other line (the recorder's
-/// own account of why it stopped). Polled from one queue at a time, so it needs no lock.
+/// passes on every complete `health ...` line, and remembers the last line that could be the
+/// recorder's reason for stopping: not a health line, not an indented continuation line (device
+/// lists, file paths), and not one of its progress lines. Polled from one queue at a time, so it
+/// needs no lock.
 final class LogTail {
     let url: URL
     private var offset: UInt64
@@ -191,19 +193,29 @@ final class LogTail {
         }
     }
 
-    /// The last line that is not a health line, including one not yet ended by a newline.
+    /// The last line that could be a reason, including one not yet ended by a newline.
     var lastMessage: String? {
-        let partial = String(decoding: pending, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !partial.isEmpty && !partial.hasPrefix("health ") { return partial }
-        return lastLine
+        LogTail.reason(String(decoding: pending, as: UTF8.self)) ?? lastLine
+    }
+
+    /// What the recorder prints while all is well (Recorder.swift), never a reason for failing.
+    private static let progress: Set<String> = ["Starting recording...", "Press Ctrl+C to stop.", "Paused",
+                                                "Resumed", "Stopping...", "Available devices:"]
+    private static let progressPrefixes = ["Recording started at ", "Saved (", "Recovered ",
+                                           "Its working files are kept."]
+
+    private static func reason(_ line: String) -> String? {
+        guard let first = line.first, !first.isWhitespace, !line.hasPrefix("health ") else { return nil }
+        let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty || progress.contains(text) || progressPrefixes.contains(where: text.hasPrefix) { return nil }
+        return text
     }
 
     private func take(_ line: String) {
         if line.hasPrefix("health ") {
             onHealthLine(line)
-        } else {
-            let text = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { lastLine = text }
+        } else if let text = LogTail.reason(line) {
+            lastLine = text
         }
     }
 }

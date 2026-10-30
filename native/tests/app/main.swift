@@ -940,19 +940,143 @@ do {
           "M5: a failed disk stop keeps the disk reason")
 }
 
-// M7: recording.dir is acted on only for a meeting folder under the store root.
-for (label, makeDir) in [("not a meeting folder", { (r: Rig) in r.store.root.appendingPathComponent("notes") }),
-                         ("outside the store root", { (r: Rig) in r.root.appendingPathComponent("2026-10-29_0900") })] {
+// M7 / Ruling D: a path that is not a meeting folder and has no recorder is only cleared away.
+do {
     let r = Rig()
-    let dir = Session.folderURL(makeDir(r).path)
+    let dir = Session.folderURL(r.store.root.appendingPathComponent("notes").path)
     try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
     try! "{\"state\": \"recording\"}".write(to: dir.appendingPathComponent("meeting.json"), atomically: true, encoding: .utf8)
     let before = r.raw(dir)
     r.writeState(dir, paused: true)
     let s = r.make()
     s.adopt()
-    check(r.rec.recovered.isEmpty && r.raw(dir) == before && s.phase == .idle, "M7: recording.dir \(label) is not acted on")
-    check(!fm.fileExists(atPath: r.dirFile.path) && !fm.fileExists(atPath: r.pausedFile.path), "M7: its state files are cleared (\(label))")
+    check(r.rec.recovered.isEmpty && r.raw(dir) == before && s.phase == .idle, "M7: recording.dir not a meeting folder is not acted on")
+    check(!fm.fileExists(atPath: r.dirFile.path) && !fm.fileExists(atPath: r.pausedFile.path), "M7: its state files are cleared")
+    check(r.rec.finds >= 1, "D: find is asked before the state files are cleared")
+}
+// Ruling D: a non-meeting path whose recorder find cannot tell about is left alone.
+do {
+    let r = Rig()
+    let dir = Session.folderURL(r.store.root.appendingPathComponent("notes").path)
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    r.writeState(dir, paused: true)
+    r.rec.findUnknown = true
+    let s = r.make()
+    s.adopt()
+    check(fm.fileExists(atPath: r.dirFile.path) && fm.fileExists(atPath: r.pausedFile.path) && names(dir).isEmpty && s.phase == .idle,
+          "D: a non-meeting path is left alone while find cannot tell")
+}
+// Ruling D: a recording outside the store root (start dir=, --dir, MB_DIR) is adopted like any other.
+do {
+    let r = Rig()
+    let elsewhere = r.root.appendingPathComponent("Work")
+    try! fm.createDirectory(at: elsewhere, withIntermediateDirectories: true)
+    let dir = Session.folderURL(elsewhere.appendingPathComponent("2026-10-29_0955").path)
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    try! r.store.update(dir) { $0.started = r.clock.base.addingTimeInterval(-300); $0.state = .recording }
+    r.writeState(dir)
+    r.rec.alive.insert(4242)
+    r.rec.running[dir.path] = 4242
+    let s = r.make()
+    s.adopt()
+    check(s.phase == .recording(dir) && fm.fileExists(atPath: r.dirFile.path), "D: a live recorder outside the store root is adopted, state files kept")
+    r.clock.t = 10
+    _ = s.stop()
+    check(r.rec.signals.last?.pid == 4242 && r.rec.signals.last?.sig == SIGINT, "D: and stop reaches it")
+    r.rec.exit(4242, 0, verifies: true)
+    r.rec.exitCodes[4242] = nil
+    r.at(11)
+    check(r.stateOf(dir) == "queued" && s.phase == .idle && !fm.fileExists(atPath: r.dirFile.path), "D: and it is queued once it exits")
+}
+for recovers in [true, false] {
+    let r = Rig()
+    r.rec.recoverResult = recovers
+    let dir = Session.folderURL(r.root.appendingPathComponent("2026-10-29_0900").path)
+    try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    try! r.store.update(dir) { $0.state = .recording }
+    r.writeState(dir)
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered == [dir] && r.stateOf(dir) == (recovers ? "queued" : "failed") && s.phase == .idle,
+          "D: a dead recording outside the store root is recovered and marked (recovers: \(recovers))")
+}
+
+// Ruling E: the error is the recorder's reason, not its last progress or continuation line.
+func failedStartError(_ lines: [String], exit code: Int32, recoverWrites: Bool = false) -> String? {
+    let r = Rig()
+    r.rec.recoverResult = false
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: "USB")
+    for line in lines { r.log(dir, line) }
+    if recoverWrites {
+        // --recover appends to the same capture.log, and a tick may land while it runs.
+        r.rec.onRecover = { d in r.log(d, "Could not recover \(d.path): no working files"); s.tick() }
+    }
+    r.rec.exit(r.rec.nextPid, code, verifies: false)
+    r.at(1)
+    return r.json(dir)["error"] as? String
+}
+check(failedStartError(["No input device matching \"USB\".", "Available devices:", "  MacBook Pro Microphone", "  Studio Display Microphone"], exit: 1)
+        == "No input device matching \"USB\".", "E: the device-list output gives the No input device matching line")
+check(failedStartError(["Starting recording...", "Recording started at 10:00", "  Microphone: USB", "Press Ctrl+C to stop.",
+                        "health mic=ok system=ok", "Paused", "Resumed", "", "Stopping..."], exit: 1)
+        == "the recording was interrupted; its files are kept", "E: progress lines are never the error")
+check(failedStartError(["Starting recording...", "Press Ctrl+C to stop."], exit: 128 + SIGKILL)
+        == "the recorder stopped unexpectedly (signal 9)", "E: a recorder killed by a signal says so")
+check(failedStartError(["Failed to create output files: disk full"], exit: 1, recoverWrites: true)
+        == "Failed to create output files: disk full", "E: the recorder's reason is kept while --recover writes to the log")
+
+// Ruling F: every signal to an adopted pid is checked first; a pid that is no longer the recorder means it exited.
+func adoptedLive(_ r: Rig) -> (Session, URL) {
+    let dir = r.meeting("2026-10-29_0955") { $0.started = r.clock.base.addingTimeInterval(-300); $0.state = .recording }
+    r.writeState(dir)
+    r.rec.alive.insert(4242)
+    r.rec.running[dir.path] = 4242
+    let s = r.make()
+    s.adopt()
+    return (s, dir)
+}
+for action in ["pause", "stop"] {
+    let r = Rig()
+    let (s, dir) = adoptedLive(r)
+    r.rec.running[dir.path] = nil // it exited; its pid now belongs to something else
+    r.rec.verified.insert(dir.path)
+    if action == "pause" { s.pause() } else { _ = s.stop() }
+    check(r.rec.signals.isEmpty, "F: \(action) sends nothing to a reused pid")
+    check(s.phase == .idle && r.stateOf(dir) == "queued" && r.finished.count == 1, "F: \(action) treats it as exited (the dead path)")
+}
+do {
+    let r = Rig()
+    let (s, dir) = adoptedLive(r)
+    r.clock.t = 30
+    s.pause()
+    r.rec.running[dir.path] = nil
+    r.rec.verified.insert(dir.path)
+    s.resume()
+    check(r.rec.sent(SIGUSR2) == 0 && s.phase == .idle && r.stateOf(dir) == "queued", "F: resume sends nothing to a reused pid")
+}
+do {
+    let r = Rig()
+    let (s, dir) = adoptedLive(r)
+    r.rec.findUnknown = true
+    s.pause()
+    check(r.rec.signals.isEmpty && s.phase == .recording(dir), "F: pause does nothing while find cannot tell")
+    _ = s.stop()
+    check(r.rec.signals.isEmpty && s.phase == .finalising(dir), "F: stop sends no SIGINT while find cannot tell")
+    r.rec.findUnknown = false
+    r.at(1)
+    check(r.rec.sent(SIGINT) == 1 && r.rec.signals.last?.pid == 4242, "F: SIGINT goes once find confirms the pid")
+}
+
+// Ruling G: a failed orphan that was stopped for disk space keeps that reason.
+do {
+    let r = Rig()
+    r.rec.recoverResult = false
+    let orphan = r.meeting("2026-10-28_0900") { $0.state = .finalising; $0.error = Session.diskStopped }
+    let s = r.make()
+    s.adopt()
+    check(r.stateOf(orphan) == "failed" && r.json(orphan)["error"] as? String == Session.diskStoppedFailed,
+          "G: a failed disk-stopped orphan keeps the disk reason")
 }
 
 // M8: start refuses while recording.dir names a live (or unknown) recorder.
@@ -1081,7 +1205,7 @@ do {
     check(flushed && text.contains("Starting recording...") && text.contains("health mic=ok"), "every stderr line goes to capture.log")
     check(text.contains("stderr-is-file 1\n"), "B: the recorder's stderr is capture.log itself, not a pipe")
     child.pollLog(dir: dir)
-    check(child.lastMessage(dir: dir) == "Stopping...", "M2: lastMessage is the last line that is not a health line")
+    check(child.lastMessage(dir: dir) == "arg USB Mic", "M2/E: lastMessage skips health and progress lines (\"Stopping...\")")
     check(text.contains("arg --record\narg -o\narg \(dir.path)\narg -n\narg meeting\narg -d\narg USB Mic\n"),
           "the recorder gets --record -o <dir> -n meeting -d <mic>")
     check(child.recover(dir: dir) == .failed, "recover fails when --recover exits 1")
@@ -1090,6 +1214,10 @@ do {
     fm.createFile(atPath: dir.appendingPathComponent("can-recover").path, contents: Data())
     check(child.recover(dir: dir) == .recovered, "recover succeeds when --recover exits 0")
     check(child.verify(dir: dir) == nil, "verify fails with no audio")
+    let killedDir = try! MeetingFolder.create(in: freshRoot(), at: Date())
+    let killed = try! child.launch(dir: killedDir, mic: nil) { _ in }
+    child.signal(killed, SIGKILL)
+    check(waitFor(5) { !child.isRunning(killed) } && child.exitStatus(killed) == 128 + SIGKILL, "E: a recorder killed by SIGKILL reports 128 + 9")
 
     // Real audio: working files finalised in process, as the recorder would.
     let audio = try! MeetingFolder.create(in: freshRoot(), at: Date())

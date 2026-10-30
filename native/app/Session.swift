@@ -94,6 +94,8 @@ final class Session {
     private var adopted = false
     /// The session stopped itself for lack of disk space.
     private var diskStop = false
+    /// Stop was asked while `find` could not confirm an adopted pid: SIGINT still to send.
+    private var stopPending = false
     private var started = Date()
     private var pausedSeconds = 0
     private var pausedAt: Date?
@@ -103,7 +105,7 @@ final class Session {
     private enum Wait { case exiting(since: Date), terminating(since: Date) }
     private var wait: Wait?
 
-    // Health, written by the recorder's stderr reader on its own thread.
+    // Health, written on the tick queue as `pollLog` reads the recorder's capture.log; read from any thread.
     private let healthLock = NSLock()
     private var mic = StreamHealth.ok
     private var system = StreamHealth.ok
@@ -194,8 +196,12 @@ final class Session {
 
     func pause() {
         guard case .recording(let dir) = phase else { return }
+        switch send(SIGUSR1, dir) {
+        case nil: return // cannot tell whether the pid is still the recorder
+        case false?: recorderGone(dir); return
+        case true?: break
+        }
         let t = now()
-        recorder.signal(pid, SIGUSR1)
         try? MeetingStore.writePrivately(Data(), to: pausedFile)
         pausedAt = t
         try? store.update(dir) { $0.pausedAt = t }
@@ -204,8 +210,12 @@ final class Session {
 
     func resume() {
         guard case .paused(let dir) = phase else { return }
+        switch send(SIGUSR2, dir) {
+        case nil: return
+        case false?: recorderGone(dir); return
+        case true?: break
+        }
         let t = now()
-        recorder.signal(pid, SIGUSR2)
         try? FileManager.default.removeItem(at: pausedFile)
         foldPause(at: t)
         let total = pausedSeconds
@@ -223,10 +233,31 @@ final class Session {
         case .finalising(let dir):
             return dir
         case .recording(let dir), .paused(let dir):
-            recorder.signal(pid, SIGINT)
-            beginFinalising(dir)
+            switch send(SIGINT, dir) {
+            case true?:
+                beginFinalising(dir)
+            case false?:
+                recorderGone(dir)
+            case nil:
+                beginFinalising(dir)
+                stopPending = true // SIGINT goes once find can confirm the pid
+            }
             return dir
         }
+    }
+
+    /// Sends `sig` to the recorder. An adopted pid gets it only once `find` confirms it is still the
+    /// recorder in `dir`. True: sent; false: the recorder has exited; nil: cannot tell, nothing sent.
+    private func send(_ sig: Int32, _ dir: URL) -> Bool? {
+        let ours = stillOurs(dir)
+        if ours == true { recorder.signal(pid, sig) }
+        return ours
+    }
+
+    /// The recorder exited while recording or paused: handled as a stop, straight to settling.
+    private func recorderGone(_ dir: URL) {
+        beginFinalising(dir)
+        advanceFinalising(dir, alive: false)
     }
 
     /// Recorded time only: pauses do not count, and the clock stops at stop.
@@ -275,7 +306,9 @@ final class Session {
                     self.record(dir, verified: true, seconds: seconds, reason: nil)
                     self.onFinished?(dir, true)
                 case .failed:
-                    self.record(dir, verified: false, seconds: nil, reason: Session.interrupted)
+                    let wasDiskStop = Session.readRecord(dir)?.error == Session.diskStopped
+                    self.record(dir, verified: false, seconds: nil,
+                                reason: wasDiskStop ? Session.diskStoppedFailed : Session.interrupted)
                     self.onFinished?(dir, false)
                 }
             }
@@ -283,18 +316,9 @@ final class Session {
         updateTimer()
     }
 
+    /// `recording.dir` may name a folder under any root (start dir=, --dir, MB_DIR). `find` is always
+    /// asked before anything is cleared: a live recorder is adopted wherever it records.
     private func adoptNamed(_ dir: URL) {
-        // Only a meeting folder in the store is ever recovered or written to.
-        guard MeetingFolder.parse(dir) != nil, Session.same(dir.deletingLastPathComponent(), store.root) else {
-            clearStateFiles()
-            return
-        }
-        let record = Session.readRecord(dir)
-        if let state = record?.state, state != .recording && state != .finalising {
-            // Already settled before the app went away; only the state files were left behind.
-            clearStateFiles()
-            return
-        }
         let t = now()
         let found: Int32
         switch recorder.find(dir: dir) {
@@ -302,6 +326,17 @@ final class Session {
             needsAdopt = true // cannot tell: change nothing, try again on the next tick
             return
         case .notFound:
+            // Nothing records there. A path that is not a meeting folder is never recovered or written to.
+            guard MeetingFolder.parse(dir) != nil else {
+                clearStateFiles()
+                return
+            }
+            let record = Session.readRecord(dir)
+            if let state = record?.state, state != .recording && state != .finalising {
+                // Already settled before the app went away; only the state files were left behind.
+                clearStateFiles()
+                return
+            }
             // The recorder died with the app: rebuild from the working files, or fail keeping them.
             adopted = true
             diskStop = record?.error == Session.diskStopped
@@ -313,6 +348,7 @@ final class Session {
         case .found(let p):
             found = p
         }
+        let record = Session.readRecord(dir)
         pid = found
         adopted = true
         diskStop = record?.error == Session.diskStopped
@@ -356,8 +392,7 @@ final class Session {
             return
         case .recording(let dir), .paused(let dir):
             if !alive {
-                beginFinalising(dir) // died on its own: handled as a stop
-                advanceFinalising(dir, alive: false)
+                recorderGone(dir) // died on its own: handled as a stop
                 return
             }
             let free = freeBytes()
@@ -410,6 +445,13 @@ final class Session {
             settle(dir, tryClean: status == nil || status == 0, exitStatus: status)
             return
         }
+        if stopPending {
+            switch send(SIGINT, dir) {
+            case true?: stopPending = false
+            case false?: settle(dir, tryClean: true, exitStatus: nil); return
+            case nil: break
+            }
+        }
         let t = now()
         switch w {
         case .exiting(let since):
@@ -452,10 +494,16 @@ final class Session {
     /// verifies, else failed with every file kept. A busy folder is left to whoever holds it.
     private func settle(_ dir: URL, tryClean: Bool, exitStatus: Int32?) {
         wait = nil
+        stopPending = false
         let rec = recorder
-        let failedExit = exitStatus.map { $0 != 0 } ?? false
+        // Taken now, while the log holds only the recorder's own lines: --recover appends to it too.
+        var exitReason: String? = nil
+        if let status = exitStatus, status != 0 {
+            exitReason = status > 128 ? "the recorder stopped unexpectedly (signal \(status - 128))"
+                                      : recorder.lastMessage(dir: dir)
+        }
         offQueue({ Session.finalise(rec, dir, tryClean: tryClean) }) { [weak self] outcome in
-            self?.finish(dir, outcome, failedExit: failedExit)
+            self?.finish(dir, outcome, exitReason: exitReason)
         }
     }
 
@@ -472,7 +520,7 @@ final class Session {
         }
     }
 
-    private func finish(_ dir: URL, _ outcome: Outcome, failedExit: Bool) {
+    private func finish(_ dir: URL, _ outcome: Outcome, exitReason: String?) {
         guard phase == .finalising(dir) else { return }
         switch outcome {
         case .busy:
@@ -480,7 +528,7 @@ final class Session {
         case .verified(let seconds):
             record(dir, verified: true, seconds: seconds ?? frozenSeconds, reason: nil)
         case .failed:
-            record(dir, verified: false, seconds: frozenSeconds, reason: failureReason(dir, failedExit: failedExit))
+            record(dir, verified: false, seconds: frozenSeconds, reason: diskStop ? Session.diskStoppedFailed : exitReason)
         }
         clearStateFiles()
         _ = resetHealth()
@@ -490,15 +538,8 @@ final class Session {
         if outcome != .busy { onFinished?(dir, outcome != .failed) }
     }
 
-    /// The disk stop if that is what ended it; else what a recorder that failed said last; else the
-    /// generic reason.
-    private func failureReason(_ dir: URL, failedExit: Bool) -> String {
-        if diskStop { return Session.diskStoppedFailed }
-        if failedExit, let message = recorder.lastMessage(dir: dir) { return message }
-        return Session.interrupted
-    }
-
-    /// Queued carries no error; failed carries the reason.
+    /// Queued carries no error; failed carries the reason (the disk stop if that ended it, else the
+    /// recorder's own reason or its signal, else the generic one).
     private func record(_ dir: URL, verified: Bool, seconds: Int?, reason: String?) {
         try? store.update(dir) { r in
             if let s = seconds { r.seconds = s }
