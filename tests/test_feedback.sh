@@ -20,31 +20,19 @@ chime start; wait
 if [ ! -s "$HOME/calls.log" ]; then pass "MB_SOUNDS=0 keeps it quiet"; else fail "MB_SOUNDS=0 keeps it quiet"; fi
 SOUNDS=1
 
-# --- start and stop play them ---
+# --- start and stop go to the app, which plays their sounds; the script plays none ---
 chime() { echo "chime $1" >> "$HOME/calls.log"; }
-notify() { :; }
+notify() { echo "notify $*" >> "$HOME/calls.log"; }
 recorder_ready() { return 0; }
-is_recording() { return 1; }
-has_session() { [ -f "$DIR_FILE" ]; }
-launch_recorder() { printf '%s' "$$"; }
-sleep() { :; }
-BASE_DIR="$HOME/Meetings"; mkdir -p "$BASE_DIR" "$STATE_DIR"
-: > "$HOME/calls.log"
-start_recording >/dev/null 2>&1
-if grep -q '^chime start$' "$HOME/calls.log"; then pass "a recording that starts plays the start sound"
-else fail "a recording that starts plays the start sound"; fi
-
-printf 'mix' > "$(cat "$DIR_FILE")/audio.m4a"
-: > "$HOME/calls.log"
-stop_recording >/dev/null 2>&1
-if grep -q '^chime stop$' "$HOME/calls.log"; then pass "stopping plays the stop sound"
-else fail "stopping plays the stop sound"; fi
-
-launch_recorder() { return 1; }
-: > "$HOME/calls.log"
+nc() { IFS= read -r _; printf '%s\n' "$REPLY"; }
+open() { echo "open $*" >> "$HOME/calls.log"; }
+mkdir -p "$APP_DIR" "$STATE_DIR"
+: > "$HOME/calls.log"; REPLY="ok recording $HOME/Meetings/a"
 (start_recording) >/dev/null 2>&1
-if ! grep -q '^chime start$' "$HOME/calls.log"; then pass "a recording that fails to start plays no start sound"
-else fail "a recording that fails to start plays no start sound"; fi
+REPLY="ok finalising $HOME/Meetings/a"
+(stop_recording) >/dev/null 2>&1
+if [ ! -s "$HOME/calls.log" ]; then pass "start and stop through the app play no sound from the script"
+else fail "start and stop through the app play no sound from the script: $(cat "$HOME/calls.log")"; fi
 
 # --- the minutes record only what was said, and owners only when named ---
 if printf '%s' "$FINAL_INSTRUCTIONS" | grep -q 'None' \

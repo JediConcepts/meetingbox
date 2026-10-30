@@ -26,6 +26,7 @@ VERSION="1.3.1"
 # --------------------------------------------------------------- configuration
 
 BASE_DIR="${MB_DIR:-$HOME/Meetings}"
+DIR_ARG="${MB_DIR:-}"                    # sent to the app only when given
 ENGINE="${MB_ENGINE:-auto}"              # auto | native | whisper
 LOCALE="${MB_LOCALE:-en-GB}"
 MIC="${MB_MIC:-}"                        # substring match, empty = system default
@@ -941,108 +942,171 @@ doctor() {
 }
 
 # ------------------------------------------------------------------- recording
+#
+# The app owns recording: it starts the recorder, signals it, finalises the audio,
+# queues the meeting and keeps the state files. This command is its client. Each
+# command is one request line over a private socket and one reply line back:
+# `ok <state> <folder or ->` or `error <message>`. The state files are read here only
+# when the app is not running, so `status` still tells the truth after a crash.
 
 # The recorder is found by the folder it writes to, not by a saved PID, so a
 # PID reused after a crash or reboot can never be mistaken for it.
 session_dir()  { cat "$DIR_FILE" 2>/dev/null || true; }
 is_recording() { d="$(session_dir)"; [ -n "$d" ] && [ -n "$(recorder_pids "$d")" ]; }
 
-# A session whose recorder died on its own (crash, sleep, force quit) still has
-# audio worth keeping, so the next press should finish it, not start a new one.
+# The app keeps recording.dir while a recording is going or still being finished.
 has_session() { [ -f "$DIR_FILE" ]; }
 
-# Start and stop run one at a time. A double tap on the hotkey would otherwise
-# start two recorders, or try to stop one that is still starting.
-LOCK="$STATE_DIR/busy"
 PAUSE_FILE="$STATE_DIR/paused"
-take_lock() {
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
-    if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
-      die "meetingbox is busy starting or stopping a recording, try again in a moment"
-    fi
-    release_lock   # left behind by a run that crashed
-    mkdir "$LOCK" 2>/dev/null || die "meetingbox is busy, try again in a moment"
-  fi
-  printf '%s' "$$" > "$LOCK/pid"
-  trap release_lock EXIT
-}
+# meetingbox 1.3 and earlier serialised start and stop with this lock; reset still
+# clears one left behind.
+LOCK="$STATE_DIR/busy"
 release_lock() { rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; }
 
-newest_m4a() {
-  found=""
-  for f in "$1"/*.m4a; do
-    [ -e "$f" ] || continue
-    [ -z "$found" ] && found="$f" && continue
-    [ "$f" -nt "$found" ] && found="$f"
+CONTROL_SOCK="$STATE_DIR/control.sock"
+APP_WAIT=10   # seconds to wait for an app that was not running
+
+# Percent-encodes every byte except unreserved characters and /, so a request stays
+# one line of plain words whatever a microphone name or folder holds.
+pct_encode() {
+  local out="" h
+  for h in $(printf '%s' "$1" | od -An -v -tx1); do
+    case "$h" in
+      2d|2e|2f|3[0-9]|4[1-9a-f]|5[0-9a]|5f|6[1-9a-f]|7[0-9a]|7e) out="$out$(printf "\\x$h")" ;;
+      *) out="$out%$(printf '%s' "$h" | tr 'a-f' 'A-F')" ;;
+    esac
   done
-  printf '%s' "$found"
+  printf '%s' "$out"
+}
+
+# One request, the first line of the reply. Fails when nothing is listening (no
+# socket, or one left by an app that has gone); a connection that is closed with
+# no reply gives an empty line.
+app_send() {
+  local reply
+  reply="$(nc -U -w 30 "$CONTROL_SOCK" <<< "$1" 2>/dev/null)" || return 1
+  printf '%s' "${reply%%
+*}"
+}
+
+# An app from meetingbox 1.3 or earlier is only a recorder: opened with no arguments
+# it starts recording on its own, with nothing to answer. An app built for this
+# command names the script in its Info.plist (MBScriptPath); only that one is opened.
+app_is_client_aware() {
+  [ -n "$(/usr/libexec/PlistBuddy -c 'Print :MBScriptPath' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)" ]
+}
+
+# Sends a request to the app, opening it in the background if it is not running and
+# trying again for up to $APP_WAIT seconds. Only a failed connection is retried: a
+# request that got through is never sent twice. An `error` reply ends the command
+# with its text; an `ok` reply leaves "<state> <folder>" in APP_REPLY.
+APP_REPLY=""
+app_request() {
+  local reply="" i=0
+  if ! reply="$(app_send "$1")"; then
+    [ -d "$APP_DIR" ] || die "meetingbox is not installed. Run: meetingbox setup"
+    app_is_client_aware || die "the installed meetingbox app is older than this command. Run: meetingbox setup"
+    open -g "$APP_DIR" >/dev/null 2>&1 || true
+    while :; do
+      [ "$i" -lt $((APP_WAIT * 2)) ] || die "meetingbox did not start. Run: meetingbox setup"
+      sleep 0.5; i=$((i + 1))
+      if reply="$(app_send "$1")"; then break; fi
+    done
+  fi
+  case "$reply" in
+    "ok "*)    APP_REPLY="${reply#ok }" ;;
+    "error "*) die "${reply#error }" ;;
+    "")        die "meetingbox did not answer. Try again in a moment" ;;
+    *)         die "meetingbox gave an answer this command does not understand: $reply" ;;
+  esac
+}
+
+# What an ok reply means, said the way status always has.
+say_state() {
+  local state="${APP_REPLY%% *}" folder="${APP_REPLY#* }"
+  case "$state" in
+    idle)              info "idle" ;;
+    recording|paused)  ok "$state -> $folder" ;;
+    finalising)        ok "stopped -> $folder"
+                       info "the minutes will open in the meetingbox window when they are ready" ;;
+    *)                 info "$APP_REPLY" ;;
+  esac
+}
+
+# --mic and --dir (or MB_MIC and MB_DIR) travel inside the request when given;
+# otherwise the app's own settings apply. A folder is sent as a full path.
+recording_options() {
+  local opts="" d="$DIR_ARG"
+  if [ -n "$MIC" ]; then opts=" mic=$(pct_encode "$MIC")"; fi
+  if [ -n "$d" ]; then
+    case "$d" in
+      /*) ;;
+      "~")  d="$HOME" ;;
+      "~/"*) d="$HOME/${d#\~/}" ;;
+      *)    d="$PWD/$d" ;;
+    esac
+    opts="$opts dir=$(pct_encode "$d")"
+  fi
+  printf '%s' "$opts"
 }
 
 start_recording() {
   recorder_ready || die "the recorder is not installed yet. Run: meetingbox setup"
-  if is_recording; then
-    warn "already recording in $(session_dir)"
-    return 0
-  fi
-  if has_session; then
-    warn "an earlier recording was never finished: $(session_dir)"
-    info "it is still on disk. To get its minutes: meetingbox process $(session_dir)/audio.m4a"
-  fi
-
-  stamp="$(date +%Y-%m-%d_%H%M)"
-  dir="$BASE_DIR/$stamp"
-  # Two recordings in the same minute would otherwise share a folder, and the
-  # second would overwrite the first meeting's audio and minutes.
-  [ -e "$dir" ] && dir="$BASE_DIR/$(date +%Y-%m-%d_%H%M%S)"
-  mkdir -p "$dir"
-  printf '%s' "$dir" > "$DIR_FILE"
-  rm -f "$PAUSE_FILE"
-
-  pid="$(launch_recorder "$dir" meeting "$dir/capture.log" ${MIC:+-d "$MIC"})" || pid=""
-  [ -n "$pid" ] && sleep 2
-  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$DIR_FILE"
-    [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
-    # nothing recorded, so drop the log just shown and the folder made above
-    if [ -z "$(newest_m4a "$dir")" ]; then
-      rm -f "$dir/capture.log"; rmdir "$dir" 2>/dev/null || true
-    fi
-    die "the recorder stopped immediately. Usually a missing permission: meetingbox setup"
-  fi
-
-  say "recording ${c_dim}->${c_0} $dir"
-  info "press the key again, or run 'meetingbox stop', to finish"
-  chime start
-  notify "meetingbox" "Recording"
+  app_request "start$(recording_options)"
+  say_state
 }
 
-# Pause and resume only signal the recorder; it keeps its files open throughout.
+stop_recording() {
+  app_request stop
+  say_state
+}
+
+# Start, or stop the recording that is going.
+toggle_recording() {
+  app_request "toggle$(recording_options)"
+  say_state
+}
+
 pause_recording() {
-  is_recording || die "not recording"
-  if [ -e "$PAUSE_FILE" ]; then info "already paused"; return 0; fi
   # A recorder from meetingbox 1.2 writes <stamp>_meeting.m4a and has no pause:
-  # SIGUSR1 would kill it and leave the audio unplayable.
-  for f in "$(session_dir)"/*_meeting.m4a; do
-    [ -e "$f" ] && die "this recording was started by an older meetingbox and cannot pause. It is still recording; 'meetingbox stop' finishes it"
-  done
-  for p in $(recorder_pids "$(session_dir)"); do kill -USR1 "$p" 2>/dev/null || true; done
-  : > "$PAUSE_FILE"
-  say "paused"
+  # SIGUSR1 would kill it and leave the audio unplayable. Refused before the app is asked.
+  local d f
+  d="$(session_dir)"
+  if [ -n "$d" ]; then
+    for f in "$d"/*_meeting.m4a; do
+      if [ -e "$f" ]; then
+        die "this recording was started by an older meetingbox and cannot pause. It is still recording; 'meetingbox stop' finishes it"
+      fi
+    done
+  fi
+  app_request pause
+  say_state
 }
 
 resume_recording() {
-  is_recording || die "not recording"
-  if [ ! -e "$PAUSE_FILE" ]; then info "not paused"; return 0; fi
-  for p in $(recorder_pids "$(session_dir)"); do kill -USR2 "$p" 2>/dev/null || true; done
-  rm -f "$PAUSE_FILE"
-  say "resumed"
+  app_request resume
+  say_state
 }
 
+# Asks the app, but never opens it. With no app answering (not running, crashed or
+# force quit) it reads the state files the app left and looks for the recorder
+# itself, which carries on recording without the app.
 status_cmd() {
-  if ! is_recording; then info "idle"
-  elif [ -e "$PAUSE_FILE" ]; then ok "paused -> $(session_dir)"
-  else ok "recording -> $(session_dir)"; fi
+  local reply d
+  if reply="$(app_send status)"; then
+    case "$reply" in
+      "ok "*)    APP_REPLY="${reply#ok }"; say_state; return 0 ;;
+      "error "*) die "${reply#error }" ;;
+    esac
+  fi
+  info "meetingbox is not running, so this is from the recording files"
+  d="$(session_dir)"
+  if is_recording; then
+    if [ -e "$PAUSE_FILE" ]; then ok "paused -> $d"; else ok "recording -> $d"; fi
+  else
+    info "idle"
+    if [ -n "$d" ]; then info "the recording in $d did not finish; open meetingbox to recover it"; fi
+  fi
 }
 
 # The recorder writes mic.caf and call.caf while recording, and on stop turns them
@@ -1070,44 +1134,6 @@ recover_cmd() {
   info "to get its minutes: meetingbox process $rdir"
 }
 
-STOPPED_AUDIO=""
-stop_recording() {
-  has_session || die "not recording"
-  dir="$(session_dir)"
-
-  if is_recording; then
-    stop_recorders "$dir"
-  else
-    warn "the recorder had already stopped, picking up what it wrote"
-  fi
-  rm -f "$DIR_FILE" "$PAUSE_FILE"
-
-  # killed before it could finish (it would not stop, or it crashed): finish it now
-  if recording_unfinished "$dir"; then
-    recover_dir "$dir" || die "this recording was not finished. Run: meetingbox recover $dir"
-    ok "recovered the recording from its working files"
-  fi
-
-  # the recorder writes the mix as audio.m4a, beside mic.m4a and call.m4a
-  audio="$dir/audio.m4a"
-  # a recording started by v1.2.2 wrote <stamp>_meeting.m4a: take that one, and only that
-  if [ ! -e "$audio" ]; then
-    for f in "$dir"/*_meeting.m4a; do
-      if [ -s "$f" ]; then mv -n "$f" "$audio" || true; break; fi
-    done
-  fi
-  if [ ! -s "$audio" ]; then
-    [ -s "$dir/capture.log" ] && sed 's/^/           /' "$dir/capture.log" >&2
-    die "no recording was written in $dir"
-  fi
-
-  secs=""
-  have ffprobe && secs="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$audio" 2>/dev/null || true)"
-  if [ -n "$secs" ]; then ok "stopped, ${secs%.*}s captured"; else ok "stopped"; fi
-  chime stop
-  notify "meetingbox" "Transcribing"
-  STOPPED_AUDIO="$audio"
-}
 
 # ----------------------------------------------------------------- transcribing
 
@@ -1756,7 +1782,7 @@ RESET_TOOLS=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --mic|--device) MIC="$2"; shift 2 ;;
-    --dir)     BASE_DIR="$2"; shift 2 ;;
+    --dir)     BASE_DIR="$2"; DIR_ARG="$2"; shift 2 ;;
     --locale)  LOCALE="$2"; shift 2 ;;
     --model)   WHISPER_MODEL="$2"; ENGINE="whisper"; shift 2 ;;
     --whisper) ENGINE="whisper"; shift ;;
@@ -1777,12 +1803,10 @@ case "${cmd:-toggle}" in
       warn "not set up yet"
       confirm "run setup now?" && setup || info "run 'meetingbox setup' when you are ready"
     else
-      take_lock
-      if has_session; then stop_recording; release_lock; process "$STOPPED_AUDIO"
-      else start_recording; fi
+      toggle_recording
     fi ;;
-  start)   take_lock; start_recording ;;
-  stop)    take_lock; stop_recording; release_lock; process "$STOPPED_AUDIO" ;;
+  start)   start_recording ;;
+  stop)    stop_recording ;;
   process) [ -n "$argfile" ] || die "usage: meetingbox process <audio-or-transcript>"
            process "$argfile" ;;
   recover) [ -n "$argfile" ] || die "usage: meetingbox recover <folder>"
@@ -1792,8 +1816,8 @@ case "${cmd:-toggle}" in
   mics|devices)
     recorder_ready || die "the recorder is not installed. Run: meetingbox setup"
     "$APP_BIN" --record -l ;;
-  pause)   take_lock; pause_recording ;;
-  resume)  take_lock; resume_recording ;;
+  pause)   pause_recording ;;
+  resume)  resume_recording ;;
   status)  status_cmd ;;
   reset)
     if [ "$RESET_TOOLS" = 1 ]; then reset_cmd tools; else reset_cmd state; fi ;;

@@ -48,37 +48,14 @@ for which in 'start system audio' 'start microphone'; do
 done
 rm -f "$PERM_DIR/log"; rmdir "$PERM_DIR" 2>/dev/null
 
-# --- stop_recording takes audio.m4a, whatever else is in the folder ---
+# --- the folder the later checks use ---
+# Stopping now belongs to the app (Session and --recover, tested in native/tests/app);
+# what stays here is recovery and processing from the terminal.
 dir="$HOME/meeting"
-has_session() { return 0; }
-session_dir() { printf '%s' "$dir"; }
-is_recording() { return 1; }
 notify() { :; }
 have() { return 1; }
 DIR_FILE="$HOME/dir"
-
 mkdir -p "$dir"
-printf 'mix' > "$dir/audio.m4a"; printf 'm' > "$dir/mic.m4a"
-touch -t 202001010000 "$dir/audio.m4a"   # mic.m4a is the newest file
-STOPPED_AUDIO=""
-stop_recording 2>/dev/null
-if [ "$STOPPED_AUDIO" = "$dir/audio.m4a" ] && [ -s "$dir/mic.m4a" ]; then
-  pass "stop_recording uses audio.m4a and leaves mic.m4a"
-else fail "stop_recording uses audio.m4a and leaves mic.m4a ($STOPPED_AUDIO)"; fi
-
-rm -f "$dir/audio.m4a"
-out="$( (stop_recording) 2>&1 )"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no recording was written' && [ -s "$dir/mic.m4a" ]; then
-  pass "stop_recording without audio.m4a: no recording, mic.m4a not taken"
-else fail "stop_recording without audio.m4a: no recording, mic.m4a not taken"; fi
-
-# a recording started by v1.2.2 wrote <stamp>_meeting.m4a: that one is taken as audio.m4a
-printf 'old' > "$dir/2026-10-27_1430_meeting.m4a"
-got="$( (stop_recording 2>/dev/null; printf '%s' "$STOPPED_AUDIO") )"
-if [ "$got" = "$dir/audio.m4a" ] && [ "$(cat "$dir/audio.m4a" 2>/dev/null)" = old ] \
-   && [ ! -e "$dir/2026-10-27_1430_meeting.m4a" ] && [ -s "$dir/mic.m4a" ]; then
-  pass "stop_recording adopts a v1.2.2 *_meeting.m4a"
-else fail "stop_recording adopts a v1.2.2 *_meeting.m4a ($got)"; fi
 
 # --- crash-safe recordings: the recorder writes mic.caf and call.caf, then the .m4a ---
 # A stand-in recorder: --recover turns the .caf into the three .m4a and the marker,
@@ -98,33 +75,6 @@ export FAKE_RECOVER_FAIL=0
 new_session() {
   rm -rf "$dir"; mkdir -p "$dir"; printf '%s' "$dir" > "$DIR_FILE"; : > "$HOME/calls.log"
 }
-# The recorder would not stop when asked, so it was killed: its .caf are left as they were.
-is_recording() { return 0; }
-stop_recorders() { echo "stop_recorders $1 (kill -9)" >> "$HOME/calls.log"; }
-
-new_session; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
-STOPPED_AUDIO=""
-out="$(stop_recording 2>&1; printf '\nAUDIO=%s' "$STOPPED_AUDIO")"
-if grep -qxF "recorder --recover $dir" "$HOME/calls.log" && printf '%s' "$out" | grep -q 'recovered' \
-   && printf '%s' "$out" | grep -qxF "AUDIO=$dir/audio.m4a" && [ -e "$dir/.recording-complete" ]; then
-  pass "stop_recording: a killed recorder's .caf are recovered, then processed"
-else fail "stop_recording: a killed recorder's .caf are recovered, then processed ($out)"; fi
-
-new_session; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
-out="$(FAKE_RECOVER_FAIL=1; (stop_recording; printf 'AUDIO=%s' "$STOPPED_AUDIO") 2>&1)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "this recording was not finished. Run: meetingbox recover $dir" \
-   && ! printf '%s' "$out" | grep -q 'AUDIO=' && [ -e "$dir/mic.caf" ] && [ -e "$dir/call.caf" ]; then
-  pass "stop_recording: recovery that fails keeps the .caf and processes nothing"
-else fail "stop_recording: recovery that fails keeps the .caf and processes nothing ($rc: $out)"; fi
-
-new_session; for f in audio mic call; do printf 'aac' > "$dir/$f.m4a"; done; : > "$dir/.recording-complete"
-STOPPED_AUDIO=""
-stop_recording 2>/dev/null
-if ! grep -q -- '--recover' "$HOME/calls.log" && [ "$STOPPED_AUDIO" = "$dir/audio.m4a" ]; then
-  pass "stop_recording: a recording the recorder finished is not recovered"
-else fail "stop_recording: a recording the recorder finished is not recovered"; fi
-is_recording() { return 1; }
-
 # --- process refuses a recording that was never finished ---
 transcribe_channels() { echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2"; }
 transcribe() { echo "transcribe $*" >> "$HOME/calls.log"; printf 'hi\n' > "$2"; }

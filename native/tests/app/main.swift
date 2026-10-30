@@ -1,4 +1,4 @@
-// sources: ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
@@ -276,8 +276,10 @@ final class FakeRecorder: RecorderControl {
     var healthLine: ((String) -> Void)? = nil
     var tails: [String: LogTail] = [:]   // the real capture.log tail, over files in the temp folder
     var nextPid: Int32 = 1000
+    var launchDelay: useconds_t = 0      // a slow launch, to widen any race between two starts
 
     func launch(dir: URL, mic: String?, onHealthLine: @escaping (String) -> Void) throws -> Int32 {
+        if launchDelay > 0 { usleep(launchDelay) }
         if let e = launchError { throw e }
         launches.append((dir, mic))
         nextPid += 1
@@ -346,9 +348,9 @@ final class Rig {
         try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
     }
     @discardableResult
-    func make() -> Session {
+    func make(tickQueue: DispatchQueue? = nil) -> Session {
         session = Session(stateDir: state, recorder: rec, store: store, now: { [clock] in clock.now() },
-                          freeBytes: { [unowned self] in self.free }, tickQueue: nil, workQueue: nil)
+                          freeBytes: { [unowned self] in self.free }, tickQueue: tickQueue, workQueue: nil)
         session.onFinished = { [unowned self] in self.finished.append(($0, $1)) }
         session.onChange = { [unowned self] in self.changes.append($0) }
         return session
@@ -1068,6 +1070,28 @@ do {
     check(r.rec.sent(SIGINT) == 1 && r.rec.signals.last?.pid == 4242, "F: SIGINT goes once find confirms the pid")
 }
 
+// Task 4 P1: a stop held while find is unknown starts its exit wait when SIGINT is finally sent,
+// so SIGINT and SIGTERM never land on the same tick and the recorder gets its full time to finalise.
+do {
+    let r = Rig()
+    let (s, dir) = adoptedLive(r) // started 300 s ago: exit limit 60 + 300 / 60 = 65 s
+    r.rec.findUnknown = true
+    _ = s.stop()
+    r.at(50)
+    r.at(101)
+    check(r.rec.signals.isEmpty && s.phase == .finalising(dir), "P1: nothing is sent while find cannot tell")
+    r.rec.findUnknown = false
+    r.at(102)
+    check(r.rec.sent(SIGINT) == 1 && r.rec.sent(SIGTERM) == 0, "P1: the held SIGINT goes alone, no SIGTERM on the same tick")
+    r.at(102 + 64)
+    check(r.rec.sent(SIGTERM) == 0 && r.rec.sent(SIGKILL) == 0, "P1: no SIGTERM before a full exit wait from the SIGINT")
+    r.at(102 + 65)
+    check(r.rec.sent(SIGTERM) == 1 && r.rec.sent(SIGKILL) == 0, "P1: SIGTERM a full exit wait after the SIGINT")
+    r.rec.exit(4242, 0, verifies: true)
+    r.at(102 + 66)
+    check(s.phase == .idle && r.stateOf(dir) == "queued", "P1: a recorder that then finishes is queued")
+}
+
 // Ruling G: a failed orphan that was stopped for disk space keeps that reason.
 do {
     let r = Rig()
@@ -1753,6 +1777,270 @@ do {
     _ = missing.run(audio: audio, progress: progress, attempt: "x") { s, l in gone = (s, l); sem2.signal() }
     check(sem2.wait(timeout: .now() + 5) == .success && gone?.0 == 127 && (gone?.1 ?? "").contains("could not start"),
           "ScriptRunner reports a script it cannot start")
+}
+
+// MARK: - The control socket (Task 6)
+
+// parse: every request, mic and dir decoded, nothing else accepted.
+do {
+    check(ControlRequest.parse("status") == .status && ControlRequest.parse("pause") == .pause
+          && ControlRequest.parse("resume") == .resume && ControlRequest.parse("stop") == .stop
+          && ControlRequest.parse("show") == .show, "parse: status, pause, resume, stop and show")
+    check(ControlRequest.parse("start") == .start(mic: nil, dir: nil)
+          && ControlRequest.parse("toggle") == .toggle(mic: nil, dir: nil), "parse: start and toggle with nothing else")
+    check(ControlRequest.parse("start mic=USB%20Mic dir=%2FUsers%2Fme%2FMy%20Meetings")
+          == .start(mic: "USB Mic", dir: "/Users/me/My Meetings"), "parse: start decodes mic and dir")
+    check(ControlRequest.parse("toggle dir=/tmp/x mic=A%3DB%25") == .toggle(mic: "A=B%", dir: "/tmp/x"),
+          "parse: toggle decodes mic and dir in either order")
+    check(ControlRequest.parse("start mic=Caf%C3%A9") == .start(mic: "Café", dir: nil), "parse: UTF-8 in a mic name")
+    for bad in ["rm -rf /", "", " ", "status\nstop", "status\n", "stop\r", "status now", "Status", "start mic=a mic=b",
+                "start colour=red", "start mic=%ZZ", "start  mic=a", "start mic", "start mic=", "show dir=/tmp",
+                "start mic=a\u{0}"] {
+        check(ControlRequest.parse(bad) == nil, "parse: refuses \(bad.debugDescription)")
+    }
+}
+
+func testDefaults() -> UserDefaults {
+    counter += 1
+    // An absolute path keeps the suite's plist in the scratch folder, away from ~/Library/Preferences.
+    return UserDefaults(suiteName: scratch.appendingPathComponent("prefs\(counter)").path)!
+}
+
+// Preferences: defaults on an empty suite, and they persist.
+do {
+    let home = URL(fileURLWithPath: "/Users/someone", isDirectory: true)
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: home)
+    check(p.showMenuBar && p.floating == .whileRecording && p.showInDock && p.openMinutes && p.sounds
+          && p.microphone == nil, "Preferences: defaults on an empty suite")
+    check(p.meetingsFolder.path == "/Users/someone/Meetings", "Preferences: the meetings folder defaults to ~/Meetings")
+    p.showMenuBar = false; p.floating = .never; p.showInDock = false; p.openMinutes = false; p.sounds = false
+    p.meetingsFolder = URL(fileURLWithPath: "/Volumes/Work/Calls", isDirectory: true)
+    p.microphone = "USB Mic"
+    let q = Preferences(defaults: d, home: home)
+    check(!q.showMenuBar && q.floating == .never && !q.showInDock && !q.openMinutes && !q.sounds
+          && q.meetingsFolder.path == "/Volumes/Work/Calls" && q.microphone == "USB Mic", "Preferences: every setting persists")
+    p.floating = .always; p.microphone = nil
+    let q2 = Preferences(defaults: d, home: home)
+    check(q2.floating == .always && q2.microphone == nil, "Preferences: floating always, and the microphone back to the default")
+    check(FloatingMode.allCases.map(\.rawValue) == ["always", "whileRecording", "never"], "FloatingMode: always, while recording, never")
+    check(p.formatTimer(0) == "00:00" && p.formatTimer(59) == "00:59" && p.formatTimer(3599) == "59:59"
+          && p.formatTimer(3600) == "1:00:00" && p.formatTimer(36_061) == "10:01:01", "formatTimer: mm:ss, then h:mm:ss")
+    d.removePersistentDomain(forName: scratch.appendingPathComponent("prefs\(counter)").path)
+}
+
+/// A handler over a Rig's session; the meetings folder preference is the Rig's store root.
+func handlerRig(tickQueue: DispatchQueue? = nil, queue: DispatchQueue = .main) -> (Rig, ControlHandler, Preferences) {
+    let r = Rig()
+    let s = r.make(tickQueue: tickQueue)
+    let prefs = Preferences(defaults: testDefaults(), home: r.root)
+    prefs.meetingsFolder = r.store.root
+    return (r, ControlHandler(session: s, preferences: prefs, queue: queue), prefs)
+}
+
+// reply: the session's answers, one line each.
+do {
+    let (r, h, prefs) = handlerRig()
+    prefs.microphone = "Desk Mic"
+    var started: [URL] = []
+    var stopped: [URL] = []
+    var shown = 0
+    h.onStarted = { started.append($0) }
+    h.onStopped = { stopped.append($0) }
+    h.onShow = { shown += 1 }
+    check(h.reply(for: .status) == "ok idle -", "reply: status when idle")
+    check(h.reply(for: .pause) == "error not recording" && h.reply(for: .resume) == "error not recording"
+          && h.reply(for: .stop) == "error not recording", "reply: pause, resume and stop with nothing recording")
+    let first = h.reply(for: .start(mic: nil, dir: nil))
+    let folders = names(r.store.root)
+    let dir = Session.folderURL(r.store.root.appendingPathComponent(folders.first ?? "none").path)
+    check(folders.count == 1 && first == "ok recording \(dir.path)", "reply: ok recording <dir> after a start (\(first))")
+    check(r.rec.launches.count == 1 && r.rec.launches[0].mic == "Desk Mic", "reply: start uses the microphone preference")
+    check(started == [dir], "reply: a start is announced once (for the start sound)")
+    check(h.reply(for: .start(mic: nil, dir: nil)) == "error already recording in \(dir.path)", "reply: a second start says already recording in <dir>")
+    check(h.reply(for: .toggle(mic: nil, dir: nil)) == "ok finalising \(dir.path)", "reply: toggle while recording stops")
+    check(stopped == [dir], "reply: a stop is announced once (for the stop sound)")
+    check(h.reply(for: .toggle(mic: nil, dir: nil)) == "ok finalising \(dir.path)" && stopped == [dir],
+          "reply: toggle while finalising changes nothing and announces nothing")
+    _ = h.reply(for: .show)
+    check(shown == 1, "reply: show asks the app to show itself")
+}
+do {
+    let (r, h, _) = handlerRig()
+    _ = h.reply(for: .start(mic: "USB", dir: nil))
+    let dir = Session.folderURL(r.store.root.appendingPathComponent(names(r.store.root)[0]).path)
+    check(r.rec.launches.last?.mic == "USB", "reply: a request's mic beats the preference")
+    check(h.reply(for: .pause) == "ok paused \(dir.path)" && h.reply(for: .status) == "ok paused \(dir.path)", "reply: pause, then status says paused")
+    check(h.reply(for: .pause) == "ok paused \(dir.path)" && r.rec.sent(SIGUSR1) == 1, "reply: a second pause sends nothing more")
+    check(h.reply(for: .resume) == "ok recording \(dir.path)", "reply: resume")
+    check(h.reply(for: .stop) == "ok finalising \(dir.path)" && r.rec.sent(SIGINT) == 1, "reply: ok finalising <dir> from stop")
+    check(h.reply(for: .stop) == "ok finalising \(dir.path)" && r.rec.sent(SIGINT) == 1, "reply: stop again while finalising sends nothing")
+    check(h.reply(for: .start(mic: nil, dir: nil)).hasPrefix("error already recording in "), "reply: no start while finalising")
+}
+do {
+    let (r, h, _) = handlerRig()
+    let other = freshRoot().appendingPathComponent("Elsewhere")
+    let reply = h.reply(for: .start(mic: nil, dir: other.path))
+    check(names(r.store.root).isEmpty && names(other).count == 1 && reply == "ok recording \(other.appendingPathComponent(names(other)[0]).path)",
+          "reply: a request's dir beats Preferences.meetingsFolder")
+}
+do {
+    let (r, h, _) = handlerRig()
+    check(h.reply(for: .start(mic: nil, dir: "Meetings")).hasPrefix("error ") && r.rec.launches.isEmpty && names(r.store.root).isEmpty,
+          "reply: a relative dir is refused and nothing is made")
+}
+do {
+    let (r, h, _) = handlerRig()
+    r.rec.launchError = FakeError(text: "Failed to start system audio: denied")
+    var started = 0
+    h.onStarted = { _ in started += 1 }
+    check(h.reply(for: .start(mic: nil, dir: nil)) == "error Failed to start system audio: denied", "reply: error <launch message> when the launch throws")
+    check(started == 0 && h.reply(for: .status) == "ok idle -", "reply: a failed start plays nothing and leaves idle")
+    r.rec.launchError = FakeError(text: "two\nlines")
+    check(h.reply(for: .toggle(mic: nil, dir: nil)) == "error two lines", "reply: an error is always one line")
+}
+
+/// A short folder in /tmp: a socket path must fit in 104 bytes.
+func shortTemp() -> URL {
+    var template = Array("/tmp/mb-t6.XXXXXX".utf8CString)
+    guard mkdtemp(&template) != nil else { fatalError("mkdtemp") }
+    return URL(fileURLWithPath: String(cString: template), isDirectory: true)
+}
+/// Runs a program, feeds it `input`, and gives its exit status and stdout.
+func run(_ path: String, _ args: [String], input: String = "") -> (Int32, String) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let inp = Pipe(), out = Pipe()
+    p.standardInput = inp
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return (-1, "") }
+    inp.fileHandleForWriting.write(Data(input.utf8))
+    try? inp.fileHandleForWriting.close()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (p.terminationStatus, String(decoding: data, as: UTF8.self))
+}
+func inode(_ u: URL) -> UInt64 {
+    var st = stat()
+    return lstat(u.path, &st) == 0 ? UInt64(st.st_ino) : 0
+}
+/// A socket file nobody listens on, as a crashed instance leaves it.
+func deadSocket(_ path: URL) {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    withUnsafeMutableBytes(of: &addr.sun_path) { buf in
+        let bytes = Array(path.path.utf8)
+        for (i, b) in bytes.enumerated() { buf[i] = b }
+    }
+    _ = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) } }
+    close(fd)
+}
+
+do {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let q = DispatchQueue(label: "meetingbox.test.tick")
+    let (r, h, _) = handlerRig(tickQueue: q, queue: q)
+    let state = tmp.appendingPathComponent("state")
+    let sock = state.appendingPathComponent("control.sock")
+    let server = try? ControlServer(socket: sock, handler: h)
+    server?.start()
+    check(server != nil && mode(state) == 0o700 && mode(sock) == 0o600, "server: the folder is 0700 and the socket 0600")
+    let nc = run("/usr/bin/nc", ["-U", "-w", "5", sock.path], input: "status\n")
+    check(nc == (0, "ok idle -\n"), "server: answers status from a real nc -U (\(nc))")
+    check(ControlClient.send("rm -rf /", to: sock) == "error unknown request", "server: an unknown request gets an error, nothing else")
+    // Clients that connect and leave before they are served, as the stale-socket probe does: the
+    // reply to them must fail quietly, never raise SIGPIPE for the whole app.
+    for _ in 0..<50 { if case .connected(let fd) = ControlServer.connectTo(sock.path) { close(fd) } }
+    usleep(200_000)
+    check(ControlClient.send("status", to: sock) == "ok idle -", "server: clients that leave at once do no harm")
+
+    // Review Focus 6: two starts at the same moment over two connections.
+    q.sync { r.rec.launchDelay = 300_000 }
+    let go = DispatchSemaphore(value: 0)
+    let group = DispatchGroup()
+    let lock = NSLock()
+    var replies: [String] = []
+    for _ in 0..<2 {
+        DispatchQueue.global().async(group: group) {
+            go.wait()
+            let reply = ControlClient.send("start", to: sock, timeout: 10) ?? "no reply"
+            lock.lock(); replies.append(reply); lock.unlock()
+        }
+    }
+    go.signal(); go.signal()
+    group.wait()
+    let oks = replies.filter { $0.hasPrefix("ok recording ") }
+    let errs = replies.filter { $0.hasPrefix("error already recording in ") }
+    check(oks.count == 1 && errs.count == 1, "RF6: two starts together give one ok recording and one already recording (\(replies))")
+    check(q.sync { r.rec.launches.count } == 1 && names(r.store.root).count == 1, "RF6: and one launch, one folder")
+    check(oks.first.map { String($0.dropFirst("ok recording ".count)) } == errs.first.map { String($0.dropFirst("error already recording in ".count)) },
+          "RF6: both name the same folder")
+
+    // A live listener's socket is never taken.
+    let (_, h2, _) = handlerRig(tickQueue: q, queue: q)
+    let before = inode(sock)
+    check((try? ControlServer(socket: sock, handler: h2)) == nil, "server: a socket with a live listener is not replaced")
+    check(inode(sock) == before && ControlClient.send("status", to: sock)?.hasPrefix("ok recording ") == true,
+          "server: and the first instance still answers on it")
+    server?.stop()
+    check(!fm.fileExists(atPath: sock.path), "server: stop removes its own socket")
+    q.sync {} // let any tick finish before the rig goes
+}
+
+// A socket left by a dead instance is replaced; anything that is not a socket is left alone.
+do {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let (_, h, _) = handlerRig()
+    let sock = tmp.appendingPathComponent("control.sock")
+    deadSocket(sock)
+    var st = stat()
+    check(lstat(sock.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK && ControlClient.send("status", to: sock) == nil,
+          "stale: a socket file nobody listens on")
+    let q = DispatchQueue(label: "meetingbox.test.tick2")
+    let (_, hq, _) = handlerRig(tickQueue: q, queue: q)
+    let server = try? ControlServer(socket: sock, handler: hq)
+    server?.start()
+    check(server != nil && ControlClient.send("status", to: sock) == "ok idle -", "stale: a socket left by a dead instance is replaced")
+    server?.stop()
+    let plain = tmp.appendingPathComponent("plain.sock")
+    try! "keep me".write(to: plain, atomically: true, encoding: .utf8)
+    check((try? ControlServer(socket: plain, handler: h)) == nil
+          && (try? String(contentsOf: plain, encoding: .utf8)) == "keep me", "stale: a file that is not a socket is never removed")
+    let long = tmp.appendingPathComponent(String(repeating: "x", count: 120))
+    check((try? ControlServer(socket: long, handler: h)) == nil, "server: a socket path too long to bind is an error, not a crash")
+}
+
+// app.lock: one instance at a time, released by the kernel when its holder dies.
+do {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let lockURL = tmp.appendingPathComponent("state/app.lock")
+    let first = AppLock.take(lockURL)
+    check(first != nil && mode(lockURL) == 0o600 && mode(lockURL.deletingLastPathComponent()) == 0o700, "app.lock: taken, 0600, in a 0700 folder")
+    check(AppLock.take(lockURL) == nil, "app.lock: a second instance in the same state folder cannot take it")
+    check(run("/usr/bin/lockf", ["-k", "-t", "0", lockURL.path, "/usr/bin/true"]).0 == 75, "app.lock: another process cannot take it either")
+    first?.release()
+    let again = AppLock.take(lockURL)
+    check(again != nil, "app.lock: free again once released")
+    again?.release()
+    // A holder that is killed outright: the kernel releases its lock.
+    let holder = Process()
+    holder.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+    holder.arguments = ["-k", lockURL.path, "/bin/sleep", "30"]
+    try! holder.run()
+    var held = false
+    for _ in 0..<50 where !held { usleep(100_000); held = AppLock.take(lockURL).map { $0.release(); return false } ?? true }
+    check(held, "app.lock: held by another process")
+    kill(holder.processIdentifier, SIGKILL)
+    holder.waitUntilExit()
+    let after = AppLock.take(lockURL)
+    check(after != nil, "app.lock: free once its holder is killed")
+    after?.release()
 }
 
 try? fm.removeItem(at: scratch)

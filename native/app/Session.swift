@@ -447,7 +447,12 @@ final class Session {
         }
         if stopPending {
             switch send(SIGINT, dir) {
-            case true?: stopPending = false
+            case true?:
+                // The recorder hears the stop only now: its time to finalise starts now too, so
+                // SIGTERM never follows on the same tick.
+                stopPending = false
+                wait = .exiting(since: now())
+                return
             case false?: settle(dir, tryClean: true, exitStatus: nil); return
             case nil: break
             }
