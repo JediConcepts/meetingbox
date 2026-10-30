@@ -1279,7 +1279,7 @@ func lstartOf(_ pid: Int32) -> String {
     let out = Pipe()
     p.executableURL = URL(fileURLWithPath: "/bin/ps")
     p.arguments = ["-o", "lstart=", "-p", String(pid)]
-    p.environment = ["LC_ALL": "C"]
+    p.environment = ["LC_ALL": "C", "TZ": "UTC0"]
     p.standardOutput = out
     try! p.run()
     let data = out.fileHandleForReading.readDataToEndOfFile()
@@ -1374,9 +1374,12 @@ do {
     q.enqueue(c)
     q.enqueue(b)
     q.enqueue(failedOne)
+    check(r.state(failedOne) == "failed" && r.error(failedOne) == "it broke" && r.attempts(failedOne) == 3,
+          "M2: enqueue ignores a failed meeting")
+    q.retry(failedOne)
     check(r.state(failedOne) == "queued" && r.attempts(failedOne) == nil && r.error(failedOne) == nil,
-          "Q: enqueue writes queued (a failed meeting, asked again) before anything runs for it")
-    q.enqueue(b); q.enqueue(a); q.enqueue(c); q.enqueue(failedOne)
+          "M2: retry writes a failed meeting queued, attempts reset, before anything runs for it")
+    q.enqueue(b); q.enqueue(a); q.enqueue(c); q.enqueue(failedOne); q.retry(failedOne)
     check(r.runner.calls.count == 1, "Q: one job at a time, and a folder queued or processing is not added twice")
     check(r.state(b) == "queued" && r.state(c) == "queued", "Q: waiting jobs stay queued on disk")
     r.runner.finish(0, 0)
@@ -1393,6 +1396,8 @@ do {
           && r.finished.map { $0.1 } == [true, false, true, true], "Q: onFinished reports each folder and whether it worked")
     q.enqueue(a)
     check(r.runner.calls.count == 4 && r.state(a) == "done", "Q: a done meeting is never processed again")
+    q.retry(a)
+    check(r.runner.calls.count == 4 && r.state(a) == "done", "M2: retry leaves anything but a failed meeting alone")
     let attemptsBefore = r.runner.calls.map { $0.attempt }
     check(Set(attemptsBefore).count == 4, "Q: every run gets its own attempt")
 }
@@ -1517,7 +1522,8 @@ do {
           "RF4: a live owner is waited for; nothing else runs meanwhile")
     try! "transcribing\nminutes\n".write(to: dir.appendingPathComponent(".process-progress"), atomically: true, encoding: .utf8)
     q.tick()
-    check(r.runner.calls.isEmpty && q.stage == "minutes", "RF4: still waiting while the owner lives; its stage shows")
+    check(r.runner.calls.isEmpty && q.stage == ProcessingQueue.waitingStage && q.stage == "waiting for another meetingbox",
+          "M3: while another holder works, stage says so, not a stale progress file")
     r.result(dir, attempt: "attempt-one", status: 0, started: t0)
     r.outputs(dir, at: Date())
     r.unlock(dir)
@@ -1525,6 +1531,8 @@ do {
     check(r.state(dir) == "done" && r.runner.calls.count == 1 && r.runner.folders == [other.lastPathComponent],
           "RF4: its result (our attempt, status 0, fresh outputs) gives done, then the next job runs")
     check(r.finished.first.map { $0.0 == dir.lastPathComponent && $0.1 } ?? false, "RF4: onFinished reports it done")
+    check(((try? Data(contentsOf: dir.appendingPathComponent(".process-progress")))?.isEmpty ?? true),
+          "M3: the progress file is emptied when the job settles")
 }
 do {
     let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "someone-else", status: 0, started: Date().addingTimeInterval(-60))
@@ -1553,6 +1561,10 @@ do {
     let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "attempt-one", status: 1, started: Date()) }
     check(r.runner.calls.isEmpty && r.state(dir) == "failed" && r.error(dir) == "processing failed (exit 1)",
           "RF4: our result with a failing status is a failure, not a retry")
+}
+do {
+    let (r, _, q) = resumed { r, dir in r.lock(dir, owner: "garbled") }
+    check(r.runner.calls.isEmpty && q.current != nil, "M7: a garbled owner with a fresh change time is waited for, as in the script")
 }
 do {
     let (r, dir, q) = resumed { r, dir in r.lock(dir, owner: nil) }
@@ -1596,14 +1608,16 @@ do {
         .deletingLastPathComponent().deletingLastPathComponent()
     let home = freshRoot()
     let dir = freshRoot()
-    func hold(_ attempt: String) -> Process {
+    func hold(_ attempt: String, tz: String? = nil) -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/bash")
         p.arguments = ["-c", """
             sed '/^# -* main$/,$d' "$1/meetingbox" > "$HOME/functions"; . "$HOME/functions"; set +e
             take_processing_lock "$2"; : > "$2/held"; while :; do sleep 0.1; done
             """, "_", repo.path, dir.path]
-        p.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "MB_ATTEMPT": attempt]
+        var env = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "MB_ATTEMPT": attempt]
+        if let tz = tz { env["TZ"] = tz }
+        p.environment = env
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
         try! p.run()
@@ -1633,6 +1647,55 @@ do {
           && ProcessResult.read(dir)?.attempt == "attempt-a", "a script killed outright leaves a stale lock (gone) and no result of its own")
     check(ProcessingLock.owner(dir, ps: URL(fileURLWithPath: "/no-such-ps"), now: Date()) == .unknown,
           "the lock's owner is unknown when ps cannot tell")
+    try? fm.removeItem(at: held)
+    let c = hold("attempt-c", tz: "Pacific/Kiritimati")
+    check(waitFor(10) { fm.fileExists(atPath: held.path) } && ProcessingLock.owner(dir, ps: ps, now: Date()) == .alive,
+          "I1: a lock taken under another time zone reads as alive")
+    c.interrupt()
+    c.waitUntilExit()
+    // The reader pins the zone too: a ps that prints the TZ it was given.
+    let tzps = freshRoot().appendingPathComponent("ps")
+    try! "#!/bin/bash\nprintf '%s\\n' \"${TZ:-unset}\"\n".write(to: tzps, atomically: true, encoding: .utf8)
+    chmod(tzps.path, 0o700)
+    let tzdir = freshRoot()
+    do {
+        let l = tzdir.appendingPathComponent(".processing")
+        try! fm.createDirectory(at: l, withIntermediateDirectories: true)
+        try! "\(me) UTC0\n".write(to: l.appendingPathComponent("owner"), atomically: true, encoding: .utf8)
+    }
+    check(ProcessingLock.owner(tzdir, ps: tzps, now: Date()) == .alive, "I1: the app reads start times with TZ=UTC0")
+}
+
+// I2: the app goes away mid-run; the script carries on, and its result is accepted on resume
+do {
+    let r = QRig()
+    let dir = r.meeting("2026-10-29_0900", queued)
+    let script = freshRoot().appendingPathComponent("meetingbox")
+    try! """
+    #!/bin/bash
+    set -euo pipefail
+    d="$(dirname "$2")"
+    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for i in 1 2 3 4 5 6; do echo "working $i" >&2; echo "out $i"; sleep 0.2; done
+    echo text > "$d/transcript.txt"; echo minutes > "$d/notes.md"
+    printf 'attempt=%s status=0 started=%s finished=%s\n' "$MB_ATTEMPT" "$started" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$d/.process-result"
+    """.write(to: script, atomically: true, encoding: .utf8)
+    chmod(script.path, 0o700)
+    var q: ProcessingQueue? = ProcessingQueue(store: r.store, runner: ScriptRunner(script: script, environment: [:]), tickQueue: nil)
+    weak var gone = q
+    q!.enqueue(dir)
+    let attempt = r.attempt(dir)
+    q = nil
+    check(gone == nil && r.state(dir) == "processing", "I2: the queue is gone while its run goes on")
+    let end = Date().addingTimeInterval(15)
+    while Date() < end && ProcessResult.read(dir) == nil { usleep(50_000) }
+    check(ProcessResult.read(dir)?.attempt == attempt && ProcessResult.read(dir)?.status == 0,
+          "I2: the orphaned run still finishes with status 0")
+    let q2 = r.make()
+    q2.resume()
+    check(r.state(dir) == "done" && r.runner.calls.isEmpty, "I2: a new queue accepts its result: done, nothing run again")
+    let log = (try? String(contentsOf: dir.appendingPathComponent(".process-log"), encoding: .utf8)) ?? ""
+    check(log.contains("working 6\n") && log.contains("out 6\n"), "I2: its output went on into .process-log")
 }
 
 // the real runner
@@ -1643,8 +1706,9 @@ do {
     try! """
     #!/bin/bash
     { for a in "$@"; do echo "arg $a"; done
-      echo "sounds=$MB_SOUNDS"; echo "progress=$MB_PROGRESS_FILE"; echo "attempt=$MB_ATTEMPT"
+      echo "sounds=$MB_SOUNDS"; echo "progress=$MB_PROGRESS_FILE"; echo "attempt=$MB_ATTEMPT"; echo "keep=$MB_KEEP_AUDIO"
       echo "path=$PATH"; echo "dir=${MB_DIR:-unset}"; } > "\(log.path)"
+    echo "to stdout"
     echo "meetingbox transcribing" >&2
     printf '\\033[0;31m     error\\033[0m the transcript came out empty\\n\\n' >&2
     exit 3
@@ -1654,6 +1718,8 @@ do {
     let runner = ScriptRunner(script: script, home: home, environment: ["PATH": "/usr/bin:/bin", "MB_DIR": "/elsewhere", "HOME": "/Users/someone"])
     let audio = dir.appendingPathComponent("audio.m4a")
     let progress = dir.appendingPathComponent(".process-progress")
+    let processLog = dir.appendingPathComponent(".process-log")
+    try! "an error from an earlier run\n".write(to: processLog, atomically: true, encoding: .utf8)
     let sem = DispatchSemaphore(value: 0)
     var got: (Int32, String)?
     let pid = runner.run(audio: audio, progress: progress, attempt: "the-attempt") { s, l in got = (s, l); sem.signal() }
@@ -1667,6 +1733,20 @@ do {
     check(text.contains("path=/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n"),
           "ScriptRunner puts ~/.local/bin, /opt/homebrew/bin and /usr/local/bin before PATH")
     check(text.contains("dir=unset\n"), "ScriptRunner passes on no MB_* setting of its own environment")
+    check(text.contains("keep=1\n"), "M1: ScriptRunner sets MB_KEEP_AUDIO=1")
+    let logText = (try? String(contentsOf: processLog, encoding: .utf8)) ?? ""
+    check(logText.hasPrefix("an error from an earlier run\n") && logText.contains("to stdout\n")
+          && logText.contains("meetingbox transcribing\n") && mode(processLog) == 0o600,
+          "I2: stdout and stderr are appended to <dir>/.process-log (0600), not a pipe")
+    var quiet: (Int32, String)?
+    let sem3 = DispatchSemaphore(value: 0)
+    let quietScript = dir.appendingPathComponent("quiet")
+    try! "#!/bin/bash\nexit 2\n".write(to: quietScript, atomically: true, encoding: .utf8)
+    chmod(quietScript.path, 0o700)
+    _ = ScriptRunner(script: quietScript, home: home, environment: [:]).run(audio: audio, progress: progress, attempt: "q") { s, l in
+        quiet = (s, l); sem3.signal() }
+    check(sem3.wait(timeout: .now() + 10) == .success && quiet?.0 == 2 && quiet?.1 == "",
+          "I2: the last line comes only from this run's part of the log")
     let missing = ScriptRunner(script: dir.appendingPathComponent("no-such-script"), home: home, environment: [:])
     var gone: (Int32, String)?
     let sem2 = DispatchSemaphore(value: 0)

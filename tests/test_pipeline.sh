@@ -145,6 +145,14 @@ KEEP_AUDIO=0
 if [ -s "$d/transcript.txt" ] && [ ! -e "$d/audio.m4a" ] && [ ! -e "$d/mic.m4a" ] && [ ! -e "$d/call.m4a" ]; then
   pass "--no-keep-audio removes audio, mic and call"
 else fail "--no-keep-audio removes audio, mic and call"; fi
+# ...but only once the minutes exist: a run that fails after transcribing keeps every file
+d="$(meeting m5b audio.m4a mic.m4a call.m4a)"
+have() { case "$1" in speech-analyzer) return 0 ;; *) return 1 ;; esac; }   # no fm: summarise fails
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+if [ "$rc" -ne 0 ] && [ -s "$d/transcript.txt" ] && [ -s "$d/audio.m4a" ] && [ -s "$d/mic.m4a" ] && [ -s "$d/call.m4a" ]; then
+  pass "--no-keep-audio never removes audio from a run that fails before the minutes"
+else fail "--no-keep-audio never removes audio from a run that fails before the minutes (rc $rc): $(ls "$d") $out"; fi
 KEEP_AUDIO=1
 
 # --- split_chunks keeps line breaks and ends a chunk at a line end ---
@@ -174,7 +182,8 @@ else fail "split_chunks still cuts a long line at n * 1.5: $(cat "$HOME"/chunks2
 
 # ======================================================= the processing lock, result and progress
 
-lstart_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+# As the script reads it: in UTC, so a reader in another time zone reads the same text.
+lstart_of() { LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
 sa_calls() { grep -c '^speech-analyzer ' "$HOME/calls.log" | tr -d ' '; }
 mode_of() { stat -f '%Lp' "$1" 2>/dev/null; }
 # A PID that has finished: nothing runs under it now.
@@ -289,6 +298,29 @@ if [ "$rc" = 75 ] && printf '%s' "$out" | grep -q 'already being processed' && [
   pass "a second process on a folder being processed is refused; the first finishes alone"
 else fail "a second process on a folder being processed is refused; the first finishes alone (rc $rc, first $rc1): $out $(cat "$HOME/calls.log")"; fi
 
+# --- I1: the holder and the second worker in different time zones: still refused ---
+d="$(meeting tz audio.m4a mic.m4a call.m4a)"
+: > "$HOME/calls.log"
+(TZ=Pacific/Kiritimati; export TZ; process "$d/audio.m4a") >"$HOME/first.out" 2>&1 & first=$!
+for _ in $(seq 1 100); do [ -s "$d/.processing/owner" ] && break; sleep 0.02; done
+out="$( (unset TZ; process "$d/audio.m4a") 2>&1 )"; rc=$?
+wait "$first"; rc1=$?
+if [ "$rc" = 75 ] && [ "$rc1" -eq 0 ] && [ "$(sa_calls)" = 2 ] && ! grep -q OVERLAP "$HOME/calls.log" && lock_clean "$d"; then
+  pass "a holder in another time zone is still seen as alive: refused, one run"
+else fail "a holder in another time zone is still seen as alive: refused, one run (rc $rc, first $rc1, $(sa_calls) calls): $out"; fi
+
+# --- M5: a worker that cannot read its own start time takes no lock ---
+eval "$(declare -f pid_lstart | sed '1s/pid_lstart/real_pid_lstart/')"
+pid_lstart() { :; }
+d="$(meeting m5x audio.m4a mic.m4a call.m4a)"
+: > "$HOME/calls.log"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+eval "$(declare -f real_pid_lstart | sed '1s/real_pid_lstart/pid_lstart/')"
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "could not read this process's start time" && [ "$(sa_calls)" = 0 ] \
+   && [ ! -e "$d/.processing" ] && ! ls -a "$d" | grep -q '^\.process'; then
+  pass "with no start time of its own, process takes no lock and runs nothing"
+else fail "with no start time of its own, process takes no lock and runs nothing (rc $rc): $out $(ls -a "$d")"; fi
+
 # --- two workers finding the same stale lock at once: exactly one runs ---
 # The liveness check is slowed, so both read the stale owner before either replaces it.
 if declare -f processing_lock_alive >/dev/null; then
@@ -312,6 +344,30 @@ for off in 0 0.05 0.15 0.35; do
 done
 if [ "$race_ok" = 1 ]; then pass "two workers on one stale lock: exactly one runs, the other refuses"
 else fail "two workers on one stale lock: exactly one runs, the other refuses:$race_log"; fi
+
+# --- M6: a TERM while a live owner's file is moved aside does not lose it ---
+# The worker reads a stale owner, a live one replaces it, the worker moves the live one aside,
+# and is sent TERM just then. It must put the live owner back and refuse.
+d="$(meeting term1 audio.m4a mic.m4a call.m4a)"
+mkdir "$d/.processing"
+printf '%s %s\n' "$dead_pid" "Thu Jan  1 00:00:00 2026" > "$d/.processing/owner"
+live="$$ $(lstart_of $$)"
+cat() {
+  case "$*" in *.processing-stale.*) kill -TERM "$(command cat "$HOME/worker.pid")"; sleep 0.1 ;; esac
+  command cat "$@"
+}
+: > "$HOME/calls.log"
+( sh -c 'printf "%s" "$PPID"' > "$HOME/worker.pid"; process "$d/audio.m4a" ) >"$HOME/term.out" 2>&1 & w=$!
+sleep 0.15
+printf '%s\n' "$live" > "$d/live.tmp"; mv "$d/live.tmp" "$d/.processing/owner"
+wait "$w"; rc=$?
+unset -f cat
+if [ "$rc" = 75 ] && [ "$(cat "$d/.processing/owner" 2>/dev/null)" = "$live" ] && ! ls -a "$d" | grep -q '^\.processing-' \
+   && [ "$(sa_calls)" = 0 ]; then
+  pass "TERM while a live owner is moved aside: it is put back, and the worker refuses"
+else fail "TERM while a live owner is moved aside: it is put back, and the worker refuses (rc $rc): $(ls -a "$d") $(cat "$HOME/term.out")"; fi
+rm -f "$d/.processing/owner" "$d"/.processing-stale.* "$d"/.processing-owner.*; rmdir "$d/.processing"
+
 if declare -f real_processing_lock_alive >/dev/null; then
   eval "$(declare -f real_processing_lock_alive | sed '1s/real_processing_lock_alive/processing_lock_alive/')"
 fi
@@ -359,6 +415,17 @@ for f in mic.words.json call.words.json transcript.txt notes.md notes-raw.md bri
 done
 if [ -z "$bad" ]; then pass "words.json, transcript, minutes and result are all 0600"
 else fail "words.json, transcript, minutes and result are all 0600:$bad"; fi
+# M4: and on failure too, when the transcriber wrote a file and then said Error
+open() {
+  local o="" e="" prev="" a
+  for a in "$@"; do [ "$prev" = -o ] && o="$a"; [ "$prev" = --stderr ] && e="$a"; prev="$a"; done
+  (umask 022; printf 'half' > "$o"; printf 'Error: it broke\n' > "$e")
+  return 0
+}
+printf 'aac' > "$HOME/m4.m4a"
+sa_run "$HOME/m4.words.json" "$HOME/m4.m4a" -f json 2>/dev/null; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(mode_of "$HOME/m4.words.json")" = 600 ]; then pass "a transcriber's output is made 0600 on failure too"
+else fail "a transcriber's output is made 0600 on failure too (rc $rc, $(mode_of "$HOME/m4.words.json"))"; fi
 unset -f open
 rmdir "$SA_APP/Contents/MacOS" "$SA_APP/Contents" "$SA_APP"
 

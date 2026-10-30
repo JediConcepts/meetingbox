@@ -1191,8 +1191,10 @@ sa_run() {
   while ps -axo command= | NEEDLE="-o $out $audio" awk 'index($0, ENVIRON["NEEDLE"]) { f = 1 } END { exit !f }'; do
     sleep 0.2
   done
-  # The transcriber is its own app and does not inherit our umask: make its output private.
-  if [ -e "$out" ] && ! grep -q '^Error' "$err"; then rm -f "$err"; chmod 600 "$out"; return 0; fi
+  # The transcriber is its own app and does not inherit our umask: make its output
+  # private, whether or not it worked.
+  [ ! -e "$out" ] || chmod 600 "$out"
+  if [ -e "$out" ] && ! grep -q '^Error' "$err"; then rm -f "$err"; return 0; fi
   grep '^Error' "$err" >&2 || true   # its usage text after the error is noise here
   rm -f "$err"
   return 1
@@ -1442,8 +1444,10 @@ PROCESSING_OWNER=""
 PROCESSING_DIR=""
 PROCESSING_STARTED=""
 
-# A PID's start time as ps gives it, or nothing when no such process runs.
-pid_lstart() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true; }
+# A PID's start time as ps gives it, or nothing when no such process runs. Read
+# in UTC: ps prints local time, and two runs with different TZ settings must
+# read one owner the same way.
+pid_lstart() { LC_ALL=C TZ=UTC0 ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true; }
 
 # Held: the owner named in $2 (the owner file's text, empty for none) is running
 # with the same start time, or there is no owner and the lock $1 is fresh.
@@ -1460,12 +1464,15 @@ processing_lock_alive() {
 busy_die() { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit "$BUSY_EXIT"; }
 
 take_processing_lock() {
-  local dir="$1" lock="$1/.processing" tmp me seen moved tries=0
+  local dir="$1" lock="$1/.processing" tmp me start seen moved took tries=0
   tmp="$(mktemp "$dir/.processing-owner.XXXXXX")" || die "could not write in $dir"
   # This shell's PID: $$ is the parent's in a subshell, and bash 3.2 has no BASHPID.
   sh -c 'printf "%s" "$PPID"' > "$tmp"
   me="$(cat "$tmp")"
-  printf '%s %s\n' "$me" "$(pid_lstart "$me")" > "$tmp"
+  start="$(pid_lstart "$me")"
+  # Without it the owner would read as stale from birth, and anyone could take over.
+  [ -n "$start" ] || { rm -f "$tmp"; die "could not read this process's start time"; }
+  printf '%s %s\n' "$me" "$start" > "$tmp"
   while :; do
     tries=$((tries + 1))
     [ "$tries" -le 20 ] || { rm -f "$tmp"; busy_die "this meeting is already being processed: $dir"; }
@@ -1483,16 +1490,22 @@ take_processing_lock() {
       continue
     fi
     # A stale owner: move that file aside (only one taker can), then put ours in.
+    # Ctrl-C or TERM are held off meanwhile, so a live owner moved aside by
+    # mistake is always put back.
     moved="$(mktemp -u "$dir/.processing-stale.XXXXXX")"
-    mv "$lock/owner" "$moved" 2>/dev/null || continue
-    if [ "$(cat "$moved" 2>/dev/null || true)" != "$seen" ]; then
-      # A newer owner, put in after we looked: give it back and look again.
-      ln "$moved" "$lock/owner" 2>/dev/null || true
+    took=0
+    trap '' INT TERM
+    if mv "$lock/owner" "$moved" 2>/dev/null; then
+      if [ "$(cat "$moved" 2>/dev/null || true)" != "$seen" ]; then
+        # A newer owner, put in after we looked: give it back and look again.
+        ln "$moved" "$lock/owner" 2>/dev/null || true
+      else
+        ln "$tmp" "$lock/owner" 2>/dev/null && took=1
+      fi
       rm -f "$moved"
-      continue
     fi
-    rm -f "$moved"
-    ln "$tmp" "$lock/owner" 2>/dev/null && break
+    trap - INT TERM
+    [ "$took" = 0 ] || break
   done
   rm -f "$tmp"
   PROCESSING_LOCK="$lock"
@@ -1560,6 +1573,8 @@ process() {
   esac
   [ -e "$input" ] || die "no such file: $input"
   transcript="$dir/transcript.txt"
+  # What --no-keep-audio removes once the minutes exist (summarise reuses $input).
+  spent_audio=""; spent_sides=0
 
   case "${input##*.}" in
     txt|md|vtt|srt)
@@ -1568,15 +1583,20 @@ process() {
       progress transcribing
       if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
         transcribe_channels "$dir" "$transcript"
-        [ "$KEEP_AUDIO" = "1" ] || rm -f "$input" "$dir/mic.m4a" "$dir/call.m4a"
+        spent_audio="$input"; spent_sides=1
       else
         transcribe "$input" "$transcript"
-        [ "$KEEP_AUDIO" = "1" ] || rm -f "$input"
+        spent_audio="$input"
       fi ;;
   esac
 
   progress minutes
   summarise "$transcript" "$dir"
+  # --no-keep-audio: only now the minutes exist, so a failed run never loses audio.
+  if [ "$KEEP_AUDIO" != "1" ] && [ -n "$spent_audio" ]; then
+    rm -f "$spent_audio"
+    [ "$spent_sides" = 0 ] || rm -f "$dir/mic.m4a" "$dir/call.m4a"
+  fi
   progress done
   chime done
   notify "meetingbox" "Minutes ready"
