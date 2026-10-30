@@ -1191,7 +1191,8 @@ sa_run() {
   while ps -axo command= | NEEDLE="-o $out $audio" awk 'index($0, ENVIRON["NEEDLE"]) { f = 1 } END { exit !f }'; do
     sleep 0.2
   done
-  if [ -e "$out" ] && ! grep -q '^Error' "$err"; then rm -f "$err"; return 0; fi
+  # The transcriber is its own app and does not inherit our umask: make its output private.
+  if [ -e "$out" ] && ! grep -q '^Error' "$err"; then rm -f "$err"; chmod 600 "$out"; return 0; fi
   grep '^Error' "$err" >&2 || true   # its usage text after the error is noise here
   rm -f "$err"
   return 1
@@ -1251,6 +1252,7 @@ transcribe_channels() {
   fi
 
   # Written aside and moved, so a failure leaves no half transcript behind.
+  progress speakers
   tmp="$(mktemp)"; err="$(mktemp)"
   if ! "$TRANSCRIPT_BIN" --mic "$dir/mic.words.json" --call "$dir/call.words.json" > "$tmp" 2> "$err"; then
     msg="$(cat "$err")"; rm -f "$tmp" "$err"
@@ -1427,26 +1429,143 @@ summarise() {
 
 # ------------------------------------------------------------------- processing
 
+# One `process` per folder at a time. The lock is the folder <dir>/.processing,
+# made with mkdir, holding `owner`: "<pid> <that pid's start time>", so a PID
+# reused after a crash or reboot never passes for the owner. owner goes in with
+# ln, which never replaces a file, so of two processes taking over one stale
+# lock exactly one gets it. A lock with no owner yet (between mkdir and ln)
+# counts as held for PROCESS_LOCK_GRACE seconds after its change time.
+PROCESS_LOCK_GRACE=10
+BUSY_EXIT=75   # EX_TEMPFAIL: refused because another process holds the folder
+PROCESSING_LOCK=""
+PROCESSING_OWNER=""
+PROCESSING_DIR=""
+PROCESSING_STARTED=""
+
+# A PID's start time as ps gives it, or nothing when no such process runs.
+pid_lstart() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true; }
+
+# Held: the owner named in $2 (the owner file's text, empty for none) is running
+# with the same start time, or there is no owner and the lock $1 is fresh.
+processing_lock_alive() {
+  local pid start changed
+  if [ -n "$2" ]; then
+    pid="${2%% *}"; start="${2#* }"
+    case "$pid" in ''|*[!0-9]*) ;; *) [ "$(pid_lstart "$pid")" = "$start" ]; return ;; esac
+  fi
+  changed="$(stat -f %c "$1" 2>/dev/null)" || return 1
+  [ $(( $(date +%s) - changed )) -lt "$PROCESS_LOCK_GRACE" ]
+}
+
+busy_die() { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit "$BUSY_EXIT"; }
+
+take_processing_lock() {
+  local dir="$1" lock="$1/.processing" tmp me seen moved tries=0
+  tmp="$(mktemp "$dir/.processing-owner.XXXXXX")" || die "could not write in $dir"
+  # This shell's PID: $$ is the parent's in a subshell, and bash 3.2 has no BASHPID.
+  sh -c 'printf "%s" "$PPID"' > "$tmp"
+  me="$(cat "$tmp")"
+  printf '%s %s\n' "$me" "$(pid_lstart "$me")" > "$tmp"
+  while :; do
+    tries=$((tries + 1))
+    [ "$tries" -le 20 ] || { rm -f "$tmp"; busy_die "this meeting is already being processed: $dir"; }
+    if mkdir "$lock" 2>/dev/null; then
+      ln "$tmp" "$lock/owner" 2>/dev/null && break
+      continue   # taken over while we were between mkdir and ln: look again
+    fi
+    seen="$(cat "$lock/owner" 2>/dev/null || true)"
+    if processing_lock_alive "$lock" "$seen"; then
+      rm -f "$tmp"
+      busy_die "this meeting is already being processed: $dir"
+    fi
+    if [ -z "$seen" ]; then
+      ln "$tmp" "$lock/owner" 2>/dev/null && break
+      continue
+    fi
+    # A stale owner: move that file aside (only one taker can), then put ours in.
+    moved="$(mktemp -u "$dir/.processing-stale.XXXXXX")"
+    mv "$lock/owner" "$moved" 2>/dev/null || continue
+    if [ "$(cat "$moved" 2>/dev/null || true)" != "$seen" ]; then
+      # A newer owner, put in after we looked: give it back and look again.
+      ln "$moved" "$lock/owner" 2>/dev/null || true
+      rm -f "$moved"
+      continue
+    fi
+    rm -f "$moved"
+    ln "$tmp" "$lock/owner" 2>/dev/null && break
+  done
+  rm -f "$tmp"
+  PROCESSING_LOCK="$lock"
+  PROCESSING_OWNER="$(cat "$lock/owner")"
+  PROCESSING_DIR="$dir"
+  PROCESSING_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  trap 'end_processing $?' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# Removes the lock only while it is still ours.
+release_processing_lock() {
+  [ -n "$PROCESSING_LOCK" ] || return 0
+  if [ "$(cat "$PROCESSING_LOCK/owner" 2>/dev/null || true)" = "$PROCESSING_OWNER" ]; then
+    rm -f "$PROCESSING_LOCK/owner"
+    rmdir "$PROCESSING_LOCK" 2>/dev/null || true
+  fi
+  PROCESSING_LOCK=""
+}
+
+# The last act of a locked run, on success or failure: .process-result written
+# aside and moved into place (so a reader never sees half of it), then the lock
+# released. The app counts a result only when its attempt is the one it started.
+end_processing() {
+  local rc="$1" attempt result tmp_result
+  trap - EXIT HUP INT TERM
+  if [ -n "$PROCESSING_LOCK" ]; then
+    attempt="$(printf '%s' "${MB_ATTEMPT:-}" | tr -cd 'A-Za-z0-9._-')"
+    result="$PROCESSING_DIR/.process-result"
+    if tmp_result="$(mktemp "$PROCESSING_DIR/.process-result.XXXXXX")"; then
+      if printf 'attempt=%s status=%s started=%s finished=%s\n' "${attempt:-terminal}" "$rc" \
+           "$PROCESSING_STARTED" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp_result"; then
+        mv -f "$tmp_result" "$result"
+      else
+        rm -f "$tmp_result"
+      fi
+    fi
+    release_processing_lock
+  fi
+  return "$rc"
+}
+
+# With MB_PROGRESS_FILE set (the app sets it), each stage is appended to it.
+progress() {
+  [ -n "${MB_PROGRESS_FILE:-}" ] || return 0
+  printf '%s\n' "$1" >> "$MB_PROGRESS_FILE" 2>/dev/null || true
+}
+
 process() {
   # transcripts and minutes are as private as the recording
   umask 077
   input="$1"
   # a meeting folder stands for its recording
   [ -d "$input" ] && input="${input%/}/audio.m4a"
+  [ -d "$(dirname "$input")" ] || die "no such file: $input"
+  dir="$(cd "$(dirname "$input")" && pwd)"
+  take_processing_lock "$dir"
   case "${input##*.}" in
     txt|md|vtt|srt) ;;
-    *) if [ -d "$(dirname "$input")" ] && recording_unfinished "$(dirname "$input")"; then
-         die "this recording was not finished. Run: meetingbox recover $(cd "$(dirname "$input")" && pwd)"
+    *) if recording_unfinished "$dir"; then
+         die "this recording was not finished. Run: meetingbox recover $dir"
        fi ;;
   esac
   [ -e "$input" ] || die "no such file: $input"
-  dir="$(cd "$(dirname "$input")" && pwd)"
   transcript="$dir/transcript.txt"
 
   case "${input##*.}" in
     txt|md|vtt|srt)
       [ "$input" = "$transcript" ] || cp "$input" "$transcript" ;;
     *)
+      progress transcribing
       if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
         transcribe_channels "$dir" "$transcript"
         [ "$KEEP_AUDIO" = "1" ] || rm -f "$input" "$dir/mic.m4a" "$dir/call.m4a"
@@ -1456,7 +1575,9 @@ process() {
       fi ;;
   esac
 
+  progress minutes
   summarise "$transcript" "$dir"
+  progress done
   chime done
   notify "meetingbox" "Minutes ready"
 
@@ -1464,6 +1585,7 @@ process() {
     printf '\n'; cat "$dir/notes.md"; printf '\n'
     have open && open "$dir/notes.md" 2>/dev/null || true
   fi
+  end_processing 0
 }
 
 # ----------------------------------------------------------------------- reset

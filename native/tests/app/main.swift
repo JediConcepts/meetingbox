@@ -1,4 +1,4 @@
-// sources: ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift
+// sources: ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
@@ -1235,6 +1235,444 @@ do {
     check(d != nil && abs(d! - 1.0) < 0.1, "verify passes with the marker and three matching .m4a, giving audio.m4a's duration (M1)")
     try! fm.removeItem(at: audio.appendingPathComponent(".recording-complete"))
     check(child.verify(dir: audio) == nil, "verify fails without the marker")
+}
+
+// MARK: - Processing queue (Task 5)
+
+/// Records each run; the test ends a run by calling `finish`.
+final class FakeRunner: PipelineRunner {
+    struct Call {
+        let audio: URL
+        let progress: URL
+        let attempt: String
+        let done: (Int32, String) -> Void
+        /// meeting.json as it was when the run began.
+        let stateAtRun: String?
+        let attemptsAtRun: Int?
+        let attemptAtRun: String?
+        let errorAtRun: String?
+    }
+    var calls: [Call] = []
+    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
+        let json = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: audio.deletingLastPathComponent()
+            .appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+        calls.append(Call(audio: audio, progress: progress, attempt: attempt, done: done,
+                          stateAtRun: json["state"] as? String, attemptsAtRun: (json["attempts"] as? NSNumber)?.intValue,
+                          attemptAtRun: json["attempt"] as? String, errorAtRun: json["error"] as? String))
+        return Int32(40000 + calls.count)
+    }
+    var folders: [String] { calls.map { $0.audio.deletingLastPathComponent().lastPathComponent } }
+    /// Ends run `i`: on success it writes the transcript and minutes, as `meetingbox process` does.
+    func finish(_ i: Int, _ status: Int32, _ line: String = "", writeOutputs: Bool = true) {
+        let dir = calls[i].audio.deletingLastPathComponent()
+        if status == 0 && writeOutputs {
+            try! "[00:00:01] Me: hello\n".write(to: dir.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
+            try! "the minutes\n".write(to: dir.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        }
+        calls[i].done(status, line)
+    }
+}
+
+/// `ps -o lstart=` for a PID, as `meetingbox process` writes it into the lock's owner file.
+func lstartOf(_ pid: Int32) -> String {
+    let p = Process()
+    let out = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/bin/ps")
+    p.arguments = ["-o", "lstart=", "-p", String(pid)]
+    p.environment = ["LC_ALL": "C"]
+    p.standardOutput = out
+    try! p.run()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+/// A PID nothing runs under any more.
+let deadPid: Int32 = {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+    try! p.run()
+    p.waitUntilExit()
+    return p.processIdentifier
+}()
+let me = getpid()
+
+final class QRig {
+    let root = freshRoot()
+    let store: MeetingStore
+    let runner = FakeRunner()
+    var queue: ProcessingQueue!
+    var finished: [(String, Bool)] = []
+    var changes = 0
+
+    init() {
+        store = MeetingStore(root: root.appendingPathComponent("Meetings"))
+        try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
+    }
+    @discardableResult
+    func make() -> ProcessingQueue {
+        queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil)
+        queue.onFinished = { [unowned self] in self.finished.append(($0.lastPathComponent, $1)) }
+        queue.onChange = { [unowned self] in self.changes += 1 }
+        return queue
+    }
+    func meeting(_ name: String, files: [String: String] = [:], _ change: ((inout MeetingRecord) -> Void)? = nil) -> URL {
+        let dir = store.root.appendingPathComponent(name, isDirectory: true)
+        try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (f, body) in files { try! body.write(to: dir.appendingPathComponent(f), atomically: true, encoding: .utf8) }
+        if let change = change { try! store.update(dir, change) }
+        return dir
+    }
+    func json(_ dir: URL) -> [String: Any] {
+        ((try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+    }
+    func state(_ dir: URL) -> String? { json(dir)["state"] as? String }
+    func attempts(_ dir: URL) -> Int? { (json(dir)["attempts"] as? NSNumber)?.intValue }
+    func attempt(_ dir: URL) -> String? { json(dir)["attempt"] as? String }
+    func error(_ dir: URL) -> String? { json(dir)["error"] as? String }
+    /// A `.processing` lock as `meetingbox process` makes it. `owner` nil: a lock with no owner yet.
+    func lock(_ dir: URL, owner: String?) {
+        let l = dir.appendingPathComponent(".processing")
+        try! fm.createDirectory(at: l, withIntermediateDirectories: true)
+        if let owner = owner { try! (owner + "\n").write(to: l.appendingPathComponent("owner"), atomically: true, encoding: .utf8) }
+    }
+    func unlock(_ dir: URL) {
+        let l = dir.appendingPathComponent(".processing")
+        try? fm.removeItem(at: l.appendingPathComponent("owner"))
+        try? fm.removeItem(at: l)
+    }
+    func result(_ dir: URL, attempt: String, status: Int, started: Date) {
+        let iso = ISO8601DateFormatter()
+        try! "attempt=\(attempt) status=\(status) started=\(iso.string(from: started)) finished=\(iso.string(from: Date()))\n"
+            .write(to: dir.appendingPathComponent(".process-result"), atomically: true, encoding: .utf8)
+    }
+    func outputs(_ dir: URL, at date: Date) {
+        for f in ["transcript.txt", "notes.md"] {
+            let u = dir.appendingPathComponent(f)
+            try! "text\n".write(to: u, atomically: true, encoding: .utf8)
+            try! fm.setAttributes([.modificationDate: date], ofItemAtPath: u.path)
+        }
+    }
+}
+
+func queued(_ r: inout MeetingRecord) { r.state = .queued }
+
+// enqueue: queued before anything runs, one at a time, in order, never twice
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = r.meeting("2026-10-29_0900") { $0.state = .queued; $0.error = "left over" }
+    let b = r.meeting("2026-10-29_1000", queued)
+    let c = r.meeting("2026-10-29_1100", queued)
+    let failedOne = r.meeting("2026-10-29_0800") { $0.state = .failed; $0.error = "it broke"; $0.attempts = 3 }
+    q.enqueue(a)
+    check(r.runner.calls.count == 1 && q.current?.lastPathComponent == a.lastPathComponent, "Q: enqueue starts the first job at once")
+    let first = r.runner.calls.first
+    check(first?.stateAtRun == "processing" && first?.attemptsAtRun == 1 && first?.attemptAtRun == first?.attempt
+          && first?.errorAtRun == nil, "Q: a job starts as processing, attempts 1, its attempt stored, error cleared")
+    check(first?.audio.lastPathComponent == "audio.m4a" && first?.progress.deletingLastPathComponent().lastPathComponent == a.lastPathComponent,
+          "Q: the runner gets the folder's audio.m4a and a progress file in the folder")
+    q.enqueue(c)
+    q.enqueue(b)
+    q.enqueue(failedOne)
+    check(r.state(failedOne) == "queued" && r.attempts(failedOne) == nil && r.error(failedOne) == nil,
+          "Q: enqueue writes queued (a failed meeting, asked again) before anything runs for it")
+    q.enqueue(b); q.enqueue(a); q.enqueue(c); q.enqueue(failedOne)
+    check(r.runner.calls.count == 1, "Q: one job at a time, and a folder queued or processing is not added twice")
+    check(r.state(b) == "queued" && r.state(c) == "queued", "Q: waiting jobs stay queued on disk")
+    r.runner.finish(0, 0)
+    check(r.state(a) == "done" && r.error(a) == nil && r.json(a)["stage"] == nil, "Q: success writes done")
+    check(r.runner.folders == [a, c].map { $0.lastPathComponent }, "Q: the next job runs when one ends, in the order asked")
+    r.runner.finish(1, 1, "transcription failed on both sides")
+    check(r.state(c) == "failed" && r.error(c) == "transcription failed on both sides",
+          "Q: a failure writes failed with the last stderr line")
+    check(r.runner.calls.count == 3 && r.runner.folders[2] == b.lastPathComponent, "Q: after a failure the next job still runs")
+    r.runner.finish(2, 0)
+    r.runner.finish(3, 0)
+    check(r.runner.calls.count == 4 && q.current == nil && q.stage == nil, "Q: the queue empties")
+    check(r.finished.map { $0.0 } == [a, c, b, failedOne].map { $0.lastPathComponent }
+          && r.finished.map { $0.1 } == [true, false, true, true], "Q: onFinished reports each folder and whether it worked")
+    q.enqueue(a)
+    check(r.runner.calls.count == 4 && r.state(a) == "done", "Q: a done meeting is never processed again")
+    let attemptsBefore = r.runner.calls.map { $0.attempt }
+    check(Set(attemptsBefore).count == 4, "Q: every run gets its own attempt")
+}
+
+// what enqueue refuses
+do {
+    let r = QRig()
+    let q = r.make()
+    let old = r.meeting("2026-01-05_0900", files: ["notes.md": "old minutes", "audio.m4a": "aac"])
+    let unprocessed = r.meeting("2026-01-06_0900") { $0.state = .unprocessed }
+    let recording = r.meeting("2026-01-07_0900") { $0.state = .recording }
+    let finalising = r.meeting("2026-01-08_0900") { $0.state = .finalising }
+    let bare = r.meeting("2026-01-09_0900", files: ["audio.m4a": "aac"])
+    for d in [old, unprocessed, recording, finalising, bare] { q.enqueue(d) }
+    check(r.runner.calls.isEmpty, "Q: enqueue never runs an old, unprocessed, recording, finalising or unrecorded folder")
+    check(!fm.fileExists(atPath: old.appendingPathComponent("meeting.json").path)
+          && !fm.fileExists(atPath: bare.appendingPathComponent("meeting.json").path)
+          && r.state(unprocessed) == "unprocessed" && r.state(recording) == "recording" && r.state(finalising) == "finalising",
+          "Q: and writes nothing for them")
+}
+
+// a busy refusal (exit 75): nothing ran, so nothing is counted; it runs again once the lock goes
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = r.meeting("2026-10-29_0900", queued)
+    q.enqueue(a)
+    r.lock(a, owner: "\(me) \(lstartOf(me))")
+    r.runner.finish(0, 75, "     error this meeting is already being processed: \(a.path)")
+    check(r.state(a) == "processing" && r.attempts(a) == 0 && r.runner.calls.count == 1 && q.current != nil,
+          "Q: refused as already being processed: not failed, not counted, waiting")
+    q.tick()
+    check(r.runner.calls.count == 1, "Q: still waiting while the other process holds the lock")
+    r.unlock(a)
+    q.tick()
+    check(r.runner.calls.count == 2 && r.attempts(a) == 1 && r.runner.calls[1].attempt != r.runner.calls[0].attempt,
+          "Q: once the lock goes it runs, attempts 1, with a new attempt")
+    r.runner.finish(1, 0)
+    check(r.state(a) == "done", "Q: and finishes")
+}
+
+// success needs the minutes; stage follows the progress file
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = r.meeting("2026-10-29_0900", queued)
+    let b = r.meeting("2026-10-29_1000", queued)
+    q.enqueue(a)
+    q.enqueue(b)
+    let progress = r.runner.calls[0].progress
+    check(fm.fileExists(atPath: progress.path) && ((try? Data(contentsOf: progress))?.isEmpty ?? false) && mode(progress) == 0o600,
+          "Q: the progress file starts empty and private")
+    let before = r.changes
+    try! "transcribing\n".write(to: progress, atomically: false, encoding: .utf8)
+    q.tick()
+    check(q.stage == "transcribing" && r.json(a)["stage"] as? String == "transcribing" && r.changes > before,
+          "Q: stage follows the progress file, into meeting.json, with onChange")
+    let h = try! FileHandle(forWritingTo: progress)
+    h.seekToEndOfFile()
+    h.write(Data("speakers\nmin".utf8))
+    h.closeFile()
+    q.tick()
+    check(q.stage == "speakers", "Q: stage is the last whole line")
+    check(ProcessingQueue.label("transcribing") == "Transcribing" && ProcessingQueue.label("speakers") == "Finding speakers"
+          && ProcessingQueue.label("minutes") == "Writing minutes", "Q: stages read as Transcribing, Finding speakers, Writing minutes")
+    r.runner.finish(0, 0, writeOutputs: false)
+    check(r.state(a) == "failed" && (r.error(a) ?? "").contains("minutes"), "Q: status 0 with no minutes written is a failure")
+    check(q.current?.lastPathComponent == b.lastPathComponent && q.stage == nil, "Q: stage resets for the next job")
+    r.runner.finish(1, 2, "")
+    check(r.error(b) == "processing failed (exit 2)", "Q: a failure with nothing on stderr names the exit status")
+}
+
+// Review Focus 4: the app crashed with five queued and one processing; a new queue picks all six up
+do {
+    let r = QRig()
+    let q1 = r.make()
+    let names = ["2026-10-29_0900", "2026-10-29_1000", "2026-10-29_1100", "2026-10-29_1200", "2026-10-29_1300", "2026-10-29_1400"]
+    let dirs = names.map { r.meeting($0, queued) }
+    let old = r.meeting("2026-01-05_0900", files: ["notes.md": "old minutes", "audio.m4a": "aac"])
+    let unprocessed = r.meeting("2026-01-06_0900") { $0.state = .unprocessed }
+    let done = r.meeting("2026-01-07_0900") { $0.state = .done }
+    let failed = r.meeting("2026-01-08_0900") { $0.state = .failed; $0.error = "no" }
+    let untouched = [old, unprocessed, done, failed].map { try? Data(contentsOf: $0.appendingPathComponent("meeting.json")) }
+    for d in dirs { q1.enqueue(d) }
+    check(r.state(dirs[0]) == "processing" && dirs.dropFirst().allSatisfy { r.state($0) == "queued" },
+          "RF4: one processing and five queued on disk when the app dies")
+    r.queue = nil // the app crashed: its runner's callbacks never come
+    let runs = r.runner.calls.count
+    let q2 = r.make()
+    q2.resume()
+    let fresh = Array(r.runner.calls[runs...])
+    check(fresh.count == 1 && fresh[0].audio.deletingLastPathComponent().lastPathComponent == names[0]
+          && fresh[0].attemptsAtRun == 2 && fresh[0].attempt != r.runner.calls[0].attempt,
+          "RF4: the interrupted job (no lock, no result) is retried with attempts 2 and a new attempt")
+    for i in 0..<6 { r.runner.finish(runs + i, 0) }
+    check(r.runner.calls.count == runs + 6 && Array(r.runner.calls[runs...]).map { $0.audio.deletingLastPathComponent().lastPathComponent } == names,
+          "RF4: all six run, one at a time, oldest first")
+    check(dirs.allSatisfy { r.state($0) == "done" }, "RF4: all six end done")
+    let after = [old, unprocessed, done, failed].map { try? Data(contentsOf: $0.appendingPathComponent("meeting.json")) }
+    check(after == untouched && !fm.fileExists(atPath: old.appendingPathComponent("meeting.json").path),
+          "RF4: resume never touches old, unprocessed, done or failed meetings")
+    q2.resume()
+    check(r.runner.calls.count == runs + 6, "RF4: resume again finds nothing to do")
+}
+
+// Review Focus 4: the processing one, case by case
+func resumed(_ setUp: (QRig, URL) -> Void) -> (QRig, URL, ProcessingQueue) {
+    let r = QRig()
+    let dir = r.meeting("2026-10-29_0900") { $0.state = .processing; $0.attempts = 1; $0.attempt = "attempt-one" }
+    setUp(r, dir)
+    let q = r.make()
+    q.resume()
+    return (r, dir, q)
+}
+do {
+    // the owner is alive: wait for the lock to go, then read the result
+    let t0 = Date().addingTimeInterval(-60)
+    let (r, dir, q) = resumed { r, dir in r.lock(dir, owner: "\(me) \(lstartOf(me))") }
+    let other = r.meeting("2026-10-29_1000", queued)
+    q.enqueue(other)
+    check(r.runner.calls.isEmpty && q.current?.lastPathComponent == dir.lastPathComponent && r.state(other) == "queued",
+          "RF4: a live owner is waited for; nothing else runs meanwhile")
+    try! "transcribing\nminutes\n".write(to: dir.appendingPathComponent(".process-progress"), atomically: true, encoding: .utf8)
+    q.tick()
+    check(r.runner.calls.isEmpty && q.stage == "minutes", "RF4: still waiting while the owner lives; its stage shows")
+    r.result(dir, attempt: "attempt-one", status: 0, started: t0)
+    r.outputs(dir, at: Date())
+    r.unlock(dir)
+    q.tick()
+    check(r.state(dir) == "done" && r.runner.calls.count == 1 && r.runner.folders == [other.lastPathComponent],
+          "RF4: its result (our attempt, status 0, fresh outputs) gives done, then the next job runs")
+    check(r.finished.first.map { $0.0 == dir.lastPathComponent && $0.1 } ?? false, "RF4: onFinished reports it done")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "someone-else", status: 0, started: Date().addingTimeInterval(-60))
+                                          r.outputs(dir, at: Date()) }
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2 && r.attempt(dir) != "attempt-one" && r.runner.calls[0].attempt == r.attempt(dir),
+          "RF4: a result for another attempt means a retry with attempts + 1 and a new attempt")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.lock(dir, owner: "\(deadPid) Thu Jan  1 00:00:00 2026") }
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2, "RF4: a dead owner and no result means a retry")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.lock(dir, owner: "\(me) Thu Jan  1 00:00:00 2026") }
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2, "RF4: a live PID with another start time is a reused PID: retry")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "attempt-one", status: 0, started: Date())
+                                          r.outputs(dir, at: Date().addingTimeInterval(-3600)) }
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2, "RF4: our result with outputs older than the run is not success: retry")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "attempt-one", status: 143, started: Date())  }
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2, "RF4: our result ended by a signal is an interruption: retry")
+}
+do {
+    let (r, dir, _) = resumed { r, dir in r.result(dir, attempt: "attempt-one", status: 1, started: Date()) }
+    check(r.runner.calls.isEmpty && r.state(dir) == "failed" && r.error(dir) == "processing failed (exit 1)",
+          "RF4: our result with a failing status is a failure, not a retry")
+}
+do {
+    let (r, dir, q) = resumed { r, dir in r.lock(dir, owner: nil) }
+    check(r.runner.calls.isEmpty && q.current != nil, "RF4: a lock with no owner yet and a fresh change time is waited for")
+    r.unlock(dir)
+    q.tick()
+    check(r.runner.calls.count == 1 && r.attempts(dir) == 2, "RF4: once it goes, with no result, a retry")
+}
+do {
+    let r = QRig()
+    let dir = r.meeting("2026-10-29_0900") { $0.state = .processing; $0.attempts = 3; $0.attempt = "attempt-three" }
+    let next = r.meeting("2026-10-29_1000", queued)
+    let q = r.make()
+    q.resume()
+    check(r.state(dir) == "failed" && r.error(dir) == "processing kept stopping part way",
+          "RF4: at attempts 3 an interrupted job becomes failed: processing kept stopping part way")
+    check(r.runner.folders == [next.lastPathComponent], "RF4: and the next job runs")
+    _ = q
+}
+do {
+    // attempts 1, 2, 3 then failed, across three crashes
+    let r = QRig()
+    let dir = r.meeting("2026-10-29_0900", queued)
+    var q: ProcessingQueue? = r.make()
+    q!.enqueue(dir)
+    var seen = [r.attempts(dir)]
+    for _ in 0..<3 {
+        q = nil
+        r.queue = nil
+        q = r.make()
+        q!.resume()
+        seen.append(r.state(dir) == "failed" ? -1 : r.attempts(dir))
+    }
+    check(seen == [1, 2, 3, -1] && r.runner.calls.count == 3 && r.error(dir) == "processing kept stopping part way",
+          "RF4: an interrupted job is retried at most three times, then failed")
+}
+
+// the lock and result as the real script writes them
+do {
+    let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    let home = freshRoot()
+    let dir = freshRoot()
+    func hold(_ attempt: String) -> Process {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/bash")
+        p.arguments = ["-c", """
+            sed '/^# -* main$/,$d' "$1/meetingbox" > "$HOME/functions"; . "$HOME/functions"; set +e
+            take_processing_lock "$2"; : > "$2/held"; while :; do sleep 0.1; done
+            """, "_", repo.path, dir.path]
+        p.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "MB_ATTEMPT": attempt]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try! p.run()
+        return p
+    }
+    func waitFor(_ seconds: Double, _ cond: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while Date() < end { if cond() { return true }; usleep(20_000) }
+        return cond()
+    }
+    let ps = URL(fileURLWithPath: "/bin/ps")
+    let held = dir.appendingPathComponent("held")
+    let a = hold("attempt-a")
+    check(waitFor(10) { fm.fileExists(atPath: held.path) } && ProcessingLock.owner(dir, ps: ps, now: Date()) == .alive,
+          "the script's lock reads as alive while its owner runs")
+    a.interrupt() // SIGINT: the script ends through its trap
+    a.waitUntilExit()
+    let result = ProcessResult.read(dir)
+    check(ProcessingLock.owner(dir, ps: ps, now: Date()) == .gone && result?.attempt == "attempt-a" && result?.status == 130
+          && result?.started != nil, "an interrupted script leaves no lock and a result with its attempt and status 130")
+    try? fm.removeItem(at: held)
+    let b = hold("attempt-b")
+    check(waitFor(10) { fm.fileExists(atPath: held.path) }, "the script takes the lock again")
+    kill(b.processIdentifier, SIGKILL)
+    b.waitUntilExit()
+    check(fm.fileExists(atPath: dir.appendingPathComponent(".processing").path) && ProcessingLock.owner(dir, ps: ps, now: Date()) == .gone
+          && ProcessResult.read(dir)?.attempt == "attempt-a", "a script killed outright leaves a stale lock (gone) and no result of its own")
+    check(ProcessingLock.owner(dir, ps: URL(fileURLWithPath: "/no-such-ps"), now: Date()) == .unknown,
+          "the lock's owner is unknown when ps cannot tell")
+}
+
+// the real runner
+do {
+    let dir = freshRoot()
+    let script = dir.appendingPathComponent("meetingbox")
+    let log = dir.appendingPathComponent("log")
+    try! """
+    #!/bin/bash
+    { for a in "$@"; do echo "arg $a"; done
+      echo "sounds=$MB_SOUNDS"; echo "progress=$MB_PROGRESS_FILE"; echo "attempt=$MB_ATTEMPT"
+      echo "path=$PATH"; echo "dir=${MB_DIR:-unset}"; } > "\(log.path)"
+    echo "meetingbox transcribing" >&2
+    printf '\\033[0;31m     error\\033[0m the transcript came out empty\\n\\n' >&2
+    exit 3
+    """.write(to: script, atomically: true, encoding: .utf8)
+    chmod(script.path, 0o700)
+    let home = URL(fileURLWithPath: "/Users/someone")
+    let runner = ScriptRunner(script: script, home: home, environment: ["PATH": "/usr/bin:/bin", "MB_DIR": "/elsewhere", "HOME": "/Users/someone"])
+    let audio = dir.appendingPathComponent("audio.m4a")
+    let progress = dir.appendingPathComponent(".process-progress")
+    let sem = DispatchSemaphore(value: 0)
+    var got: (Int32, String)?
+    let pid = runner.run(audio: audio, progress: progress, attempt: "the-attempt") { s, l in got = (s, l); sem.signal() }
+    check(pid > 0, "ScriptRunner returns the worker's PID")
+    check(sem.wait(timeout: .now() + 10) == .success, "ScriptRunner calls done")
+    check(got?.0 == 3 && got?.1 == "the transcript came out empty", "ScriptRunner gives the exit status and the last stderr line")
+    let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+    check(text.contains("arg process\narg \(audio.path)\n"), "ScriptRunner runs <script> process <audio>")
+    check(text.contains("sounds=0\n") && text.contains("progress=\(progress.path)\n") && text.contains("attempt=the-attempt\n"),
+          "ScriptRunner sets MB_SOUNDS=0, MB_PROGRESS_FILE and MB_ATTEMPT")
+    check(text.contains("path=/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n"),
+          "ScriptRunner puts ~/.local/bin, /opt/homebrew/bin and /usr/local/bin before PATH")
+    check(text.contains("dir=unset\n"), "ScriptRunner passes on no MB_* setting of its own environment")
+    let missing = ScriptRunner(script: dir.appendingPathComponent("no-such-script"), home: home, environment: [:])
+    var gone: (Int32, String)?
+    let sem2 = DispatchSemaphore(value: 0)
+    _ = missing.run(audio: audio, progress: progress, attempt: "x") { s, l in gone = (s, l); sem2.signal() }
+    check(sem2.wait(timeout: .now() + 5) == .success && gone?.0 == 127 && (gone?.1 ?? "").contains("could not start"),
+          "ScriptRunner reports a script it cannot start")
 }
 
 try? fm.removeItem(at: scratch)

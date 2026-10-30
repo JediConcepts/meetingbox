@@ -1,0 +1,436 @@
+import Darwin
+import Foundation
+
+/// Runs `meetingbox process` for one meeting. Returns the worker's PID (or -1 when it could not be
+/// started); `done` is called once, on any queue, with the exit status and the last stderr line.
+/// `attempt` names this run: the script writes it into `.process-result`.
+protocol PipelineRunner {
+    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32
+}
+
+/// The real runner: `<MBScriptPath> process <audio>` with `MB_PROGRESS_FILE`, `MB_ATTEMPT` and
+/// `MB_SOUNDS=0`, and `PATH` led by `~/.local/bin:/opt/homebrew/bin:/usr/local/bin`. The app's own
+/// `MB_*` variables are not passed on: settings travel explicitly, never through the environment.
+final class ScriptRunner: PipelineRunner {
+    let script: URL
+    private let home: URL
+    private let environment: [String: String]
+
+    init(script: URL, home: URL = FileManager.default.homeDirectoryForCurrentUser,
+         environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.script = script
+        self.home = home
+        self.environment = environment
+    }
+
+    /// The script named by `MBScriptPath` in the app's Info.plist.
+    static func fromBundle(_ bundle: Bundle = .main) -> ScriptRunner? {
+        guard let path = bundle.object(forInfoDictionaryKey: "MBScriptPath") as? String, !path.isEmpty else { return nil }
+        return ScriptRunner(script: URL(fileURLWithPath: path))
+    }
+
+    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
+        var env = environment.filter { !$0.key.hasPrefix("MB_") }
+        let lead = ["\(home.path)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"].joined(separator: ":")
+        env["PATH"] = lead + ":" + (env["PATH"].flatMap { $0.isEmpty ? nil : $0 } ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        env["MB_PROGRESS_FILE"] = progress.path
+        env["MB_ATTEMPT"] = attempt
+        env["MB_SOUNDS"] = "0"
+
+        let process = Process()
+        process.executableURL = script
+        process.arguments = ["process", audio.path]
+        process.environment = env
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        let err = Pipe()
+        process.standardError = err
+        do {
+            try process.run()
+        } catch {
+            let message = "could not start meetingbox: \(error.localizedDescription)"
+            DispatchQueue.global(qos: .utility).async { done(127, message) }
+            return -1
+        }
+        let pid = process.processIdentifier
+        DispatchQueue.global(qos: .utility).async {
+            let data = err.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let status = process.terminationReason == .uncaughtSignal ? 128 + process.terminationStatus : process.terminationStatus
+            done(status, ScriptRunner.lastLine(data))
+        }
+        return pid
+    }
+
+    /// The last line with text, without colour codes or the script's "error" label.
+    static func lastLine(_ data: Data) -> String {
+        let text = String(decoding: data, as: UTF8.self)
+            .replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+        guard let line = text.split(whereSeparator: \.isNewline)
+            .map({ $0.trimmingCharacters(in: .whitespaces) }).last(where: { !$0.isEmpty }) else { return "" }
+        return line.hasPrefix("error ") ? String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces) : line
+    }
+}
+
+/// Reads `<dir>/.processing`, the lock `meetingbox process` holds (see the script for how it is
+/// taken). Never writes or removes it: the script takes over a stale lock itself.
+enum ProcessingLock {
+    enum Owner: Equatable { case alive, gone, unknown }
+    /// How long a lock with no owner file yet counts as held, after its change time.
+    static let grace: TimeInterval = 10
+
+    /// `gone` covers no lock and a stale one (owner dead, or its PID reused by another process).
+    static func owner(_ dir: URL, ps: URL, now: Date) -> Owner {
+        let lock = dir.appendingPathComponent(".processing")
+        var st = stat()
+        if lstat(lock.path, &st) != 0 { return errno == ENOENT ? .gone : .unknown }
+        let text = (try? String(contentsOf: lock.appendingPathComponent("owner"), encoding: .utf8))?
+            .split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        if let space = text.firstIndex(of: " "), let pid = Int32(text[..<space]), pid > 0 {
+            let start = text[text.index(after: space)...].trimmingCharacters(in: .whitespaces)
+            guard let current = lstart(pid, ps: ps) else { return .unknown }
+            return current == start ? .alive : .gone
+        }
+        if !text.isEmpty { return .gone } // unreadable owner: as the script treats it, stale
+        let changed = Date(timeIntervalSince1970: TimeInterval(st.st_ctimespec.tv_sec))
+        return now.timeIntervalSince(changed) < grace ? .alive : .gone
+    }
+
+    /// `ps -o lstart=` for the PID: "" when nothing runs under it, nil when ps cannot tell.
+    private static func lstart(_ pid: Int32, ps: URL) -> String? {
+        let process = Process()
+        let out = Pipe()
+        process.executableURL = ps
+        process.arguments = ["-o", "lstart=", "-p", String(pid)]
+        process.environment = ["LC_ALL": "C", "PATH": "/usr/bin:/bin"]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationReason == .exit else { return nil }
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        switch process.terminationStatus {
+        case 0: return text
+        case 1: return text.isEmpty ? "" : nil // ps exits 1 when no such process
+        default: return nil
+        }
+    }
+}
+
+/// `.process-result`: `attempt=<id> status=<n> started=<ISO 8601> finished=<ISO 8601>`.
+struct ProcessResult: Equatable {
+    var attempt: String
+    var status: Int
+    var started: Date?
+
+    static func read(_ dir: URL) -> ProcessResult? {
+        guard let text = try? String(contentsOf: dir.appendingPathComponent(".process-result"), encoding: .utf8) else { return nil }
+        var fields: [String: String] = [:]
+        for pair in text.split(whereSeparator: { $0 == " " || $0.isNewline }) {
+            guard let eq = pair.firstIndex(of: "=") else { continue }
+            fields[String(pair[..<eq])] = String(pair[pair.index(after: eq)...])
+        }
+        guard let attempt = fields["attempt"], let status = fields["status"].flatMap({ Int($0) }) else { return nil }
+        return ProcessResult(attempt: attempt, status: status,
+                             started: fields["started"].flatMap { ISO8601DateFormatter().date(from: $0) })
+    }
+}
+
+/// The durable processing queue. Its state lives in each meeting's `meeting.json` (`queued`,
+/// `processing`, `attempts`, `attempt`), so a crash loses nothing: `resume()` picks up every
+/// `queued` and `processing` meeting, and never touches `unprocessed` or `done` ones. One job runs
+/// at a time, oldest first. A job found `processing` after a crash is settled from its lock and
+/// `.process-result`: a live owner is waited for; our attempt's success is done; anything that
+/// stopped part way is run again, at most three runs in all.
+/// Call it from one queue (the main queue in the app); a 1 s timer there follows the progress file
+/// and waits on a lock held by another process.
+final class ProcessingQueue {
+    static let maxAttempts = 3
+    static let keptStopping = "processing kept stopping part way"
+    static let noMinutes = "processing finished but wrote no minutes"
+    /// `meetingbox process` refused: another process holds the folder (EX_TEMPFAIL).
+    static let busyExit: Int32 = 75
+    static let progressName = ".process-progress"
+
+    /// How a stage from the progress file reads in the app.
+    static func label(_ stage: String) -> String {
+        switch stage {
+        case "transcribing": return "Transcribing"
+        case "speakers": return "Finding speakers"
+        case "minutes": return "Writing minutes"
+        case "done": return "Done"
+        default: return stage
+        }
+    }
+
+    /// The meeting being processed, or waited on.
+    private(set) var current: URL?
+    /// The last stage in its progress file.
+    private(set) var stage: String?
+    var onChange: (() -> Void)?
+    /// The folder, and whether it ended done (true) or failed (false).
+    var onFinished: ((URL, Bool) -> Void)?
+
+    private let store: MeetingStore
+    private let runner: PipelineRunner
+    private let now: () -> Date
+    private let ps: URL
+    private let tickQueue: DispatchQueue?
+    private var timer: DispatchSourceTimer?
+
+    private var pending: [URL] = []
+    private enum Job {
+        /// Our run, started at `started`. `token` ignores a late `done` from an earlier run.
+        case running(started: Date, token: Int)
+        /// Another process holds the folder: wait for its lock to go, then settle from the result.
+        case waiting
+    }
+    private var job: Job?
+    private var token = 0
+
+    /// `tickQueue` runs the 1 s timer and receives the runner's `done`; nil means no timer and
+    /// `done` handled where it is called (tests call `tick()`). `ps` is injectable, as in ChildRecorder.
+    init(store: MeetingStore, runner: PipelineRunner, now: @escaping () -> Date = Date.init,
+         ps: URL = URL(fileURLWithPath: "/bin/ps"), tickQueue: DispatchQueue? = .main) {
+        self.store = store
+        self.runner = runner
+        self.now = now
+        self.ps = ps
+        self.tickQueue = tickQueue
+    }
+
+    deinit { timer?.cancel() }
+
+    // MARK: enqueue, resume
+
+    /// Queues a meeting whose `meeting.json` says `queued` (Session wrote it after a verified
+    /// finalise), or `failed` (asked again: it is written `queued`, with its attempts reset, before
+    /// anything runs). A meeting already queued or processing here is not added twice; any other
+    /// state, or no `meeting.json`, is left alone.
+    func enqueue(_ folder: URL) {
+        let dir = ProcessingQueue.normal(folder)
+        guard !known(dir), let record = ProcessingQueue.read(dir) else { return }
+        switch record.state {
+        case .queued, .processing:
+            break
+        case .failed:
+            do {
+                try store.update(dir) {
+                    guard $0.state == .failed else { return }
+                    $0.state = .queued
+                    $0.error = nil
+                    $0.stage = nil
+                    $0.attempts = nil
+                    $0.attempt = nil
+                }
+            } catch { return }
+        default:
+            return
+        }
+        pending.append(dir)
+        onChange?()
+        advance()
+    }
+
+    /// Picks up every meeting left `queued` or `processing`, oldest first. Safe to call again.
+    func resume() {
+        for meeting in store.scan().reversed() {
+            guard let state = meeting.record?.state, state == .queued || state == .processing else { continue }
+            let dir = ProcessingQueue.normal(meeting.folder.url)
+            if !known(dir) { pending.append(dir) }
+        }
+        onChange?()
+        advance()
+    }
+
+    // MARK: running
+
+    /// Follows the progress file, and settles a job whose lock another process held once it goes.
+    func tick() {
+        guard let dir = current, let job = job else { return }
+        pollProgress(dir)
+        if case .waiting = job, ProcessingLock.owner(dir, ps: ps, now: now()) == .gone {
+            settle(dir)
+            advance()
+        }
+    }
+
+    /// Starts jobs until one is running or waiting, or none is left.
+    private func advance() {
+        while job == nil {
+            guard !pending.isEmpty else {
+                if current != nil || stage != nil {
+                    current = nil
+                    stage = nil
+                    onChange?()
+                }
+                updateTimer()
+                return
+            }
+            let dir = pending.removeFirst()
+            current = dir
+            stage = nil
+            guard let record = ProcessingQueue.read(dir) else { current = nil; continue }
+            switch record.state {
+            case .queued:
+                launch(dir, attempts: 1)
+            case .processing:
+                // Left by a crash, or a process we were refused for: its owner may still be at work.
+                if ProcessingLock.owner(dir, ps: ps, now: now()) == .gone {
+                    settle(dir)
+                } else {
+                    job = .waiting
+                    pollProgress(dir)
+                }
+            default:
+                break // changed since it was queued: not ours to run
+            }
+            if job == nil { current = nil }
+            onChange?()
+        }
+        updateTimer()
+    }
+
+    /// A `processing` meeting nobody holds: done when its result is our attempt's success with fresh
+    /// minutes; failed when that run failed on its own; otherwise it stopped part way and runs again.
+    private func settle(_ dir: URL) {
+        job = nil
+        guard let record = ProcessingQueue.read(dir), record.state == .processing else { return }
+        if let result = ProcessResult.read(dir), let attempt = record.attempt, result.attempt == attempt {
+            if result.status == 0, let started = result.started, ProcessingQueue.fresh(dir, since: started) {
+                succeed(dir)
+                return
+            }
+            if result.status != 0 && result.status < 128 {
+                fail(dir, "processing failed (exit \(result.status))")
+                return
+            }
+        }
+        let attempts = record.attempts ?? 0
+        if attempts >= ProcessingQueue.maxAttempts {
+            fail(dir, ProcessingQueue.keptStopping)
+        } else {
+            launch(dir, attempts: attempts + 1)
+        }
+    }
+
+    private func launch(_ dir: URL, attempts: Int) {
+        let attempt = UUID().uuidString
+        do {
+            try store.update(dir) {
+                $0.state = .processing
+                $0.attempts = attempts
+                $0.attempt = attempt
+                $0.error = nil
+                $0.stage = nil
+            }
+        } catch {
+            return // cannot even record it: leave it queued for the next resume
+        }
+        let progress = dir.appendingPathComponent(ProcessingQueue.progressName)
+        try? MeetingStore.writePrivately(Data(), to: progress)
+        token += 1
+        let mine = token
+        let started = now()
+        job = .running(started: started, token: mine)
+        _ = runner.run(audio: dir.appendingPathComponent("audio.m4a"), progress: progress, attempt: attempt) { [weak self] status, line in
+            self?.onQueue { self?.ended(mine, dir, status, line) }
+        }
+    }
+
+    private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {
+        guard case .running(let started, let t)? = job, t == mine,
+              let cur = current, cur.path == dir.path else { return }
+        pollProgress(dir)
+        if status == ProcessingQueue.busyExit {
+            // Refused: nothing ran, so this run is not counted. Wait for the holder, then settle.
+            try? store.update(dir) { if let n = $0.attempts { $0.attempts = max(0, n - 1) } }
+            job = .waiting
+            onChange?()
+            updateTimer()
+            return
+        }
+        job = nil
+        if status == 0 {
+            if ProcessingQueue.fresh(dir, since: started) { succeed(dir) } else { fail(dir, ProcessingQueue.noMinutes) }
+        } else {
+            fail(dir, line.isEmpty ? "processing failed (exit \(status))" : line)
+        }
+        advance()
+    }
+
+    private func succeed(_ dir: URL) {
+        try? store.update(dir) {
+            $0.state = .done
+            $0.stage = nil
+            $0.error = nil
+        }
+        onFinished?(dir, true)
+    }
+
+    private func fail(_ dir: URL, _ reason: String) {
+        try? store.update(dir) {
+            $0.state = .failed
+            $0.stage = nil
+            $0.error = reason
+        }
+        onFinished?(dir, false)
+    }
+
+    // MARK: helpers
+
+    private func pollProgress(_ dir: URL) {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent(ProcessingQueue.progressName)) else { return }
+        let text = String(decoding: data, as: UTF8.self)
+        // whole lines only: the script may be half way through writing the next
+        let lines = text.hasSuffix("\n") ? text.split(whereSeparator: \.isNewline) : text.split(whereSeparator: \.isNewline).dropLast()
+        guard let last = lines.last.map({ $0.trimmingCharacters(in: .whitespaces) }), !last.isEmpty, last != stage else { return }
+        stage = last
+        try? store.update(dir) { $0.stage = last }
+        onChange?()
+    }
+
+    private func known(_ dir: URL) -> Bool {
+        current?.path == dir.path || pending.contains { $0.path == dir.path }
+    }
+
+    /// The timer runs while a job is running or waited on.
+    private func updateTimer() {
+        if job == nil {
+            timer?.cancel()
+            timer = nil
+        } else if timer == nil, let q = tickQueue {
+            let source = DispatchSource.makeTimerSource(queue: q)
+            source.schedule(deadline: .now() + 1, repeating: 1)
+            source.setEventHandler { [weak self] in self?.tick() }
+            source.resume()
+            timer = source
+        }
+    }
+
+    private func onQueue(_ work: @escaping () -> Void) {
+        if let q = tickQueue { q.async(execute: work) } else { work() }
+    }
+
+    /// `transcript.txt` and `notes.md` both exist and were written at or after `since` (to the second).
+    private static func fresh(_ dir: URL, since: Date) -> Bool {
+        let floor = since.addingTimeInterval(-1)
+        return ["transcript.txt", "notes.md"].allSatisfy { name in
+            let attrs = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(name).path)
+            guard let modified = attrs?[.modificationDate] as? Date else { return false }
+            return modified >= floor
+        }
+    }
+
+    private static func read(_ dir: URL) -> MeetingRecord? {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent("meeting.json")),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return MeetingRecord(json: obj)
+    }
+
+    private static func normal(_ url: URL) -> URL {
+        URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: true)
+    }
+}

@@ -172,4 +172,194 @@ if [ "$(grep -c . "$HOME/chunks2.list")" = 2 ] && [ "$(wc -w < "$HOME/chunks2/ch
   pass "split_chunks still cuts a long line at n * 1.5"
 else fail "split_chunks still cuts a long line at n * 1.5: $(cat "$HOME"/chunks2/*)"; fi
 
+# ======================================================= the processing lock, result and progress
+
+lstart_of() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
+sa_calls() { grep -c '^speech-analyzer ' "$HOME/calls.log" | tr -d ' '; }
+mode_of() { stat -f '%Lp' "$1" 2>/dev/null; }
+# A PID that has finished: nothing runs under it now.
+sh -c 'exit 0' & dead_pid=$!; wait "$dead_pid"
+# Nothing of the lock's own making left in the folder: no lock, no temp, no stale copy.
+lock_clean() { ! ls -a "$1" | grep -q '^\.processing\|^\.process-result\.'; }
+
+# --- success: the result names the attempt and status 0, written privately; the lock is gone ---
+d="$(meeting r1 audio.m4a mic.m4a call.m4a)"
+out="$( (MB_ATTEMPT=attempt-one; export MB_ATTEMPT; process "$d/audio.m4a") 2>&1 )"; rc=$?
+r="$(cat "$d/.process-result" 2>/dev/null)"
+if [ "$rc" -eq 0 ] && printf '%s' "$r" | grep -qE '^attempt=attempt-one status=0 started=[0-9T:+Z-]+ finished=[0-9T:+Z-]+$'; then
+  pass "a finished process writes .process-result with MB_ATTEMPT and status 0"
+else fail "a finished process writes .process-result with MB_ATTEMPT and status 0 (rc $rc): [$r] $out"; fi
+if [ "$(mode_of "$d/.process-result")" = 600 ]; then pass ".process-result is 0600"
+else fail ".process-result is 0600: $(mode_of "$d/.process-result")"; fi
+if [ ! -e "$d/.processing" ] && lock_clean "$d"; then pass "the lock is gone after success"
+else fail "the lock is gone after success: $(ls -a "$d")"; fi
+
+# --- from a terminal, with no MB_ATTEMPT ---
+d="$(meeting r2 audio.m4a mic.m4a call.m4a)"
+(process "$d/audio.m4a") >/dev/null 2>&1
+if grep -q '^attempt=terminal status=0 ' "$d/.process-result" 2>/dev/null; then pass "with no MB_ATTEMPT the result says terminal"
+else fail "with no MB_ATTEMPT the result says terminal: $(cat "$d/.process-result" 2>/dev/null)"; fi
+
+# --- failure: the result carries the failing status; the lock is gone ---
+d="$(meeting r3 audio.m4a mic.m4a call.m4a)"
+SA_FAIL=both
+out="$( (MB_ATTEMPT=attempt-two; export MB_ATTEMPT; process "$d/audio.m4a") 2>&1 )"; rc=$?
+SA_FAIL=""
+if [ "$rc" -ne 0 ] && grep -q "^attempt=attempt-two status=$rc " "$d/.process-result" 2>/dev/null; then
+  pass "a failed process writes .process-result with its exit status"
+else fail "a failed process writes .process-result with its exit status (rc $rc): $(cat "$d/.process-result" 2>/dev/null)"; fi
+if [ ! -e "$d/.processing" ] && lock_clean "$d"; then pass "the lock is gone after failure"
+else fail "the lock is gone after failure: $(ls -a "$d")"; fi
+
+# --- the result is written aside and moved into place ---
+if grep -q 'process-result' "$ROOT/meetingbox" && grep -q 'mv -f "$tmp_result" "$result"' "$ROOT/meetingbox"; then
+  pass ".process-result is written to a temp file, then moved"
+else fail ".process-result is written to a temp file, then moved"; fi
+
+# --- a lock held by a live owner: refused, nothing run, nothing written, lock untouched ---
+d="$(meeting l1 audio.m4a mic.m4a call.m4a)"
+mkdir "$d/.processing"
+printf '%s %s\n' "$$" "$(lstart_of $$)" > "$d/.processing/owner"
+before="$(cat "$d/.processing/owner")"
+: > "$HOME/calls.log"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'already being processed' && [ "$(sa_calls)" = 0 ] \
+   && [ ! -e "$d/transcript.txt" ] && [ ! -e "$d/.process-result" ] && [ "$(cat "$d/.processing/owner")" = "$before" ]; then
+  pass "a live owner's lock is refused: already being processed, nothing run or written"
+else fail "a live owner's lock is refused: already being processed, nothing run or written (rc $rc): $out"; fi
+if [ "$rc" = 75 ]; then pass "the refusal exits 75, so the app can tell it from a failure"
+else fail "the refusal exits 75, so the app can tell it from a failure (rc $rc)"; fi
+
+# --- the same PID with a different start time is a reused PID: stale ---
+printf '%s %s\n' "$$" "Thu Jan  1 00:00:00 2026" > "$d/.processing/owner"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ -s "$d/notes.md" ] && [ ! -e "$d/.processing" ] && lock_clean "$d"; then
+  pass "a live PID with another start time is a reused PID: the lock is stale and replaced"
+else fail "a live PID with another start time is a reused PID: the lock is stale and replaced (rc $rc): $out"; fi
+
+# --- a dead owner: stale, replaced, and removed after ---
+d="$(meeting l2 audio.m4a mic.m4a call.m4a)"
+mkdir "$d/.processing"
+printf '%s %s\n' "$dead_pid" "Thu Jan  1 00:00:00 2026" > "$d/.processing/owner"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ -s "$d/notes.md" ] && [ ! -e "$d/.processing" ] && lock_clean "$d"; then
+  pass "a dead owner's lock is stale, taken over, and gone after"
+else fail "a dead owner's lock is stale, taken over, and gone after (rc $rc): $out $(ls -a "$d")"; fi
+
+# --- no owner yet and a fresh change time: someone is between mkdir and writing owner ---
+d="$(meeting l3 audio.m4a mic.m4a call.m4a)"
+mkdir "$d/.processing"
+: > "$HOME/calls.log"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" = 75 ] && printf '%s' "$out" | grep -q 'already being processed' && [ "$(sa_calls)" = 0 ] && [ -d "$d/.processing" ]; then
+  pass "a lock with no owner and a fresh change time is respected"
+else fail "a lock with no owner and a fresh change time is respected (rc $rc): $out"; fi
+# ...and once it is older than the grace, it is stale
+PROCESS_LOCK_GRACE=0
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+PROCESS_LOCK_GRACE=10
+if [ "$rc" -eq 0 ] && [ ! -e "$d/.processing" ] && lock_clean "$d"; then
+  pass "a lock with no owner past the grace is stale and replaced"
+else fail "a lock with no owner past the grace is stale and replaced (rc $rc): $out"; fi
+
+# --- a second process while the first is running: refused, the first finishes ---
+SA_SLOW=0.4
+speech-analyzer() {
+  echo "speech-analyzer $*" >> "$HOME/calls.log"
+  if [ -n "$SA_SLOW" ]; then
+    mkdir "$HOME/inside" 2>/dev/null || echo "OVERLAP" >> "$HOME/calls.log"
+    sleep "$SA_SLOW"
+    rmdir "$HOME/inside" 2>/dev/null
+  fi
+  for a in "$@"; do :; done
+  case "$a" in
+    *mic.m4a)  cat "$FIX/sa-mic.json" ;;
+    *call.m4a) cat "$FIX/sa-call.json" ;;
+    *) return 1 ;;
+  esac
+}
+d="$(meeting l4 audio.m4a mic.m4a call.m4a)"
+: > "$HOME/calls.log"
+(process "$d/audio.m4a") >"$HOME/first.out" 2>&1 & first=$!
+for _ in $(seq 1 100); do [ -s "$d/.processing/owner" ] && break; sleep 0.02; done
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+wait "$first"; rc1=$?
+if [ "$rc" = 75 ] && printf '%s' "$out" | grep -q 'already being processed' && [ "$rc1" -eq 0 ] \
+   && [ "$(sa_calls)" = 2 ] && ! grep -q OVERLAP "$HOME/calls.log" && [ ! -e "$d/.processing" ] && lock_clean "$d"; then
+  pass "a second process on a folder being processed is refused; the first finishes alone"
+else fail "a second process on a folder being processed is refused; the first finishes alone (rc $rc, first $rc1): $out $(cat "$HOME/calls.log")"; fi
+
+# --- two workers finding the same stale lock at once: exactly one runs ---
+# The liveness check is slowed, so both read the stale owner before either replaces it.
+if declare -f processing_lock_alive >/dev/null; then
+  eval "$(declare -f processing_lock_alive | sed '1s/processing_lock_alive/real_processing_lock_alive/')"
+  processing_lock_alive() { real_processing_lock_alive "$@"; local r=$?; sleep 0.3; return $r; }
+fi
+race_ok=1; race_log=""
+for off in 0 0.05 0.15 0.35; do
+  d="$(meeting "race$off" audio.m4a mic.m4a call.m4a)"
+  mkdir "$d/.processing"
+  printf '%s %s\n' "$dead_pid" "Thu Jan  1 00:00:00 2026" > "$d/.processing/owner"
+  : > "$HOME/calls.log"
+  (process "$d/audio.m4a") >"$HOME/a.out" 2>&1 & pa=$!
+  sleep "$off"
+  (process "$d/audio.m4a") >"$HOME/b.out" 2>&1 & pb=$!
+  wait "$pa"; ra=$?; wait "$pb"; rb=$?
+  pair="$ra $rb"
+  if { [ "$pair" = "0 75" ] || [ "$pair" = "75 0" ]; } && [ "$(sa_calls)" = 2 ] && ! grep -q OVERLAP "$HOME/calls.log" \
+     && cat "$HOME/a.out" "$HOME/b.out" | grep -q 'already being processed' && [ ! -e "$d/.processing" ] && lock_clean "$d"; then :
+  else race_ok=0; race_log="$race_log [offset $off: $pair, $(sa_calls) calls, $(ls -a "$d" | tr '\n' ' ') $(cat "$HOME/a.out" "$HOME/b.out" | grep error)]"; fi
+done
+if [ "$race_ok" = 1 ]; then pass "two workers on one stale lock: exactly one runs, the other refuses"
+else fail "two workers on one stale lock: exactly one runs, the other refuses:$race_log"; fi
+if declare -f real_processing_lock_alive >/dev/null; then
+  eval "$(declare -f real_processing_lock_alive | sed '1s/real_processing_lock_alive/processing_lock_alive/')"
+fi
+SA_SLOW=""
+
+# --- progress: the stages in order with MB_PROGRESS_FILE, nothing without it ---
+d="$(meeting p1 audio.m4a mic.m4a call.m4a)"
+(MB_PROGRESS_FILE="$HOME/progress-p1"; export MB_PROGRESS_FILE; process "$d/audio.m4a") >/dev/null 2>&1
+if [ "$(tr '\n' ' ' < "$HOME/progress-p1" 2>/dev/null)" = "transcribing speakers minutes done " ]; then
+  pass "MB_PROGRESS_FILE gets transcribing, speakers, minutes, done in order"
+else fail "MB_PROGRESS_FILE gets transcribing, speakers, minutes, done in order: $(cat "$HOME/progress-p1" 2>/dev/null)"; fi
+d="$(meeting p2 audio.m4a mic.m4a call.m4a)"
+before="$(ls -a "$HOME" | tr '\n' ' ')"
+(process "$d/audio.m4a") >/dev/null 2>&1
+if [ "$(ls -a "$HOME" | tr '\n' ' ')" = "$before" ] && ! ls -a "$d" | grep -qi progress; then
+  pass "without MB_PROGRESS_FILE no progress file is written"
+else fail "without MB_PROGRESS_FILE no progress file is written: $(ls -a "$d")"; fi
+
+# --- every file process writes is private, even one an app it opens creates (Gate 1) ---
+mkdir -p "$SA_APP/Contents/MacOS"
+open() {
+  local o="" prev="" a last=""
+  for a in "$@"; do [ "$prev" = -o ] && o="$a"; prev="$a"; last="$a"; done
+  # another app: it does not inherit our umask
+  case "$last" in
+    *mic.m4a)  (umask 022; cat "$FIX/sa-mic.json" > "$o") ;;
+    *call.m4a) (umask 022; cat "$FIX/sa-call.json" > "$o") ;;
+  esac
+  return 0
+}
+fm() {
+  case "$1" in
+    count-tokens) cat >/dev/null; echo 100 ;;
+    respond) cat >/dev/null; echo "the minutes" ;;
+    schema) echo '{}' ;;
+    *) return 1 ;;
+  esac
+}
+d="$(meeting u1 audio.m4a mic.m4a call.m4a)"
+(umask 022; process "$d/audio.m4a") >/dev/null 2>&1
+bad=""
+for f in mic.words.json call.words.json transcript.txt notes.md notes-raw.md brief.json .process-result; do
+  [ -e "$d/$f" ] || { bad="$bad $f(missing)"; continue; }
+  [ "$(mode_of "$d/$f")" = 600 ] || bad="$bad $f($(mode_of "$d/$f"))"
+done
+if [ -z "$bad" ]; then pass "words.json, transcript, minutes and result are all 0600"
+else fail "words.json, transcript, minutes and result are all 0600:$bad"; fi
+unset -f open
+rmdir "$SA_APP/Contents/MacOS" "$SA_APP/Contents" "$SA_APP"
+
 finish
