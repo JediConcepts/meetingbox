@@ -44,6 +44,9 @@ SH
 cat > "$STUB/sleep" <<'SH'
 #!/bin/bash
 echo "sleep $*" >> "$HOME/calls.log"
+# with $HOME/app-up-at-3: the app finishes starting at the third sleep
+[ -e "$HOME/app-up-at-3" ] && [ "$(grep -c '^sleep ' "$HOME/calls.log")" -ge 3 ] && rm -f "$HOME/app-down"
+exit 0
 SH
 cat > "$STUB/ps" <<'SH'
 #!/bin/bash
@@ -55,7 +58,7 @@ chmod +x "$STUB"/*
 mb() { PATH="$STUB:$PATH" bash "$ROOT/meetingbox" "$@" 2>&1; }
 reset_calls() {
   : > "$HOME/calls.log"; : > "$HOME/sent"
-  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/open-holds-lock" "$HOME/lock-held" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
+  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/open-holds-lock" "$HOME/app-up-at-3" "$HOME/lock-held" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
 }
 reply() { printf '%s\n' "$1" > "$HOME/reply"; }
 sent() { cat "$HOME/sent"; }
@@ -249,9 +252,17 @@ else fail "M5: status with a connection but no reply says the app did not answer
 reset_calls; : > "$HOME/app-down"; : > "$HOME/lock-held"; : > "$STATE_DIR/app.lock"
 out="$(mb start)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox is running but not answering. Quit it and open it again." \
-   && ! grep -q '^open ' "$HOME/calls.log" && [ "$(slept)" = 0 ] && grep -q '^lockf -n ' "$HOME/calls.log"; then
-  pass "M6: app.lock held but no answer: says it is running but not answering, opens nothing, waits for nothing"
-else fail "M6: app.lock held but no answer ($rc, slept $(slept): $out)"; fi
+   && ! grep -q '^open ' "$HOME/calls.log" && [ "$(slept)" = 10 ] && grep -q '^lockf -n ' "$HOME/calls.log"; then
+  pass "M6/N1: app.lock held but no answer: opens nothing, waits the full 10 s, then says it is running but not answering"
+else fail "M6/N1: app.lock held but no answer ($rc, slept $(slept): $out)"; fi
+# N1: an app that holds the lock but has not bound its socket yet answers within the wait.
+reset_calls; : > "$HOME/app-down"; : > "$HOME/lock-held"; : > "$STATE_DIR/app.lock"; reply "ok recording /Meetings/starting"
+: > "$HOME/app-up-at-3"
+out="$(mb start)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(sent)" = "start" ] && ! grep -q '^open ' "$HOME/calls.log" && [ "$(slept)" = 1.5 ] \
+   && printf '%s' "$out" | grep -qF "/Meetings/starting" && ! printf '%s' "$out" | grep -q "not answering"; then
+  pass "N1: app.lock held while the app is still starting: waits, then the request goes through"
+else fail "N1: app.lock held while the app is still starting ($rc, slept $(slept): $out)"; fi
 reset_calls; : > "$HOME/app-down"; : > "$HOME/open-holds-lock"; : > "$STATE_DIR/app.lock"
 out="$(mb start)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox is running but not answering. Quit it and open it again." \

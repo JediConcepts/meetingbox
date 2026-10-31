@@ -1017,9 +1017,9 @@ app_request() {
   if ! reply="$(app_send "$1")"; then
     [ -d "$APP_DIR" ] || die "meetingbox is not installed. Run: meetingbox setup"
     app_is_client_aware || die "the installed meetingbox app is older than this command. Run: meetingbox setup"
-    # Running but not listening (its socket could not be opened): opening it again changes nothing.
-    if app_lock_held; then die "$NOT_ANSWERING"; fi
-    open -g "$APP_DIR" >/dev/null 2>&1 || true
+    # Running but not listening yet (starting or quitting) or not at all: opening it again
+    # changes nothing, so only wait. NOT_ANSWERING is said when the wait runs out.
+    if ! app_lock_held; then open -g "$APP_DIR" >/dev/null 2>&1 || true; fi
     while :; do
       if [ "$i" -ge $((APP_WAIT * 2)) ]; then
         if app_lock_held; then die "$NOT_ANSWERING"; fi
@@ -1509,7 +1509,7 @@ processing_lock_alive() {
 busy_die() { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit "$BUSY_EXIT"; }
 
 take_processing_lock() {
-  local dir="$1" lock="$1/.processing" tmp me start seen moved took tries=0
+  local dir="$1" lock="$1/.processing" tmp me start owner seen moved took tries=0
   tmp="$(mktemp "$dir/.processing-owner.XXXXXX")" || die "could not write in $dir"
   # This shell's PID: $$ is the parent's in a subshell, and bash 3.2 has no BASHPID.
   sh -c 'printf "%s" "$PPID"' > "$tmp"
@@ -1517,7 +1517,8 @@ take_processing_lock() {
   start="$(pid_lstart "$me")"
   # Without it the owner would read as stale from birth, and anyone could take over.
   [ -n "$start" ] || { rm -f "$tmp"; die "could not read this process's start time"; }
-  printf '%s %s\n' "$me" "$start" > "$tmp"
+  owner="$me $start"
+  printf '%s\n' "$owner" > "$tmp"
   while :; do
     tries=$((tries + 1))
     [ "$tries" -le 20 ] || { rm -f "$tmp"; busy_die "this meeting is already being processed: $dir"; }
@@ -1554,7 +1555,8 @@ take_processing_lock() {
   done
   rm -f "$tmp"
   PROCESSING_LOCK="$lock"
-  PROCESSING_OWNER="$(cat "$lock/owner")"
+  # Our own text, not a re-read: a loser may hold the shared file aside just now.
+  PROCESSING_OWNER="$owner"
   PROCESSING_DIR="$dir"
   PROCESSING_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   trap 'end_processing $?' EXIT

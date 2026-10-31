@@ -345,6 +345,51 @@ done
 if [ "$race_ok" = 1 ]; then pass "two workers on one stale lock: exactly one runs, the other refuses"
 else fail "two workers on one stale lock: exactly one runs, the other refuses:$race_log"; fi
 
+# --- the winner keeps its own owner text, though a loser holds the owner file aside ---
+# Deterministic: the loser (the worker whose moved file is not the dead owner) holds the
+# owner file aside until released, and the winner waits at its first clean-up until the loser
+# is holding it. So the winner always looks for its owner file while it is missing. Run
+# without set -e (as the other tests do) and under set -e (as the real script does).
+dead_owner="$dead_pid Thu Jan  1 00:00:00 2026"
+cat() {
+  case "$*" in
+    *.processing-stale.*)
+      if [ "$(command cat "$@")" != "$dead_owner" ]; then : > "$HOME/loser.held"; sleep 0.6; fi ;;
+  esac
+  command cat "$@"
+}
+rm() {
+  case "$*" in
+    *.processing-stale.*)
+      if [ ! -e "$HOME/loser.held" ]; then
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          [ -e "$HOME/loser.held" ] && break; sleep 0.1
+        done
+      fi ;;
+  esac
+  command rm "$@"
+}
+hold_ok=1; hold_log=""
+for mode in "set +e" "set -eo pipefail"; do
+  d="$(meeting "hold${mode// /}" audio.m4a mic.m4a call.m4a)"
+  mkdir "$d/.processing"
+  printf '%s\n' "$dead_owner" > "$d/.processing/owner"
+  command rm -f "$HOME/loser.held"
+  : > "$HOME/calls.log"
+  ( $mode; process "$d/audio.m4a" ) >"$HOME/a.out" 2>&1 & pa=$!
+  sleep 0.05
+  ( $mode; process "$d/audio.m4a" ) >"$HOME/b.out" 2>&1 & pb=$!
+  wait "$pa"; ra=$?; wait "$pb"; rb=$?
+  pair="$ra $rb"
+  if { [ "$pair" = "0 75" ] || [ "$pair" = "75 0" ]; } && [ "$(sa_calls)" = 2 ] && ! grep -q OVERLAP "$HOME/calls.log" \
+     && [ -e "$HOME/loser.held" ] && ! cat "$HOME/a.out" "$HOME/b.out" | grep -q 'No such file' \
+     && [ ! -e "$d/.processing" ] && lock_clean "$d"; then :
+  else hold_ok=0; hold_log="$hold_log [$mode: $pair, $(sa_calls) calls, $(ls -a "$d" | tr '\n' ' ') $(cat "$HOME/a.out" "$HOME/b.out" | grep error)]"; fi
+done
+unset -f cat rm
+if [ "$hold_ok" = 1 ]; then pass "the winner keeps its own owner text while a loser holds the owner file: one runs, no lock left, with and without set -e"
+else fail "the winner keeps its own owner text while a loser holds the owner file:$hold_log"; fi
+
 # --- M6: a TERM while a live owner's file is moved aside does not lose it ---
 # The worker reads a stale owner, a live one replaces it, the worker moves the live one aside,
 # and is sent TERM just then. It must put the live owner back and refuse.
