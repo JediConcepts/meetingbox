@@ -83,9 +83,13 @@ final class Session {
     private let recorder: RecorderControl
     private let store: MeetingStore
     private let now: () -> Date
-    private let freeBytes: () -> Int64
-    private let tickQueue: DispatchQueue?
+    /// Free bytes on the volume holding a folder; nil when that cannot be read.
+    private let freeBytes: (URL) -> Int64?
+    /// The queue every entry point runs on, and that callbacks come back on (nil: the caller's).
+    let tickQueue: DispatchQueue?
     private let workQueue: DispatchQueue?
+    /// Where notes for the system log go (NSLog in the app; tests collect them).
+    private let log: (String) -> Void
     private var timer: DispatchSourceTimer?
 
     // The current recording.
@@ -96,6 +100,8 @@ final class Session {
     private var diskStop = false
     /// Stop was asked while `find` could not confirm an adopted pid: SIGINT still to send.
     private var stopPending = false
+    /// Free space could not be read during this recording (logged once).
+    private var freeUnknownLogged = false
     private var started = Date()
     private var pausedSeconds = 0
     private var pausedAt: Date?
@@ -125,8 +131,10 @@ final class Session {
     /// (tests call `tick()`). `workQueue` runs recovery and verification off that queue; nil runs
     /// them inline.
     init(stateDir: URL, recorder: RecorderControl, store: MeetingStore, now: @escaping () -> Date,
-         freeBytes: @escaping () -> Int64, tickQueue: DispatchQueue? = .main,
-         workQueue: DispatchQueue? = DispatchQueue(label: "meetingbox.session.work")) {
+         freeBytes: @escaping (URL) -> Int64?, tickQueue: DispatchQueue? = .main,
+         workQueue: DispatchQueue? = DispatchQueue(label: "meetingbox.session.work"),
+         log: @escaping (String) -> Void = { NSLog("%@", $0) }) {
+        self.log = log
         self.stateDir = stateDir
         self.recorder = recorder
         self.store = store
@@ -154,8 +162,14 @@ final class Session {
         if let named = namedFolder(), recorder.find(dir: named) != .notFound {
             throw SessionError("already recording in \(named.path)")
         }
-        guard freeBytes() >= Session.startFloor else {
-            throw SessionError("not enough free disk space to record (2 GB needed)")
+        // Measured where the recording will go. Unknown is not a reason to refuse, nor is it unlimited:
+        // it is logged, and the disk stop then waits until the space can be read.
+        if let free = freeBytes(root) {
+            guard free >= Session.startFloor else {
+                throw SessionError("not enough free disk space to record (2 GB needed)")
+            }
+        } else {
+            log("meetingbox: cannot read the free space for \(root.path); starting anyway")
         }
         let t = now()
         let dir = Session.folderURL(try MeetingFolder.create(in: root, at: t).path)
@@ -187,6 +201,7 @@ final class Session {
         pid = newPid
         adopted = false
         diskStop = false
+        freeUnknownLogged = false
         started = t
         pausedSeconds = 0
         pausedAt = nil
@@ -395,16 +410,20 @@ final class Session {
                 recorderGone(dir) // died on its own: handled as a stop
                 return
             }
-            let free = freeBytes()
-            if free < Session.stopFloor {
+            let free = freeBytes(dir)
+            if let free = free, free < Session.stopFloor {
                 diskStop = true
                 try? store.update(dir) { $0.error = Session.diskStopped }
                 stop()
                 return
             }
+            if free == nil && !freeUnknownLogged {
+                freeUnknownLogged = true
+                log("meetingbox: cannot read the free space for \(dir.path); the disk stop waits until it can")
+            }
             let t = now()
             healthLock.lock()
-            disk = free < Session.lowFloor ? .low : .ok
+            if let free = free { disk = free < Session.lowFloor ? .low : .ok }
             if t.timeIntervalSince(lastLine) >= Session.silenceLimit {
                 if mic != .error { mic = .stalled }
                 if system != .error { system = .stalled }

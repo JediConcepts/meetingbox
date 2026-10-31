@@ -979,12 +979,12 @@ pct_encode() {
   printf '%s' "$out"
 }
 
-# One request, the first line of the reply. Fails when nothing is listening (no
-# socket, or one left by an app that has gone); a connection that is closed with
-# no reply gives an empty line.
+# One request, the first line of the reply, waiting up to $2 seconds (30 by default).
+# Fails when nothing is listening (no socket, or one left by an app that has gone);
+# a connection that is closed with no reply gives an empty line.
 app_send() {
   local reply
-  reply="$(nc -U -w 30 "$CONTROL_SOCK" <<< "$1" 2>/dev/null)" || return 1
+  reply="$(nc -U -w "${2:-30}" "$CONTROL_SOCK" <<< "$1" 2>/dev/null)" || return 1
   printf '%s' "${reply%%
 *}"
 }
@@ -996,6 +996,17 @@ app_is_client_aware() {
   [ -n "$(/usr/libexec/PlistBuddy -c 'Print :MBScriptPath' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)" ]
 }
 
+# A running meetingbox holds app.lock for its whole life. lockf opens it only to read
+# (-n: never creates it, -k: never removes it) and, when it is free, holds it for no
+# longer than it takes to run true.
+app_lock_held() {
+  local rc=0
+  [ -e "$STATE_DIR/app.lock" ] || return 1
+  lockf -n -k -s -t 0 "$STATE_DIR/app.lock" true >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 75 ]
+}
+NOT_ANSWERING="meetingbox is running but not answering. Quit it and open it again."
+
 # Sends a request to the app, opening it in the background if it is not running and
 # trying again for up to $APP_WAIT seconds. Only a failed connection is retried: a
 # request that got through is never sent twice. An `error` reply ends the command
@@ -1006,9 +1017,14 @@ app_request() {
   if ! reply="$(app_send "$1")"; then
     [ -d "$APP_DIR" ] || die "meetingbox is not installed. Run: meetingbox setup"
     app_is_client_aware || die "the installed meetingbox app is older than this command. Run: meetingbox setup"
+    # Running but not listening (its socket could not be opened): opening it again changes nothing.
+    if app_lock_held; then die "$NOT_ANSWERING"; fi
     open -g "$APP_DIR" >/dev/null 2>&1 || true
     while :; do
-      [ "$i" -lt $((APP_WAIT * 2)) ] || die "meetingbox did not start. Run: meetingbox setup"
+      if [ "$i" -ge $((APP_WAIT * 2)) ]; then
+        if app_lock_held; then die "$NOT_ANSWERING"; fi
+        die "meetingbox did not start. Run: meetingbox setup"
+      fi
       sleep 0.5; i=$((i + 1))
       if reply="$(app_send "$1")"; then break; fi
     done
@@ -1093,13 +1109,16 @@ resume_recording() {
 # itself, which carries on recording without the app.
 status_cmd() {
   local reply d
-  if reply="$(app_send status)"; then
+  if reply="$(app_send status 5)"; then
     case "$reply" in
       "ok "*)    APP_REPLY="${reply#ok }"; say_state; return 0 ;;
       "error "*) die "${reply#error }" ;;
     esac
+    # Connected, but no answer within 5 s: the app may be running, so it is not called gone.
+    info "meetingbox did not answer; from the recording files:"
+  else
+    info "meetingbox is not running, so this is from the recording files"
   fi
-  info "meetingbox is not running, so this is from the recording files"
   d="$(session_dir)"
   if is_recording; then
     if [ -e "$PAUSE_FILE" ]; then ok "paused -> $d"; else ok "recording -> $d"; fi

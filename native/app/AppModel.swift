@@ -27,11 +27,8 @@ final class AppModel: ObservableObject {
         self.stateDir = stateDir
         self.preferences = preferences
         let store = MeetingStore(root: preferences.meetingsFolder)
-        // Free space where the recording is (or, before one starts, in the meetings folder).
-        let box = SessionBox()
         let session = Session(stateDir: stateDir, recorder: ChildRecorder(), store: store, now: Date.init,
-                              freeBytes: { AppModel.freeBytes(near: box.session?.phase.folder ?? store.root) })
-        box.session = session
+                              freeBytes: { AppModel.freeBytes(near: $0) })
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")
         self.store = store
         self.session = session
@@ -82,18 +79,13 @@ final class AppModel: ObservableObject {
         NSSound(named: NSSound.Name(name))?.play()
     }
 
-    /// Free bytes on the volume holding `url`, or on its nearest existing parent.
-    nonisolated static func freeBytes(near url: URL) -> Int64 {
+    /// Free bytes on the volume holding `url`, or on its nearest existing parent; nil when unreadable.
+    nonisolated static func freeBytes(near url: URL) -> Int64? {
         var dir = url
         while !FileManager.default.fileExists(atPath: dir.path), dir.pathComponents.count > 1 {
             dir = dir.deletingLastPathComponent()
         }
         let attrs = try? FileManager.default.attributesOfFileSystem(forPath: dir.path)
-        return (attrs?[.systemFreeSize] as? NSNumber)?.int64Value ?? Int64.max
+        return (attrs?[.systemFreeSize] as? NSNumber)?.int64Value
     }
-}
-
-/// Lets the session's free-space closure see the session, which does not exist yet when the closure is made.
-private final class SessionBox {
-    weak var session: Session?
 }

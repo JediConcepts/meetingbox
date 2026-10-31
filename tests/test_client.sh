@@ -31,6 +31,14 @@ cat > "$STUB/open" <<'SH'
 #!/bin/bash
 echo "open $*" >> "$HOME/calls.log"
 [ -e "$HOME/open-starts-app" ] && rm -f "$HOME/app-down"
+[ -e "$HOME/open-holds-lock" ] && : > "$HOME/lock-held"
+exit 0
+SH
+# lockf: the probe for app.lock. Exits 75 (held) while $HOME/lock-held exists.
+cat > "$STUB/lockf" <<'SH'
+#!/bin/bash
+echo "lockf $*" >> "$HOME/calls.log"
+[ -e "$HOME/lock-held" ] && exit 75
 exit 0
 SH
 cat > "$STUB/sleep" <<'SH'
@@ -47,7 +55,7 @@ chmod +x "$STUB"/*
 mb() { PATH="$STUB:$PATH" bash "$ROOT/meetingbox" "$@" 2>&1; }
 reset_calls() {
   : > "$HOME/calls.log"; : > "$HOME/sent"
-  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
+  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/open-holds-lock" "$HOME/lock-held" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
 }
 reply() { printf '%s\n' "$1" > "$HOME/reply"; }
 sent() { cat "$HOME/sent"; }
@@ -220,6 +228,48 @@ if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "older than this command" && 
   pass "an app from meetingbox 1.3 is never opened"
 else fail "an app from meetingbox 1.3 is never opened ($rc: $out)"; fi
 cp "$HOME/plist-aside" "$APP_DIR/Contents/Info.plist"
+
+# --- fix round 1 ---
+# M5: status waits 5 s, other commands 30 s; a connection with no reply is not "not running".
+reset_calls; reply "ok idle -"
+mb status >/dev/null; mb stop >/dev/null
+if grep -qxF "nc -U -w 5 $SOCK" "$HOME/calls.log" && grep -qxF "nc -U -w 30 $SOCK" "$HOME/calls.log"; then
+  pass "M5: status waits 5 s for the app, other commands 30 s"
+else fail "M5: status waits 5 s for the app, other commands 30 s ($(grep '^nc' "$HOME/calls.log" | tr '\n' ';'))"; fi
+reset_calls; rm -f "$HOME/reply"
+printf '%s' "/Meetings/q" > "$DIR_FILE"
+printf '  4242 %s --record -o /Meetings/q -n meeting\n' "$APP_BIN" > "$HOME/ps-out"
+out="$(mb status)"
+if printf '%s' "$out" | grep -qF "meetingbox did not answer; from the recording files:" && ! printf '%s' "$out" | grep -q "not running" \
+   && printf '%s' "$out" | grep -qF "recording -> /Meetings/q"; then
+  pass "M5: status with a connection but no reply says the app did not answer, then the files"
+else fail "M5: status with a connection but no reply says the app did not answer, then the files ($out)"; fi
+
+# M6: no answer while app.lock is held: the app is running but not answering; setup would not help.
+reset_calls; : > "$HOME/app-down"; : > "$HOME/lock-held"; : > "$STATE_DIR/app.lock"
+out="$(mb start)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox is running but not answering. Quit it and open it again." \
+   && ! grep -q '^open ' "$HOME/calls.log" && [ "$(slept)" = 0 ] && grep -q '^lockf -n ' "$HOME/calls.log"; then
+  pass "M6: app.lock held but no answer: says it is running but not answering, opens nothing, waits for nothing"
+else fail "M6: app.lock held but no answer ($rc, slept $(slept): $out)"; fi
+reset_calls; : > "$HOME/app-down"; : > "$HOME/open-holds-lock"; : > "$STATE_DIR/app.lock"
+out="$(mb start)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox is running but not answering. Quit it and open it again." \
+   && [ "$(slept)" = 10 ]; then
+  pass "M6: an app that opens but never answers in 10 s is reported as running but not answering"
+else fail "M6: an app that opens but never answers in 10 s ($rc, slept $(slept): $out)"; fi
+reset_calls; : > "$HOME/app-down"; rm -f "$STATE_DIR/app.lock"
+out="$(mb start)"
+if printf '%s' "$out" | grep -qF "meetingbox did not start. Run: meetingbox setup" && [ ! -e "$STATE_DIR/app.lock" ]; then
+  pass "M6: the lock probe creates no app.lock, and with none the app simply did not start"
+else fail "M6: the lock probe creates no app.lock ($out)"; fi
+
+# I1: a start the app reports as failed exits non-zero with the reason, for toggle too.
+reset_calls; reply 'error No input device matching "USB"'
+out="$(mb --mic USB)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF 'No input device matching "USB"'; then
+  pass "I1: a toggle that fails to start exits non-zero with the recorder's reason"
+else fail "I1: a toggle that fails to start exits non-zero with the recorder's reason ($rc: $out)"; fi
 
 # --- process still runs in the terminal, never through the app ---
 reset_calls

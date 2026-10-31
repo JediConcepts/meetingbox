@@ -277,14 +277,21 @@ final class FakeRecorder: RecorderControl {
     var tails: [String: LogTail] = [:]   // the real capture.log tail, over files in the temp folder
     var nextPid: Int32 = 1000
     var launchDelay: useconds_t = 0      // a slow launch, to widen any race between two starts
+    var dieOnLaunch: (code: Int32, line: String)? = nil // logs its reason and exits at once, as on a missing permission
 
     func launch(dir: URL, mic: String?, onHealthLine: @escaping (String) -> Void) throws -> Int32 {
         if launchDelay > 0 { usleep(launchDelay) }
         if let e = launchError { throw e }
         launches.append((dir, mic))
         nextPid += 1
-        alive.insert(nextPid)
         running[dir.path] = nextPid
+        if let die = dieOnLaunch {
+            let log = dir.appendingPathComponent("capture.log")
+            try? (die.line + "\n").write(to: log, atomically: true, encoding: .utf8)
+            exitCodes[nextPid] = die.code
+        } else {
+            alive.insert(nextPid)
+        }
         healthLine = onHealthLine
         tails[dir.path] = LogTail(dir.appendingPathComponent("capture.log"), fromEnd: false, onHealthLine: onHealthLine)
         return nextPid
@@ -336,7 +343,9 @@ final class Rig {
     let state: URL
     let rec = FakeRecorder()
     let clock = FakeClock()
-    var free: Int64 = 50 * GB
+    var free: Int64? = 50 * GB          // nil: the volume's free space cannot be read
+    var freeAsked: [URL] = []
+    var logs: [String] = []
     let store: MeetingStore
     var session: Session!
     var finished: [(URL, Bool)] = []
@@ -350,7 +359,8 @@ final class Rig {
     @discardableResult
     func make(tickQueue: DispatchQueue? = nil) -> Session {
         session = Session(stateDir: state, recorder: rec, store: store, now: { [clock] in clock.now() },
-                          freeBytes: { [unowned self] in self.free }, tickQueue: tickQueue, workQueue: nil)
+                          freeBytes: { [unowned self] u in self.freeAsked.append(u); return self.free }, tickQueue: tickQueue, workQueue: nil,
+                          log: { [unowned self] in self.logs.append($0) })
         session.onFinished = { [unowned self] in self.finished.append(($0, $1)) }
         session.onChange = { [unowned self] in self.changes.append($0) }
         return session
@@ -698,7 +708,7 @@ do {
     var s: Session! = nil
     var dir: URL! = nil
     q.sync {
-        s = Session(stateDir: r.state, recorder: r.rec, store: r.store, now: { Date() }, freeBytes: { 50 * GB },
+        s = Session(stateDir: r.state, recorder: r.rec, store: r.store, now: { Date() }, freeBytes: { _ in 50 * GB },
                     tickQueue: q, workQueue: DispatchQueue(label: "test.session.work"))
         s.onFinished = { result = ($0, $1); done.signal() }
         dir = try! s.start(root: r.store.root, mic: nil)
@@ -1830,12 +1840,64 @@ do {
 }
 
 /// A handler over a Rig's session; the meetings folder preference is the Rig's store root.
-func handlerRig(tickQueue: DispatchQueue? = nil, queue: DispatchQueue = .main) -> (Rig, ControlHandler, Preferences) {
+func handlerRig(tickQueue: DispatchQueue? = nil) -> (Rig, ControlHandler, Preferences) {
     let r = Rig()
     let s = r.make(tickQueue: tickQueue)
     let prefs = Preferences(defaults: testDefaults(), home: r.root)
     prefs.meetingsFolder = r.store.root
-    return (r, ControlHandler(session: s, preferences: prefs, queue: queue), prefs)
+    return (r, ControlHandler(session: s, preferences: prefs), prefs)
+}
+
+// Fix 1 M4: the handler's queue is the session's tick queue (main when the session has none).
+do {
+    let q = DispatchQueue(label: "meetingbox.test.m4")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    check(h.queue === q && r.session.tickQueue === q, "M4: the handler runs on the session's tick queue")
+    let (_, hm, _) = handlerRig()
+    check(hm.queue === DispatchQueue.main, "M4: a session with no tick queue gives the main queue")
+}
+
+// Fix 1 M9: pause and resume that cannot reach the recorder say so, and change nothing.
+do {
+    let (r, h, _) = handlerRig()
+    let dir = r.meeting("2026-10-29_0955") { $0.started = r.clock.base.addingTimeInterval(-300); $0.state = .recording }
+    r.writeState(dir)
+    r.rec.alive.insert(4242)
+    r.rec.running[dir.path] = 4242
+    r.session.adopt()
+    r.rec.findUnknown = true
+    check(h.reply(for: .pause) == "error cannot reach the recorder right now, try again" && r.rec.signals.isEmpty
+          && r.session.phase == .recording(dir), "M9: pause while the recorder cannot be checked says so and changes nothing")
+    r.rec.findUnknown = false
+    check(h.reply(for: .pause) == "ok paused \(dir.path)", "M9: and works once it can")
+    r.rec.findUnknown = true
+    check(h.reply(for: .resume) == "error cannot reach the recorder right now, try again" && r.session.phase == .paused(dir),
+          "M9: resume while the recorder cannot be checked says so and changes nothing")
+}
+
+// Fix 1 M3: free space is measured where the recording goes, and unknown is not unlimited.
+do {
+    let (r, h, _) = handlerRig()
+    let other = freshRoot().appendingPathComponent("Elsewhere")
+    _ = h.reply(for: .start(mic: nil, dir: other.path))
+    check(r.freeAsked.first.map { $0.standardizedFileURL.path } == other.standardizedFileURL.path,
+          "M3: the start floor is measured on the folder the request names")
+    r.freeAsked.removeAll()
+    r.at(1)
+    let folder = r.session.phase.folder
+    check(folder != nil && r.freeAsked.last == folder, "M3: while recording, on the recording's own folder")
+}
+do {
+    let r = Rig()
+    r.free = nil
+    let s = r.make()
+    let dir = try? s.start(root: r.store.root, mic: nil)
+    check(dir != nil && r.rec.launches.count == 1, "M3: start is allowed when free space cannot be read")
+    check(r.logs.count == 1 && r.logs[0].contains("cannot read the free space"), "M3: and that is logged")
+    r.at(1); r.at(2)
+    check(dir.map { s.phase == .recording($0) } == true && r.rec.sent(SIGINT) == 0,
+          "M3: and unknown free space never stops the recording")
+    check(r.logs.count == 2 && r.logs[1].contains("the disk stop waits"), "M3: logged once while recording, not every tick")
 }
 
 // reply: the session's answers, one line each.
@@ -1943,7 +2005,7 @@ do {
     let tmp = shortTemp()
     defer { try? fm.removeItem(at: tmp) }
     let q = DispatchQueue(label: "meetingbox.test.tick")
-    let (r, h, _) = handlerRig(tickQueue: q, queue: q)
+    let (r, h, _) = handlerRig(tickQueue: q)
     let state = tmp.appendingPathComponent("state")
     let sock = state.appendingPathComponent("control.sock")
     let server = try? ControlServer(socket: sock, handler: h)
@@ -1981,7 +2043,7 @@ do {
           "RF6: both name the same folder")
 
     // A live listener's socket is never taken.
-    let (_, h2, _) = handlerRig(tickQueue: q, queue: q)
+    let (_, h2, _) = handlerRig(tickQueue: q)
     let before = inode(sock)
     check((try? ControlServer(socket: sock, handler: h2)) == nil, "server: a socket with a live listener is not replaced")
     check(inode(sock) == before && ControlClient.send("status", to: sock)?.hasPrefix("ok recording ") == true,
@@ -1989,6 +2051,32 @@ do {
     server?.stop()
     check(!fm.fileExists(atPath: sock.path), "server: stop removes its own socket")
     q.sync {} // let any tick finish before the rig goes
+}
+
+// Fix 1 I1: a start whose recorder dies straight away is an error with the recorder's reason,
+// and plays no start sound; one that stays alive is ok. toggle takes the same path.
+for verb in ["start", "toggle"] {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let q = DispatchQueue(label: "meetingbox.test.i1")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var sounds = 0
+    h.onStarted = { _ in sounds += 1 }
+    let sock = tmp.appendingPathComponent("control.sock")
+    let server = try? ControlServer(socket: sock, handler: h)
+    server?.start()
+    q.sync {
+        r.rec.recoverResult = false
+        r.rec.dieOnLaunch = (1, "No input device matching \"USB\"")
+    }
+    let reply = ControlClient.send(verb, to: sock, timeout: 15)
+    check(reply == "error No input device matching \"USB\"", "I1: \(verb): a recorder that dies at once gives error <its reason> (\(reply ?? "nil"))")
+    check(q.sync { sounds } == 0 && q.sync { r.session.phase } == .idle, "I1: \(verb): no start sound, and idle")
+    q.sync { r.rec.dieOnLaunch = nil }
+    let ok = ControlClient.send(verb, to: sock, timeout: 15) ?? "nil"
+    check(ok.hasPrefix("ok recording ") && q.sync { sounds } == 1, "I1: \(verb): a recorder that stays alive gives ok and one start sound (\(ok))")
+    server?.stop()
+    q.sync {}
 }
 
 // A socket left by a dead instance is replaced; anything that is not a socket is left alone.
@@ -2002,7 +2090,7 @@ do {
     check(lstat(sock.path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFSOCK && ControlClient.send("status", to: sock) == nil,
           "stale: a socket file nobody listens on")
     let q = DispatchQueue(label: "meetingbox.test.tick2")
-    let (_, hq, _) = handlerRig(tickQueue: q, queue: q)
+    let (_, hq, _) = handlerRig(tickQueue: q)
     let server = try? ControlServer(socket: sock, handler: hq)
     server?.start()
     check(server != nil && ControlClient.send("status", to: sock) == "ok idle -", "stale: a socket left by a dead instance is replaced")

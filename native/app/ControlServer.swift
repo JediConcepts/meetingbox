@@ -51,7 +51,18 @@ enum ControlRequest: Equatable {
 /// session's tick queue, so two requests that arrive together are answered one after the other.
 /// Every recording command, whatever it comes from, goes through here. Sounds and windows are the
 /// app's: it hears about starts, stops and `show` through the closures, called on `queue`.
+///
+/// A start counts only once its recorder has stayed up for `startGrace`: one that exits at once (a
+/// missing permission, no microphone matching) is reported with its reason, not as recording.
 final class ControlHandler {
+    /// What a request comes to: a reply now, or a start decided once the recorder has survived.
+    enum Handled: Equatable { case reply(String), starting(URL) }
+    /// How long a new recorder must stay up before its start is reported.
+    static let startGrace: TimeInterval = 2
+    /// After the grace, how long more to wait for a recorder that died to be settled.
+    static let settleLimit: TimeInterval = 10
+    static let cannotReach = "error cannot reach the recorder right now, try again"
+
     let queue: DispatchQueue
     private let session: Session
     private let preferences: Preferences
@@ -62,34 +73,79 @@ final class ControlHandler {
     /// `show`: bring the app forward.
     var onShow: (() -> Void)?
 
-    init(session: Session, preferences: Preferences, queue: DispatchQueue = .main) {
+    /// The queue is the session's tick queue, so the two can never differ.
+    init(session: Session, preferences: Preferences) {
         self.session = session
         self.preferences = preferences
-        self.queue = queue
+        self.queue = session.tickQueue ?? .main
     }
 
-    /// `ok <state> <folder or ->` or `error <message>`, always one line. Call on `queue`.
+    /// `ok <state> <folder or ->` or `error <message>`, always one line, without waiting: a start is
+    /// reported on the state it is in at once. The socket uses `handle` and `startOutcome`. Call on `queue`.
     func reply(for request: ControlRequest) -> String {
+        switch handle(request) {
+        case .reply(let text): return text
+        case .starting(let dir): return startOutcome(dir, settled: true, giveUp: true) ?? status()
+        }
+    }
+
+    /// Call on `queue`. A start that launched comes back as `.starting`: ask `startOutcome` until it answers.
+    func handle(_ request: ControlRequest) -> Handled {
         dispatchPrecondition(condition: .onQueue(queue))
-        let text: String
+        let handled = handleRequest(request)
+        if case .reply(let text) = handled { return .reply(ControlHandler.oneLine(text)) }
+        return handled
+    }
+
+    private func handleRequest(_ request: ControlRequest) -> Handled {
         switch request {
         case .status:
-            text = status()
+            return .reply(status())
         case .start(let mic, let dir):
-            text = start(mic: mic, dir: dir)
+            return start(mic: mic, dir: dir)
         case .toggle(let mic, let dir):
-            text = session.phase == .idle ? start(mic: mic, dir: dir) : stop()
+            return session.phase == .idle ? start(mic: mic, dir: dir) : .reply(stop())
         case .pause:
-            text = whileRecording { session.pause() }
+            return .reply(whileRecording(wanted: { if case .paused = $0 { return true }; return false }) { session.pause() })
         case .resume:
-            text = whileRecording { session.resume() }
+            return .reply(whileRecording(wanted: { if case .recording = $0 { return true }; return false }) { session.resume() })
         case .stop:
-            text = stop()
+            return .reply(stop())
         case .show:
             onShow?()
-            text = status()
+            return .reply(status())
         }
-        return text.replacingOccurrences(of: "\r\n", with: " ")
+    }
+
+    /// Where a start stands, nil while undecided. Call on `queue`. `settled`: the grace has passed;
+    /// `giveUp`: stop waiting for a dead recorder to be settled. The start sound goes only with `ok`.
+    func startOutcome(_ dir: URL, settled: Bool, giveUp: Bool) -> String? {
+        dispatchPrecondition(condition: .onQueue(queue))
+        switch session.phase {
+        case .recording(let d) where d == dir, .paused(let d) where d == dir:
+            guard settled else { return nil }
+            onStarted?(dir)
+            return "ok recording \(dir.path)"
+        case .finalising(let d) where d == dir:
+            // It stopped already; its reason is written once it is settled.
+            return giveUp ? ControlHandler.oneLine("error the recorder stopped straight after it started; its files are in \(dir.path)") : nil
+        default:
+            return ControlHandler.oneLine("error \(ControlHandler.failure(dir))")
+        }
+    }
+
+    /// The reason Session recorded for a recording that ended at once.
+    private static func failure(_ dir: URL) -> String {
+        if let data = try? Data(contentsOf: dir.appendingPathComponent("meeting.json")),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let error = obj["error"] as? String, !error.isEmpty {
+            return error
+        }
+        return "the recorder stopped straight after it started; its files are in \(dir.path)"
+    }
+
+    private static func oneLine(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: " ")
             .replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
     }
 
@@ -102,21 +158,20 @@ final class ControlHandler {
         }
     }
 
+
     /// The request's folder beats the meetings folder setting, and its mic the microphone setting.
-    private func start(mic: String?, dir: String?) -> String {
+    private func start(mic: String?, dir: String?) -> Handled {
         let root: URL
         if let dir = dir {
-            guard dir.hasPrefix("/") else { return "error the folder must be a full path: \(dir)" }
+            guard dir.hasPrefix("/") else { return .reply(ControlHandler.oneLine("error the folder must be a full path: \(dir)")) }
             root = URL(fileURLWithPath: dir, isDirectory: true)
         } else {
             root = preferences.meetingsFolder
         }
         do {
-            let folder = try session.start(root: root, mic: mic ?? preferences.microphone)
-            onStarted?(folder)
-            return "ok recording \(folder.path)"
+            return .starting(try session.start(root: root, mic: mic ?? preferences.microphone))
         } catch {
-            return "error \(error.localizedDescription)"
+            return .reply(ControlHandler.oneLine("error \(error.localizedDescription)"))
         }
     }
 
@@ -129,16 +184,20 @@ final class ControlHandler {
         }
         guard let dir = session.stop() else { return "error not recording" }
         if running { onStopped?(dir) }
-        return "ok finalising \(dir.path)"
+        return ControlHandler.oneLine("ok finalising \(dir.path)")
     }
 
-    private func whileRecording(_ change: () -> Void) -> String {
+    /// Pause or resume. When the session is still where it was and not where it was asked to be,
+    /// the recorder could not be reached (its identity cannot be checked), so nothing was sent.
+    private func whileRecording(wanted: (Session.Phase) -> Bool, _ change: () -> Void) -> String {
         switch session.phase {
         case .idle: return "error not recording"
-        case .finalising(let dir): return "error the recording in \(dir.path) has already stopped"
+        case .finalising(let dir): return ControlHandler.oneLine("error the recording in \(dir.path) has already stopped")
         case .recording, .paused:
+            let before = session.phase
             change()
-            return status()
+            if session.phase == before && !wanted(before) { return ControlHandler.cannotReach }
+            return ControlHandler.oneLine(status())
         }
     }
 }
@@ -174,7 +233,10 @@ final class ControlServer {
             throw ControlError("the socket path is too long: \(socket.path)")
         }
         try ControlServer.clearStale(socket.path)
-        fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        // Kept in a local until it listens: a throw before `fd` is set runs no deinit, so the one
+        // close below is the only one (a deinit after a failure would close the number again,
+        // perhaps someone else's by then).
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ControlServer.posix("could not make the socket") }
         _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
         // Set on the listener so every accepted socket has it from the start: on one whose client
@@ -200,6 +262,7 @@ final class ControlServer {
             throw error
         }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        self.fd = fd
     }
 
     deinit { stop() }
@@ -208,7 +271,7 @@ final class ControlServer {
         guard source == nil, fd >= 0 else { return }
         let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: acceptQueue)
         let listening = fd
-        src.setEventHandler { [weak self] in self?.acceptAll() }
+        src.setEventHandler { [weak self] in self?.acceptAll(listening) }
         src.setCancelHandler { close(listening) }
         source = src
         src.resume()
@@ -224,9 +287,10 @@ final class ControlServer {
         fd = -1
     }
 
-    private func acceptAll() {
+    /// `listening` is the descriptor `start()` captured: `fd` itself is changed by `stop()` on another queue.
+    private func acceptAll(_ listening: Int32) {
         while true {
-            let c = accept(fd, nil, nil)
+            let c = accept(listening, nil, nil)
             if c < 0 {
                 if errno == EINTR { continue }
                 return // EAGAIN: nothing more waiting
@@ -246,7 +310,21 @@ final class ControlServer {
         guard let line = readLine(c) else { return }
         let reply: String
         if let text = String(data: line, encoding: .utf8), let request = ControlRequest.parse(text) {
-            reply = handler.queue.sync { handler.reply(for: request) }
+            switch handler.queue.sync(execute: { handler.handle(request) }) {
+            case .reply(let text):
+                reply = text
+            case .starting(let dir):
+                // Waits here, on the connection's thread, never on the handler's queue or main.
+                let settleAt = Date().addingTimeInterval(ControlHandler.startGrace)
+                let giveUpAt = settleAt.addingTimeInterval(ControlHandler.settleLimit)
+                var outcome: String?
+                while outcome == nil {
+                    usleep(100_000)
+                    let now = Date()
+                    outcome = handler.queue.sync { handler.startOutcome(dir, settled: now >= settleAt, giveUp: now >= giveUpAt) }
+                }
+                reply = outcome ?? "error not recording"
+            }
         } else {
             reply = "error unknown request"
         }
