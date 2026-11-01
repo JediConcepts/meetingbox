@@ -346,10 +346,16 @@ if [ "$race_ok" = 1 ]; then pass "two workers on one stale lock: exactly one run
 else fail "two workers on one stale lock: exactly one runs, the other refuses:$race_log"; fi
 
 # --- the winner keeps its own owner text, though a loser holds the owner file aside ---
-# Deterministic: the loser (the worker whose moved file is not the dead owner) holds the
+# The contract is asserted on every run: one worker runs, the other exits 75, no lock is left,
+# no bare cat/mv/ln error. Whether the loser got as far as holding the file aside is not part of
+# it (a loser whose mv finds no file refuses with 75 too), so that is only counted in the name.
+# The overrides below steer the loser towards holding it. The loser (the worker whose moved file is not the dead owner) holds the
 # owner file aside until released, and the winner waits at its first clean-up until the loser
-# is holding it. So the winner always looks for its owner file while it is missing. Run
-# without set -e (as the other tests do) and under set -e (as the real script does).
+# is holding it. So the winner always looks for its owner file while it is missing. The order
+# is fixed by mv, not by the clock: the first worker to move the stale owner waits until the
+# second has also reached its mv (so both have read the stale owner), and the second waits until
+# the first's owner is in place. Run without set -e (as the other tests do) and under
+# set -euo pipefail (as the real script does).
 dead_owner="$dead_pid Thu Jan  1 00:00:00 2026"
 cat() {
   case "$*" in
@@ -369,25 +375,58 @@ rm() {
   esac
   command rm "$@"
 }
-hold_ok=1; hold_log=""
-for mode in "set +e" "set -eo pipefail"; do
+# Barrier: a worker that has judged the lock stale (the stale owner is in $2) waits, up to 30 s,
+# until the other worker has too. Neither can then have seen the other's owner before its mv.
+bar_alive() {
+  local n
+  real_processing_lock_alive "$@" && return 0
+  if [ "$2" = "$dead_owner" ]; then
+    if mkdir "$HOME/bar.1" 2>/dev/null; then
+      for n in $(seq 1 600); do [ -d "$HOME/bar.2" ] && break; sleep 0.05; done
+    else
+      mkdir "$HOME/bar.2" 2>/dev/null
+      for n in $(seq 1 600); do [ -d "$HOME/bar.1" ] && break; sleep 0.05; done
+    fi
+  fi
+  return 1
+}
+eval "$(declare -f processing_lock_alive | sed '1s/processing_lock_alive/prev_processing_lock_alive/')"
+eval "$(declare -f bar_alive | sed '1s/bar_alive/processing_lock_alive/')"
+mv() {
+  case "$*" in
+    */owner\ *.processing-stale.*)
+      local n
+      if mkdir "$HOME/mv.first" 2>/dev/null; then
+        for n in $(seq 1 600); do [ -d "$HOME/mv.second" ] && break; sleep 0.05; done
+      else
+        mkdir "$HOME/mv.second" 2>/dev/null
+        for n in $(seq 1 600); do
+          [ -e "$1" ] && [ "$(command cat "$1" 2>/dev/null)" != "$dead_owner" ] && break; sleep 0.05
+        done
+      fi ;;
+  esac
+  command mv "$@"
+}
+hold_ok=1; hold_log=""; held_n=0
+for mode in "set +e" "set -euo pipefail"; do
   d="$(meeting "hold${mode// /}" audio.m4a mic.m4a call.m4a)"
   mkdir "$d/.processing"
   printf '%s\n' "$dead_owner" > "$d/.processing/owner"
-  command rm -f "$HOME/loser.held"
+  command rm -rf "$HOME/loser.held" "$HOME/mv.first" "$HOME/mv.second" "$HOME/bar.1" "$HOME/bar.2"
   : > "$HOME/calls.log"
   ( $mode; process "$d/audio.m4a" ) >"$HOME/a.out" 2>&1 & pa=$!
-  sleep 0.05
   ( $mode; process "$d/audio.m4a" ) >"$HOME/b.out" 2>&1 & pb=$!
   wait "$pa"; ra=$?; wait "$pb"; rb=$?
   pair="$ra $rb"
   if { [ "$pair" = "0 75" ] || [ "$pair" = "75 0" ]; } && [ "$(sa_calls)" = 2 ] && ! grep -q OVERLAP "$HOME/calls.log" \
-     && [ -e "$HOME/loser.held" ] && ! cat "$HOME/a.out" "$HOME/b.out" | grep -q 'No such file' \
-     && [ ! -e "$d/.processing" ] && lock_clean "$d"; then :
+     && ! cat "$HOME/a.out" "$HOME/b.out" | grep -Eq '(^|[^a-z])(cat|mv|ln|rm): |No such file' \
+     && [ ! -e "$d/.processing" ] && lock_clean "$d"; then [ ! -e "$HOME/loser.held" ] || held_n=$((held_n + 1))
   else hold_ok=0; hold_log="$hold_log [$mode: $pair, $(sa_calls) calls, $(ls -a "$d" | tr '\n' ' ') $(cat "$HOME/a.out" "$HOME/b.out" | grep error)]"; fi
 done
-unset -f cat rm
-if [ "$hold_ok" = 1 ]; then pass "the winner keeps its own owner text while a loser holds the owner file: one runs, no lock left, with and without set -e"
+unset -f cat rm mv
+eval "$(declare -f prev_processing_lock_alive | sed '1s/prev_processing_lock_alive/processing_lock_alive/')"
+unset -f prev_processing_lock_alive
+if [ "$hold_ok" = 1 ]; then pass "the winner keeps its own owner text while a loser holds the owner file: one runs, no lock left, with and without set -e (loser held it aside in $held_n of 2 runs)"
 else fail "the winner keeps its own owner text while a loser holds the owner file:$hold_log"; fi
 
 # --- M6: a TERM while a live owner's file is moved aside does not lose it ---
