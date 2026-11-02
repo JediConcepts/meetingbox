@@ -129,6 +129,77 @@ if installed_by_us "$APP_DIR" && grep -q -- "^codesign --force .* --identifier $
   pass "the new app is on the install record and signed"
 else fail "the new app is on the install record and signed"; fi
 
+# --- the recorder runs from a nested helper bundle (Gate 2) ---
+# The recorder checks in with the window server, so LaunchServices registers its executable's
+# bundle. From the app's own executable it was taken for the app itself, and a recorder
+# orphaned by a crash left the app impossible to reopen. In a bundle of its own it is a
+# different app, with a different identifier.
+H="$APP_DIR/Contents/Helpers/meetingbox-recorder.app"
+hplist="$H/Contents/Info.plist"
+hp() { /usr/libexec/PlistBuddy -c "Print :$1" "$hplist" 2>/dev/null; }
+if [ "$REC_BIN" = "$H/Contents/MacOS/meetingbox-recorder" ] && [ -x "$REC_BIN" ] && cmp -s "$APP_BIN" "$REC_BIN" \
+   && [ "$(grep -c '^swiftc ' "$HOME/calls.log")" = 1 ]; then
+  pass "the helper's executable is a copy of the one compiled binary, not a second compile"
+else fail "the helper's executable is a copy of the one compiled binary, not a second compile ($REC_BIN)"; fi
+
+if plutil -lint "$hplist" >/dev/null 2>&1 \
+   && [ "$(hp CFBundleIdentifier)" = com.jediconcepts.meetingbox.recorder ] \
+   && [ "$(hp CFBundleExecutable)" = meetingbox-recorder ] \
+   && [ "$(hp CFBundlePackageType)" = APPL ] \
+   && [ "$(hp LSUIElement)" = true ] \
+   && [ "$(hp CFBundleShortVersionString)" = "$VERSION" ] \
+   && [ "$(hp CFBundleVersion)" = "$VERSION" ] \
+   && [ -n "$(hp NSMicrophoneUsageDescription)" ] \
+   && [ "$(hp NSMicrophoneUsageDescription)" = "$(pb NSMicrophoneUsageDescription)" ] \
+   && [ -n "$(hp NSAudioCaptureUsageDescription)" ] \
+   && [ "$(hp NSAudioCaptureUsageDescription)" = "$(pb NSAudioCaptureUsageDescription)" ]; then
+  pass "the helper's Info.plist has its own identifier and executable, LSUIElement, the version and both usage strings"
+else fail "the helper's Info.plist has its own identifier and executable, LSUIElement, the version and both usage strings: $(cat "$hplist" 2>/dev/null)"; fi
+
+# Signed inside out: the helper first, then the app around it, never with --deep.
+: > "$HOME/calls.log"
+build_app >/dev/null 2>&1; rc=$?
+hline="$(grep -n -- "^codesign --force --sign .* --identifier com.jediconcepts.meetingbox.recorder $H\$" "$HOME/calls.log" | cut -d: -f1)"
+aline="$(grep -n -- "^codesign --force --sign .* --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" | cut -d: -f1)"
+hwho="$(grep -- "--identifier com.jediconcepts.meetingbox.recorder $H\$" "$HOME/calls.log" | sed 's/ --identifier .*//')"
+awho="$(grep -- "--identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" | sed 's/ --identifier .*//')"
+if [ "$rc" -eq 0 ] && [ -n "$hline" ] && [ -n "$aline" ] && [ "$hline" -lt "$aline" ] \
+   && [ "$(printf '%s\n' "$hline" | wc -l)" -eq 1 ] && [ "$(printf '%s\n' "$aline" | wc -l)" -eq 1 ] \
+   && [ -n "$hwho" ] && [ "$hwho" = "$awho" ] && printf '%s' "$hwho" | grep -q -- '--keychain ' \
+   && ! grep -q -- '--deep' "$HOME/calls.log"; then
+  pass "the helper is signed before the app, with its own identifier, the same certificate and keychain, no --deep"
+else fail "the helper is signed before the app, with its own identifier, the same certificate and keychain, no --deep (rc $rc): $(grep '^codesign' "$HOME/calls.log")"; fi
+
+# a certificate that cannot sign the helper: reported as for the app, then ad hoc, helper first
+codesign() {
+  echo "codesign $*" >> "$HOME/calls.log"
+  case "$*" in *"--sign - "*) return 0 ;; *" $H") return 1 ;; esac
+  return 0
+}
+: > "$HOME/calls.log"
+out="$(build_app 2>&1)"; rc=$?
+hline="$(grep -n -- "^codesign --force --sign - --identifier com.jediconcepts.meetingbox.recorder $H\$" "$HOME/calls.log" | cut -d: -f1)"
+aline="$(grep -n -- "^codesign --force --sign - --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" | cut -d: -f1)"
+if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'could not use the meetingbox signing certificate' \
+   && ! grep -q -- "^codesign --force --sign [0-9A-Fa-f]\{40\} .* --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" \
+   && [ -n "$hline" ] && [ -n "$aline" ] && [ "$hline" -lt "$aline" ]; then
+  pass "a helper the certificate cannot sign is reported, the app is not signed around it, ad hoc signs both, helper first"
+else fail "a helper the certificate cannot sign is reported, the app is not signed around it, ad hoc signs both, helper first (rc $rc): $out $(grep '^codesign' "$HOME/calls.log")"; fi
+
+# a helper that cannot be signed at all: the build fails, as it does when the app cannot be signed
+codesign() {
+  echo "codesign $*" >> "$HOME/calls.log"
+  case "$*" in *" $H") return 1 ;; esac
+  return 0
+}
+: > "$HOME/calls.log"
+out="$(build_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'could not sign the recorder app' \
+   && ! grep -q -- "--identifier $APP_ID $APP_DIR\$" "$HOME/calls.log"; then
+  pass "a helper that cannot be signed fails the build with the same message as the app, and the app is never signed"
+else fail "a helper that cannot be signed fails the build with the same message as the app, and the app is never signed (rc $rc): $out"; fi
+codesign() { echo "codesign $*" >> "$HOME/calls.log"; return 0; }
+
 # A failed build must leave the installed app exactly as it was, so the user can
 # still record until the toolchain is fixed.
 snapshot() { (cd "$APP_DIR" && find . -type f -exec cksum {} \; | sort); }
@@ -185,6 +256,44 @@ if [ "$(recorder_pids /m/a | tr '\n' ' ')" = "101 " ] && [ "$(recorder_pids "" |
 else fail "recorder_pids matches \"\$APP_BIN --record -o DIR -n\" only: $(recorder_pids /m/a | tr '\n' ' ') / $(recorder_pids "" | tr '\n' ' ')"; fi
 unset -f ps
 
+# A recorder is found under the helper's prefix (what the app starts now) and under the old
+# one (a recorder the previous build started, still running after an upgrade).
+ps() {
+  printf '  201 %s --record -o /m/a -n meeting\n' "$REC_BIN"
+  printf '  202 %s -o /m/a -n meeting\n' "$REC_BIN"
+  printf '  203 %s --record -o /m/b -n meeting -d USB\n' "$REC_BIN"
+  printf '  204 %s --recover /m/c\n' "$REC_BIN"
+  printf '  205 %s\n' "$REC_BIN"
+  printf '  206 %s --record -o /m/d -n meeting\n' "$APP_BIN"
+  printf '  207 %s --record -o /m/a2 -n meeting\n' "$REC_BIN"
+}
+if [ "$(recorder_pids /m/a | tr '\n' ' ')" = "201 " ] && [ "$(recorder_pids /m/b | tr '\n' ' ')" = "203 " ] \
+   && [ "$(recorder_pids /m/d | tr '\n' ' ')" = "206 " ] \
+   && [ "$(recorder_pids "" | tr '\n' ' ' | tr ' ' '\n' | sort | tr '\n' ' ')" = "201 203 206 207 " ] \
+   && [ -z "$(recorder_pids /m/c)" ] && [ -z "$(recorder_pids /m)" ]; then
+  pass "recorder_pids finds a recorder under the helper's prefix and under the old one, and nothing else"
+else fail "recorder_pids finds a recorder under the helper's prefix and under the old one, and nothing else: $(recorder_pids /m/a | tr '\n' ' ') / $(recorder_pids /m/d | tr '\n' ' ') / $(recorder_pids "" | tr '\n' ' ')"; fi
+unset -f ps
+
+# Only the recorder is started from the helper, by the app. The script's own calls keep the
+# main executable: the permission check goes through the app bundle so the first prompts are
+# meetingbox.app's, and --record -l and --recover do not touch the window server.
+if ! grep -q '"\$REC_BIN" --' "$ROOT/meetingbox" \
+   && grep -q '"\$APP_BIN" --recover "\$1"' "$ROOT/meetingbox" \
+   && grep -q -- 'open -n -g --stdout /dev/null --stderr "\$log" "\$APP_DIR" --args --record' "$ROOT/meetingbox"; then
+  pass "the script still runs --record -l and --recover from APP_BIN and the permission check through the app"
+else fail "the script still runs --record -l and --recover from APP_BIN and the permission check through the app"; fi
+
+# The recorder's disk floor is wired in: started with the recording, cancelled at the stop, and
+# it asks for the stop through the same stream as the SIGINT and SIGTERM handlers. The
+# floor itself is tested natively with a fake free-space source; this only keeps it from
+# being unplugged.
+rec="$ROOT/native/recorder/Recorder.swift"
+if grep -q 'DiskFloor(directory: outputDir)' "$rec" && grep -q 'diskFloor.start()' "$rec" && grep -q 'diskFloor.cancel()' "$rec" \
+   && [ "$(grep -c 'stopRequest.yield()' "$rec")" = 2 ]; then
+  pass "the recorder starts the disk floor with the recording and stops through the same request as a signal"
+else fail "the recorder starts the disk floor with the recording and stops through the same request as a signal"; fi
+
 # --- the permission check launches the recorder mode through open ---
 PERM_DIR="$HOME/permcheck"
 open() { echo "open $*" >> "$HOME/calls.log"; return 0; }
@@ -240,6 +349,8 @@ refuses() {   # $1: what is going on
 
 FAKE_PS="$APP_BIN --record -o $BASE_DIR/x -n meeting"; refuses "a recorder is running"
 FAKE_PS="$APP_BIN --recover $BASE_DIR/x"; refuses "a recovery is running"
+FAKE_PS="$REC_BIN --record -o $BASE_DIR/x -n meeting"; refuses "a recorder from the helper is running"
+FAKE_PS="$REC_BIN --recover $BASE_DIR/x"; refuses "a recovery from the helper is running"
 FAKE_PS=""
 mkdir -p "$BASE_DIR/2026-10-29_0900" "$BASE_DIR/2026-10-29 1000 Standup"
 printf '{\n  "id" : "1",\n  "state" : "recording"\n}\n' > "$BASE_DIR/2026-10-29_0900/meeting.json"

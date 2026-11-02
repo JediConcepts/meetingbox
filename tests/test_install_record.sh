@@ -76,6 +76,7 @@ unset -f git
 
 # recorder_ready also checks the app is the current version
 APP_DIR="$HOME/t.app"; APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
+REC_BIN="$APP_DIR/Contents/Helpers/meetingbox-recorder.app/Contents/MacOS/meetingbox-recorder"
 mkdir -p "$APP_DIR/Contents/MacOS"
 printf '#!/bin/sh\n' > "$APP_BIN"; chmod +x "$APP_BIN"
 writeplist() {
@@ -89,7 +90,16 @@ writeplist "$VERSION"
 TRANSCRIPT_BIN="$HOME/t-mb-transcript"
 if ! recorder_ready; then pass "recorder_ready false without mb-transcript"; else fail "recorder_ready false without mb-transcript"; fi
 printf '#!/bin/sh\n' > "$TRANSCRIPT_BIN"; chmod +x "$TRANSCRIPT_BIN"
-if recorder_ready; then pass "recorder_ready true when the app matches VERSION"; else fail "recorder_ready true when the app matches VERSION"; fi
+# an app built before the recorder had a helper bundle has the right version and no helper:
+# it is not ready, so setup rebuilds it
+if ! recorder_ready; then pass "recorder_ready false without the recorder helper, even at the right version"
+else fail "recorder_ready false without the recorder helper, even at the right version"; fi
+mkdir -p "$(dirname "$REC_BIN")"
+printf '#!/bin/sh\n' > "$REC_BIN"
+if ! recorder_ready; then pass "recorder_ready false when the helper is not executable"
+else fail "recorder_ready false when the helper is not executable"; fi
+chmod +x "$REC_BIN"
+if recorder_ready; then pass "recorder_ready true when the app matches VERSION and the helper is there"; else fail "recorder_ready true when the app matches VERSION and the helper is there"; fi
 
 # install_recorder builds mb-transcript beside the app and records it
 SRC_DIR="$HOME/src2"; SOURCE_DIR="$SRC_DIR/meetingbox"; BIN_DIR="$HOME/bin2"

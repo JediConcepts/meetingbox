@@ -1271,6 +1271,87 @@ do {
     check(child.verify(dir: audio) == nil, "verify fails without the marker")
 }
 
+// ChildRecorder runs the recorder from the helper bundle (Gate 2). The recorder checks in with
+// the window server, so LaunchServices registers the bundle its executable is in. From the
+// app's own executable it was taken for the app itself, and a recorder orphaned by a crash
+// left the app impossible to reopen. The helper has an identifier of its own.
+do {
+    let helperTail = "Contents/Helpers/meetingbox-recorder.app/Contents/MacOS/meetingbox-recorder"
+    let app = URL(fileURLWithPath: "/Users/someone/Applications/meetingbox.app", isDirectory: true)
+    check(ChildRecorder.helperExecutable(in: app).path == "/Users/someone/Applications/meetingbox.app/" + helperTail,
+          "G2: the helper's executable is Contents/Helpers/meetingbox-recorder.app/Contents/MacOS/meetingbox-recorder")
+    check(ChildRecorder().executable.path == Bundle.main.bundleURL.appendingPathComponent(helperTail).path,
+          "G2: ChildRecorder uses the helper by default, for --record and --recover")
+
+    let bin = freshRoot()
+    func script(_ name: String, _ body: String) -> URL {
+        let url = bin.appendingPathComponent(name)
+        try! "#!/bin/sh\n\(body)\n".write(to: url, atomically: true, encoding: .utf8)
+        chmod(url.path, 0o755)
+        return url
+    }
+    let helper = bin.appendingPathComponent("helper/meetingbox-recorder")
+    let legacy = bin.appendingPathComponent("legacy/meetingbox")
+    let dirA = bin.appendingPathComponent("Meetings/a b")
+    let dirB = bin.appendingPathComponent("Meetings/b")
+    let dirC = bin.appendingPathComponent("Meetings/c")
+    let dirD = bin.appendingPathComponent("Meetings/d")
+    // A fixed process listing, in the shape of `ps -axo pid=,command=`.
+    let listing = [
+        "  100 /usr/sbin/cfprefsd agent",
+        "  201 \(helper.path) --record -o \(dirA.path) -n meeting -d USB Mic",
+        "  202 \(legacy.path) --record -o \(dirB.path) -n meeting",
+        "  203 \(helper.path) --recover \(dirC.path)",
+        "  204 \(legacy.path) --recover \(dirC.path)",
+        "  205 \(helper.path) -o \(dirD.path) -n meeting",
+        "  206 \(legacy.path)",
+    ].joined(separator: "\n")
+    let listed = script("ps-listing", "cat <<'EOF'\n\(listing)\nEOF")
+    let finder = ChildRecorder(executable: helper, legacyExecutable: legacy, ps: listed)
+    check(finder.find(dir: dirA) == .found(201), "G2: find matches a recorder under the helper's prefix")
+    check(finder.find(dir: dirB) == .found(202), "G2: find matches a recorder the previous build started, under the old prefix")
+    check(finder.find(dir: dirC) == .notFound, "G2: find ignores --recover, under either prefix")
+    check(finder.find(dir: dirD) == .notFound, "G2: find needs --record -o <dir> -n")
+    check(finder.find(dir: dirA.deletingLastPathComponent().appendingPathComponent("a")) == .notFound,
+          "G2: find does not take a folder for its longer neighbour")
+    // The order of the listing decides when both are there; the main executable of another app
+    // in the same position is not a recorder.
+    let foreign = ChildRecorder(executable: bin.appendingPathComponent("elsewhere/meetingbox-recorder"),
+                                legacyExecutable: bin.appendingPathComponent("elsewhere/meetingbox"), ps: listed)
+    check(foreign.find(dir: dirA) == .notFound && foreign.find(dir: dirB) == .notFound,
+          "G2: find matches this app's executables only")
+
+    // A missing helper is a clear error: nothing is started, no fallback to the app's own executable.
+    let before = freshRoot()
+    let dir = try! MeetingFolder.create(in: before, at: Date())
+    let missing = ChildRecorder(executable: bin.appendingPathComponent("no-such/meetingbox-recorder"),
+                                legacyExecutable: script("legacy-recorder", "echo ran > \"\(bin.path)/legacy-ran\""))
+    var message = ""
+    do { _ = try missing.launch(dir: dir, mic: nil) { _ in } } catch { message = error.localizedDescription }
+    check(message == "the recorder is missing; run meetingbox setup", "G2: a missing helper gives the clear error (\(message))")
+    check(!fm.fileExists(atPath: bin.appendingPathComponent("legacy-ran").path), "G2: a missing helper never falls back to the app's own executable")
+    check(!fm.fileExists(atPath: dir.appendingPathComponent("capture.log").path), "G2: a missing helper leaves no capture.log behind")
+    // present but not executable is as good as missing
+    let flat = bin.appendingPathComponent("flat/meetingbox-recorder")
+    try! fm.createDirectory(at: flat.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try! "x".write(to: flat, atomically: true, encoding: .utf8)
+    chmod(flat.path, 0o644)
+    var flatMessage = ""
+    do { _ = try ChildRecorder(executable: flat).launch(dir: dir, mic: nil) { _ in } } catch { flatMessage = error.localizedDescription }
+    check(flatMessage == "the recorder is missing; run meetingbox setup", "G2: a helper that is not executable gives the same error")
+    // and with no helper at the default place, as in this test run
+    var defaultMessage = ""
+    do { _ = try ChildRecorder().launch(dir: dir, mic: nil) { _ in } } catch { defaultMessage = error.localizedDescription }
+    check(defaultMessage == "the recorder is missing; run meetingbox setup", "G2: the default helper path is checked too")
+
+    // --recover goes through the executable it was given, the helper, not the app's own.
+    let recoverLog = bin.appendingPathComponent("recover-args")
+    let recoverer = script("helper-recover", "echo \"$@\" > \"\(recoverLog.path)\"")
+    let recovered = ChildRecorder(executable: recoverer, legacyExecutable: legacy).recover(dir: dir)
+    check(recovered == .recovered && ((try? String(contentsOf: recoverLog, encoding: .utf8)) ?? "") == "--recover \(dir.path)\n",
+          "G2: recover runs --recover <dir> through the helper")
+}
+
 // MARK: - Processing queue (Task 5)
 
 /// Records each run; the test ends a run by calling `finish`.

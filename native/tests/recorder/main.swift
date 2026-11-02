@@ -1,4 +1,4 @@
-// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift
+// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift ../../recorder/DiskFloor.swift
 // The recorder writes crash-safe working files (mic.caf, call.caf) and turns them
 // into the three .m4a at stop, or later through recovery. Synthetic sine audio in
 // temporary folders only: no devices, no permissions.
@@ -328,6 +328,117 @@ do {
     health.error(from: .system)
     health.buffer(from: .system)
     check(health.line() == "health mic=ok system=error", "health: a stream error sticks")
+}
+
+// MARK: - The disk floor (Gate 2)
+// A recorder whose app has gone (crashed, quit with "keep recording", not reopened) would run until
+// the disk is full. It watches the free space of its own output volume and stops itself below
+// 100 MB, as on SIGINT. A fake free-space source stands in for the disk: a real full disk is never needed.
+
+/// Counts calls and gives out free space from a script of values; the last value repeats.
+final class FakeDisk: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Int64?]
+    private(set) var asked: [URL] = []
+    private(set) var low = 0
+    private(set) var lines: [String] = []
+    init(_ values: [Int64?]) { self.values = values }
+    func free(_ url: URL) -> Int64? {
+        lock.lock(); defer { lock.unlock() }
+        asked.append(url)
+        return values.count > 1 ? values.removeFirst() : values.first ?? nil
+    }
+    func report(_ line: String) { lock.lock(); lines.append(line); lock.unlock() }
+    func onLow() { lock.lock(); low += 1; lock.unlock() }
+    var askedCount: Int { lock.lock(); defer { lock.unlock() }; return asked.count }
+    var lowCount: Int { lock.lock(); defer { lock.unlock() }; return low }
+    var reported: [String] { lock.lock(); defer { lock.unlock() }; return lines }
+}
+
+func waitUntil(_ seconds: Double, _ cond: () -> Bool) -> Bool {
+    let end = Date().addingTimeInterval(seconds)
+    while Date() < end { if cond() { return true }; usleep(10_000) }
+    return cond()
+}
+
+do {
+    check(DiskFloor.bytes == 100_000_000, "G2: the floor is 100 MB, decimal")
+    check(DiskFloor.interval == 10, "G2: the free space is checked every 10 s")
+    check(DiskFloor.message == "stopped: the disk is nearly full", "G2: the line the recorder writes is exact")
+
+    let out = newFolder()
+    func make(_ disk: FakeDisk, floor: Int64 = DiskFloor.bytes, interval: TimeInterval = 10) -> DiskFloor {
+        DiskFloor(directory: out, floor: floor, interval: interval, freeBytes: { disk.free($0) },
+                  report: { disk.report($0) }, onLow: { disk.onLow() })
+    }
+
+    // one check, by hand
+    let plenty = FakeDisk([5_000_000_000])
+    let a = make(plenty)
+    a.check(); a.check()
+    check(plenty.lowCount == 0 && plenty.reported.isEmpty, "G2: plenty of space never stops the recorder")
+    check(plenty.asked.allSatisfy { $0 == out } && plenty.askedCount == 2, "G2: the free space asked about is the output folder's")
+
+    let edge = FakeDisk([100_000_000])
+    make(edge).check()
+    check(edge.lowCount == 0, "G2: exactly 100 MB free is not below the floor")
+
+    let under = FakeDisk([99_999_999])
+    let b = make(under)
+    b.check()
+    check(under.lowCount == 1 && under.reported == ["stopped: the disk is nearly full"], "G2: below 100 MB it stops, with the one line")
+    b.check(); b.check()
+    check(under.lowCount == 1 && under.reported.count == 1, "G2: it stops once and says so once, however often it is asked")
+
+    let unreadable = FakeDisk([nil])
+    make(unreadable).check()
+    check(unreadable.lowCount == 0 && unreadable.reported.isEmpty, "G2: space that cannot be read does not stop a recording")
+
+    let custom = FakeDisk([400])
+    make(custom, floor: 500).check()
+    check(custom.lowCount == 1, "G2: the floor can be set for a test")
+
+    // on its timer: fine, fine, then the disk fills
+    let filling = FakeDisk([900, 800, 700, 50, 40])
+    let timed = make(filling, floor: 100, interval: 0.03)
+    timed.start()
+    check(waitUntil(5) { filling.lowCount == 1 }, "G2: on its timer it notices the disk filling")
+    usleep(300_000)
+    check(filling.lowCount == 1 && filling.reported == ["stopped: the disk is nearly full"],
+          "G2: and stops asking once it has stopped the recorder")
+    let askedAtStop = filling.askedCount
+    usleep(150_000)
+    check(filling.askedCount == askedAtStop, "G2: the timer is cancelled after that")
+
+    // the first check is at once, so a recorder started into a full disk does not wait 10 s
+    let full = FakeDisk([10])
+    let immediate = make(full, floor: 100, interval: 600)
+    immediate.start()
+    check(waitUntil(5) { full.lowCount == 1 }, "G2: the first check is at the start, not one interval later")
+
+    // cancelled, it stays quiet
+    let quiet = FakeDisk([10])
+    let cancelled = make(quiet, floor: 100, interval: 0.03)
+    cancelled.cancel()
+    cancelled.start()
+    usleep(200_000)
+    check(quiet.lowCount == 0 && quiet.askedCount == 0, "G2: cancel before start keeps it quiet")
+    let later = FakeDisk([1000])
+    let stopped = make(later, floor: 100, interval: 0.03)
+    stopped.start()
+    check(waitUntil(5) { later.askedCount >= 2 }, "G2: it keeps asking while all is well")
+    stopped.cancel()
+    usleep(100_000)
+    let askedAtCancel = later.askedCount
+    usleep(150_000)
+    check(later.askedCount == askedAtCancel && later.lowCount == 0, "G2: cancel stops the timer")
+
+    // the real source, on a scratch folder: its volume, or its nearest parent that exists
+    let real = DiskFloor.freeBytes(near: scratch)
+    check(real != nil && real! > 0, "G2: the real source reads the free space of a folder")
+    let viaParent = DiskFloor.freeBytes(near: scratch.appendingPathComponent("not/made/yet"))
+    check(viaParent != nil && real != nil && abs(viaParent! - real!) < 100_000_000,
+          "G2: a folder not made yet is read through its nearest parent")
 }
 
 try? fm.removeItem(at: scratch)

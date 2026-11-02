@@ -180,6 +180,7 @@ build_app 2>/dev/null
 rc=$?
 if [ "$rc" -eq 0 ] \
    && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID " "$HOME/calls.log" \
+   && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID.recorder " "$HOME/calls.log" \
    && ! grep -q -- '--sign - ' "$HOME/calls.log"; then
   pass "build_app signs with the certificate's hash"
 else fail "build_app signs with the certificate's hash"; fi
@@ -193,6 +194,7 @@ codesign() {
 out="$(build_app 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ] && grep -q -- "^codesign --force --sign - --identifier $APP_ID " "$HOME/calls.log" \
+   && grep -q -- "^codesign --force --sign - --identifier $APP_ID.recorder " "$HOME/calls.log" \
    && printf '%s\n' "$out" | grep -q 'could not use the meetingbox signing certificate'; then
   pass "build_app falls back to ad hoc and warns"
 else fail "build_app falls back to ad hoc and warns"; fi
@@ -292,6 +294,7 @@ out="$(setup 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q -- '-.* a signing certificate' \
    && printf '%s\n' "$out" | grep -q '+.* the recorder$' \
    && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID " "$HOME/calls.log" \
+   && grep -q -- "^codesign --force --sign $HASH --keychain $SIGN_KEYCHAIN --identifier $APP_ID.recorder " "$HOME/calls.log" \
    && ! grep -q '^install_recorder' "$HOME/calls.log" && grep -q '^prime_permissions' "$HOME/calls.log" \
    && app_signed_by_us; then
   pass "setup re-signs an ad hoc app, without a rebuild"

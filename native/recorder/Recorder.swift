@@ -216,18 +216,18 @@ func runRecorder(_ arguments: [String]) async -> Never {
         return source
     }
 
-    let stopSignal = AsyncStream<Void> { continuation in
-        let sources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
-            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-            source.setEventHandler {
-                continuation.yield()
-                continuation.finish()
-            }
-            source.resume()
-            return source
+    // A stop is one request, whether it came from a signal or from the disk floor below.
+    let (stopSignal, stopRequest) = AsyncStream<Void>.makeStream()
+    let stopSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+        source.setEventHandler {
+            stopRequest.yield()
+            stopRequest.finish()
         }
-        continuation.onTermination = { _ in sources.forEach { $0.cancel() } }
+        source.resume()
+        return source
     }
+    stopRequest.onTermination = { _ in stopSources.forEach { $0.cancel() } }
 
     // MARK: Start capture
 
@@ -277,6 +277,15 @@ func runRecorder(_ arguments: [String]) async -> Never {
     healthTimer.setEventHandler { eprint(health.line()) }
     healthTimer.resume()
 
+    // The backstop for a recorder whose app has gone: below 100 MB free it stops itself as on
+    // SIGINT (finalise, verify, marker), after writing "stopped: the disk is nearly full". The
+    // app's own floor is 200 MB, so with the app running the app stops it first.
+    let diskFloor = DiskFloor(directory: outputDir) {
+        stopRequest.yield()
+        stopRequest.finish()
+    }
+    diskFloor.start()
+
     // Nothing uses the pause sources again, and a local may be released after
     // its last use, so keep them alive for the whole recording explicitly.
     for await _ in stopSignal { break }
@@ -285,6 +294,7 @@ func runRecorder(_ arguments: [String]) async -> Never {
     // MARK: Stop
 
     eprint("\nStopping...")
+    diskFloor.cancel()
     healthTimer.cancel()
     micRecorder.stop()
     try? await systemRecorder.stop()

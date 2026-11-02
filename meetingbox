@@ -52,12 +52,26 @@ SAY_BIN="/usr/bin/say"   # macOS text to speech; `say` here is meetingbox's own 
 # app happened to start it (Terminal, Shortcuts, Raycast). One executable, three
 # modes: `--record` is the recorder, `--recover DIR` finishes an interrupted
 # recording, and with neither it is the app.
+#
+# The app runs the recorder from a copy of that executable in a helper bundle
+# of its own, meetingbox.app/Contents/Helpers/meetingbox-recorder.app. A
+# recorder connects to the window server, so LaunchServices registers the
+# bundle its executable is in. From the app's own executable it was taken for
+# the app itself, and a recorder left running by a crash made macOS refuse to
+# open the app again. The helper has an identifier of its own, so it never is.
+# It is still a child of the app, so macOS still files the permissions under
+# meetingbox. The script's own calls (the setup permission check, `--record -l`
+# and `--recover`) keep using the app's executable. A recorder started by an
+# earlier build, from the app's executable, is still found and stopped.
 APP_ID="com.jediconcepts.meetingbox"
+REC_ID="$APP_ID.recorder"
 APP_DIR="$HOME/Applications/meetingbox.app"
 # The Swift source lives in this repo, under native/recorder and native/app. setup
 # builds it from a clone of the release tag, or from MB_SOURCE_DIR if set.
 SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
 APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
+REC_APP="$APP_DIR/Contents/Helpers/meetingbox-recorder.app"
+REC_BIN="$REC_APP/Contents/MacOS/meetingbox-recorder"
 # Merges the mic and call transcripts into one labelled Me and Them. Built from
 # native/transcript alongside the app.
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
@@ -224,6 +238,8 @@ on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 # Ready means built, and built by this version, so updating meetingbox rebuilds it.
 recorder_ready() {
   [ -x "$APP_BIN" ] || return 1
+  # an app built before the helper existed has the right version and no helper
+  [ -x "$REC_BIN" ] || return 1
   [ -x "$TRANSCRIPT_BIN" ] || return 1
   local built
   built="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
@@ -259,8 +275,19 @@ launch_recorder() {
 # PIDs of the recorders writing into one folder, or of every meetingbox recorder
 # when the folder is "". Every launch gets a folder of its own, so this names the
 # right process however late it started. Matched as a fixed string, since a
-# folder name is not a pattern.
-recorder_pids() { pids_with_prefix "$APP_BIN --record -o ${1:+$1 -n }"; }
+# folder name is not a pattern. Both executables count: the helper's, which is
+# what the app starts, and the app's own, which is what the build before the
+# helper started and what the setup permission check still starts.
+recorder_pids() {
+  pids_with_prefix "$REC_BIN --record -o ${1:+$1 -n }"
+  pids_with_prefix "$APP_BIN --record -o ${1:+$1 -n }"
+}
+
+# PIDs of the recoveries running: the app's, from the helper, or the command's own.
+recover_pids() {
+  pids_with_prefix "$REC_BIN --recover "
+  pids_with_prefix "$APP_BIN --recover "
+}
 
 # PIDs of the processes whose command line starts with $1, a fixed string.
 pids_with_prefix() {
@@ -274,7 +301,7 @@ pids_with_prefix() {
 # the app underneath it could cost the meeting.
 recording_busy() {
   [ -n "$(recorder_pids "")" ] && return 0
-  [ -n "$(pids_with_prefix "$APP_BIN --recover ")" ] && return 0
+  [ -n "$(recover_pids)" ] && return 0
   for j in "$BASE_DIR"/*/meeting.json; do
     [ -f "$j" ] || continue
     grep -Eq '"state"[[:space:]]*:[[:space:]]*"(recording|finalising)"' "$j" && return 0
@@ -403,20 +430,23 @@ install_recorder() {
 # Build meetingbox.app: the recorder and the app compiled into one executable,
 # the icon and the Info.plist, signed with the meetingbox certificate so the
 # permissions survive a rebuild. Without it the app is signed ad hoc, and macOS
-# asks again after each update.
+# asks again after each update. The same executable, copied, is the recorder
+# helper (see REC_BIN above): one compile, a second bundle with its own
+# identifier.
 #
 # The whole bundle is made in a temporary folder first. The installed app is
 # replaced only once the new one is complete, so a failed build leaves the user
 # with the app they had, still able to record.
 build_app() {
-  local had_ad_hoc=0 build_tmp bundle iconset s
+  local had_ad_hoc=0 build_tmp bundle helper iconset s
   # from the app being replaced, before it is
   [ -d "$APP_DIR" ] && ! app_signed_by_us && had_ad_hoc=1
   adopt_own_app
   build_tmp="$(mktemp -d)" || return 1
   bundle="$build_tmp/meetingbox.app"
+  helper="$bundle/Contents/Helpers/meetingbox-recorder.app"
   iconset="$build_tmp/meetingbox.iconset"
-  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$iconset"
+  mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources" "$helper/Contents/MacOS" "$iconset"
   # Apple deprecates names each macOS release; warnings are noise here, errors still show.
   if ! swiftc -O -parse-as-library -o "$bundle/Contents/MacOS/meetingbox" \
          "$SOURCE_DIR"/native/recorder/*.swift "$SOURCE_DIR"/native/app/*.swift \
@@ -426,6 +456,9 @@ build_app() {
     warn "compile failed, see the output above"
     return 1
   fi
+  # The recorder helper: a copy of that executable, not a second compile.
+  install -m 755 "$bundle/Contents/MacOS/meetingbox" "$helper/Contents/MacOS/meetingbox-recorder" \
+    || { rm -rf -- "$build_tmp"; warn "could not make the recorder helper"; return 1; }
   # The icon: every size macOS asks for, from the one 1024 px png.
   for s in 16 32 128 256 512; do
     sips -z "$s" "$s" "$SOURCE_DIR/native/app/icon.png" --out "$iconset/icon_${s}x${s}.png" >/dev/null 2>&1 \
@@ -456,6 +489,26 @@ build_app() {
 </dict>
 </plist>
 PLIST
+  # No icon and no script path: nothing shows it, and it runs only --record and --recover.
+  cat > "$helper/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>$REC_ID</string>
+  <key>CFBundleName</key><string>meetingbox recorder</string>
+  <key>CFBundleDisplayName</key><string>meetingbox recorder</string>
+  <key>CFBundleExecutable</key><string>meetingbox-recorder</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>meetingbox records your side of the meeting.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>meetingbox records the other side of the meeting.</string>
+</dict>
+</plist>
+PLIST
   # Complete: now, and only now, replace the installed app.
   # ~/Applications is the user's own folder, so it is made if missing but never recorded.
   mkdir -p "$(dirname "$APP_DIR")"
@@ -471,7 +524,9 @@ PLIST
     if [ "$had_ad_hoc" = 1 ]; then forget_old_approvals; fi
   else
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
-    codesign --force --sign - --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1 \
+    # the helper first, as with the certificate: the app's signature seals the helper's
+    { codesign --force --sign - --identifier "$REC_ID" "$REC_APP" \
+        && codesign --force --sign - --identifier "$APP_ID" "$APP_DIR"; } >/dev/null 2>&1 \
       || { warn "could not sign the recorder app"; return 1; }
     register_app
   fi
@@ -489,11 +544,18 @@ forget_old_approvals() {
 
 # The one way the app is signed with the certificate: after a build, and by
 # setup when the app is not signed by it (an earlier ad hoc fallback, or a
-# certificate deleted since).
+# certificate deleted since). Inside out, without --deep: the helper is signed
+# first, with an identifier of its own, because the app's signature seals what
+# is inside it. A helper that cannot be signed leaves the app unsigned, and is
+# reported by the caller as the app is.
 sign_app() {
+  local hash
   ensure_signing_identity || return 1
   tell_signing_prompt
-  codesign --force --sign "$(signing_hash)" --keychain "$SIGN_KEYCHAIN" \
+  hash="$(signing_hash)"
+  codesign --force --sign "$hash" --keychain "$SIGN_KEYCHAIN" \
+    --identifier "$REC_ID" "$REC_APP" >/dev/null 2>&1 || return 1
+  codesign --force --sign "$hash" --keychain "$SIGN_KEYCHAIN" \
     --identifier "$APP_ID" "$APP_DIR" >/dev/null 2>&1
 }
 

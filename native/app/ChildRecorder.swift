@@ -1,24 +1,44 @@
 import Darwin
 import Foundation
 
-/// The real recorder: this same executable run as `--record`, a child of the app. Its stderr is
-/// `<dir>/capture.log` itself (0600, appended), not a pipe, so it keeps logging if the app goes
-/// away. Health lines are read back by tailing that file: from its start for a recorder launched
-/// here, from its end for one adopted after a crash. The next launch finds a running recorder
-/// again by its command line.
+/// The real recorder: a copy of this same executable, run from the helper bundle inside the app
+/// (`meetingbox.app/Contents/Helpers/meetingbox-recorder.app`) as `--record`, a child of the app.
+/// A recorder connects to the window server, so LaunchServices registers the bundle its
+/// executable is in. Run from the app's own executable it was taken for the app itself, and one
+/// left running by a crash made macOS refuse to open the app again. The helper has an identifier
+/// of its own. It is still our child, so macOS still files the permissions under the app.
+///
+/// Its stderr is `<dir>/capture.log` itself (0600, appended), not a pipe, so it keeps logging if
+/// the app goes away. Health lines are read back by tailing that file: from its start for a
+/// recorder launched here, from its end for one adopted after a crash. The next launch finds a
+/// running recorder again by its command line, whichever executable started it.
 final class ChildRecorder: RecorderControl {
+    /// What `--record` and `--recover` run: the helper's executable.
     let executable: URL
+    /// The app's own executable, only to recognise a recorder the previous build started with it.
+    private let legacyExecutable: URL
     private let ps: URL
     private let lock = NSLock()
     private var children: [Int32: Process] = [:]
     private var tails: [String: LogTail] = [:]
 
+    /// The helper's executable inside the app bundle at `app`.
+    static func helperExecutable(in app: URL) -> URL {
+        app.appendingPathComponent("Contents/Helpers/meetingbox-recorder.app/Contents/MacOS/meetingbox-recorder")
+    }
+
     /// `ps` is injectable so a test can make it fail.
-    init(executable: URL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]),
+    init(executable: URL = ChildRecorder.helperExecutable(in: Bundle.main.bundleURL),
+         legacyExecutable: URL = Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]),
          ps: URL = URL(fileURLWithPath: "/bin/ps")) {
         self.executable = executable
+        self.legacyExecutable = legacyExecutable
         self.ps = ps
     }
+
+    /// Shown when a recording cannot start because the helper is not there (an install from before
+    /// the helper, or a damaged one). Never worked around by running the app's own executable.
+    static let missingMessage = "the recorder is missing; run meetingbox setup"
 
     /// `--record -o <dir> -n meeting [-d <mic>]`, per the shared contract.
     static func arguments(dir: URL, mic: String?) -> [String] {
@@ -28,6 +48,9 @@ final class ChildRecorder: RecorderControl {
     }
 
     func launch(dir: URL, mic: String?, onHealthLine: @escaping (String) -> Void) throws -> Int32 {
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            throw SessionError(ChildRecorder.missingMessage)
+        }
         let log = try ChildRecorder.openLog(in: dir)
         defer { try? log.close() } // the child has its own copy once it runs
         let process = Process()
@@ -74,10 +97,12 @@ final class ChildRecorder: RecorderControl {
         return child.terminationReason == .uncaughtSignal ? 128 + child.terminationStatus : child.terminationStatus
     }
 
-    /// The first process whose command line starts `<executable> --record -o <dir> -n`. Unknown
-    /// when `ps` cannot be run, fails, or gives nothing readable (it always lists itself).
+    /// The first process whose command line starts `<helper> --record -o <dir> -n`, or the same
+    /// with the app's own executable, which is how the previous build started its recorder: one
+    /// still running after an upgrade is found and adopted all the same. Unknown when `ps` cannot
+    /// be run, fails, or gives nothing readable (it always lists itself).
     func find(dir: URL) -> FindResult {
-        let needle = "\(executable.path) --record -o \(dir.path) -n"
+        let needles = [executable, legacyExecutable].map { "\($0.path) --record -o \(dir.path) -n" }
         let process = Process()
         let out = Pipe()
         process.executableURL = ps
@@ -93,7 +118,8 @@ final class ChildRecorder: RecorderControl {
         for line in text.split(separator: "\n") {
             let trimmed = line.drop { $0 == " " }
             guard let space = trimmed.firstIndex(of: " "), let pid = Int32(trimmed[..<space]) else { continue }
-            if trimmed[trimmed.index(after: space)...].hasPrefix(needle) { return .found(pid) }
+            let command = trimmed[trimmed.index(after: space)...]
+            if needles.contains(where: command.hasPrefix) { return .found(pid) }
         }
         return .notFound
     }

@@ -9,6 +9,7 @@ STUB="$HOME/stub"
 mkdir -p "$STUB" "$STATE_DIR" "$APP_DIR/Contents/MacOS" "$(dirname "$TRANSCRIPT_BIN")"
 # Installed, as far as recorder_ready can tell.
 printf '#!/bin/bash\nexit 0\n' > "$APP_BIN"; chmod +x "$APP_BIN"
+mkdir -p "$(dirname "$REC_BIN")"; printf '#!/bin/bash\nexit 0\n' > "$REC_BIN"; chmod +x "$REC_BIN"
 printf '#!/bin/bash\nexit 0\n' > "$TRANSCRIPT_BIN"; chmod +x "$TRANSCRIPT_BIN"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
