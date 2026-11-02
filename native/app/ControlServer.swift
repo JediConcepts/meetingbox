@@ -89,6 +89,34 @@ final class ControlHandler {
         }
     }
 
+    /// `handle` for a caller that must not wait: the menu and the floating button run on `queue`,
+    /// which is the main queue in the app. Call on `queue`. A reply completes at once. A start is
+    /// re-checked on `queue` every `pollInterval`, by the socket's rules (settled once `startGrace` has
+    /// passed, given up on once `settleLimit` more has), and completes with its final line, on `queue`.
+    func perform(_ request: ControlRequest, completion: @escaping (String) -> Void) {
+        switch handle(request) {
+        case .reply(let text):
+            completion(text)
+        case .starting(let dir):
+            let settleAt = Date().addingTimeInterval(ControlHandler.startGrace)
+            awaitStart(dir, settleAt: settleAt, giveUpAt: settleAt.addingTimeInterval(ControlHandler.settleLimit), completion)
+        }
+    }
+
+    /// How often `perform` looks again at a start that is not decided.
+    static let pollInterval: DispatchTimeInterval = .milliseconds(250)
+
+    private func awaitStart(_ dir: URL, settleAt: Date, giveUpAt: Date, _ completion: @escaping (String) -> Void) {
+        queue.asyncAfter(deadline: .now() + ControlHandler.pollInterval) { [self] in
+            let now = Date()
+            if let outcome = startOutcome(dir, settled: now >= settleAt, giveUp: now >= giveUpAt) {
+                completion(outcome)
+            } else {
+                awaitStart(dir, settleAt: settleAt, giveUpAt: giveUpAt, completion)
+            }
+        }
+    }
+
     /// Call on `queue`. A start that launched comes back as `.starting`: ask `startOutcome` until it answers.
     func handle(_ request: ControlRequest) -> Handled {
         dispatchPrecondition(condition: .onQueue(queue))

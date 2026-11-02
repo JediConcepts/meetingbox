@@ -1,4 +1,4 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
@@ -2129,6 +2129,247 @@ do {
     let after = AppLock.take(lockURL)
     check(after != nil, "app.lock: free once its holder is killed")
     after?.release()
+}
+
+// MARK: - Menu bar item and floating button (Task 7)
+
+let meetingA = URL(fileURLWithPath: "/Meetings/2026-10-29_1000", isDirectory: true)
+let meetingB = URL(fileURLWithPath: "/Meetings/2026-10-29_1100", isDirectory: true)
+let allOk = Session.Health(mic: .ok, system: .ok, disk: .ok)
+
+func present(_ phase: Session.Phase = .idle, seconds: Int = 0, health: Session.Health = allOk, processing: URL? = nil,
+             stage: String? = nil, ready: URL? = nil, failure: String? = nil, floating: FloatingMode = .whileRecording,
+             preferences: Bool = false) -> StatusPresentation {
+    StatusPresentation(StatusInput(phase: phase, seconds: seconds, health: health, processing: processing, stage: stage,
+                                   ready: ready, failure: failure, floating: floating, preferencesAvailable: preferences))
+}
+/// The menu as text: "-" for a separator, a disabled line in brackets.
+func lines(_ p: StatusPresentation) -> [String] {
+    p.menu.map { $0.action == .separator ? "-" : ($0.enabled ? $0.title : "(\($0.title))") }
+}
+func action(_ title: String, in p: StatusPresentation) -> MenuAction? { p.menu.first { $0.title == title }?.action }
+
+// Every phase: the status button and the menu, in the exact words.
+do {
+    let tail = ["-", "Open meetingbox", "(Preferences…)", "-", "Quit meetingbox"]
+    let idle = present()
+    check(idle.button == StatusButton(symbol: "record.circle", tint: .none, title: "", help: "meetingbox"), "status: idle is record.circle, untinted, no title")
+    check(lines(idle) == ["Start recording"] + tail, "menu: idle (\(lines(idle)))")
+    check(action("Start recording", in: idle) == .start && action("Open meetingbox", in: idle) == .openMeetingbox
+          && action("Quit meetingbox", in: idle) == .quit && action("Preferences…", in: idle) == .preferences, "menu: idle actions")
+    check(present(preferences: true).menu.first { $0.title == "Preferences…" }?.enabled == true, "menu: Preferences… is enabled once its window exists")
+
+    let rec = present(.recording(meetingA), seconds: 7)
+    check(rec.button == StatusButton(symbol: "circle.fill", tint: .red, title: "00:07", help: "Recording"), "status: recording is a red dot and the timer")
+    check(lines(rec) == ["(Microphone: capturing)", "(System audio: capturing)", "-", "Pause", "Stop", "Show recording folder"] + tail,
+          "menu: recording (\(lines(rec)))")
+    check(action("Pause", in: rec) == .pause && action("Stop", in: rec) == .stop && action("Show recording folder", in: rec) == .showFolder(meetingA),
+          "menu: recording actions, the folder is the recording's")
+
+    let paused = present(.paused(meetingA), seconds: 65)
+    check(paused.button == StatusButton(symbol: "pause.circle", tint: .none, title: "01:05", help: "Paused"), "status: paused is pause.circle and the frozen timer")
+    check(lines(paused) == ["(Microphone: capturing)", "(System audio: capturing)", "-", "Resume", "Stop", "Show recording folder"] + tail,
+          "menu: paused (\(lines(paused)))")
+    check(action("Resume", in: paused) == .resume, "menu: paused offers Resume")
+
+    let fin = present(.finalising(meetingA), seconds: 90)
+    check(fin.button == StatusButton(symbol: "ellipsis.circle", tint: .none, title: "", help: "Writing minutes"), "status: finalising shows the busy symbol, no timer")
+    check(lines(fin) == ["(Writing minutes)", "-", "Show recording folder"] + tail, "menu: finalising (\(lines(fin)))")
+
+    let proc = present(processing: meetingA, stage: "transcribing")
+    check(proc.button == StatusButton(symbol: "ellipsis.circle", tint: .none, title: "", help: "Transcribing"), "status: processing is busy, the tooltip names the stage")
+    check(lines(proc) == ["(Writing minutes)", "-", "Start recording"] + tail, "menu: processing while idle (\(lines(proc)))")
+    check(present(processing: meetingA).button.help == "Writing minutes", "status: processing with no stage yet reads Writing minutes")
+
+    let ready = present(ready: meetingB)
+    check(ready.button.symbol == "record.circle", "status: minutes ready leaves the idle symbol")
+    check(lines(ready) == ["Minutes ready", "-", "Start recording"] + tail && action("Minutes ready", in: ready) == .openMinutes(meetingB),
+          "menu: Minutes ready is a link to that meeting (\(lines(ready)))")
+    check(lines(present(.recording(meetingA), processing: meetingB, ready: meetingB))
+          == ["(Microphone: capturing)", "(System audio: capturing)", "(Writing minutes)", "Minutes ready", "-", "Pause", "Stop", "Show recording folder"] + tail,
+          "menu: recording while the last meeting is processed and another is ready")
+
+    let failed = present(failure: "No input device matching \"USB\"")
+    check(failed.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "", help: "Could not start: No input device matching \"USB\""),
+          "status: a failed start shows the warning triangle")
+    check(lines(failed) == ["(Could not start: No input device matching \"USB\")", "-", "Start recording"] + tail
+          && failed.menu[0].action == .none && !failed.menu[0].enabled, "menu: a failed start is the first line, disabled (\(lines(failed)))")
+    let failedBusy = present(.finalising(meetingA), failure: "x")
+    check(lines(failedBusy).prefix(2) == ["(Could not start: x)", "(Writing minutes)"], "menu: the failed start comes before everything else")
+    check(present(.recording(meetingA), failure: "x").button.symbol == "circle.fill"
+          && lines(present(.recording(meetingA), failure: "x")) == lines(rec), "status and menu: a recording hides an old failure")
+
+    check(present(.recording(meetingA), seconds: 3725).button.title == "1:02:05" && present(.paused(meetingA), seconds: 0).button.title == "00:00",
+          "status: the timer is mm:ss, then h:mm:ss")
+}
+
+// Health: every combination, while recording and while paused; none shown otherwise.
+do {
+    var combos = 0
+    var allRight = true
+    var shownWhenNot = false
+    for mic in [Session.StreamHealth.ok, .stalled, .error] {
+        for system in [Session.StreamHealth.ok, .stalled, .error] {
+            for disk in [Session.DiskHealth.ok, .low] {
+                let h = Session.Health(mic: mic, system: system, disk: disk)
+                let good = mic == .ok && system == .ok && disk == .ok
+                var expected = [mic == .ok ? "(Microphone: capturing)" : "(Microphone: not receiving audio)",
+                                system == .ok ? "(System audio: capturing)" : "(System audio: not receiving audio)"]
+                if disk == .low { expected.append("(Disk space low)") }
+                for (phase, symbol, clean) in [(Session.Phase.recording(meetingA), "circle.fill", StatusTint.red), (.paused(meetingA), "pause.circle", .none)] {
+                    combos += 1
+                    let p = present(phase, seconds: 3, health: h)
+                    let tint = good ? clean : StatusTint.amber
+                    if p.button.symbol != symbol || p.button.tint != tint || p.panel.dot != tint
+                        || Array(lines(p).prefix(expected.count)) != expected || lines(p)[expected.count] != "-" { allRight = false }
+                }
+                for phase in [Session.Phase.idle, .finalising(meetingA)] {
+                    let p = present(phase, health: h)
+                    if lines(p).contains(where: { $0.contains("Microphone") || $0.contains("System audio") || $0.contains("Disk space") })
+                        || p.button.tint == .amber || p.panel.dot == .amber { shownWhenNot = true }
+                }
+            }
+        }
+    }
+    check(combos == 36 && allRight, "health: all 18 combinations, recording and paused, give the right lines, an amber dot when not ok, red (or none when paused) when ok")
+    check(!shownWhenNot, "health: nothing about health shows while idle or finalising")
+    let both = present(.recording(meetingA), health: Session.Health(mic: .error, system: .stalled, disk: .low))
+    check(lines(both).prefix(3) == ["(Microphone: not receiving audio)", "(System audio: not receiving audio)", "(Disk space low)"]
+          && both.button.help == "Recording, but some audio is not arriving", "health: stalled and error both read not receiving audio")
+}
+
+// The floating panel: shown per mode and phase, and what it holds.
+do {
+    let phases: [Session.Phase] = [.idle, .recording(meetingA), .paused(meetingA), .finalising(meetingA)]
+    var grid: [String] = []
+    for mode in FloatingMode.allCases {
+        grid.append(phases.map { present($0, floating: mode).panel.visible ? "1" : "0" }.joined())
+    }
+    check(grid == ["1111", "0110", "0000"], "panel: always, while recording and never against idle, recording, paused, finalising (\(grid))")
+
+    let idle = present(floating: .always).panel
+    check(idle == PanelPresentation(visible: true, dot: .none, label: "Ready", controls: [.start], help: nil), "panel: ready with a Record button when idle")
+    check(present(processing: meetingA, floating: .always).panel.label == "Writing minutes"
+          && present(processing: meetingA, floating: .always).panel.controls == [.start], "panel: idle while minutes are written still offers Record")
+    let failed = present(failure: "No microphone", floating: .always).panel
+    check(failed.label == "Could not start" && failed.dot == .amber && failed.controls == [.start] && failed.help == "Could not start: No microphone",
+          "panel: a failed start is named, with the reason as its tooltip")
+    check(present(.recording(meetingA), failure: "x", floating: .always).panel.help == nil, "panel: a recording hides an old failure")
+
+    let rec = present(.recording(meetingA), seconds: 12).panel
+    check(rec == PanelPresentation(visible: true, dot: .red, label: "00:12", controls: [.pause, .stop, .showFolder(meetingA)], help: nil),
+          "panel: recording has a red dot, the timer, Pause, Stop and the folder")
+    let paused = present(.paused(meetingA), seconds: 12).panel
+    check(paused == PanelPresentation(visible: true, dot: .none, label: "00:12", controls: [.resume, .stop, .showFolder(meetingA)], help: nil),
+          "panel: paused holds the timer and offers Resume")
+    let fin = present(.finalising(meetingA), floating: .always).panel
+    check(fin == PanelPresentation(visible: true, dot: .none, label: "Writing minutes", controls: [.showFolder(meetingA)], help: nil),
+          "panel: finalising reads Writing minutes and keeps the folder")
+    check(MenuAction.start.title == "Start recording" && MenuAction.pause.title == "Pause" && MenuAction.resume.title == "Resume"
+          && MenuAction.stop.title == "Stop" && MenuAction.showFolder(meetingA).title == "Show recording folder",
+          "panel: its buttons carry the menu's words")
+}
+
+// Where the floating button is kept and put.
+do {
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: URL(fileURLWithPath: "/Users/someone", isDirectory: true))
+    check(p.floatingOrigin == nil, "floatingOrigin: nothing saved by default")
+    p.floatingOrigin = CGPoint(x: 312.5, y: -40.25)
+    let q = Preferences(defaults: d, home: URL(fileURLWithPath: "/Users/someone", isDirectory: true))
+    check(q.floatingOrigin == CGPoint(x: 312.5, y: -40.25), "floatingOrigin: two Doubles round-trip, a negative one too")
+    d.set(5.0, forKey: "floatingX")
+    d.removeObject(forKey: "floatingY")
+    check(Preferences(defaults: d).floatingOrigin == nil, "floatingOrigin: half a position is no position")
+    d.set(Double.nan, forKey: "floatingX"); d.set(1.0, forKey: "floatingY")
+    check(Preferences(defaults: d).floatingOrigin == nil, "floatingOrigin: a value that is not a number is no position")
+    q.floatingOrigin = CGPoint(x: 1, y: 2)
+    q.floatingOrigin = nil
+    check(Preferences(defaults: d).floatingOrigin == nil, "floatingOrigin: cleared")
+
+    let main = CGRect(x: 0, y: 25, width: 1440, height: 875)
+    let side = CGRect(x: 1440, y: 0, width: 1920, height: 1080)
+    let size = FloatingPlacement.size
+    check(size == CGSize(width: 220, height: 44), "placement: about 220 x 44")
+    let corner = CGPoint(x: 1440 - 220 - 16, y: 900 - 44 - 16)
+    check(FloatingPlacement.origin(saved: nil, size: size, screens: [main], main: main) == corner, "placement: the first time, the top right of the main screen's visible frame")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 100, y: 100), size: size, screens: [main], main: main) == CGPoint(x: 100, y: 100), "placement: a saved position on a screen is kept")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 5000, y: 5000), size: size, screens: [main], main: main) == corner, "placement: a saved position off every screen goes back to the top right")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 1400, y: 500), size: size, screens: [main], main: main) == corner, "placement: a position with only a sliver on screen goes back too")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 1300, y: 500), size: size, screens: [main], main: main) == CGPoint(x: 1300, y: 500), "placement: partly off an edge but easy to grab is kept")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 2000, y: 400), size: size, screens: [main, side], main: main) == CGPoint(x: 2000, y: 400), "placement: a position on a second screen is kept")
+    check(FloatingPlacement.origin(saved: CGPoint(x: 2000, y: 400), size: size, screens: [main], main: main) == corner, "placement: and goes back when that screen is unplugged")
+}
+
+// One path for every action: perform answers like the socket, without ever waiting on the queue.
+do {
+    let q = DispatchQueue(label: "meetingbox.test.perform")
+    let onQ = DispatchSpecificKey<Bool>()
+    q.setSpecific(key: onQ, value: true)
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0, stopped = 0
+    h.onStarted = { _ in started += 1 }
+    h.onStopped = { _ in stopped += 1 }
+
+    var now: String?
+    q.sync { h.perform(.status) { now = $0 } }
+    check(q.sync { now } == "ok idle -", "perform: a reply is delivered at once")
+    q.sync { now = nil; h.perform(.pause) { now = $0 } }
+    check(q.sync { now } == "error not recording", "perform: an error reply too")
+
+    // A start whose recorder stays up.
+    let done = DispatchSemaphore(value: 0)
+    var answer: String?, answeredOnQueue = false, early = true, soundsAtAnswer = -1
+    q.sync {
+        h.perform(.start(mic: nil, dir: nil)) {
+            answer = $0
+            answeredOnQueue = DispatchQueue.getSpecific(key: onQ) == true
+            soundsAtAnswer = started
+            done.signal()
+        }
+        early = answer == nil
+    }
+    check(q.sync { early } && q.sync { started } == 0, "perform: a start returns before it is settled, and plays nothing yet")
+    // While it waits the queue is free: another request is answered straight away.
+    var during: String?
+    q.sync { h.perform(.status) { during = $0 } }
+    let dir = q.sync { r.session.phase.folder }
+    check(dir != nil && q.sync { during } == "ok recording \(dir!.path)", "perform: the queue is free while a start settles")
+    check(done.wait(timeout: .now() + 15) == .success, "perform: a start that stays up is answered")
+    let (okAnswer, onQueue, sounds) = q.sync { (answer, answeredOnQueue, soundsAtAnswer) }
+    check(dir != nil && okAnswer == "ok recording \(dir!.path)", "perform: ok recording <dir> once the recorder has stayed up (\(okAnswer ?? "nil"))")
+    check(onQueue, "perform: the completion arrives on the handler's queue")
+    check(sounds == 1 && q.sync { started } == 1, "perform: the start sound is announced once, with the answer")
+    // Every other action takes the same path.
+    var paused: String?
+    q.sync { h.perform(.pause) { paused = $0 } }
+    check(q.sync { paused } == "ok paused \(dir!.path)", "perform: pause")
+    var stop: String?
+    q.sync { h.perform(.stop) { stop = $0 } }
+    check(q.sync { stop } == "ok finalising \(dir!.path)" && q.sync { stopped } == 1, "perform: stop, and the stop sound is announced")
+    q.sync {}
+}
+do {
+    let q = DispatchQueue(label: "meetingbox.test.perform.dies")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0
+    h.onStarted = { _ in started += 1 }
+    q.sync {
+        r.rec.recoverResult = false
+        r.rec.dieOnLaunch = (1, "No input device matching \"USB\"")
+    }
+    let done = DispatchSemaphore(value: 0)
+    var answer: String?, early = true
+    q.sync {
+        h.perform(.start(mic: nil, dir: nil)) { answer = $0; done.signal() }
+        early = answer == nil
+    }
+    check(q.sync { early }, "perform: a start that will fail is not answered before it returns")
+    check(done.wait(timeout: .now() + 20) == .success, "perform: a recorder that dies at once is answered")
+    let (reply, sounds, phase) = q.sync { (answer, started, r.session.phase) }
+    check(reply == "error No input device matching \"USB\"" && sounds == 0 && phase == .idle,
+          "perform: error <its reason>, no start sound, and idle (\(reply ?? "nil"))")
+    q.sync {}
 }
 
 try? fm.removeItem(at: scratch)

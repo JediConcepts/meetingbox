@@ -34,6 +34,8 @@ final class Preferences {
         static let sounds = "sounds"
         static let meetingsFolder = "meetingsFolder"
         static let microphone = "microphone"
+        static let floatingX = "floatingX"
+        static let floatingY = "floatingY"
     }
 
     private func bool(_ key: String, _ fallback: Bool) -> Bool {
@@ -87,8 +89,29 @@ final class Preferences {
         }
     }
 
+    /// Where the floating button was left, its lower left corner in screen coordinates (two Doubles);
+    /// nil until it has been moved, or when what is stored is not a position.
+    var floatingOrigin: CGPoint? {
+        get {
+            guard let x = defaults.object(forKey: Key.floatingX) as? Double, let y = defaults.object(forKey: Key.floatingY) as? Double,
+                  x.isFinite, y.isFinite else { return nil }
+            return CGPoint(x: x, y: y)
+        }
+        set {
+            if let p = newValue {
+                defaults.set(Double(p.x), forKey: Key.floatingX)
+                defaults.set(Double(p.y), forKey: Key.floatingY)
+            } else {
+                defaults.removeObject(forKey: Key.floatingX)
+                defaults.removeObject(forKey: Key.floatingY)
+            }
+        }
+    }
+
     /// Recorded time as the timer shows it: `mm:ss` under an hour, then `h:mm:ss`.
-    func formatTimer(_ seconds: Int) -> String {
+    func formatTimer(_ seconds: Int) -> String { Preferences.timerText(seconds) }
+
+    static func timerText(_ seconds: Int) -> String {
         let s = max(0, seconds)
         let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60)
         let two = { (n: Int) in n < 10 ? "0\(n)" : "\(n)" }
