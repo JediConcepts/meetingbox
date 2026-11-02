@@ -72,6 +72,9 @@ final class ControlHandler {
     var onStopped: ((URL) -> Void)?
     /// `show`: bring the app forward.
     var onShow: (() -> Void)?
+    /// The folder of the last recording a stop was asked for (on `queue`), so a start still settling
+    /// for it is told apart from one that failed.
+    private var stoppedFolder: URL?
 
     /// The queue is the session's tick queue, so the two can never differ.
     init(session: Session, preferences: Preferences) {
@@ -93,6 +96,8 @@ final class ControlHandler {
     /// which is the main queue in the app. Call on `queue`. A reply completes at once. A start is
     /// re-checked on `queue` every `pollInterval`, by the socket's rules (settled once `startGrace` has
     /// passed, given up on once `settleLimit` more has), and completes with its final line, on `queue`.
+    /// Unlike the socket, a start that the same caller then stops, or pauses, within the grace is not
+    /// reported as a failure or announced as a start: the menu puts Stop one click away from Start.
     func perform(_ request: ControlRequest, completion: @escaping (String) -> Void) {
         switch handle(request) {
         case .reply(let text):
@@ -109,7 +114,16 @@ final class ControlHandler {
     private func awaitStart(_ dir: URL, settleAt: Date, giveUpAt: Date, _ completion: @escaping (String) -> Void) {
         queue.asyncAfter(deadline: .now() + ControlHandler.pollInterval) { [self] in
             let now = Date()
-            if let outcome = startOutcome(dir, settled: now >= settleAt, giveUp: now >= giveUpAt) {
+            let settled = now >= settleAt
+            let outcome: String?
+            if stoppedFolder == dir {
+                outcome = status() // stopped on request: not a failed start, and no start sound
+            } else if case .paused(let paused) = session.phase, paused == dir {
+                outcome = settled ? status() : nil // paused within the grace: no start sound; wait for the recorder to prove itself
+            } else {
+                outcome = startOutcome(dir, settled: settled, giveUp: now >= giveUpAt)
+            }
+            if let outcome = outcome {
                 completion(outcome)
             } else {
                 awaitStart(dir, settleAt: settleAt, giveUpAt: giveUpAt, completion)
@@ -211,7 +225,10 @@ final class ControlHandler {
         case .idle, .finalising: running = false
         }
         guard let dir = session.stop() else { return "error not recording" }
-        if running { onStopped?(dir) }
+        if running {
+            stoppedFolder = dir
+            onStopped?(dir)
+        }
         return ControlHandler.oneLine("ok finalising \(dir.path)")
     }
 

@@ -10,17 +10,13 @@ import Combine
 /// the one path the socket uses too.
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var phase: Session.Phase = .idle
-    /// Recorded time, and the capture health, refreshed each second while recording or paused.
-    @Published private(set) var seconds = 0
-    @Published private(set) var health = Session.Health(mic: .ok, system: .ok, disk: .ok)
-    /// The meeting being processed, and its stage.
-    @Published private(set) var processing: URL?
-    @Published private(set) var stage: String?
-    /// The meeting whose minutes were finished last, until it is opened or the next recording starts.
-    @Published private(set) var ready: URL?
-    /// Why the last start did not work, until the next action.
-    @Published private(set) var failure: String?
+    /// What the views show, changed only by `StatusEvent`s (StatusReducer.swift, where the rules are
+    /// tested): the phase, the recorded time and health, the job being processed and its stage, the
+    /// meeting whose minutes are ready, and what the user asked for last that did not work.
+    @Published private(set) var status = StatusInput()
+    var phase: Session.Phase { status.phase }
+    var processing: URL? { status.processing }
+    var stage: String? { status.stage }
 
     let preferences: Preferences
     let stateDir: URL
@@ -50,20 +46,22 @@ final class AppModel: ObservableObject {
     /// (Task 5), then answer on the socket. The caller already holds `app.lock`.
     func launch() {
         let queue = self.queue
-        session.onChange = { [weak self] phase in Task { @MainActor in self?.changed(to: phase) } }
+        session.onChange = { [weak self] phase in
+            Task { @MainActor in
+                self?.apply(.phase(phase))
+                self?.syncClock()
+            }
+        }
         // Only verified audio is queued; a failed recording is never processed.
         session.onFinished = { dir, ok in if ok { queue.enqueue(dir) } }
         queue.onChange = { [weak self] in
             let (current, stage) = (queue.current, queue.stage)
-            Task { @MainActor in
-                self?.processing = current
-                self?.stage = stage
-            }
+            Task { @MainActor in self?.apply(.processing(current, stage: stage)) }
         }
         queue.onFinished = { [weak self] dir, ok in
             Task { @MainActor in
                 guard ok else { return }
-                self?.ready = dir
+                self?.apply(.minutesReady(dir))
                 self?.play("Glass")
             }
         }
@@ -91,17 +89,25 @@ final class AppModel: ObservableObject {
 
     /// What the menu bar item and the floating button show now.
     var presentation: StatusPresentation {
-        StatusPresentation(StatusInput(phase: phase, seconds: seconds, health: health, processing: processing, stage: stage,
-                                       ready: ready, failure: failure, floating: preferences.floating))
+        var input = status
+        input.floating = preferences.floating
+        return StatusPresentation(input)
+    }
+
+    /// Only a change publishes, so the views are not told every second that nothing happened.
+    private func apply(_ event: StatusEvent) {
+        var next = status
+        next.apply(event)
+        if next != status { status = next }
     }
 
     /// A menu entry or floating button was chosen. Recording commands go through the same
     /// `ControlHandler` as the socket, so a click and `meetingbox start` get the same answers;
     /// nothing here waits (a modal alert would block the queue the session ticks on).
     func perform(_ action: MenuAction) {
-        failure = nil
+        apply(.acted)
         switch action {
-        case .none, .separator, .preferences:
+        case .info, .separator, .preferences:
             break // the preferences window comes with Task 9
         case .start:
             send(.start(mic: nil, dir: nil))
@@ -118,7 +124,7 @@ final class AppModel: ObservableObject {
             NSWorkspace.shared.open(preferences.meetingsFolder)
         case .openMinutes(let dir):
             // Task 8 opens the meeting in the window instead.
-            if ready == dir { ready = nil }
+            apply(.minutesOpened(dir))
             let notes = dir.appendingPathComponent("notes.md")
             NSWorkspace.shared.open(FileManager.default.fileExists(atPath: notes.path) ? notes : dir)
         case .quit:
@@ -136,49 +142,33 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Only a start that fails is shown (the icon and the menu's first line). A pause or stop that
-    /// loses a race with the recorder ending changes nothing worth a warning.
+    /// A failed start, and a pause or resume that could not reach the recorder, are shown (the icon
+    /// and the menu's first line). The races, such as a pause that lost to the recorder ending, only go
+    /// to the log.
     private func answered(_ request: ControlRequest, _ reply: String) {
         guard reply.hasPrefix("error ") else { return }
-        let reason = String(reply.dropFirst("error ".count))
-        if case .start = request {
-            failure = reason
+        if let failure = Failure.from(request, reply: reply) {
+            apply(.failed(failure))
         } else {
-            NSLog("meetingbox: %@ was refused: %@", String(describing: request), reason)
+            NSLog("meetingbox: %@ was refused: %@", String(describing: request), String(reply.dropFirst("error ".count)))
         }
-    }
-
-    /// The session moved to `new`: remember it, start the clock when there is one to show, and
-    /// forget the last minutes and any old failure once a recording is under way.
-    private func changed(to new: Session.Phase) {
-        let began = phase == .idle
-        phase = new
-        if case .recording = new, began {
-            ready = nil
-            failure = nil
-        }
-        refreshClock()
     }
 
     /// Once a second while recording or paused, on the main queue (the session's tick queue), so
-    /// reading the session here is safe. Stops when idle.
-    private func refreshClock() {
-        switch phase {
-        case .recording, .paused:
-            let (now, current) = (session.recordedSeconds(at: Date()), session.health)
-            if seconds != now { seconds = now }
-            if health != current { health = current }
-            guard clock == nil else { return }
-            let timer = DispatchSource.makeTimerSource(queue: .main)
-            timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
-            timer.setEventHandler { [weak self] in Task { @MainActor in self?.refreshClock() } }
-            timer.resume()
-            clock = timer
-        case .idle, .finalising:
+    /// reading the session here is safe. One timer at most, cancelled when `clockRuns` is false.
+    private func syncClock() {
+        guard status.clockRuns else {
             clock?.cancel()
             clock = nil
-            if seconds != 0 { seconds = 0 }
+            return
         }
+        apply(.tick(seconds: session.recordedSeconds(at: Date()), health: session.health))
+        guard clock == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in Task { @MainActor in self?.syncClock() } }
+        timer.resume()
+        clock = timer
     }
 
     /// The start, stop and done sounds, unless they are turned off.

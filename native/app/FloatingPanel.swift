@@ -105,7 +105,7 @@ final class FloatingPanel: NSObject {
 
     private func tint(_ t: StatusTint) -> NSColor {
         switch t {
-        case .none: return .secondaryLabelColor
+        case .plain: return .secondaryLabelColor
         case .red: return .systemRed
         case .amber: return .systemOrange
         }

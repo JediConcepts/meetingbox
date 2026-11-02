@@ -1,7 +1,8 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
+setvbuf(stdout, nil, _IOLBF, 0) // a crash then leaves every line before it
 var failures = 0
 func check(_ cond: Bool, _ name: String) {
     if cond {
@@ -2219,7 +2220,7 @@ let meetingB = URL(fileURLWithPath: "/Meetings/2026-10-29_1100", isDirectory: tr
 let allOk = Session.Health(mic: .ok, system: .ok, disk: .ok)
 
 func present(_ phase: Session.Phase = .idle, seconds: Int = 0, health: Session.Health = allOk, processing: URL? = nil,
-             stage: String? = nil, ready: URL? = nil, failure: String? = nil, floating: FloatingMode = .whileRecording,
+             stage: String? = nil, ready: URL? = nil, failure: Failure? = nil, floating: FloatingMode = .whileRecording,
              preferences: Bool = false) -> StatusPresentation {
     StatusPresentation(StatusInput(phase: phase, seconds: seconds, health: health, processing: processing, stage: stage,
                                    ready: ready, failure: failure, floating: floating, preferencesAvailable: preferences))
@@ -2234,7 +2235,7 @@ func action(_ title: String, in p: StatusPresentation) -> MenuAction? { p.menu.f
 do {
     let tail = ["-", "Open meetingbox", "(Preferences…)", "-", "Quit meetingbox"]
     let idle = present()
-    check(idle.button == StatusButton(symbol: "record.circle", tint: .none, title: "", help: "meetingbox"), "status: idle is record.circle, untinted, no title")
+    check(idle.button == StatusButton(symbol: "record.circle", tint: .plain, title: "", help: "meetingbox"), "status: idle is record.circle, untinted, no title")
     check(lines(idle) == ["Start recording"] + tail, "menu: idle (\(lines(idle)))")
     check(action("Start recording", in: idle) == .start && action("Open meetingbox", in: idle) == .openMeetingbox
           && action("Quit meetingbox", in: idle) == .quit && action("Preferences…", in: idle) == .preferences, "menu: idle actions")
@@ -2248,37 +2249,53 @@ do {
           "menu: recording actions, the folder is the recording's")
 
     let paused = present(.paused(meetingA), seconds: 65)
-    check(paused.button == StatusButton(symbol: "pause.circle", tint: .none, title: "01:05", help: "Paused"), "status: paused is pause.circle and the frozen timer")
+    check(paused.button == StatusButton(symbol: "pause.circle", tint: .plain, title: "01:05", help: "Paused"), "status: paused is pause.circle and the frozen timer")
     check(lines(paused) == ["(Microphone: capturing)", "(System audio: capturing)", "-", "Resume", "Stop", "Show recording folder"] + tail,
           "menu: paused (\(lines(paused)))")
     check(action("Resume", in: paused) == .resume, "menu: paused offers Resume")
 
     let fin = present(.finalising(meetingA), seconds: 90)
-    check(fin.button == StatusButton(symbol: "ellipsis.circle", tint: .none, title: "", help: "Writing minutes"), "status: finalising shows the busy symbol, no timer")
+    check(fin.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Writing minutes", help: "Writing minutes"), "status: finalising says Writing minutes in the bar, no timer")
     check(lines(fin) == ["(Writing minutes)", "-", "Show recording folder"] + tail, "menu: finalising (\(lines(fin)))")
 
     let proc = present(processing: meetingA, stage: "transcribing")
-    check(proc.button == StatusButton(symbol: "ellipsis.circle", tint: .none, title: "", help: "Transcribing"), "status: processing is busy, the tooltip names the stage")
+    check(proc.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Writing minutes", help: "Transcribing"), "status: processing says Writing minutes in the bar, the tooltip names the stage")
     check(lines(proc) == ["(Writing minutes)", "-", "Start recording"] + tail, "menu: processing while idle (\(lines(proc)))")
-    check(present(processing: meetingA).button.help == "Writing minutes", "status: processing with no stage yet reads Writing minutes")
+    check(present(processing: meetingA).button.help == "Writing minutes" && present(processing: meetingA).button.title == "Writing minutes",
+          "status: processing with no stage yet reads Writing minutes")
 
     let ready = present(ready: meetingB)
-    check(ready.button.symbol == "record.circle", "status: minutes ready leaves the idle symbol")
+    check(ready.button == StatusButton(symbol: "checkmark.circle", tint: .plain, title: "Minutes ready", help: "Minutes ready"),
+          "status: minutes ready says so in the bar, with its own symbol")
+    check(present(processing: meetingA, ready: meetingB).button == present(processing: meetingA).button, "status: busy wins over ready")
+    check(present(.finalising(meetingA), ready: meetingB).button == fin.button, "status: finalising wins over ready too")
+    check(present(.recording(meetingA), seconds: 7, ready: meetingB).button == rec.button
+          && present(.paused(meetingA), seconds: 65, ready: meetingB).button == paused.button, "status: a recording or a pause hides ready in the bar")
+    check(present(ready: meetingB, failure: Failure("start", "x")).button.symbol == "exclamationmark.triangle", "status: a failure wins over ready")
     check(lines(ready) == ["Minutes ready", "-", "Start recording"] + tail && action("Minutes ready", in: ready) == .openMinutes(meetingB),
           "menu: Minutes ready is a link to that meeting (\(lines(ready)))")
     check(lines(present(.recording(meetingA), processing: meetingB, ready: meetingB))
           == ["(Microphone: capturing)", "(System audio: capturing)", "(Writing minutes)", "Minutes ready", "-", "Pause", "Stop", "Show recording folder"] + tail,
           "menu: recording while the last meeting is processed and another is ready")
 
-    let failed = present(failure: "No input device matching \"USB\"")
+    let failed = present(failure: Failure("start", "No input device matching \"USB\""))
     check(failed.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "", help: "Could not start: No input device matching \"USB\""),
           "status: a failed start shows the warning triangle")
     check(lines(failed) == ["(Could not start: No input device matching \"USB\")", "-", "Start recording"] + tail
-          && failed.menu[0].action == .none && !failed.menu[0].enabled, "menu: a failed start is the first line, disabled (\(lines(failed)))")
-    let failedBusy = present(.finalising(meetingA), failure: "x")
+          && failed.menu[0].action == .info && !failed.menu[0].enabled, "menu: a failed start is the first line, disabled (\(lines(failed)))")
+    let failedBusy = present(.finalising(meetingA), failure: Failure("start", "x"))
     check(lines(failedBusy).prefix(2) == ["(Could not start: x)", "(Writing minutes)"], "menu: the failed start comes before everything else")
-    check(present(.recording(meetingA), failure: "x").button.symbol == "circle.fill"
-          && lines(present(.recording(meetingA), failure: "x")) == lines(rec), "status and menu: a recording hides an old failure")
+    // M1: a pause or resume the recorder could not be reached for, shown while the recording goes on.
+    let noPause = present(.recording(meetingA), seconds: 7, failure: Failure("pause", ControlHandler.cannotReach.replacingOccurrences(of: "error ", with: "")))
+    check(noPause.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "00:07",
+                                         help: "Could not pause: cannot reach the recorder right now, try again"),
+          "status: a refused pause shows the warning, and the timer keeps running beside it")
+    check(lines(noPause) == ["(Could not pause: cannot reach the recorder right now, try again)", "(Microphone: capturing)", "(System audio: capturing)",
+                             "-", "Pause", "Stop", "Show recording folder"] + tail, "menu: a refused pause is the first line, and Pause is still offered (\(lines(noPause)))")
+    let noResume = present(.paused(meetingA), seconds: 65, failure: Failure("resume", "cannot reach the recorder right now, try again"))
+    check(noResume.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "01:05",
+                                          help: "Could not resume: cannot reach the recorder right now, try again")
+          && lines(noResume).first == "(Could not resume: cannot reach the recorder right now, try again)", "status and menu: a refused resume likewise")
 
     check(present(.recording(meetingA), seconds: 3725).button.title == "1:02:05" && present(.paused(meetingA), seconds: 0).button.title == "00:00",
           "status: the timer is mm:ss, then h:mm:ss")
@@ -2287,8 +2304,8 @@ do {
 // Health: every combination, while recording and while paused; none shown otherwise.
 do {
     var combos = 0
-    var allRight = true
-    var shownWhenNot = false
+    var wrong: [String] = []
+    var shownWhenNot: [String] = []
     for mic in [Session.StreamHealth.ok, .stalled, .error] {
         for system in [Session.StreamHealth.ok, .stalled, .error] {
             for disk in [Session.DiskHealth.ok, .low] {
@@ -2297,26 +2314,41 @@ do {
                 var expected = [mic == .ok ? "(Microphone: capturing)" : "(Microphone: not receiving audio)",
                                 system == .ok ? "(System audio: capturing)" : "(System audio: not receiving audio)"]
                 if disk == .low { expected.append("(Disk space low)") }
-                for (phase, symbol, clean) in [(Session.Phase.recording(meetingA), "circle.fill", StatusTint.red), (.paused(meetingA), "pause.circle", .none)] {
+                for (phase, symbol, clean, name) in [(Session.Phase.recording(meetingA), "circle.fill", StatusTint.red, "recording"), (.paused(meetingA), "pause.circle", .plain, "paused")] {
                     combos += 1
                     let p = present(phase, seconds: 3, health: h)
                     let tint = good ? clean : StatusTint.amber
                     if p.button.symbol != symbol || p.button.tint != tint || p.panel.dot != tint
-                        || Array(lines(p).prefix(expected.count)) != expected || lines(p)[expected.count] != "-" { allRight = false }
+                        || Array(lines(p).prefix(expected.count)) != expected || lines(p)[expected.count] != "-" {
+                        wrong.append("\(name) mic=\(mic) system=\(system) disk=\(disk)")
+                    }
                 }
                 for phase in [Session.Phase.idle, .finalising(meetingA)] {
                     let p = present(phase, health: h)
                     if lines(p).contains(where: { $0.contains("Microphone") || $0.contains("System audio") || $0.contains("Disk space") })
-                        || p.button.tint == .amber || p.panel.dot == .amber { shownWhenNot = true }
+                        || p.button.tint == .amber || p.panel.dot == .amber { shownWhenNot.append("mic=\(mic) system=\(system) disk=\(disk)") }
                 }
             }
         }
     }
-    check(combos == 36 && allRight, "health: all 18 combinations, recording and paused, give the right lines, an amber dot when not ok, red (or none when paused) when ok")
-    check(!shownWhenNot, "health: nothing about health shows while idle or finalising")
+    check(combos == 36 && wrong.isEmpty, "health: all 18 combinations, recording and paused, give the right lines, an amber dot when not ok, red (or plain when paused) when ok (wrong: \(wrong))")
+    check(shownWhenNot.isEmpty, "health: nothing about health shows while idle or finalising (shown: \(shownWhenNot))")
     let both = present(.recording(meetingA), health: Session.Health(mic: .error, system: .stalled, disk: .low))
     check(lines(both).prefix(3) == ["(Microphone: not receiving audio)", "(System audio: not receiving audio)", "(Disk space low)"]
           && both.button.help == "Recording, but some audio is not arriving", "health: stalled and error both read not receiving audio")
+}
+
+// M2: a menu whose entries differ only in their titles is updated in place.
+do {
+    let before = present(.recording(meetingA), seconds: 1).menu
+    let flap = present(.recording(meetingA), seconds: 2, health: Session.Health(mic: .stalled, system: .ok, disk: .ok)).menu
+    check(before != flap && MenuEntry.sameShape(before, flap), "menu shape: a stream flapping changes a title, not the shape")
+    check(MenuEntry.sameShape(before, before), "menu shape: the same menu is the same shape")
+    check(!MenuEntry.sameShape(before, present(.recording(meetingA), health: Session.Health(mic: .ok, system: .ok, disk: .low)).menu),
+          "menu shape: a new line (disk space low) is a new shape")
+    check(!MenuEntry.sameShape(present(.recording(meetingA)).menu, present(.paused(meetingA)).menu), "menu shape: Pause against Resume is a new shape")
+    check(!MenuEntry.sameShape(present(.recording(meetingA)).menu, present(.recording(meetingB)).menu), "menu shape: another folder is a new shape")
+    check(!MenuEntry.sameShape(present().menu, present(preferences: true).menu), "menu shape: enabling an entry is a new shape")
 }
 
 // The floating panel: shown per mode and phase, and what it holds.
@@ -2329,22 +2361,25 @@ do {
     check(grid == ["1111", "0110", "0000"], "panel: always, while recording and never against idle, recording, paused, finalising (\(grid))")
 
     let idle = present(floating: .always).panel
-    check(idle == PanelPresentation(visible: true, dot: .none, label: "Ready", controls: [.start], help: nil), "panel: ready with a Record button when idle")
+    check(idle == PanelPresentation(visible: true, dot: .plain, label: "Ready", controls: [.start], help: nil), "panel: ready with a Record button when idle")
     check(present(processing: meetingA, floating: .always).panel.label == "Writing minutes"
           && present(processing: meetingA, floating: .always).panel.controls == [.start], "panel: idle while minutes are written still offers Record")
-    let failed = present(failure: "No microphone", floating: .always).panel
+    let failed = present(failure: Failure("start", "No microphone"), floating: .always).panel
     check(failed.label == "Could not start" && failed.dot == .amber && failed.controls == [.start] && failed.help == "Could not start: No microphone",
           "panel: a failed start is named, with the reason as its tooltip")
-    check(present(.recording(meetingA), failure: "x", floating: .always).panel.help == nil, "panel: a recording hides an old failure")
+    let panelNoPause = present(.recording(meetingA), seconds: 12, failure: Failure("pause", "cannot reach the recorder right now, try again")).panel
+    check(panelNoPause == PanelPresentation(visible: true, dot: .amber, label: "00:12", controls: [.pause, .stop, .showFolder(meetingA)],
+                                            help: "Could not pause: cannot reach the recorder right now, try again"),
+          "panel: a refused pause turns the dot amber, names it in the tooltip, and keeps the timer and the controls")
 
     let rec = present(.recording(meetingA), seconds: 12).panel
     check(rec == PanelPresentation(visible: true, dot: .red, label: "00:12", controls: [.pause, .stop, .showFolder(meetingA)], help: nil),
           "panel: recording has a red dot, the timer, Pause, Stop and the folder")
     let paused = present(.paused(meetingA), seconds: 12).panel
-    check(paused == PanelPresentation(visible: true, dot: .none, label: "00:12", controls: [.resume, .stop, .showFolder(meetingA)], help: nil),
+    check(paused == PanelPresentation(visible: true, dot: .plain, label: "00:12", controls: [.resume, .stop, .showFolder(meetingA)], help: nil),
           "panel: paused holds the timer and offers Resume")
     let fin = present(.finalising(meetingA), floating: .always).panel
-    check(fin == PanelPresentation(visible: true, dot: .none, label: "Writing minutes", controls: [.showFolder(meetingA)], help: nil),
+    check(fin == PanelPresentation(visible: true, dot: .plain, label: "Writing minutes", controls: [.showFolder(meetingA)], help: nil),
           "panel: finalising reads Writing minutes and keeps the folder")
     check(MenuAction.start.title == "Start recording" && MenuAction.pause.title == "Pause" && MenuAction.resume.title == "Resume"
           && MenuAction.stop.title == "Stop" && MenuAction.showFolder(meetingA).title == "Show recording folder",
@@ -2382,6 +2417,86 @@ do {
     check(FloatingPlacement.origin(saved: CGPoint(x: 2000, y: 400), size: size, screens: [main], main: main) == corner, "placement: and goes back when that screen is unplugged")
 }
 
+// M3: the rules for the state the views show (the clock, the failure, the ready meeting) apart from AppKit.
+do {
+    let stalled = Session.Health(mic: .stalled, system: .ok, disk: .ok)
+    var st = StatusInput()
+    check(!st.clockRuns, "reducer: no clock when idle")
+    st.apply(.tick(seconds: 5, health: stalled))
+    check(st.seconds == 0 && st.health == allOk, "reducer: a tick when nothing is recording changes nothing")
+    st.apply(.phase(.recording(meetingA)))
+    check(st.clockRuns && st.phase == .recording(meetingA), "reducer: the clock runs while recording")
+    st.apply(.tick(seconds: 5, health: stalled))
+    check(st.seconds == 5 && st.health == stalled, "reducer: a tick sets the seconds and the health")
+    st.apply(.phase(.paused(meetingA)))
+    check(st.clockRuns && st.seconds == 5, "reducer: the clock runs while paused, and the seconds stay")
+    st.apply(.phase(.recording(meetingA)))
+    check(st.clockRuns && st.seconds == 5, "reducer: resuming keeps them")
+    st.apply(.phase(.finalising(meetingA)))
+    check(!st.clockRuns && st.seconds == 0, "reducer: the clock stops when finalising, and the seconds go")
+    st.apply(.tick(seconds: 9, health: stalled))
+    check(st.seconds == 0, "reducer: a late tick after the stop is ignored")
+    st.apply(.phase(.idle))
+    check(!st.clockRuns && st.phase == .idle, "reducer: and it is off when idle")
+    var on = 0
+    for _ in 0..<5 {
+        st.apply(.phase(.recording(meetingA)))
+        if st.clockRuns { on += 1 }
+        st.apply(.phase(.finalising(meetingA)))
+        st.apply(.phase(.idle))
+        if st.clockRuns { on += 100 }
+    }
+    check(on == 5, "reducer: repeated starts turn the clock on once each and off again")
+
+    var m = StatusInput()
+    m.apply(.processing(meetingA, stage: "transcribing"))
+    check(m.processing == meetingA && m.stage == "transcribing", "reducer: the job being processed and its stage")
+    m.apply(.processing(nil, stage: nil))
+    check(m.processing == nil && m.stage == nil, "reducer: and nothing once it is done")
+    m.apply(.minutesReady(meetingB))
+    check(m.ready == meetingB, "reducer: a finished job sets ready")
+    m.apply(.minutesOpened(meetingA))
+    check(m.ready == meetingB, "reducer: opening another meeting leaves it")
+    m.apply(.minutesOpened(meetingB))
+    check(m.ready == nil, "reducer: opening that meeting clears it")
+    m.apply(.minutesReady(meetingB))
+    m.apply(.phase(.paused(meetingA)))
+    check(m.ready == meetingB, "reducer: a recording taken up as paused is not a new recording")
+    m.apply(.phase(.idle))
+    m.apply(.phase(.recording(meetingA)))
+    check(m.ready == nil, "reducer: the next recording starting clears ready")
+    m.apply(.minutesReady(meetingB))
+    m.apply(.phase(.paused(meetingA)))
+    m.apply(.phase(.recording(meetingA)))
+    check(m.ready == meetingB, "reducer: resuming does not (ready arrived during the recording)")
+
+    var f = StatusInput()
+    f.apply(.failed(Failure("start", "no microphone")))
+    check(f.failure == Failure("start", "no microphone") && f.failure?.line == "Could not start: no microphone", "reducer: a failure is kept, worded Could not <action>: <reason>")
+    f.apply(.acted)
+    check(f.failure == nil, "reducer: the next action clears it")
+    f.apply(.failed(Failure("start", "no microphone")))
+    f.apply(.phase(.finalising(meetingA)))
+    check(f.failure != nil, "reducer: a recording ending does not clear it (the start's error arrives after the recorder has died)")
+    f.apply(.phase(.idle))
+    f.apply(.phase(.recording(meetingA)))
+    check(f.failure == nil, "reducer: a recording starting clears it (a start from the command line)")
+    f.apply(.failed(Failure("pause", "x")))
+    f.apply(.phase(.paused(meetingA)))
+    f.apply(.phase(.recording(meetingA)))
+    check(f.failure != nil, "reducer: a pause that failed stays until the next action, whatever the phase does")
+
+    let unreachable = "error " + "cannot reach the recorder right now, try again"
+    check(ControlHandler.cannotReach == unreachable, "reducer: the reply it keys on is the handler's own")
+    check(Failure.from(.start(mic: nil, dir: nil), reply: "error No input device") == Failure("start", "No input device"), "failure: a failed start is shown")
+    check(Failure.from(.pause, reply: unreachable) == Failure("pause", "cannot reach the recorder right now, try again"), "failure: a pause that could not reach the recorder is shown")
+    check(Failure.from(.resume, reply: unreachable) == Failure("resume", "cannot reach the recorder right now, try again"), "failure: and a resume")
+    check(Failure.from(.pause, reply: "error not recording") == nil && Failure.from(.resume, reply: "error the recording in /x has already stopped") == nil,
+          "failure: the races (not recording, already stopped) are only logged")
+    check(Failure.from(.stop, reply: "error not recording") == nil && Failure.from(.stop, reply: unreachable) == nil, "failure: a stop is never shown")
+    check(Failure.from(.start(mic: nil, dir: nil), reply: "ok recording /x") == nil && Failure.from(.pause, reply: "ok paused /x") == nil, "failure: an ok reply is not one")
+}
+
 // One path for every action: perform answers like the socket, without ever waiting on the queue.
 do {
     let q = DispatchQueue(label: "meetingbox.test.perform")
@@ -2400,10 +2515,11 @@ do {
 
     // A start whose recorder stays up.
     let done = DispatchSemaphore(value: 0)
-    var answer: String?, answeredOnQueue = false, early = true, soundsAtAnswer = -1
+    var answer: String?, answeredOnQueue = false, early = true, soundsAtAnswer = -1, answers = 0
     q.sync {
         h.perform(.start(mic: nil, dir: nil)) {
             answer = $0
+            answers += 1
             answeredOnQueue = DispatchQueue.getSpecific(key: onQ) == true
             soundsAtAnswer = started
             done.signal()
@@ -2421,6 +2537,8 @@ do {
     check(dir != nil && okAnswer == "ok recording \(dir!.path)", "perform: ok recording <dir> once the recorder has stayed up (\(okAnswer ?? "nil"))")
     check(onQueue, "perform: the completion arrives on the handler's queue")
     check(sounds == 1 && q.sync { started } == 1, "perform: the start sound is announced once, with the answer")
+    usleep(900_000) // a few polls on: nothing more is announced and nothing is answered twice
+    check(q.sync { started } == 1 && q.sync { answers } == 1, "perform: and not again by a later poll (M4)")
     // Every other action takes the same path.
     var paused: String?
     q.sync { h.perform(.pause) { paused = $0 } }
@@ -2451,6 +2569,80 @@ do {
     check(reply == "error No input device matching \"USB\"" && sounds == 0 && phase == .idle,
           "perform: error <its reason>, no start sound, and idle (\(reply ?? "nil"))")
     q.sync {}
+}
+
+// I2: a start the user ends, or pauses, inside the grace is not a failed start, and plays no start sound.
+/// Ends a recording the fake recorder keeps alive, as a real stop would: stop, the recorder exits, the
+/// session settles to idle. Its timer then stops, so no tick is left to run after the rig is gone (the
+/// session's callbacks hold the rig unowned, and a block that ends at the grace races the 2 s tick).
+func settleToIdle(_ r: Rig, _ q: DispatchQueue) {
+    q.sync {
+        _ = r.session.stop()
+        r.rec.exit(r.rec.nextPid, 0, verifies: true)
+        r.session.tick()
+    }
+}
+
+do {
+    let q = DispatchQueue(label: "meetingbox.test.perform.stop")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0, stopped = 0
+    h.onStarted = { _ in started += 1 }
+    h.onStopped = { _ in stopped += 1 }
+    let done = DispatchSemaphore(value: 0)
+    var answer: String?
+    q.sync { h.perform(.start(mic: nil, dir: nil)) { answer = $0; done.signal() } }
+    let dir = q.sync { r.session.phase.folder }
+    var stopReply: String?
+    q.sync { h.perform(.stop) { stopReply = $0 } }
+    check(dir != nil && q.sync { stopReply } == "ok finalising \(dir!.path)", "I2: a stop inside the grace is accepted")
+    check(done.wait(timeout: .now() + 1.5) == .success, "I2: the start is answered at the next poll, not left waiting out the grace")
+    let (reply, sounds, stops) = q.sync { (answer, started, stopped) }
+    check(reply == "ok finalising \(dir!.path)" && sounds == 0 && stops == 1,
+          "I2: the start's answer is the status, not an error, with no start sound and the one stop sound (\(reply ?? "nil"))")
+    // The stop was of that folder only: a later start that fails is still an error.
+    let pid = q.sync { r.rec.nextPid }
+    q.sync { r.rec.exit(pid, 0, verifies: true); r.session.tick() }
+    check(q.sync { r.session.phase } == .idle, "I2: the stopped recording settles to idle")
+    q.sync { r.rec.recoverResult = false; r.rec.dieOnLaunch = (1, "No input device matching \"USB\"") }
+    let again = DispatchSemaphore(value: 0)
+    var second: String?
+    q.sync { h.perform(.start(mic: nil, dir: nil)) { second = $0; again.signal() } }
+    check(again.wait(timeout: .now() + 20) == .success && q.sync { second } == "error No input device matching \"USB\"",
+          "I2: a later start that fails is still reported as an error (\(q.sync { second } ?? "nil"))")
+    q.sync {}
+}
+do {
+    let q = DispatchQueue(label: "meetingbox.test.perform.pause")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0
+    h.onStarted = { _ in started += 1 }
+    let done = DispatchSemaphore(value: 0)
+    var answer: String?
+    q.sync { h.perform(.start(mic: nil, dir: nil)) { answer = $0; done.signal() } }
+    let dir = q.sync { r.session.phase.folder }
+    q.sync { h.perform(.pause) { _ in } }
+    check(q.sync { r.session.phase } == .paused(dir!), "I2: paused inside the grace")
+    check(done.wait(timeout: .now() + 15) == .success, "I2: a start paused inside the grace is answered")
+    let (reply, sounds) = q.sync { (answer, started) }
+    check(reply == "ok paused \(dir!.path)" && sounds == 0, "I2: with the status and no start sound (\(reply ?? "nil"))")
+    settleToIdle(r, q)
+}
+do {
+    let q = DispatchQueue(label: "meetingbox.test.perform.resume")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0
+    h.onStarted = { _ in started += 1 }
+    let done = DispatchSemaphore(value: 0)
+    var answer: String?
+    q.sync { h.perform(.start(mic: nil, dir: nil)) { answer = $0; done.signal() } }
+    let dir = q.sync { r.session.phase.folder }
+    q.sync { h.perform(.pause) { _ in } }
+    q.sync { h.perform(.resume) { _ in } }
+    check(done.wait(timeout: .now() + 15) == .success, "I2: a start paused and resumed inside the grace is answered")
+    let (reply, sounds) = q.sync { (answer, started) }
+    check(reply == "ok recording \(dir!.path)" && sounds == 1, "I2: it is a recording, and the start sound plays once (\(reply ?? "nil"))")
+    settleToIdle(r, q)
 }
 
 try? fm.removeItem(at: scratch)

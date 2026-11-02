@@ -31,14 +31,21 @@ final class StatusItem: NSObject {
         let before = shown
         shown = now
         if before?.button != now.button { draw(now.button) }
-        if before?.menu != now.menu { rebuild(now.menu) }
+        if before?.menu != now.menu {
+            // Only titles changed (a stream flapped): update the open menu in place, so nothing is taken from under the pointer.
+            if let old = before?.menu, MenuEntry.sameShape(old, now.menu), menu.items.count == now.menu.count {
+                for (item, entry) in zip(menu.items, now.menu) where item.title != entry.title { item.title = entry.title }
+            } else {
+                rebuild(now.menu)
+            }
+        }
     }
 
     private func draw(_ b: StatusButton) {
         guard let button = item.button else { return }
         var image = NSImage(systemSymbolName: b.symbol, accessibilityDescription: b.help)
         switch b.tint {
-        case .none:
+        case .plain:
             image?.isTemplate = true // follows the menu bar, light or dark
         case .red:
             image = image?.withSymbolConfiguration(NSImage.SymbolConfiguration(paletteColors: [.systemRed]))
