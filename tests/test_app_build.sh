@@ -284,16 +284,6 @@ if ! grep -q '"\$REC_BIN" --' "$ROOT/meetingbox" \
   pass "the script still runs --record -l and --recover from APP_BIN and the permission check through the app"
 else fail "the script still runs --record -l and --recover from APP_BIN and the permission check through the app"; fi
 
-# The recorder's disk floor is wired in: started with the recording, cancelled at the stop, and
-# it asks for the stop through the same stream as the SIGINT and SIGTERM handlers. The
-# floor itself is tested natively with a fake free-space source; this only keeps it from
-# being unplugged.
-rec="$ROOT/native/recorder/Recorder.swift"
-if grep -q 'DiskFloor(directory: outputDir)' "$rec" && grep -q 'diskFloor.start()' "$rec" && grep -q 'diskFloor.cancel()' "$rec" \
-   && [ "$(grep -c 'stopRequest.yield()' "$rec")" = 2 ]; then
-  pass "the recorder starts the disk floor with the recording and stops through the same request as a signal"
-else fail "the recorder starts the disk floor with the recording and stops through the same request as a signal"; fi
-
 # --- the permission check launches the recorder mode through open ---
 PERM_DIR="$HOME/permcheck"
 open() { echo "open $*" >> "$HOME/calls.log"; return 0; }

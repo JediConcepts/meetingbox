@@ -43,25 +43,47 @@ enum Finaliser {
     static let working = ["mic.caf", "call.caf"]
     static let marker = ".recording-complete"
     private static let markerTemp = ".tmp-recording-complete"
+    static let encodeBitRate = 96_000
     static let encodeSettings: [String: Any] = [
         AVFormatIDKey: kAudioFormatMPEG4AAC,
         AVSampleRateKey: AudioMixer.sampleRate,
         AVNumberOfChannelsKey: 1,
-        AVEncoderBitRateKey: 96000,
+        AVEncoderBitRateKey: encodeBitRate,
     ]
+
+    /// What finalising writes for each second recorded: the three .m4a, mono AAC at 96 kbit/s each,
+    /// so 12 000 bytes a second apiece. They are written beside the working files, which go only
+    /// once the .m4a verify, so this much free space is needed on top of what the recording holds.
+    static let finishBytesPerSecond = Int64(finals.count * encodeBitRate / 8)
+    /// Room to spare over the estimate, for container overhead and the encoder's own variation.
+    static let finishMargin = 1.25
+
+    /// The free space finalising `seconds` of recording needs (36 000 bytes a second, plus a quarter).
+    /// The stop floors of the recorder and of the app both add it to their reserve, so a stop leaves
+    /// room to finish.
+    static func finishNeed(seconds: Double) -> Int64 {
+        guard seconds.isFinite, seconds > 0 else { return 0 }
+        return Int64((Double(finishBytesPerSecond) * seconds * finishMargin).rounded(.up))
+    }
 
     /// Takes the folder's lock first, so it never runs beside a recorder still
     /// writing there, or beside another finalise. Waits up to `lockWait` seconds for it.
     static func finalise(directory: URL, lockWait: TimeInterval = 0,
-                         afterStep: (FinaliseStep) throws -> Void = { _ in }) throws {
+                         afterStep: (FinaliseStep) throws -> Void = { _ in },
+                         encode: Encoder = Finaliser.encode) throws {
         let lock = try FolderLock(directory, wait: lockWait)
         try withExtendedLifetime(lock) {
-            try finaliseLocked(directory: directory, afterStep: afterStep)
+            try finaliseLocked(directory: directory, afterStep: afterStep, encode: encode)
         }
     }
 
+    /// Writes one output (`name`: audio.m4a, mic.m4a or call.m4a) from the two working files.
+    /// A test can give its own, to fail the way a full disk does.
+    typealias Encoder = (_ name: String, _ output: URL, _ mic: URL, _ call: URL) throws -> Void
+
     /// For a caller that already holds the folder's lock (the recorder at stop).
-    static func finaliseLocked(directory: URL, afterStep: (FinaliseStep) throws -> Void = { _ in }) throws {
+    static func finaliseLocked(directory: URL, afterStep: (FinaliseStep) throws -> Void = { _ in },
+                               encode: Encoder = Finaliser.encode) throws {
         let fm = FileManager.default
         func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
         func has(_ name: String) -> Bool { fm.fileExists(atPath: url(name).path) }
@@ -81,7 +103,14 @@ enum Finaliser {
         // 3: build it from the working files.
         for name in finals { try? fm.removeItem(at: url(temp(name))) }
         for name in finals {
-            try encode(name, to: url(temp(name)), mic: url("mic.caf"), call: url("call.caf"))
+            do {
+                try encode(name, url(temp(name)), url("mic.caf"), url("call.caf"))
+            } catch {
+                // An encode that fails, a full disk most likely, must not leave what it wrote: that
+                // is what keeps the disk full. The working files are never touched here.
+                for made in finals { try? fm.removeItem(at: url(temp(made))) }
+                throw error
+            }
             try makePrivate(url(temp(name)))
             try afterStep(.encoded(name))
         }
@@ -146,7 +175,7 @@ enum Finaliser {
 
     /// One pass over the working files: the mix for audio.m4a (by the mixer's rule),
     /// or one side. Every output is as long as the longer side, padded with silence.
-    private static func encode(_ name: String, to output: URL, mic: URL, call: URL) throws {
+    static func encode(_ name: String, _ output: URL, _ mic: URL, _ call: URL) throws {
         let micFile = try AVAudioFile(forReading: mic, commonFormat: .pcmFormatFloat32, interleaved: false)
         let callFile = try AVAudioFile(forReading: call, commonFormat: .pcmFormatFloat32, interleaved: false)
         for file in [micFile, callFile] where file.processingFormat != AudioMixer.format {

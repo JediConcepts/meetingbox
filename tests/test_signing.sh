@@ -210,7 +210,12 @@ else fail "no delete-identity -c call"; fi
 codesign() {
   echo "codesign $*" >> "$HOME/calls.log"
   case "$1" in
-    --force) [ "${CODESIGN_FAILS:-}" = "$3" ] && return 1; echo "$3" > "$HOME/signed" ;;
+    --force) [ "${CODESIGN_FAILS:-}" = "$3" ] && return 1
+             # the certificate (not ad hoc) cannot sign this one target
+             if [ "$3" != - ] && [ -n "${CODESIGN_CERT_FAILS_ON:-}" ]; then
+               case "$*" in *" $CODESIGN_CERT_FAILS_ON") return 1 ;; esac
+             fi
+             echo "$3" > "$HOME/signed" ;;
     -d) [ -f "$HOME/signed" ] || return 1
         s="$(cat "$HOME/signed")"
         if [ "$s" = - ]; then echo "designated => cdhash H\"0123456789abcdef0123456789abcdef01234567\""
@@ -261,6 +266,38 @@ resign_app >/dev/null 2>&1
 if app_signed_by_us && [ "$(resets)" = 2 ]; then pass "re-signing an ad hoc app clears its old approvals"
 else fail "re-signing an ad hoc app clears its old approvals"; fi
 
+# M1: a re-sign that signs the helper with the certificate and then cannot sign the app would leave
+# the app's seal naming a helper that has changed. It falls back to ad hoc for both, helper first,
+# as a build does, so the seal is whole again.
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(CODESIGN_CERT_FAILS_ON="$APP_DIR" resign_app 2>&1)"; rc=$?
+cert_h="$(grep -n -- "^codesign --force --sign $HASH .* --identifier $APP_ID.recorder " "$HOME/calls.log" | cut -d: -f1)"
+cert_a="$(grep -n -- "^codesign --force --sign $HASH .* --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" | cut -d: -f1)"
+adhoc_h="$(grep -n -- "^codesign --force --sign - --identifier $APP_ID.recorder " "$HOME/calls.log" | cut -d: -f1)"
+adhoc_a="$(grep -n -- "^codesign --force --sign - --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" | cut -d: -f1)"
+if [ "$rc" -eq 0 ] && [ -n "$cert_h" ] && [ -n "$cert_a" ] && [ -n "$adhoc_h" ] && [ -n "$adhoc_a" ] \
+   && [ "$cert_h" -lt "$cert_a" ] && [ "$cert_a" -lt "$adhoc_h" ] && [ "$adhoc_h" -lt "$adhoc_a" ] \
+   && printf '%s\n' "$out" | grep -q 'could not use the meetingbox signing certificate' \
+   && ! printf '%s\n' "$out" | grep -q 'could not sign the recorder app' && ! app_signed_by_us; then
+  pass "a re-sign that signs the helper but not the app falls back to ad hoc for both, helper first"
+else fail "a re-sign that signs the helper but not the app falls back to ad hoc for both, helper first (rc $rc): $out $(grep '^codesign --force' "$HOME/calls.log")"; fi
+
+# a certificate that cannot sign the helper: the same fallback (nothing was half done, but it is safe)
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(CODESIGN_CERT_FAILS_ON="$REC_APP" resign_app 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q -- "^codesign --force --sign $HASH .* --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log" \
+   && grep -q -- "^codesign --force --sign - --identifier $APP_ID.recorder " "$HOME/calls.log" \
+   && grep -q -- "^codesign --force --sign - --identifier $APP_ID $APP_DIR\$" "$HOME/calls.log"; then
+  pass "a re-sign whose helper the certificate cannot sign never signs the app around it"
+else fail "a re-sign whose helper the certificate cannot sign never signs the app around it (rc $rc): $out"; fi
+
+# and when ad hoc fails as well, the user is told the app could not be signed, and the step fails
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(CODESIGN_CERT_FAILS_ON="$APP_DIR" CODESIGN_FAILS=- resign_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'could not sign the recorder app'; then
+  pass "a re-sign that cannot sign the app at all says so and fails"
+else fail "a re-sign that cannot sign the app at all says so and fails (rc $rc): $out"; fi
+
 echo - > "$HOME/signed"; : > "$HOME/calls.log"
 CODESIGN_FAILS="$HASH" build_app >/dev/null 2>&1
 if ! app_signed_by_us && [ "$(resets)" = 0 ]; then pass "falling back to ad hoc clears nothing"
@@ -299,6 +336,14 @@ if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q -- '-.* a signing certifica
    && app_signed_by_us; then
   pass "setup re-signs an ad hoc app, without a rebuild"
 else fail "setup re-signs an ad hoc app, without a rebuild (rc $rc): $out"; fi
+
+# a re-sign that leaves the app unsigned stops setup, with the reason
+echo - > "$HOME/signed"; : > "$HOME/calls.log"
+out="$(CODESIGN_CERT_FAILS_ON="$APP_DIR" CODESIGN_FAILS=- setup 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -q 'could not sign the recorder app' && ! grep -q '^prime_permissions' "$HOME/calls.log"; then
+  pass "setup stops when the app cannot be re-signed at all"
+else fail "setup stops when the app cannot be re-signed at all (rc $rc): $out"; fi
+: > "$HOME/kc"; SIGN_TOLD=0; : > "$HOME/calls.log"; echo - > "$HOME/signed"
 
 # the certificate deleted by hand: setup makes a new one and re-signs
 : > "$HOME/kc"; SIGN_TOLD=0; : > "$HOME/calls.log"

@@ -15,16 +15,21 @@ import Foundation
 final class ChildRecorder: RecorderControl {
     /// What `--record` and `--recover` run: the helper's executable.
     let executable: URL
-    /// The app's own executable, only to recognise a recorder the previous build started with it.
-    private let legacyExecutable: URL
+    /// The app's own executable: to recognise a recorder the previous build started with it, and to
+    /// recover with when the helper is missing (recovery never touches the window server).
+    let legacyExecutable: URL
     private let ps: URL
     private let lock = NSLock()
     private var children: [Int32: Process] = [:]
     private var tails: [String: LogTail] = [:]
 
+    /// The helper's name: its bundle is `<name>.app` and its executable `<name>`, in Contents/Helpers
+    /// of the app. A process started under this name is the recorder, never the app (LaunchMode).
+    static let helperName = "meetingbox-recorder"
+
     /// The helper's executable inside the app bundle at `app`.
     static func helperExecutable(in app: URL) -> URL {
-        app.appendingPathComponent("Contents/Helpers/meetingbox-recorder.app/Contents/MacOS/meetingbox-recorder")
+        app.appendingPathComponent("Contents/Helpers/\(helperName).app/Contents/MacOS/\(helperName)")
     }
 
     /// `ps` is injectable so a test can make it fail.
@@ -125,18 +130,33 @@ final class ChildRecorder: RecorderControl {
     }
 
     /// Runs `--recover <dir>` and waits; its stderr is appended to capture.log. Blocks: call it off
-    /// the main queue. Exit 75 means another process holds the folder (busy); a recovery that
-    /// cannot even be started is reported as busy too, so nothing is marked failed on its account.
+    /// the main queue. Exit 75 means another process holds the folder (busy), and only that is
+    /// busy. With the helper missing it runs from the app's own executable, which is safe because
+    /// recovery never touches the window server, and says so in capture.log. A recovery that cannot
+    /// be started at all (neither executable runs) is failed, with the reason in capture.log: never
+    /// busy, or an interrupted meeting would stay unrecovered and block setup for good.
     func recover(dir: URL) -> RecoverResult {
+        let log = try? ChildRecorder.openLog(in: dir)
+        defer { try? log?.close() }
+        func note(_ line: String) { try? log?.write(contentsOf: Data((line + "\n").utf8)) }
+
+        var program = executable
+        if !FileManager.default.isExecutableFile(atPath: executable.path) {
+            note(ChildRecorder.helperMissingNote)
+            program = legacyExecutable
+        }
         let process = Process()
-        process.executableURL = executable
+        process.executableURL = program
         process.arguments = ["--recover", dir.path]
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
-        let log = try? ChildRecorder.openLog(in: dir)
         process.standardError = log ?? FileHandle.nullDevice
-        defer { try? log?.close() }
-        guard (try? process.run()) != nil else { return .busy }
+        do {
+            try process.run()
+        } catch {
+            note("meetingbox: cannot recover: the recorder could not be started (\(error.localizedDescription))")
+            return .failed
+        }
         process.waitUntilExit()
         guard process.terminationReason == .exit else { return .failed }
         switch process.terminationStatus {
@@ -145,6 +165,9 @@ final class ChildRecorder: RecorderControl {
         default: return .failed
         }
     }
+
+    /// Written to capture.log when a recovery has to run from the app's own executable.
+    static let helperMissingNote = "meetingbox: the recorder helper is missing; recovering with the app's own executable"
 
     /// `--recover`'s exit status when the folder's lock is held (EX_TEMPFAIL).
     static let busyExit: Int32 = 75

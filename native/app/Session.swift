@@ -64,8 +64,24 @@ final class Session {
 
     // Disk floors in decimal units, as Finder shows free space.
     static let startFloor: Int64 = 2_000_000_000
-    static let lowFloor: Int64 = 1_000_000_000
-    static let stopFloor: Int64 = 200_000_000
+    /// The reserves of the warning and of the stop. Each leaves room to finish, as the recorder's
+    /// own floor does: finalising writes three .m4a, about 36 000 bytes for each second recorded,
+    /// and a stop with less than that left would fill the disk trying.
+    static let lowReserve: Int64 = 1_000_000_000
+    static let stopReserve: Int64 = 200_000_000
+
+    /// Below this much free space the disk is low (the warning): 1 GB plus what finalising the
+    /// recording so far needs.
+    static func lowFloor(recordedSeconds: Int) -> Int64 {
+        lowReserve + Finaliser.finishNeed(seconds: Double(recordedSeconds))
+    }
+
+    /// Below this much free space the session stops itself: 200 MB plus what finalising the
+    /// recording so far needs. The recorder's own backstop is 100 MB plus the same, so with the
+    /// app running the app stops it first.
+    static func stopFloor(recordedSeconds: Int) -> Int64 {
+        stopReserve + Finaliser.finishNeed(seconds: Double(recordedSeconds))
+    }
     /// No health line for this long means both streams are stalled.
     static let silenceLimit: TimeInterval = 10
     /// After SIGTERM, this long before SIGKILL.
@@ -410,8 +426,10 @@ final class Session {
                 recorderGone(dir) // died on its own: handled as a stop
                 return
             }
+            let t = now()
+            let recorded = recordedSeconds(at: t)
             let free = freeBytes(dir)
-            if let free = free, free < Session.stopFloor {
+            if let free = free, free < Session.stopFloor(recordedSeconds: recorded) {
                 diskStop = true
                 try? store.update(dir) { $0.error = Session.diskStopped }
                 stop()
@@ -421,9 +439,8 @@ final class Session {
                 freeUnknownLogged = true
                 log("meetingbox: cannot read the free space for \(dir.path); the disk stop waits until it can")
             }
-            let t = now()
             healthLock.lock()
-            if let free = free { disk = free < Session.lowFloor ? .low : .ok }
+            if let free = free { disk = free < Session.lowFloor(recordedSeconds: recorded) ? .low : .ok }
             if t.timeIntervalSince(lastLine) >= Session.silenceLimit {
                 if mic != .error { mic = .stalled }
                 if system != .error { system = .stalled }

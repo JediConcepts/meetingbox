@@ -20,19 +20,14 @@ func findDevice(matching name: String) -> AVCaptureDevice? {
     discoverInputDevices().first { $0.localizedName.localizedCaseInsensitiveContains(name) }
 }
 
-/// Finalising blocks its thread while AVFoundation reads durations (see
+/// The end of the recording blocks its thread while AVFoundation reads durations (see
 /// Finaliser.duration(of:), which waits on a semaphore for a detached task). So
 /// it runs on a dispatch thread of its own, never on the Swift concurrency pool
 /// that the task it waits for needs.
-private func finishOffThePool(_ output: RecordingOutput) async throws {
-    try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
+private func endOffThePool(_ output: RecordingOutput, _ stop: StopRequest, _ directory: URL) async -> Ending {
+    await withCheckedContinuation { (done: CheckedContinuation<Ending, Never>) in
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try output.finish()
-                done.resume()
-            } catch {
-                done.resume(throwing: error)
-            }
+            done.resume(returning: endRecording(output: output, stop: stop, directory: directory))
         }
     }
 }
@@ -217,17 +212,14 @@ func runRecorder(_ arguments: [String]) async -> Never {
     }
 
     // A stop is one request, whether it came from a signal or from the disk floor below.
-    let (stopSignal, stopRequest) = AsyncStream<Void>.makeStream()
+    let stop = StopRequest()
     let stopSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
         let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
-        source.setEventHandler {
-            stopRequest.yield()
-            stopRequest.finish()
-        }
+        source.setEventHandler { stop.request(.signal) }
         source.resume()
         return source
     }
-    stopRequest.onTermination = { _ in stopSources.forEach { $0.cancel() } }
+    stop.onStop { stopSources.forEach { $0.cancel() } }
 
     // MARK: Start capture
 
@@ -277,18 +269,15 @@ func runRecorder(_ arguments: [String]) async -> Never {
     healthTimer.setEventHandler { eprint(health.line()) }
     healthTimer.resume()
 
-    // The backstop for a recorder whose app has gone: below 100 MB free it stops itself as on
-    // SIGINT (finalise, verify, marker), after writing "stopped: the disk is nearly full". The
-    // app's own floor is 200 MB, so with the app running the app stops it first.
-    let diskFloor = DiskFloor(directory: outputDir) {
-        stopRequest.yield()
-        stopRequest.finish()
-    }
-    diskFloor.start()
+    // The backstop for a recorder whose app has gone: below 100 MB free, plus what finalising the
+    // audio written so far needs, it stops itself as on SIGINT (finalise, verify, marker), after
+    // writing "stopped: the disk is nearly full". The app's own floor is 200 MB plus the same need,
+    // so with the app running the app stops it first.
+    let diskFloor = DiskFloor.watching(outputDir, secondsWritten: { output.secondsWritten }, stop: stop)
 
     // Nothing uses the pause sources again, and a local may be released after
     // its last use, so keep them alive for the whole recording explicitly.
-    for await _ in stopSignal { break }
+    await stop.wait()
     withExtendedLifetime(pauseSources) {}
 
     // MARK: Stop
@@ -299,10 +288,15 @@ func runRecorder(_ arguments: [String]) async -> Never {
     micRecorder.stop()
     try? await systemRecorder.stop()
     mixer.finish()
-    do {
-        try await finishOffThePool(output)
-    } catch {
-        eprint("Could not finish the recording: \(error.localizedDescription)")
+    switch await endOffThePool(output, stop, outputDir) {
+    case .saved:
+        break
+    case .refused(let line):
+        // The disk is too full to encode: nothing was written, and the working files are kept.
+        eprint(line)
+        exit(1)
+    case .failed(let message):
+        eprint("Could not finish the recording: \(message)")
         eprint("Its working files are kept. Run: meetingbox recover \(outputDir.path)")
         exit(1)
     }

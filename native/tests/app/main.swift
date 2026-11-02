@@ -1,4 +1,4 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
@@ -1351,6 +1351,172 @@ do {
     let recovered = ChildRecorder(executable: recoverer, legacyExecutable: legacy).recover(dir: dir)
     check(recovered == .recovered && ((try? String(contentsOf: recoverLog, encoding: .utf8)) ?? "") == "--recover \(dir.path)\n",
           "G2: recover runs --recover <dir> through the helper")
+}
+
+// MARK: - Gate 2 fix round 1
+
+// I1: a helper that is not there must not turn every recovery into a quiet "busy". Recovery never
+// touches the window server, so it runs from the app's own executable, and says so in capture.log.
+// "Busy" is only ever exit 75.
+do {
+    let bin = freshRoot()
+    func script(_ name: String, _ body: String, mode: mode_t = 0o755) -> URL {
+        let url = bin.appendingPathComponent(name)
+        try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! "#!/bin/sh\n\(body)\n".write(to: url, atomically: true, encoding: .utf8)
+        chmod(url.path, mode)
+        return url
+    }
+    func newDir() -> URL { try! MeetingFolder.create(in: freshRoot(), at: Date()) }
+    func log(_ dir: URL) -> [String] {
+        ((try? String(contentsOf: dir.appendingPathComponent("capture.log"), encoding: .utf8)) ?? "")
+            .split(separator: "\n").map(String.init)
+    }
+    let missingNote = "meetingbox: the recorder helper is missing; recovering with the app's own executable"
+    let absent = bin.appendingPathComponent("no-such/meetingbox-recorder")
+    let ran = bin.appendingPathComponent("ran")
+
+    // helper missing, the app's executable recovers
+    do {
+        let dir = newDir()
+        let legacy = script("a/meetingbox", "echo \"$@\" > \"\(ran.path)\"; echo from-the-app >&2")
+        let result = ChildRecorder(executable: absent, legacyExecutable: legacy).recover(dir: dir)
+        check(result == .recovered, "I1: a missing helper recovers through the app's own executable")
+        check(((try? String(contentsOf: ran, encoding: .utf8)) ?? "") == "--recover \(dir.path)\n", "I1: with --recover <dir>")
+        check(log(dir) == [missingNote, "from-the-app"], "I1: capture.log says the helper was missing, once, then carries the recovery's own lines (\(log(dir)))")
+        try? fm.removeItem(at: ran)
+    }
+    // its exit statuses mean what they always meant: only 75 is busy
+    for (status, expected) in [(75, RecoverResult.busy), (1, .failed), (3, .failed), (0, .recovered)] {
+        let dir = newDir()
+        let legacy = script("b\(status)/meetingbox", "exit \(status)")
+        check(ChildRecorder(executable: absent, legacyExecutable: legacy).recover(dir: dir) == expected,
+              "I1: through the app's executable, exit \(status) is \(expected)")
+    }
+    // present but not executable is as good as missing
+    do {
+        let dir = newDir()
+        let flat = script("flat/meetingbox-recorder", "exit 0", mode: 0o644)
+        let legacy = script("c/meetingbox", "exit 0")
+        check(ChildRecorder(executable: flat, legacyExecutable: legacy).recover(dir: dir) == .recovered && log(dir).first == missingNote,
+              "I1: a helper that is not executable is treated as missing")
+    }
+    // neither runs: failed, with the reason, never busy
+    do {
+        let dir = newDir()
+        let result = ChildRecorder(executable: absent, legacyExecutable: bin.appendingPathComponent("no-such/meetingbox")).recover(dir: dir)
+        check(result == .failed, "I1: no executable to run is failed, never busy")
+        let lines = log(dir)
+        check(lines.count == 2 && lines[0] == missingNote && lines[1].hasPrefix("meetingbox: cannot recover: the recorder could not be started"),
+              "I1: and capture.log says why (\(lines))")
+    }
+    do {
+        let dir = newDir()
+        let flatApp = script("d/meetingbox", "exit 0", mode: 0o644)
+        check(ChildRecorder(executable: absent, legacyExecutable: flatApp).recover(dir: dir) == .failed,
+              "I1: an app executable that cannot run is failed too")
+    }
+    // the helper there and working: the app's executable is not used, and nothing is said
+    do {
+        let dir = newDir()
+        let helper = script("e/meetingbox-recorder", "echo helper > \"\(ran.path)\"; exit 75")
+        let legacy = script("e/meetingbox", "echo legacy > \"\(ran.path)\"; exit 0")
+        let result = ChildRecorder(executable: helper, legacyExecutable: legacy).recover(dir: dir)
+        check(result == .busy && ((try? String(contentsOf: ran, encoding: .utf8)) ?? "") == "helper\n" && log(dir).isEmpty,
+              "I1: with the helper there, 75 is busy, the app's executable is not used, nothing is added to capture.log")
+    }
+    // a folder that cannot be logged in does not stop the recovery, nor turn it into busy
+    do {
+        let gone = bin.appendingPathComponent("never-made")
+        let legacy = script("f/meetingbox", "exit 0")
+        check(ChildRecorder(executable: absent, legacyExecutable: legacy).recover(dir: gone) == .recovered,
+              "I1: a folder with no capture.log to write still recovers")
+    }
+}
+
+// M4: the app's own executable, for recognising a recorder the previous build started, is the
+// running one by default. If that drifted, an upgraded app would stop adopting such a recorder.
+do {
+    check(ChildRecorder().legacyExecutable == Bundle.main.executableURL, "M4: the legacy executable defaults to the running executable")
+    check(ChildRecorder.helperExecutable(in: URL(fileURLWithPath: "/x/meetingbox.app")).lastPathComponent == ChildRecorder.helperName
+          && ChildRecorder.helperName == "meetingbox-recorder", "M2: the helper's executable is named meetingbox-recorder")
+}
+
+// M2: the helper opened by hand (open -b, a click) has no mode, and must not run as the whole app.
+do {
+    let name = ChildRecorder.helperName
+    check(LaunchMode.choose(arguments: ["--record", "-o", "/x", "-n", "meeting"], executableName: name) == .record, "M2: the helper records")
+    check(LaunchMode.choose(arguments: ["--record", "-l"], executableName: name) == .record, "M2: the helper lists microphones as --record")
+    check(LaunchMode.choose(arguments: ["--recover", "/x"], executableName: name) == .recover, "M2: the helper recovers")
+    check(LaunchMode.choose(arguments: [], executableName: name) == .refuse, "M2: the helper opened with no arguments refuses")
+    check(LaunchMode.choose(arguments: ["-psn_0_12345"], executableName: name) == .refuse, "M2: and with anything else")
+    check(LaunchMode.choose(arguments: ["recover", "/x"], executableName: name) == .refuse, "M2: a mode needs its two dashes")
+    check(LaunchMode.choose(arguments: [], executableName: "meetingbox") == .app, "M2: the app with no arguments is the app")
+    check(LaunchMode.choose(arguments: ["-psn_0_12345"], executableName: "meetingbox") == .app, "M2: and with anything else")
+    check(LaunchMode.choose(arguments: ["--record"], executableName: "meetingbox") == .record
+          && LaunchMode.choose(arguments: ["--recover", "/x"], executableName: "meetingbox") == .recover, "M2: the app still records and recovers")
+    check(LaunchMode.choose(arguments: [], executableName: "meetingbox-recorder-2") == .app, "M2: the helper is told by its exact name")
+    check(LaunchMode.refusal == "this is meetingbox's recorder; open meetingbox.app instead" && LaunchMode.refusalExit == 64,
+          "M2: the one line, and exit 64")
+    check(!LaunchMode.currentExecutableName.isEmpty && LaunchMode.currentExecutableName == Bundle.main.executableURL?.lastPathComponent,
+          "M2: the name it was started under is the running executable's")
+}
+
+// I2: the app's floors leave room to finish, as the recorder's do. A stop at 200 MB cannot finalise a
+// recording of more than about 90 minutes; the stop and the warning take the finalise need on top.
+do {
+    check(Session.startFloor == 2_000_000_000, "I2: the start floor is unchanged, 2 GB")
+    check(Session.stopFloor(recordedSeconds: 0) == 200_000_000 && Session.lowFloor(recordedSeconds: 0) == 1_000_000_000,
+          "I2: with nothing recorded the floors are 200 MB and 1 GB")
+    check(Session.stopFloor(recordedSeconds: 3600) == 362_000_000, "I2: the stop floor after an hour is 200 MB plus 162 MB")
+    check(Session.lowFloor(recordedSeconds: 3600) == 1_162_000_000, "I2: the warning after an hour is 1 GB plus 162 MB")
+    check(Session.stopFloor(recordedSeconds: 7 * 3600) == 200_000_000 + Finaliser.finishNeed(seconds: 7 * 3600)
+          && Session.lowFloor(recordedSeconds: 7 * 3600) == 1_000_000_000 + Finaliser.finishNeed(seconds: 7 * 3600),
+          "I2: both add the same finalise need as the recorder's floor")
+    check(Session.stopFloor(recordedSeconds: -5) == 200_000_000, "I2: a clock that ran backwards does not lower the floor")
+    check(Session.diskStopped == "recording stopped because the disk was nearly full (under 200 MB free)"
+          && Session.diskStoppedFailed == "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
+          && Session.interrupted == "the recording was interrupted; its files are kept",
+          "I2: the messages are as they were")
+}
+do {
+    // After an hour: the stop is at 362 MB, not 200 MB.
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.free = 363 * MB
+    r.at(3600)
+    check(s.phase == .recording(dir) && r.rec.sent(SIGINT) == 0, "I2: 363 MB free after an hour does not stop it")
+    r.free = 361 * MB
+    r.at(3601)
+    check(s.phase == .finalising(dir) && r.rec.sent(SIGINT) == 1, "I2: 361 MB free after an hour stops it, with room left to finish")
+    check((r.json(dir)["error"] as? String ?? "").contains("disk"), "I2: and the reason is recorded")
+}
+do {
+    // The warning is at 1 GB plus the finalise need.
+    let r = Rig()
+    let s = r.make()
+    _ = try! s.start(root: r.store.root, mic: nil)
+    r.free = 1_100 * MB
+    r.at(3600)
+    check(s.health.disk == .low, "I2: 1.1 GB free after an hour is low (the line is 1.162 GB)")
+    r.free = 1_200 * MB
+    r.at(3601)
+    check(s.health.disk == .ok, "I2: 1.2 GB free after an hour is not")
+}
+do {
+    // Only recorded time counts: a long pause adds nothing to what finalising will need.
+    let r = Rig()
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.clock.t = 60
+    s.pause()
+    r.free = 205 * MB
+    r.at(7200)
+    check(s.phase == .paused(dir) && r.rec.sent(SIGINT) == 0, "I2: two hours paused after one minute: the floor is for one minute (205 MB is enough)")
+    r.free = 202 * MB
+    r.at(7201)
+    check(s.phase == .finalising(dir), "I2: but 202 MB is not (200 MB plus 2.7 MB for a minute)")
 }
 
 // MARK: - Processing queue (Task 5)

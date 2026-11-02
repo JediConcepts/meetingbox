@@ -524,12 +524,17 @@ PLIST
     if [ "$had_ad_hoc" = 1 ]; then forget_old_approvals; fi
   else
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
-    # the helper first, as with the certificate: the app's signature seals the helper's
-    { codesign --force --sign - --identifier "$REC_ID" "$REC_APP" \
-        && codesign --force --sign - --identifier "$APP_ID" "$APP_DIR"; } >/dev/null 2>&1 \
-      || { warn "could not sign the recorder app"; return 1; }
+    sign_ad_hoc || { warn "could not sign the recorder app"; return 1; }
     register_app
   fi
+}
+
+# The signature without the certificate, for when the certificate cannot be used. The helper
+# first, as with the certificate: the app's signature seals the helper's. Both, always, so the seal
+# is whole whatever the certificate did or did not manage before it failed.
+sign_ad_hoc() {
+  { codesign --force --sign - --identifier "$REC_ID" "$REC_APP" \
+      && codesign --force --sign - --identifier "$APP_ID" "$APP_DIR"; } >/dev/null 2>&1
 }
 
 # macOS ties Screen Recording and the Microphone to the app's signature. Once an
@@ -568,6 +573,10 @@ resign_app() {
     ok "meetingbox.app signed with the meetingbox certificate"
   else
     warn "could not use the meetingbox signing certificate, so macOS will ask for permissions again after each update"
+    # A certificate that signed the helper and then failed on the app has left the app's seal
+    # naming a helper that has changed. Ad hoc for both makes it whole again.
+    sign_ad_hoc || { warn "could not sign the recorder app"; return 1; }
+    register_app
   fi
 }
 
@@ -944,7 +953,7 @@ setup() {
 
   case " $todo " in
     *" capture "*) install_recorder || return 1 ;;
-    *" sign "*)    resign_app ;;
+    *" sign "*)    resign_app || return 1 ;;
   esac
 
   case " $todo " in

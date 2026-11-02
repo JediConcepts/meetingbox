@@ -1,4 +1,4 @@
-// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift ../../recorder/DiskFloor.swift
+// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift ../../recorder/DiskFloor.swift ../../recorder/Stop.swift
 // The recorder writes crash-safe working files (mic.caf, call.caf) and turns them
 // into the three .m4a at stop, or later through recovery. Synthetic sine audio in
 // temporary folders only: no devices, no permissions.
@@ -355,6 +355,17 @@ final class FakeDisk: @unchecked Sendable {
     var reported: [String] { lock.lock(); defer { lock.unlock() }; return lines }
 }
 
+/// A value shared with timers and other threads.
+final class Locked<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T
+    init(_ value: T) { stored = value }
+    var value: T {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
+    }
+}
+
 func waitUntil(_ seconds: Double, _ cond: () -> Bool) -> Bool {
     let end = Date().addingTimeInterval(seconds)
     while Date() < end { if cond() { return true }; usleep(10_000) }
@@ -439,6 +450,225 @@ do {
     let viaParent = DiskFloor.freeBytes(near: scratch.appendingPathComponent("not/made/yet"))
     check(viaParent != nil && real != nil && abs(viaParent! - real!) < 100_000_000,
           "G2: a folder not made yet is read through its nearest parent")
+}
+
+// MARK: - Room to finish (Gate 2 fix round 1, I2)
+// A stop must leave room for the three .m4a, or finalising a long recording fills the disk to zero.
+// The floors are therefore a reserve plus what finalising needs for the audio recorded so far.
+
+do {
+    // The figure, from what Finalise.swift really does: three mono AAC files at 96 kbit/s.
+    check(Finaliser.finals.count == 3 && (Finaliser.encodeSettings[AVEncoderBitRateKey] as? Int) == 96_000
+          && (Finaliser.encodeSettings[AVNumberOfChannelsKey] as? Int) == 1,
+          "I2: finalising writes three mono files at 96 kbit/s")
+    check(Finaliser.finishBytesPerSecond == 36_000, "I2: that is 36 000 bytes per recorded second")
+    check(Finaliser.finishNeed(seconds: 0) == 0 && Finaliser.finishNeed(seconds: -3) == 0 && Finaliser.finishNeed(seconds: .nan) == 0,
+          "I2: nothing recorded needs nothing")
+    check(Finaliser.finishNeed(seconds: 1) == 45_000, "I2: the need is 36 000 x seconds x 1.25")
+    check(Finaliser.finishNeed(seconds: 3600) == 162_000_000 && Finaliser.finishNeed(seconds: 7 * 3600) == 1_134_000_000,
+          "I2: an hour needs 162 MB, seven hours 1.134 GB")
+
+    // Measured: a real finalise of 20 s writes no more than the estimate, and not a great deal less.
+    let dir = cafFolder(micSeconds: 20, callSeconds: 20)
+    try recover(directory: dir)
+    let total = finals.reduce(0) { sum, name in
+        sum + ((try? fm.attributesOfItem(atPath: dir.appendingPathComponent(name).path)[.size]) as? Int ?? 0)
+    }
+    check(complete(dir) && Int64(total) <= Finaliser.finishNeed(seconds: 20) && total > 36_000 * 20 / 2,
+          "I2: the three real .m4a of 20 s fit the estimate (\(total) of \(Finaliser.finishNeed(seconds: 20)) bytes)")
+} catch {
+    check(false, "I2: the figure: \(error)")
+}
+
+do {
+    check(DiskFloor.stopBytes(secondsWritten: 0) == 100_000_000, "I2: the recorder's floor starts at 100 MB")
+    check(DiskFloor.stopBytes(secondsWritten: 3600) == 262_000_000, "I2: and takes an hour's finalising on top: 262 MB")
+    check(DiskFloor.stopBytes(secondsWritten: 7 * 3600) == 1_234_000_000, "I2: seven hours: 1.234 GB")
+    check(DiskFloor.stopBytes(secondsWritten: 10, floor: 500) == 500 + 450_000, "I2: the reserve can be set for a test")
+
+    // The floor rises with the recording: 200 MB is plenty at the start and too little after an hour.
+    let out = newFolder()
+    let seconds = Locked(0.0)
+    func make(_ disk: FakeDisk) -> DiskFloor {
+        DiskFloor(directory: out, secondsWritten: { seconds.value }, freeBytes: { disk.free($0) },
+                  report: { disk.report($0) }, onLow: { disk.onLow() })
+    }
+    let early = FakeDisk([200_000_000])
+    make(early).check()
+    check(early.lowCount == 0, "I2: 200 MB free is enough at the start of a recording")
+    seconds.value = 3600
+    let late = FakeDisk([261_999_999])
+    make(late).check()
+    check(late.lowCount == 1 && late.reported == [DiskFloor.message], "I2: below 262 MB after an hour it stops, with the same line")
+    let exact = FakeDisk([262_000_000])
+    make(exact).check()
+    check(exact.lowCount == 0, "I2: exactly the floor is not below it")
+    seconds.value = 7 * 3600
+    let orphan = FakeDisk([1_000_000_000])
+    make(orphan).check()
+    check(orphan.lowCount == 1, "I2: a seven-hour orphan with 1 GB left stops, while there is room to finish")
+}
+
+// The stop request: one request whoever makes it, and the first reason stands.
+do {
+    let stop = StopRequest()
+    check(stop.reason == nil, "M3: nothing is requested at first")
+    let stopped = Locked(0)
+    stop.onStop { stopped.value += 1 }
+    stop.request(.diskFloor)
+    stop.request(.signal)
+    check(stop.reason == .diskFloor, "M3: the first reason stands")
+    await stop.wait()
+    check(stopped.value == 1, "M3: whatever hangs on the stop runs once")
+
+    let later = StopRequest()
+    let signalled = Task.detached { try? await Task.sleep(nanoseconds: 100_000_000); later.request(.signal) }
+    await later.wait()
+    check(later.reason == .signal, "M3: a wait is ended by the request, from another thread")
+    _ = await signalled.value
+}
+
+// What runRecorder wires: the floor asks for the stop, through the request a signal also uses.
+do {
+    let out = newFolder()
+    let disk = FakeDisk([10_000_000_000, 10_000_000_000, 50_000_000])
+    let stop = StopRequest()
+    let watch = DiskFloor.watching(out, secondsWritten: { 0 }, stop: stop, interval: 0.03,
+                                   freeBytes: { disk.free($0) }, report: { disk.report($0) })
+    check(waitUntil(5) { stop.reason != nil }, "M3: the floor asks for the stop when the disk fills")
+    await stop.wait()
+    check(stop.reason == .diskFloor && disk.reported == ["stopped: the disk is nearly full"],
+          "M3: as the floor's, with the one line")
+    check(disk.asked.allSatisfy { $0 == out }, "M3: it watched the output folder")
+    watch.cancel()
+
+    let calm = FakeDisk([10_000_000_000])
+    let quiet = StopRequest()
+    let watching = DiskFloor.watching(out, secondsWritten: { 0 }, stop: quiet, interval: 0.03,
+                                      freeBytes: { calm.free($0) }, report: { calm.report($0) })
+    check(waitUntil(5) { calm.askedCount >= 3 } && quiet.reason == nil, "M3: plenty of space asks for nothing")
+    watching.cancel()
+}
+
+// The end of a recording, as runRecorder calls it, with a real output and fake free space.
+/// A recording of `seconds` whole seconds, still open as the recorder holds it at a stop.
+final class OpenRecording {
+    var output: RecordingOutput?
+    let dir = newFolder()
+    init(seconds: Int) {
+        let output = try! RecordingOutput(directory: dir)
+        for k in 0..<(seconds * 10) {
+            output.write(mic: sine(440, 0.3, 4800, from: k * 4800), system: sine(660, 0.3, 4800, from: k * 4800))
+        }
+        self.output = output
+    }
+    func end(_ stop: StopRequest, free: (URL) -> Int64?) -> Ending {
+        endRecording(output: output!, stop: stop, directory: dir, freeBytes: free)
+    }
+}
+func requested(_ reason: StopRequest.Reason) -> StopRequest {
+    let stop = StopRequest()
+    stop.request(reason)
+    return stop
+}
+func untouched(_ dir: URL) -> Bool {
+    exists(dir, "mic.caf") && exists(dir, "call.caf") && !finals.contains { exists(dir, $0) }
+        && !exists(dir, ".recording-complete") && !names(dir).contains { $0.hasPrefix(".tmp-") }
+}
+let tooFull = "the disk is too full to finish the recording; free some space, then run: meetingbox recover "
+
+do {
+    // 3 s recorded: finalising needs 135 000 bytes.
+    let rec = OpenRecording(seconds: 3)
+    check(rec.end(requested(.diskFloor), free: { _ in 134_999 }) == .refused(tooFull + rec.dir.path),
+          "I2: at the floor with less than finalising needs it refuses, with the line")
+    check(untouched(rec.dir), "I2: and encodes nothing: the working files are kept, no .m4a, no temporaries, no marker (\(names(rec.dir)))")
+    rec.output = nil // the recorder exits, and the folder's lock with it
+    try recover(directory: rec.dir)
+    check(complete(rec.dir), "I2: once there is room, recover finishes it from those files")
+} catch {
+    check(false, "I2: refusing: \(error)")
+}
+
+do {
+    let rec = OpenRecording(seconds: 3)
+    var asked: [URL] = []
+    let result = rec.end(requested(.diskFloor), free: { asked.append($0); return 135_000 })
+    check(result == .saved && complete(rec.dir) && asked == [rec.dir], "I2: exactly what finalising needs is room enough, and the output folder is asked")
+}
+
+do {
+    let rec = OpenRecording(seconds: 3)
+    check(rec.end(requested(.diskFloor), free: { _ in 5_000_000_000 }) == .saved && complete(rec.dir),
+          "I2: at the floor with room to finish, it finishes as ever")
+}
+
+do {
+    let rec = OpenRecording(seconds: 3)
+    check(rec.end(requested(.diskFloor), free: { _ in nil }) == .saved && complete(rec.dir),
+          "I2: space that cannot be read is not a reason to refuse")
+}
+
+do {
+    let rec = OpenRecording(seconds: 3)
+    check(rec.end(requested(.signal), free: { _ in 1 }) == .saved && complete(rec.dir),
+          "I2: only the floor's stop is refused; a stop by signal finalises as before")
+}
+
+do {
+    // The seconds are what was written, so a longer recording needs more room.
+    let rec = OpenRecording(seconds: 6)
+    check(rec.end(requested(.diskFloor), free: { _ in 269_999 }) == .refused(tooFull + rec.dir.path) && untouched(rec.dir),
+          "I2: six seconds need 270 000 bytes: 269 999 is refused")
+}
+
+do {
+    // A finalise that fails for another reason is reported as that.
+    let rec = OpenRecording(seconds: 2)
+    rec.output!.close()
+    try fm.removeItem(at: rec.dir.appendingPathComponent("mic.caf"))
+    if case .failed(let message) = rec.end(requested(.signal), free: { _ in 5_000_000_000 }) {
+        check(message.contains("no working files to recover from"), "I2: a failed finalise comes back as failed, with its reason (\(message))")
+    } else {
+        check(false, "I2: a failed finalise comes back as failed")
+    }
+} catch {
+    check(false, "I2: a failed finalise: \(error)")
+}
+
+// A finalise that fails part way, for want of space, must not leave the disk full: its own
+// temporaries go, the working files stay, and the next attempt works.
+do {
+    struct DiskFull: Error {}
+    let dir = cafFolder()
+    fm.createFile(atPath: dir.appendingPathComponent("notes.txt").path, contents: Data("mine".utf8))
+    var calls = 0
+    var thrown: Error?
+    do {
+        try Finaliser.finalise(directory: dir, encode: { name, output, mic, call in
+            calls += 1
+            if calls == 1 {
+                try Finaliser.encode(name, output, mic, call)
+            } else {
+                fm.createFile(atPath: output.path, contents: Data(repeating: 1, count: 4096))
+                throw DiskFull()
+            }
+        })
+    } catch { thrown = error }
+    check(thrown is DiskFull && calls == 2, "I2: an encode that fails fails the finalise with its own error")
+    check(names(dir) == ["call.caf", "mic.caf", "notes.txt"],
+          "I2: its .tmp-*.m4a files are removed, the .caf files and anything else are kept (\(names(dir)))")
+    try recover(directory: dir)
+    check(complete(dir) && exists(dir, "notes.txt"), "I2: and a later recover finishes the folder")
+} catch {
+    check(false, "I2: failed encode: \(error)")
+}
+
+// A simulated crash is not an encode that failed: its temporary stays, for recovery to clear.
+do {
+    let dir = cafFolder()
+    do { try Finaliser.finalise(directory: dir, afterStep: { step in if step == .encoded("audio.m4a") { throw Interrupt() } }) } catch is Interrupt {}
+    check(exists(dir, ".tmp-audio.m4a"), "I2: only a failed encode clears the temporaries; an interruption elsewhere leaves them")
 }
 
 try? fm.removeItem(at: scratch)
