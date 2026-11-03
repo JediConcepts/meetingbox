@@ -252,10 +252,32 @@ final class ProcessingQueue {
         onTickQueue()
         let dir = ProcessingQueue.normal(folder)
         guard !known(dir), ProcessingQueue.read(dir)?.state == .failed else { return }
+        queueAgain(dir, from: [.failed])
+    }
+
+    /// "Process" on a meeting that was never processed, or whose run failed: it needs the
+    /// `audio.m4a` a job runs. Written `queued` (attempts and error reset) before anything runs, then
+    /// queued. A meeting with no `meeting.json` has the state a scan infers for it, `done` when it has
+    /// notes and `unprocessed` when it has not. Any other state, or no audio, changes nothing at all:
+    /// no record is made for a folder that is refused.
+    func process(_ folder: URL) {
+        onTickQueue()
+        let dir = ProcessingQueue.normal(folder)
+        let audio = dir.appendingPathComponent("audio.m4a").path
+        guard !known(dir), FileManager.default.fileExists(atPath: audio) else { return }
+        let state = ProcessingQueue.read(dir)?.state
+            ?? (FileManager.default.fileExists(atPath: dir.appendingPathComponent("notes.md").path) ? .done : .unprocessed)
+        guard state == .unprocessed || state == .failed else { return }
+        queueAgain(dir, from: [.unprocessed, .failed])
+    }
+
+    /// Writes a meeting in one of the `accepted` states `queued`, with attempts and error reset, and
+    /// queues it. A state that changed under us is left as it is.
+    private func queueAgain(_ dir: URL, from accepted: [MeetingState]) {
         var requeued = false
         do {
             try store.update(dir) {
-                guard $0.state == .failed else { return }
+                guard accepted.contains($0.state) else { return }
                 $0.state = .queued
                 $0.error = nil
                 $0.stage = nil

@@ -5,9 +5,9 @@ import Combine
 /// the session and the processing queue, the `Session`, the `ProcessingQueue`, the `ControlHandler`
 /// every recording command goes through, and the control socket. Core callbacks reach UI state by
 /// hopping here with `Task { @MainActor in ... }`; the core itself runs on the main queue, its tick
-/// queue. The menu bar item, the floating button and the windows (later tasks) are views over this;
-/// every action they offer comes back through `perform`, and from there through `ControlHandler`,
-/// the one path the socket uses too.
+/// queue. The menu bar item, the floating button and the meetingbox window are views over this; every
+/// recording action they offer comes back through `perform`, and from there through `ControlHandler`,
+/// the one path the socket uses too. The window's own state is `library`.
 @MainActor
 final class AppModel: ObservableObject {
     /// What the views show, changed only by `StatusEvent`s (StatusReducer.swift, where the rules are
@@ -24,10 +24,12 @@ final class AppModel: ObservableObject {
     let session: Session
     let queue: ProcessingQueue
     let handler: ControlHandler
+    /// What the meetingbox window shows and remembers (LibraryModel.swift).
+    let library: LibraryModel
     private var server: ControlServer?
     private var clock: DispatchSourceTimer?
-    /// `show` from the socket (a second launch, or the command): bring the app forward.
-    var onShow: (() -> Void)?
+    /// Bring the meetingbox window forward (AppDelegate makes it the first time).
+    var onOpenLibrary: (@MainActor () -> Void)?
 
     init(stateDir: URL, preferences: Preferences) {
         self.stateDir = stateDir
@@ -36,10 +38,14 @@ final class AppModel: ObservableObject {
         let session = Session(stateDir: stateDir, recorder: ChildRecorder(), store: store, now: Date.init,
                               freeBytes: { AppModel.freeBytes(near: $0) })
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")
+        let queue = ProcessingQueue(store: store, runner: ScriptRunner.fromBundle() ?? ScriptRunner(script: script))
         self.store = store
         self.session = session
-        self.queue = ProcessingQueue(store: store, runner: ScriptRunner.fromBundle() ?? ScriptRunner(script: script))
+        self.queue = queue
         self.handler = ControlHandler(session: session, preferences: preferences)
+        self.library = LibraryModel(store: store, session: session, queue: queue)
+        // The window's Pause, Resume and Stop take the path the menu's do.
+        library.control = { [weak self] action in self?.perform(action) }
     }
 
     /// In this order: take up a recording left by a crash (Task 4), pick up the processing queue
@@ -60,14 +66,22 @@ final class AppModel: ObservableObject {
         }
         queue.onFinished = { [weak self] dir, ok in
             Task { @MainActor in
+                guard let self = self else { return }
+                self.library.reload()
                 guard ok else { return }
-                self?.apply(.minutesReady(dir))
-                self?.play("Glass")
+                self.apply(.minutesReady(dir))
+                self.play("Glass")
+                // The window comes forward on the minutes, unless a recording is running.
+                if LibraryPresentation.shouldOpenMinutes(openMinutes: self.preferences.openMinutes, phase: self.session.phase) {
+                    self.apply(.minutesOpened(dir))
+                    self.showLibrary(on: dir)
+                }
             }
         }
         handler.onStarted = { [weak self] _ in Task { @MainActor in self?.play("Tink") } }
         handler.onStopped = { [weak self] _ in Task { @MainActor in self?.play("Pop") } }
-        handler.onShow = { [weak self] in Task { @MainActor in self?.onShow?() } }
+        // `show` from the socket (a second launch, or the command): the window.
+        handler.onShow = { [weak self] in Task { @MainActor in self?.showLibrary() } }
 
         session.adopt()
         queue.resume()
@@ -98,7 +112,16 @@ final class AppModel: ObservableObject {
     private func apply(_ event: StatusEvent) {
         var next = status
         next.apply(event)
-        if next != status { status = next }
+        if next != status {
+            status = next
+            library.update(next)
+        }
+    }
+
+    /// Brings the meetingbox window forward, on that meeting's minutes when one is given.
+    func showLibrary(on dir: URL? = nil) {
+        if let dir = dir { library.show(dir) }
+        onOpenLibrary?()
     }
 
     /// A menu entry or floating button was chosen. Recording commands go through the same
@@ -120,13 +143,10 @@ final class AppModel: ObservableObject {
         case .showFolder(let dir):
             NSWorkspace.shared.open(dir)
         case .openMeetingbox:
-            // Task 8 opens the library window instead.
-            NSWorkspace.shared.open(preferences.meetingsFolder)
+            showLibrary()
         case .openMinutes(let dir):
-            // Task 8 opens the meeting in the window instead.
             apply(.minutesOpened(dir))
-            let notes = dir.appendingPathComponent("notes.md")
-            NSWorkspace.shared.open(FileManager.default.fileExists(atPath: notes.path) ? notes : dir)
+            showLibrary(on: dir)
         case .quit:
             NSApp.terminate(nil)
         }

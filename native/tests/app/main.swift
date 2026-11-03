@@ -1,4 +1,4 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
 
@@ -2809,6 +2809,464 @@ do {
     let (reply, sounds) = q.sync { (answer, started) }
     check(reply == "ok recording \(dir!.path)" && sounds == 1, "I2: it is a recording, and the start sound plays once (\(reply ?? "nil"))")
     settleToIdle(r, q)
+}
+
+// MARK: - The window: library, minutes, transcript, rename (Task 8)
+
+// ProcessingQueue.process: an unprocessed (or failed) meeting with audio is written queued, then queued;
+// nothing else is changed.
+do {
+    let r = QRig()
+    let q = r.make()
+    let busy = r.meeting("2026-10-30_0800", files: ["audio.m4a": "a"], queued)
+    q.enqueue(busy)
+    let a = r.meeting("2026-10-30_0900", files: ["audio.m4a": "a"]) { $0.state = .unprocessed }
+    q.process(a)
+    check(r.state(a) == "queued" && r.attempts(a) == nil && r.runner.calls.count == 1,
+          "P1: process writes queued through the store before anything runs, and waits its turn behind a running job")
+    q.process(a); q.process(busy)
+    check(r.runner.calls.count == 1 && q.current?.lastPathComponent == busy.lastPathComponent,
+          "P1: a meeting already queued or running is not added twice")
+    r.runner.finish(0, 0)
+    check(r.runner.folders == [busy, a].map { $0.lastPathComponent } && r.runner.calls[1].stateAtRun == "processing"
+          && r.runner.calls[1].attemptsAtRun == 1 && r.runner.calls[1].audio.lastPathComponent == "audio.m4a",
+          "P1: it then runs as any queued job: processing, attempt 1, its audio.m4a")
+    r.runner.finish(1, 0)
+    check(r.state(a) == "done" && r.finished.last.map { $0.0 == a.lastPathComponent && $0.1 } ?? false, "P1: and ends done")
+}
+do {
+    // v1.2 folders have no meeting.json at all: a scan says unprocessed
+    let r = QRig()
+    let q = r.make()
+    let a = r.meeting("2026-10-30_1000", files: ["audio.m4a": "a"])
+    check(!fm.fileExists(atPath: a.appendingPathComponent("meeting.json").path), "P2: the folder has no meeting.json to begin with")
+    q.process(a)
+    check(r.runner.calls.count == 1 && r.runner.calls[0].stateAtRun == "processing" && r.attempts(a) == 1,
+          "P2: a folder with no meeting.json and no notes is unprocessed, so it is processed")
+    r.runner.finish(0, 0)
+    check(r.state(a) == "done", "P2: and ends done")
+}
+do {
+    let r = QRig()
+    let q = r.make()
+    let failed = r.meeting("2026-10-30_1100", files: ["audio.m4a": "a"]) { $0.state = .failed; $0.error = "it broke"; $0.attempts = 3; $0.attempt = "old" }
+    q.process(failed)
+    check(r.runner.calls.count == 1 && r.runner.calls[0].errorAtRun == nil && r.runner.calls[0].attemptsAtRun == 1
+          && r.runner.calls[0].attemptAtRun != "old", "P3: a failed meeting with audio is run again from a clean record, as retry does")
+}
+do {
+    // without the audio the queue would run, nothing happens: the state, and the absence of a record, stay
+    let r = QRig()
+    let q = r.make()
+    let noAudio = r.meeting("2026-10-30_1200") { $0.state = .unprocessed }
+    let noRecord = r.meeting("2026-10-30_1210")
+    let v12 = r.meeting("2026-10-30_1220", files: ["2026-10-30_1220_meeting.m4a": "a"])
+    let failedNoAudio = r.meeting("2026-10-30_1230") { $0.state = .failed; $0.error = "it broke"; $0.attempts = 3 }
+    for dir in [noAudio, noRecord, v12, failedNoAudio] { q.process(dir) }
+    check(r.runner.calls.isEmpty && q.current == nil, "P4: without audio.m4a nothing is queued or run")
+    check(r.state(noAudio) == "unprocessed" && r.state(failedNoAudio) == "failed" && r.error(failedNoAudio) == "it broke"
+          && r.attempts(failedNoAudio) == 3, "P4: and the records are as they were")
+    check(!fm.fileExists(atPath: noRecord.appendingPathComponent("meeting.json").path)
+          && !fm.fileExists(atPath: v12.appendingPathComponent("meeting.json").path), "P4: no record is made for a folder that is refused")
+}
+do {
+    // any other state is left alone, with audio there
+    let r = QRig()
+    let q = r.make()
+    var dirs: [(String, URL)] = []
+    for (i, s) in [MeetingState.done, .recording, .finalising, .queued, .processing].enumerated() {
+        dirs.append((s.rawValue, r.meeting("2026-10-30_13\(i)0", files: ["audio.m4a": "a"]) { $0.state = s }))
+    }
+    let inferredDone = r.meeting("2026-10-30_1390", files: ["audio.m4a": "a", "notes.md": "minutes"])
+    for (_, dir) in dirs { q.process(dir) }
+    q.process(inferredDone)
+    check(r.runner.calls.isEmpty && q.current == nil && dirs.allSatisfy { r.state($0.1) == $0.0 },
+          "P5: done, recording, finalising, queued and processing meetings are not touched or run")
+    check(!fm.fileExists(atPath: inferredDone.appendingPathComponent("meeting.json").path),
+          "P5: nor is a folder a scan would call done (notes.md and no meeting.json) given a record")
+}
+
+// The library's decisions: rows, search, actions, busy, rename. Foundation only.
+let libRoot = URL(fileURLWithPath: "/Meetings", isDirectory: true)
+/// A meeting as a scan reports it, without a disk: its record (unless `record` is false) carries `state`.
+func libMeeting(_ name: String, _ state: MeetingState = .done, title: String? = nil, seconds: Int = 0, stage: String? = nil,
+                record: Bool = true) -> Meeting {
+    let folder = MeetingFolder.parse(libRoot.appendingPathComponent(name, isDirectory: true))!
+    var rec = MeetingRecord(title: title, started: folder.date, seconds: seconds, state: state)
+    rec.stage = stage
+    return Meeting(folder: folder, record: record ? rec : nil, state: state)
+}
+func libURL(_ name: String) -> URL { libRoot.appendingPathComponent(name, isDirectory: true) }
+
+// Rows: title, date, length, badge, in the exact words.
+do {
+    let titled = LibraryPresentation.row(libMeeting("2026-10-28_1508", title: "Weekly sync", seconds: 2530))
+    check(titled.title == "Weekly sync" && titled.date == "28 Oct 2026, 15:08" && titled.length == "42 min" && titled.badge == nil,
+          "L1: a titled meeting: title, date, length, no badge (\(titled))")
+    check(titled.caption == "28 Oct 2026, 15:08 · 42 min", "L1: its caption is the date and the length (\(titled.caption))")
+    let untitled = LibraryPresentation.row(libMeeting("2026-10-28_1508", seconds: 2530))
+    check(untitled.title == "28 October 2026, 15:08" && untitled.caption == "42 min",
+          "L1: an untitled meeting is titled by its date, which its caption does not repeat (\(untitled.title) / \(untitled.caption))")
+    let v12 = LibraryPresentation.row(libMeeting("2026-10-28 0900 Standup", record: false))
+    check(v12.title == "Standup" && v12.length == nil && v12.caption == "28 Oct 2026, 09:00" && v12.badge == nil,
+          "L1: a folder with no record takes its title from the folder name and has no length (\(v12))")
+    let blank = LibraryPresentation.row(libMeeting("2026-10-28 0900 Standup", title: "  "))
+    check(blank.title == "Standup", "L1: a blank title in the record falls back to the folder's")
+    check(titled.id == LibraryPresentation.key(libURL("2026-10-28_1508")) && titled.id == "/Meetings/2026-10-28_1508",
+          "L1: a row's id is its folder's path")
+    let spellings = ["/var/folders/x/Meetings/2026-10-28_1508", "/private/var/folders/x/Meetings/2026-10-28_1508/", "/var/folders/x/./Meetings/2026-10-28_1508/",
+                     "/var/folders/x/Meetings/../Meetings/2026-10-28_1508"]
+    check(Set(spellings.map { LibraryPresentation.key(URL(fileURLWithPath: $0)) }).count == 1
+          && LibraryPresentation.key(URL(fileURLWithPath: "/private/tmp/a")) == "/tmp/a" && LibraryPresentation.key(URL(fileURLWithPath: "/private/other/a")) == "/private/other/a",
+          "L1: one folder, one key, however it is spelled, whether or not it is still there")
+    let lengths: [(Int, String?)] = [(-5, nil), (0, nil), (1, "1 s"), (59, "59 s"), (60, "1 min"), (119, "1 min"), (120, "2 min"),
+                                     (3599, "59 min"), (3600, "1 h 00 min"), (3900, "1 h 05 min"), (7260, "2 h 01 min")]
+    let wrong = lengths.filter { LibraryPresentation.lengthText($0.0) != $0.1 }.map { "\($0.0) -> \(LibraryPresentation.lengthText($0.0) ?? "nil")" }
+    check(wrong.isEmpty, "L1: length in words, from under a minute to hours (\(wrong))")
+}
+do {
+    let name = "2026-10-28_1508"
+    let here = libURL(name)
+    func badge(_ m: Meeting, _ phase: Session.Phase = .idle, processing: URL? = nil, stage: String? = nil) -> String? {
+        LibraryPresentation.row(m, phase: phase, processing: processing, stage: stage).badge?.text
+    }
+    check(badge(libMeeting(name, .done)) == nil, "L2: done has no badge")
+    check(badge(libMeeting(name, .recording), .recording(here)) == "Recording", "L2: the session's folder, recording: Recording")
+    check(badge(libMeeting(name, .recording), .paused(here)) == "Paused", "L2: the session's folder, paused: Paused")
+    check(badge(libMeeting(name, .finalising), .finalising(here)) == "Finalising", "L2: the session's folder, finalising: Finalising")
+    check(badge(libMeeting(name, .recording)) == "Recording", "L2: a record that says recording, with no session on it: Recording")
+    check(badge(libMeeting(name, .finalising)) == "Finalising", "L2: a record that says finalising: Finalising")
+    check(badge(libMeeting(name, .queued)) == "Queued", "L2: queued")
+    check(badge(libMeeting(name, .processing)) == "Processing", "L2: processing, no stage known")
+    check(badge(libMeeting(name, .processing, stage: "minutes")) == "Writing minutes", "L2: processing, with the stage its record holds")
+    check(badge(libMeeting(name, .processing, stage: "transcribing"), processing: here, stage: "speakers") == "Finding speakers",
+          "L2: processing, the live stage wins over the record's")
+    check(badge(libMeeting(name, .queued), processing: here) == "Processing", "L2: the queue's current job is processing even if the record still says queued")
+    check(badge(libMeeting(name, .queued), processing: here, stage: "transcribing") == "Transcribing", "L2: with its stage in words")
+    check(badge(libMeeting(name, .processing, stage: ProcessingQueue.waitingStage), processing: here, stage: ProcessingQueue.waitingStage)
+          == "Waiting for another meetingbox", "L2: waiting on another meetingbox says so")
+    check(badge(libMeeting(name, .queued), processing: libURL("2026-10-28_1600"), stage: "minutes") == "Queued",
+          "L2: another meeting being processed does not touch this one's badge")
+    check(badge(libMeeting(name, .failed)) == "Failed", "L2: failed")
+    check(badge(libMeeting(name, .unprocessed)) == "Unprocessed", "L2: unprocessed")
+    check(badge(libMeeting(name, .done), .recording(libURL("2026-10-28_1600"))) == nil, "L2: a recording elsewhere does not touch this one's badge")
+    check(badge(libMeeting(name, .queued), .recording(URL(fileURLWithPath: "/Meetings/./2026-10-28_1508/"))) == "Recording",
+          "L2: folders are the same place however they are spelled")
+    check(LibraryBadge.processing(stage: "done").text == "Done" && LibraryBadge.processing(stage: "odd").text == "odd",
+          "L2: any stage the queue labels, or its own words")
+}
+do {
+    // newest first, as the store gives them, through rows
+    let root = freshRoot()
+    for n in ["2026-10-26_1000", "2026-10-28_1508", "2026-10-27 0900 Standup"] { _ = make(root, n) }
+    let rows = LibraryPresentation.rows(MeetingStore(root: root).scan())
+    check(rows.map(\.title) == ["28 October 2026, 15:08", "Standup", "26 October 2026, 10:00"], "L3: rows are newest first (\(rows.map(\.title)))")
+}
+
+// Search: through the store's own matches, after indexTranscripts.
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    let a = make(root, "2026-10-28_1508", files: ["transcript.txt": "We went through the Café budget"])
+    _ = make(root, "2026-10-27 0900 Standup", files: ["transcript.txt": "nothing to see"])
+    let c = make(root, "2026-10-26_1000")
+    try! store.update(c) { $0.title = "Budget review" }
+    let sem = DispatchSemaphore(value: 0)
+    store.indexTranscripts { sem.signal() }
+    check(sem.wait(timeout: .now() + 10) == .success, "L4: the transcripts are indexed")
+    let all = store.scan()
+    func found(_ q: String) -> [String] { LibraryPresentation.visible(all, query: q, store: store).map { $0.folder.url.lastPathComponent } }
+    check(found("") == all.map { $0.folder.url.lastPathComponent } && found("   ") == found(""), "L4: a blank search shows every meeting, in order")
+    check(found("cafe") == [a.lastPathComponent], "L4: a transcript word, case and accents ignored (\(found("cafe")))")
+    check(found("standup") == ["2026-10-27 0900 Standup"], "L4: a title in a folder name (\(found("standup")))")
+    check(found("budget") == [a.lastPathComponent, c.lastPathComponent], "L4: a title in a record and a transcript, newest first (\(found("budget")))")
+    check(found("nonesuch").isEmpty, "L4: nothing matches nothing")
+}
+
+// Actions.
+do {
+    let name = "2026-10-28_1508"
+    let here = libURL(name)
+    let audio = MeetingFiles(audio: here.appendingPathComponent("audio.m4a"), runnable: true)
+    let old = MeetingFiles(audio: here.appendingPathComponent("2026-10-28_1508_meeting.m4a"), runnable: false)
+    let none = MeetingFiles()
+    func acts(_ m: Meeting, _ files: MeetingFiles, _ phase: Session.Phase = .idle) -> [LibraryAction] {
+        LibraryPresentation.actions(for: m, phase: phase, files: files)
+    }
+    check(acts(libMeeting(name, .done), audio) == [.rename, .showInFinder, .playAudio], "L5: a done meeting: Rename, Show in Finder, Play audio")
+    check(acts(libMeeting(name, .done), none) == [.rename, .showInFinder], "L5: no audio, no Play")
+    check(acts(libMeeting(name, .done), old) == [.rename, .showInFinder, .playAudio], "L5: a v1.2 audio file plays")
+    check(acts(libMeeting(name, .unprocessed), audio) == [.rename, .showInFinder, .playAudio, .process], "L5: unprocessed with audio: Process too")
+    check(acts(libMeeting(name, .failed), audio) == [.rename, .showInFinder, .playAudio, .process], "L5: failed with audio: Process too")
+    check(acts(libMeeting(name, .unprocessed), none) == [.rename, .showInFinder] && acts(libMeeting(name, .failed), none) == [.rename, .showInFinder],
+          "L5: Process is not offered without audio")
+    check(acts(libMeeting(name, .unprocessed), old) == [.rename, .showInFinder, .playAudio],
+          "L5: nor for audio the queue does not run (a v1.2 *_meeting.m4a)")
+    for s in [MeetingState.done, .queued, .processing] {
+        check(!acts(libMeeting(name, s), audio).contains(.process), "L5: no Process for \(s)")
+    }
+    check(acts(libMeeting(name, .recording), audio, .idle) == [.rename, .showInFinder, .playAudio], "L5: a stale recording record is just a meeting")
+    check(LibraryAction.allCases.map(\.title) == ["Pause", "Resume", "Stop", "Rename…", "Show in Finder", "Play audio", "Process"], "L5: the words")
+    // the meeting being recorded
+    let live = libMeeting(name, .recording)
+    check(acts(live, none, .recording(here)) == [.pause, .stop, .showInFinder], "L5: recording: Pause, Stop, Show in Finder")
+    check(acts(live, none, .paused(here)) == [.resume, .stop, .showInFinder], "L5: paused: Resume, Stop, Show in Finder")
+    check(acts(live, none, .finalising(here)) == [.showInFinder], "L5: finalising: only Show in Finder")
+    check(acts(libMeeting(name, .done), audio, .recording(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .playAudio],
+          "L5: another meeting is unaffected by a recording")
+}
+do {
+    // what is on disk
+    let root = freshRoot()
+    let main = MeetingFolder.parse(make(root, "2026-10-28_1508", files: ["audio.m4a": "a", "2026-10-28_1508_meeting.m4a": "b"]))!
+    let old = MeetingFolder.parse(make(root, "2026-10-28_1600", files: ["2026-10-28_1600_meeting.m4a": "b"]))!
+    let empty = MeetingFolder.parse(make(root, "2026-10-28_1700"))!
+    let m = MeetingFiles.read(main), o = MeetingFiles.read(old), e = MeetingFiles.read(empty)
+    check(m.audio?.lastPathComponent == "audio.m4a" && m.runnable, "L5: audio.m4a plays and is what the queue runs")
+    check(o.audio?.lastPathComponent == "2026-10-28_1600_meeting.m4a" && !o.runnable, "L5: a v1.2 file plays, but the queue does not run it")
+    check(e.audio == nil && !e.runnable, "L5: nothing there, nothing to play")
+}
+
+// Busy, and rename, in words.
+do {
+    let name = "2026-10-28_1508"
+    let here = libURL(name)
+    let other = libURL("2026-10-28_1600")
+    func busy(_ recorded: MeetingState?, phase: Session.Phase = .idle, current: URL? = nil) -> Bool {
+        LibraryPresentation.isBusy(here, phase: phase, current: current, recorded: recorded)
+    }
+    check(busy(.recording) && busy(.finalising) && busy(.queued) && busy(.processing), "R1: recording, finalising, queued and processing records are busy")
+    check(!busy(.done) && !busy(.failed) && !busy(.unprocessed) && !busy(nil), "R1: done, failed, unprocessed and no record are not")
+    check(busy(.done, phase: .recording(here)) && busy(.done, phase: .paused(here)) && busy(nil, phase: .finalising(here)),
+          "R1: the session's folder is busy in any phase but idle")
+    check(!busy(.done, phase: .recording(other)) && !busy(.done, phase: .idle), "R1: another meeting recording does not make this one busy")
+    check(busy(.done, current: here) && !busy(.done, current: other), "R1: the queue's current job is busy")
+    check(LibraryPresentation.renameMessage(RenameError.busy) == "That meeting is busy"
+          && LibraryPresentation.renameMessage(RenameError.exists) == "A meeting with that name already exists"
+          && LibraryPresentation.renameMessage(RenameError.emptyTitle) == "Type a title", "R1: the three messages, exactly")
+    check(LibraryPresentation.renameMessage(POSIXError(.EACCES)).hasPrefix("Could not rename"), "R1: any other error is said to be a failure to rename")
+}
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    func folder(_ name: String, _ state: MeetingState? = nil) -> MeetingFolder {
+        let dir = make(root, name)
+        if let state = state { try! store.update(dir) { $0.state = state } }
+        return MeetingFolder.parse(dir)!
+    }
+    func rename(_ f: MeetingFolder, _ title: String, phase: Session.Phase = .idle, current: URL? = nil) -> (MeetingFolder?, Error?) {
+        do { return (try LibraryPresentation.rename(f, to: title, store: store, phase: phase, current: current), nil) }
+        catch { return (nil, error) }
+    }
+    func says(_ e: Error?) -> String? { e.map(LibraryPresentation.renameMessage) }
+
+    let f1 = folder("2026-10-28_1508", .done)
+    let (r1, e1) = rename(f1, "Weekly sync")
+    let named = root.appendingPathComponent("2026-10-28 1508 Weekly sync")
+    check(e1 == nil && r1?.url.path == named.path && r1?.title == "Weekly sync" && fm.fileExists(atPath: named.path)
+          && !fm.fileExists(atPath: f1.url.path), "R2: the folder is renamed to 'YYYY-MM-DD HHMM Title'")
+    let json = (try? JSONSerialization.jsonObject(with: Data(contentsOf: named.appendingPathComponent("meeting.json")))) as? [String: Any]
+    check(json?["title"] as? String == "Weekly sync" && json?["state"] as? String == "done", "R2: and the title is written to meeting.json beside it, the state kept")
+    let scanned = store.scan().first
+    check(scanned?.record?.title == "Weekly sync" && scanned?.folder.url.lastPathComponent == "2026-10-28 1508 Weekly sync", "R2: a scan then shows it")
+
+    let f2 = folder("2026-10-28_1600")
+    let (r2, _) = rename(f2, "a/b: c")
+    check(r2?.title == "a-b- c" && (try? JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("2026-10-28 1600 a-b- c/meeting.json"))) as? [String: Any])?["title"] as? String == "a-b- c",
+          "R2: unsafe characters become hyphens, in the folder and the title; a folder with no record is given one")
+
+    // a folder already named as the rename would name it
+    let f4 = folder("2026-10-28_1800")
+    _ = make(root, "2026-10-28 1800 Review")
+    let (r4, e4) = rename(f4, "Review")
+    check(r4 == nil && says(e4) == "A meeting with that name already exists" && fm.fileExists(atPath: f4.url.path)
+          && fm.fileExists(atPath: root.appendingPathComponent("2026-10-28 1800 Review").path), "R2: a name that is taken is refused, and nothing moves")
+
+    for title in ["", "   ", "...", " . "] {
+        let (r, e) = rename(f4, title)
+        check(r == nil && says(e) == "Type a title" && fm.fileExists(atPath: f4.url.path), "R2: '\(title)' is refused as 'Type a title'")
+    }
+
+    // busy: checked now, on the record on disk and on the session and the queue
+    for (i, s) in [MeetingState.recording, .finalising, .queued, .processing].enumerated() {
+        let f = folder("2026-10-29_10\(i)0", s)
+        let (r, e) = rename(f, "Busy one")
+        check(r == nil && says(e) == "That meeting is busy" && fm.fileExists(atPath: f.url.path), "R3: a \(s) meeting is busy")
+    }
+    let f5 = folder("2026-10-29_1400", .done)
+    let (r5, e5) = rename(f5, "Busy one", phase: .recording(f5.url))
+    check(r5 == nil && says(e5) == "That meeting is busy", "R3: the session's folder is busy")
+    let f6 = folder("2026-10-29_1410", .done)
+    let (r6, e6) = rename(f6, "Busy one", current: f6.url)
+    check(r6 == nil && says(e6) == "That meeting is busy", "R3: the queue's current job is busy")
+    let f7 = folder("2026-10-29_1420", .done)
+    let (r7, e7) = rename(f7, "Fine", phase: .recording(f6.url), current: f6.url)
+    check(r7?.title == "Fine" && e7 == nil, "R3: a meeting nothing is using renames")
+    // the moment of renaming: a record that changed since the list was read
+    let f8 = folder("2026-10-29_1430", .done)
+    try! store.update(f8.url) { $0.state = .queued }
+    let (r8, e8) = rename(f8, "Late")
+    check(r8 == nil && says(e8) == "That meeting is busy", "R3: the state is read from the disk at the moment, not from a list read earlier")
+    let f9 = folder("2026-10-29_1440", .failed)
+    check(rename(f9, "After failure").0?.title == "After failure", "R3: failed and unprocessed meetings rename")
+    check(rename(folder("2026-10-29_1450", .unprocessed), "Never run").0?.title == "Never run", "R3: unprocessed too")
+}
+
+// LibraryModel: the window's state, driven as the views drive it. The work it hands to background
+// queues comes back to the main queue, so these wait on the main run loop. Never Show in Finder or Play
+// (they would open the real Finder).
+func settle(_ condition: @MainActor () -> Bool, timeout: TimeInterval = 10) -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if MainActor.assumeIsolated(condition) { return true }
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.01))
+    }
+    return MainActor.assumeIsolated(condition)
+}
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let runner = FakeRunner()
+    let queue = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil)
+    let model = LibraryModel(store: r.store, session: session, queue: queue)
+    var controlled: [MenuAction] = []
+    model.control = { controlled.append($0) }
+    let root = r.store.root
+    let a = make(root, "2026-10-28_1508", files: ["notes.md": "**Decisions**\n- ship on Friday", "transcript.txt": "[00:00:01] Me: the café budget",
+                                                  "audio.m4a": "a"])
+    try! r.store.update(a) { $0.state = .done; $0.seconds = 2530 }
+    let b = make(root, "2026-10-27 0900 Standup", files: ["transcript.txt": "[00:00:02] Me: nothing to see"])
+    let c = make(root, "2026-10-26_1000", files: ["audio.m4a": "a"])
+    let keyA = LibraryPresentation.key(a), keyB = LibraryPresentation.key(b), keyC = LibraryPresentation.key(c)
+
+    check(!model.hasScanned && model.rows.isEmpty && model.selectedMeeting == nil, "W1: before anything is read there is nothing, and it is not 'no meetings'")
+    model.reload()
+    check(settle { model.hasScanned && model.meetings.count == 3 }, "W1: reload reads the meetings off the main queue and publishes them")
+    check(model.rows.map(\.id) == [keyA, keyB, keyC] && model.visible.count == 3, "W1: newest first, all listed")
+    check(model.rows.map { $0.badge?.text } == [nil, "Unprocessed", "Unprocessed"],
+          "W1: a record that says done has no badge, folders with no record and no notes are unprocessed (\(model.rows.map { $0.badge?.text ?? "-" }))")
+
+    // selection reads the files off the main queue; another meeting's text is never shown for this one
+    model.select(keyA)
+    check(model.shownContent == nil && model.selectedMeeting != nil, "W2: selected, not yet read: nothing shown")
+    check(settle { model.shownContent != nil }, "W2: the minutes and the transcript are read")
+    let shownMinutes = model.shownContent?.minutes.map { String($0.characters) }
+    check(shownMinutes == "Decisions\n- ship on Friday" && model.shownContent?.transcript == "[00:00:01] Me: the café budget"
+          && model.shownContent?.files.audio?.lastPathComponent == "audio.m4a" && model.shownContent?.files.runnable == true,
+          "W2: notes.md as inline markdown, transcript.txt as it is, the audio")
+    check(model.actions(for: model.selectedMeeting!) == [.rename, .showInFinder, .playAudio], "W2: its actions")
+    model.select(keyB)
+    check(model.shownContent == nil, "W2: the previous meeting's text is gone at once")
+    check(settle { model.shownContent?.key == keyB }, "W2: and the new one's arrives")
+    check(model.shownContent.map { $0.minutes == nil && $0.transcript != nil && $0.files.audio == nil } ?? false, "W2: a meeting with no minutes and no audio says so (nil)")
+    check(model.actions(for: model.selectedMeeting!) == [.rename, .showInFinder], "W2: and offers no Play")
+
+    // search: off the main queue, through the store's matches; a newer keystroke wins
+    model.search("café")
+    check(settle { model.visible.map(\.folder.url.lastPathComponent) == ["2026-10-28_1508"] }, "W3: a transcript word narrows the list")
+    check(model.rows.count == 1 && model.meetings.count == 3, "W3: the rows are the narrowed list, the meetings are all of them")
+    model.search("sta"); model.search("stand"); model.search("standup")
+    check(settle { model.visible.map(\.folder.url.lastPathComponent) == ["2026-10-27 0900 Standup"] }, "W3: typing on, the last search is the one shown")
+    model.search("nonesuch")
+    check(settle { model.visible.isEmpty }, "W3: no match, an empty list")
+    model.search("")
+    check(model.visible.count == 3, "W3: a blank search lists all of them at once")
+
+    // show: a meeting's minutes, whatever was searched
+    model.search("nonesuch")
+    model.show(a)
+    check(model.searchText == "" && model.selection == keyA && model.pane == .minutes, "W4: show clears the search, selects the meeting and opens its minutes")
+    check(settle { model.visible.count == 3 && model.shownContent?.key == keyA }, "W4: and the list and the text follow")
+
+    // rename: the sheet, the checks, the folder, the record, the selection
+    model.select(keyC)
+    model.beginRename()
+    check(model.renaming?.key == keyC && model.renaming?.text == "", "R4: the sheet opens empty for an untitled meeting")
+    model.renameText("Budget review")
+    model.commitRename()
+    let renamedC = root.appendingPathComponent("2026-10-26 1000 Budget review")
+    check(model.renaming == nil && fm.fileExists(atPath: renamedC.path) && !fm.fileExists(atPath: c.path), "R4: the folder is renamed and the sheet closes")
+    check(model.selection == LibraryPresentation.key(renamedC) && model.selectedMeeting?.folder.title == "Budget review",
+          "R4: the selection follows the folder at once")
+    check(model.rows.last?.title == "Budget review", "R4: titled in its row at once")
+    check(settle { model.meetings.last?.record?.title == "Budget review" && model.shownContent?.key == model.selection },
+          "R4: the list is read again, now with the title in meeting.json, and the text follows")
+    model.beginRename()
+    check(model.renaming?.text == "Budget review", "R4: the sheet opens with the title as it is")
+    model.commitRename()
+    check(model.renaming == nil && fm.fileExists(atPath: renamedC.path), "R4: an unchanged title closes the sheet and changes nothing")
+    model.cancelRename()
+
+    model.select(keyB)
+    model.beginRename()
+    model.renameText("   ")
+    model.commitRename()
+    check(model.renaming?.error == "Type a title" && fm.fileExists(atPath: b.path), "R5: an empty title is said to be, and the sheet stays")
+    model.renameText("Standup")
+    check(model.renaming?.error == nil, "R5: typing clears the message")
+    _ = make(root, "2026-10-27 0900 Standup copy")
+    model.renameText("Standup copy")
+    model.commitRename()
+    check(model.renaming?.error == "A meeting with that name already exists" && fm.fileExists(atPath: b.path), "R5: a taken name is said to be")
+    try! r.store.update(b) { $0.state = .queued }
+    model.renameText("Fresh name")
+    model.commitRename()
+    check(model.renaming?.error == "That meeting is busy" && fm.fileExists(atPath: b.path), "R5: a meeting that became busy since the list was read is busy")
+    model.cancelRename()
+    check(model.renaming == nil, "R5: Cancel closes the sheet")
+
+    // Process: unprocessed goes through process, failed through retry
+    let u = make(root, "2026-10-25_0900", files: ["audio.m4a": "a"])
+    let f = make(root, "2026-10-24_0900", files: ["audio.m4a": "a"])
+    try! r.store.update(f) { $0.state = .failed; $0.error = "it broke" }
+    model.reload()
+    check(settle { model.meetings.count == 6 }, "P6: two more meetings are read")
+    model.select(LibraryPresentation.key(u))
+    check(settle { model.shownContent?.files.runnable == true }, "P6: the audio is found")
+    check(model.actions(for: model.selectedMeeting!).contains(.process), "P6: an unprocessed meeting with audio offers Process")
+    model.perform(.process)
+    check(runner.calls.count == 1 && runner.calls[0].audio.deletingLastPathComponent().lastPathComponent == "2026-10-25_0900"
+          && runner.calls[0].stateAtRun == "processing", "P6: Process queues it, and it runs")
+    model.update(StatusInput(processing: u, stage: "transcribing"))
+    check(model.rows.first { $0.id == LibraryPresentation.key(u) }?.badge?.text == "Transcribing", "P6: its row says what the queue is doing, from the live stage")
+    model.select(LibraryPresentation.key(f))
+    check(settle { model.shownContent?.key == LibraryPresentation.key(f) && model.shownContent?.files.runnable == true }, "P6: the failed meeting's audio is found")
+    check(model.actions(for: model.selectedMeeting!).contains(.process), "P6: a failed meeting with audio offers Process")
+    model.perform(.process)
+    check(r.store.scan().first { $0.folder.url.lastPathComponent == "2026-10-24_0900" }?.state == .queued && runner.calls.count == 1,
+          "P6: a failed meeting is written queued behind the running job (retry)")
+
+    // the session: a new recording appears at once, and its row has the controls
+    let live = make(root, "2026-10-29_0900")
+    try! r.store.update(live) { $0.state = .recording }
+    model.update(StatusInput(phase: .recording(live)))
+    check(settle { model.meetings.count == 7 }, "S1: a new phase reads the list again, so the recording is in it")
+    check(model.rows.first?.badge == .recording && model.rows.first?.id == LibraryPresentation.key(live), "S1: newest first, badged Recording")
+    model.select(LibraryPresentation.key(live))
+    check(model.actions(for: model.selectedMeeting!) == [.pause, .stop, .showInFinder], "S1: and it offers Pause, Stop and Show in Finder")
+    model.perform(.pause); model.perform(.stop)
+    model.update(StatusInput(phase: .paused(live)))
+    model.perform(.resume)
+    check(controlled == [.pause, .stop, .resume], "S1: Pause, Stop and Resume go through the control path, never the session")
+    check(session.phase == .idle, "S1: the model did not touch the session")
+}
+
+// The window comes forward for finished minutes unless a recording is running.
+check(LibraryPresentation.shouldOpenMinutes(openMinutes: true, phase: .idle), "O1: minutes ready, nothing recording: open them")
+check(LibraryPresentation.shouldOpenMinutes(openMinutes: true, phase: .finalising(libURL("2026-10-28_1508"))), "O1: a recording only being finalised does not hold them back")
+check(!LibraryPresentation.shouldOpenMinutes(openMinutes: true, phase: .recording(libURL("2026-10-28_1508"))), "O1: never over a recording")
+check(!LibraryPresentation.shouldOpenMinutes(openMinutes: true, phase: .paused(libURL("2026-10-28_1508"))), "O1: nor a paused one")
+check(!LibraryPresentation.shouldOpenMinutes(openMinutes: false, phase: .idle), "O1: nor when the setting is off")
+
+// Minutes: inline markdown, whitespace kept, plain text when it will not parse.
+do {
+    let text = "**Decisions**\n- ship on Friday\n\n  indented _note_"
+    let rendered = LibraryPresentation.minutes(text)
+    check(String(rendered.characters) == "Decisions\n- ship on Friday\n\n  indented note", "M1: markdown marks go, line breaks and spaces stay (\(String(rendered.characters).debugDescription))")
+    let strong = rendered.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) ?? false }
+    check(strong, "M1: bold is bold")
+    check(String(LibraryPresentation.minutes("").characters) == "" && String(LibraryPresentation.minutes("a [b](").characters).contains("b"),
+          "M1: an empty text, and a broken link, still give text")
 }
 
 try? fm.removeItem(at: scratch)
