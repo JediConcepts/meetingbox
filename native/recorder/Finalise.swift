@@ -5,18 +5,25 @@ import AVFoundation
 /// call.caf. Used by the recorder's own stop and by `--recover` after a crash.
 /// Waits up to 5 s for the folder's lock: a recorder just killed with -9, or that
 /// crashed a moment ago, can hold it until the kernel has finished with it.
-func recover(directory: URL, lockWait: TimeInterval = 5) throws {
-    try Finaliser.finalise(directory: directory, lockWait: lockWait)
+func recover(directory: URL, lockWait: TimeInterval = 5,
+             freeBytes: (URL) -> Int64? = Finaliser.freeSpaceUnknown) throws {
+    try Finaliser.finalise(directory: directory, lockWait: lockWait, freeBytes: freeBytes)
 }
 
 /// `--recover`'s exit status: 0 when the folder ends complete; 75 (EX_TEMPFAIL) when
 /// another process still holds the folder's lock after the wait (a recorder still
 /// recording, or another finalise), so the caller knows it is busy rather than lost;
-/// 1 when it cannot be finished. The message says what happened.
-func recoverStatus(directory: URL, lockWait: TimeInterval = 5) -> (status: Int32, message: String) {
+/// `Finaliser.refusedStatus` (1) when the disk is too full to finish it, with nothing
+/// encoded and the working files kept, as for a refused stop; 1 when it cannot be
+/// finished. The message says what happened. `freeBytes` reads the free space, which
+/// a full finalise is checked against: the recorder gives the real one, a test a fake.
+func recoverStatus(directory: URL, lockWait: TimeInterval = 5,
+                   freeBytes: (URL) -> Int64?) -> (status: Int32, message: String) {
     do {
-        try recover(directory: directory, lockWait: lockWait)
+        try recover(directory: directory, lockWait: lockWait, freeBytes: freeBytes)
         return (0, "Recovered \(directory.path)")
+    } catch let error as NoRoomToFinishError {
+        return (Finaliser.refusedStatus, error.message)
     } catch {
         let message = "Could not recover \(directory.path): \(error.localizedDescription)"
         return (error is FolderBusyError ? 75 : 1, message)
@@ -32,7 +39,8 @@ enum FinaliseStep: Equatable {
 /// Finalising, shared by a clean stop and recovery, in this order and safe to repeat:
 ///   1. the marker exists and the three .m4a verify: done (remove leftover working files);
 ///   2. the three .m4a verify without the marker: write the marker, remove working files;
-///   3. mic.caf and call.caf exist: encode .tmp-<name> for each, verify, publish each
+///   3. mic.caf and call.caf exist: (recovery first refuses, changing nothing, if the volume has
+///      less than `finishNeed` of their length free) encode .tmp-<name> for each, verify, publish each
 ///      (keeping verified output from an earlier attempt, replacing unverified), write
 ///      the marker atomically, and only then remove the working files;
 ///   4. otherwise change nothing and fail.
@@ -66,14 +74,30 @@ enum Finaliser {
         return Int64((Double(finishBytesPerSecond) * seconds * finishMargin).rounded(.up))
     }
 
+    /// What a refused finalise exits with: the recorder after a stop with too little room, and
+    /// `--recover` with too little room. The same code, so a caller reads both alike.
+    static let refusedStatus: Int32 = 1
+
+    /// The line printed when there is too little room to finish `directory`'s recording.
+    static func tooFullLine(directory: URL) -> String {
+        "the disk is too full to finish the recording; free some space, then run: meetingbox recover \(directory.path)"
+    }
+
+    /// The default free-space source: it knows nothing, and space that cannot be read is never a
+    /// reason to refuse. A caller that wants the room checked gives a real one.
+    static let freeSpaceUnknown: (URL) -> Int64? = { _ in nil }
+
     /// Takes the folder's lock first, so it never runs beside a recorder still
     /// writing there, or beside another finalise. Waits up to `lockWait` seconds for it.
+    /// With a `freeBytes` that reads the folder's volume, a finalise that has to encode first
+    /// checks there is room for the three .m4a (see `finaliseLocked`).
     static func finalise(directory: URL, lockWait: TimeInterval = 0,
                          afterStep: (FinaliseStep) throws -> Void = { _ in },
-                         encode: Encoder = Finaliser.encode) throws {
+                         encode: Encoder = Finaliser.encode,
+                         freeBytes: (URL) -> Int64? = Finaliser.freeSpaceUnknown) throws {
         let lock = try FolderLock(directory, wait: lockWait)
         try withExtendedLifetime(lock) {
-            try finaliseLocked(directory: directory, afterStep: afterStep, encode: encode)
+            try finaliseLocked(directory: directory, afterStep: afterStep, encode: encode, freeBytes: freeBytes)
         }
     }
 
@@ -81,9 +105,13 @@ enum Finaliser {
     /// A test can give its own, to fail the way a full disk does.
     typealias Encoder = (_ name: String, _ output: URL, _ mic: URL, _ call: URL) throws -> Void
 
-    /// For a caller that already holds the folder's lock (the recorder at stop).
+    /// For a caller that already holds the folder's lock (the recorder at stop). The recorder's
+    /// stop does its own room check first (`DiskFloor.refusal`) and gives no `freeBytes`; recovery
+    /// gives one and is refused, before anything is encoded, if the volume holds less than
+    /// `finishNeed` of the seconds in the working files.
     static func finaliseLocked(directory: URL, afterStep: (FinaliseStep) throws -> Void = { _ in },
-                               encode: Encoder = Finaliser.encode) throws {
+                               encode: Encoder = Finaliser.encode,
+                               freeBytes: (URL) -> Int64? = Finaliser.freeSpaceUnknown) throws {
         let fm = FileManager.default
         func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
         func has(_ name: String) -> Bool { fm.fileExists(atPath: url(name).path) }
@@ -101,20 +129,29 @@ enum Finaliser {
         }
 
         // 3: build it from the working files.
-        for name in finals { try? fm.removeItem(at: url(temp(name))) }
+        // What an earlier attempt left is cleared first: it is only ever partial, and it would
+        // hold the very room this attempt needs.
+        func clearTemporaries() { for name in finals { try? fm.removeItem(at: url(temp(name))) } }
+        clearTemporaries()
+        if let seconds = workingSeconds(in: directory), let free = freeBytes(directory), free < finishNeed(seconds: seconds) {
+            throw NoRoomToFinishError(message: tooFullLine(directory: directory))
+        }
         for name in finals {
             do {
                 try encode(name, url(temp(name)), url("mic.caf"), url("call.caf"))
             } catch {
                 // An encode that fails, a full disk most likely, must not leave what it wrote: that
                 // is what keeps the disk full. The working files are never touched here.
-                for made in finals { try? fm.removeItem(at: url(temp(made))) }
+                clearTemporaries()
                 throw error
             }
             try makePrivate(url(temp(name)))
             try afterStep(.encoded(name))
         }
         guard let encoded = durations(finals.map { url(temp($0)) }) else {
+            // Encoded, but not audio that verifies: the three files are as large, and as useless, as
+            // a failed encode's leftovers. Only this run's temporaries go; the working files stay.
+            clearTemporaries()
             throw RecordingError("the files encoded from the working files in \(directory.path) did not verify")
         }
         for (name, newDuration) in zip(finals, encoded) {
@@ -139,6 +176,18 @@ enum Finaliser {
         }
         try writeMarker(in: directory)
         removeWorkingFiles(in: directory)
+    }
+
+    /// The seconds of audio the working files hold: the frames of the longer one over 48 000, as
+    /// every output is as long as the longer side. Nil unless both open; the encode then fails
+    /// with its own reason, and there is nothing to estimate.
+    static func workingSeconds(in directory: URL) -> Double? {
+        var frames: AVAudioFramePosition = 0
+        for name in working {
+            guard let file = try? AVAudioFile(forReading: directory.appendingPathComponent(name)) else { return nil }
+            frames = max(frames, file.length)
+        }
+        return Double(frames) / AudioMixer.sampleRate
     }
 
     static func verify(directory: URL) -> Bool {
@@ -271,6 +320,13 @@ final class FolderLock {
     }
 
     deinit { Darwin.close(fd) }
+}
+
+/// A recovery that finds less free space than the three .m4a need. Nothing was encoded and the
+/// working files are kept; `message` is the line to print (`Finaliser.tooFullLine`).
+struct NoRoomToFinishError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 /// Another process holds a folder's lock: busy for now, not broken.

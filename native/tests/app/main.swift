@@ -1103,15 +1103,57 @@ do {
     check(s.phase == .idle && r.stateOf(dir) == "queued", "P1: a recorder that then finishes is queued")
 }
 
-// Ruling G: a failed orphan that was stopped for disk space keeps that reason.
+// Ruling G: a failed orphan that was stopped for disk space keeps that reason. A meeting.json written
+// before the wording changed (Session.diskStoppedLegacy) is the same stop as one written now, at all
+// three places adopt reads it: the orphan sweep, a named recording whose recorder is gone, and one still found.
+for (which, text) in [("new text", Session.diskStopped), ("old text", Session.diskStoppedLegacy)] {
+    do {
+        let r = Rig()
+        r.rec.recoverResult = false
+        let orphan = r.meeting("2026-10-28_0900") { $0.state = .finalising; $0.error = text }
+        let s = r.make()
+        s.adopt()
+        check(r.stateOf(orphan) == "failed" && r.json(orphan)["error"] as? String == Session.diskStoppedFailed,
+              "G: a failed disk-stopped orphan keeps the disk reason (\(which))")
+    }
+    do {
+        let r = Rig()
+        r.rec.recoverResult = false
+        let dir = r.meeting("2026-10-28_0930") { $0.state = .recording; $0.error = text }
+        r.writeState(dir)
+        let s = r.make()
+        s.adopt()
+        check(r.stateOf(dir) == "failed" && r.json(dir)["error"] as? String == Session.diskStoppedFailed && s.phase == .idle,
+              "G: so does a named recording whose recorder is gone (\(which))")
+    }
+    do {
+        let r = Rig()
+        r.rec.recoverResult = false
+        let dir = r.meeting("2026-10-28_1000") { $0.state = .recording; $0.error = text }
+        r.writeState(dir)
+        r.rec.alive.insert(5151)
+        r.rec.running[dir.path] = 5151
+        let s = r.make()
+        s.adopt()
+        r.rec.exit(5151, 1, verifies: false)
+        r.at(1)
+        check(r.stateOf(dir) == "failed" && r.json(dir)["error"] as? String == Session.diskStoppedFailed,
+              "G: so does a recorder found alive and then gone (\(which))")
+    }
+}
 do {
+    // Not every error is a disk stop: any other text, or none, ends as the generic interruption.
     let r = Rig()
     r.rec.recoverResult = false
-    let orphan = r.meeting("2026-10-28_0900") { $0.state = .finalising; $0.error = Session.diskStopped }
+    let other = r.meeting("2026-10-28_1100") { $0.state = .finalising; $0.error = "the microphone was unplugged" }
+    let none = r.meeting("2026-10-28_1200") { $0.state = .finalising }
     let s = r.make()
     s.adopt()
-    check(r.stateOf(orphan) == "failed" && r.json(orphan)["error"] as? String == Session.diskStoppedFailed,
-          "G: a failed disk-stopped orphan keeps the disk reason")
+    check(r.json(other)["error"] as? String == Session.interrupted && r.json(none)["error"] as? String == Session.interrupted,
+          "G: a failed orphan with another reason, or none, is just interrupted")
+    check(Session.isDiskStopped(Session.diskStopped) && Session.isDiskStopped(Session.diskStoppedLegacy)
+          && !Session.isDiskStopped(Session.diskStoppedFailed) && !Session.isDiskStopped(Session.interrupted) && !Session.isDiskStopped(nil),
+          "G: only the two disk-stop texts are the disk stop; the failed text is not")
 }
 
 // M8: start refuses while recording.dir names a live (or unknown) recorder.
@@ -1474,10 +1516,14 @@ do {
           && Session.lowFloor(recordedSeconds: 7 * 3600) == 1_000_000_000 + Finaliser.finishNeed(seconds: 7 * 3600),
           "I2: both add the same finalise need as the recorder's floor")
     check(Session.stopFloor(recordedSeconds: -5) == 200_000_000, "I2: a clock that ran backwards does not lower the floor")
-    check(Session.diskStopped == "recording stopped because the disk was nearly full (under 200 MB free)"
-          && Session.diskStoppedFailed == "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
+    check(Session.diskStopped == "recording stopped because the disk was nearly full, so that it could be finished"
+          && !Session.diskStopped.contains("200") && !Session.diskStopped.contains("MB"),
+          "G2F2: the stop's message says why in plain words, with no figure to go stale")
+    check(Session.diskStoppedLegacy == "recording stopped because the disk was nearly full (under 200 MB free)",
+          "G2F2: the old message is kept, to be recognised in meetings written with it")
+    check(Session.diskStoppedFailed == "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
           && Session.interrupted == "the recording was interrupted; its files are kept",
-          "I2: the messages are as they were")
+          "I2: the other messages are as they were")
 }
 do {
     // After an hour: the stop is at 362 MB, not 200 MB.
@@ -1490,7 +1536,7 @@ do {
     r.free = 361 * MB
     r.at(3601)
     check(s.phase == .finalising(dir) && r.rec.sent(SIGINT) == 1, "I2: 361 MB free after an hour stops it, with room left to finish")
-    check((r.json(dir)["error"] as? String ?? "").contains("disk"), "I2: and the reason is recorded")
+    check(r.json(dir)["error"] as? String == Session.diskStopped, "I2: and the reason is recorded, in the current words")
 }
 do {
     // The warning is at 1 GB plus the finalise need.

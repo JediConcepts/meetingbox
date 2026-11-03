@@ -114,7 +114,7 @@ final class DiskFloor: @unchecked Sendable {
                         freeBytes: (URL) -> Int64?) -> String? {
         guard stop.reason == .diskFloor, let free = freeBytes(directory),
               free < Finaliser.finishNeed(seconds: secondsWritten) else { return nil }
-        return "the disk is too full to finish the recording; free some space, then run: meetingbox recover \(directory.path)"
+        return Finaliser.tooFullLine(directory: directory)
     }
 
     /// Free bytes on the volume holding `url`, or on its nearest existing parent; nil when unreadable.

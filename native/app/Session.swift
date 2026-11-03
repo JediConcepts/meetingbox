@@ -87,7 +87,14 @@ final class Session {
     /// After SIGTERM, this long before SIGKILL.
     static let killGrace: TimeInterval = 10
     static let interrupted = "the recording was interrupted; its files are kept"
-    static let diskStopped = "recording stopped because the disk was nearly full (under 200 MB free)"
+    static let diskStopped = "recording stopped because the disk was nearly full, so that it could be finished"
+    /// What `diskStopped` said before the stop floor rose with the length of the recording. A
+    /// meeting.json written by that build still carries it, so adopt takes it as the same stop.
+    static let diskStoppedLegacy = "recording stopped because the disk was nearly full (under 200 MB free)"
+    /// Whether a meeting's recorded error is the disk stop, in its current words or its old ones.
+    static func isDiskStopped(_ error: String?) -> Bool {
+        error == diskStopped || error == diskStoppedLegacy
+    }
     static let diskStoppedFailed = "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
 
     private(set) var phase: Phase = .idle
@@ -337,7 +344,7 @@ final class Session {
                     self.record(dir, verified: true, seconds: seconds, reason: nil)
                     self.onFinished?(dir, true)
                 case .failed:
-                    let wasDiskStop = Session.readRecord(dir)?.error == Session.diskStopped
+                    let wasDiskStop = Session.isDiskStopped(Session.readRecord(dir)?.error)
                     self.record(dir, verified: false, seconds: nil,
                                 reason: wasDiskStop ? Session.diskStoppedFailed : Session.interrupted)
                     self.onFinished?(dir, false)
@@ -370,7 +377,7 @@ final class Session {
             }
             // The recorder died with the app: rebuild from the working files, or fail keeping them.
             adopted = true
-            diskStop = record?.error == Session.diskStopped
+            diskStop = Session.isDiskStopped(record?.error)
             frozenSeconds = record?.seconds ?? 0
             wait = nil
             set(.finalising(dir))
@@ -382,7 +389,7 @@ final class Session {
         let record = Session.readRecord(dir)
         pid = found
         adopted = true
-        diskStop = record?.error == Session.diskStopped
+        diskStop = Session.isDiskStopped(record?.error)
         started = record?.started ?? MeetingFolder.parse(dir)?.date ?? t
         pausedSeconds = record?.pausedSeconds ?? 0
         let gen = resetHealth()

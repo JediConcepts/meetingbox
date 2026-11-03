@@ -37,8 +37,10 @@ private func endOffThePool(_ output: RecordingOutput, _ stop: StopRequest, _ dir
 /// `meetingbox --recover <dir>`: finishes a recording whose recorder was killed
 /// or crashed, from its working files. Exit 0 when the folder ends complete, 75
 /// (EX_TEMPFAIL) when another process still holds the folder's lock, 1 with
-/// everything left in place when it cannot. Main calls it on the main
-/// thread, never on the concurrency pool, so finalising may block there.
+/// everything left in place when it cannot, including when the disk is too full
+/// to finish it (nothing is encoded then, and it says to free some space). Main
+/// calls it on the main thread, never on the concurrency pool, so finalising may
+/// block there.
 func runRecover(_ arguments: [String]) -> Never {
     // As before the recorder became one mode of the app: a stop signal must not
     // cut recovery short, and the files it writes are private.
@@ -54,7 +56,7 @@ func runRecover(_ arguments: [String]) -> Never {
         exit(1)
     }
     let dir = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath)
-    let result = recoverStatus(directory: dir)
+    let result = recoverStatus(directory: dir, freeBytes: DiskFloor.freeBytes(near:))
     eprint(result.message)
     exit(result.status)
 }
@@ -294,7 +296,7 @@ func runRecorder(_ arguments: [String]) async -> Never {
     case .refused(let line):
         // The disk is too full to encode: nothing was written, and the working files are kept.
         eprint(line)
-        exit(1)
+        exit(Finaliser.refusedStatus)
     case .failed(let message):
         eprint("Could not finish the recording: \(message)")
         eprint("Its working files are kept. Run: meetingbox recover \(outputDir.path)")

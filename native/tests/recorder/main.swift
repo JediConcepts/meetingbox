@@ -99,6 +99,9 @@ func complete(_ dir: URL) -> Bool {
 
 struct Interrupt: Error {}
 
+/// Free space for a --recover that is not about room: far more than any test folder needs.
+let ample: (URL) -> Int64? = { _ in 5_000_000_000 }
+
 // Files must come out 0600 whatever umask the caller left, so loosen it here.
 umask(0o022)
 
@@ -256,7 +259,7 @@ for (label, files) in [("nothing", [String]()), ("an unreadable audio.m4a", ["au
     for name in files { fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: Data("x".utf8)) }
     let before = snapshot(dir)
     check((try? recover(directory: dir)) == nil && snapshot(dir) == before, "\(label): recover fails and changes nothing")
-    check(recoverStatus(directory: dir).status == 1, "\(label): --recover exits 1")
+    check(recoverStatus(directory: dir, freeBytes: ample).status == 1, "\(label): --recover exits 1")
 }
 
 // Another process holding the folder's lock: a recorder still dying after kill -9.
@@ -292,7 +295,7 @@ do {
     check(message.contains("is still being recorded or saved") && snapshot(dir) == before && waited >= 4.5 && waited < 6.5,
           "a lock held past 5 s: recover fails after about 5 s and changes nothing (\(String(format: "%.1f", waited)) s)")
     // The same lock seen by --recover's exit status: 75 (EX_TEMPFAIL), busy, not 1.
-    let quick = recoverStatus(directory: dir, lockWait: 0)
+    let quick = recoverStatus(directory: dir, lockWait: 0, freeBytes: ample)
     check(quick.status == 75 && quick.message.contains("is still being recorded or saved") && snapshot(dir) == before,
           "--recover exits 75 while another process holds the folder lock")
     holder.terminate()
@@ -506,7 +509,7 @@ do {
     seconds.value = 7 * 3600
     let orphan = FakeDisk([1_000_000_000])
     make(orphan).check()
-    check(orphan.lowCount == 1, "I2: a seven-hour orphan with 1 GB left stops, while there is room to finish")
+    check(orphan.lowCount == 1, "I2: a seven-hour orphan with 1 GB left stops, as 1 GB is below its 1.234 GB floor (100 MB and 1.134 GB to finish)")
 }
 
 // The stop request: one request whoever makes it, and the first reason stands.
@@ -664,11 +667,128 @@ do {
     check(false, "I2: failed encode: \(error)")
 }
 
+// The same when every encode returns but the files do not verify: the three temporaries go, nothing else.
+do {
+    let dir = cafFolder()
+    fm.createFile(atPath: dir.appendingPathComponent("notes.txt").path, contents: Data("mine".utf8))
+    fm.createFile(atPath: dir.appendingPathComponent(".tmp-theirs").path, contents: Data("not this run's".utf8))
+    var calls = 0
+    var message = ""
+    do {
+        try Finaliser.finalise(directory: dir, encode: { name, output, mic, call in
+            calls += 1
+            if calls < 3 {
+                try Finaliser.encode(name, output, mic, call)
+            } else {
+                fm.createFile(atPath: output.path, contents: Data(repeating: 1, count: 4096)) // returns, but is not audio
+            }
+        })
+    } catch { message = error.localizedDescription }
+    check(calls == 3 && message.contains("did not verify"), "I2: encodes that return but do not verify fail the finalise with that reason (\(message))")
+    check(names(dir) == [".tmp-theirs", "call.caf", "mic.caf", "notes.txt"],
+          "I2: all three .tmp-*.m4a of this run are removed; the .caf files, other .tmp- names and anything else are kept (\(names(dir)))")
+    try fm.removeItem(at: dir.appendingPathComponent(".tmp-theirs"))
+    try recover(directory: dir)
+    check(complete(dir) && exists(dir, "notes.txt"), "I2: and a later recover finishes the folder")
+} catch {
+    check(false, "I2: failed verify: \(error)")
+}
+
 // A simulated crash is not an encode that failed: its temporary stays, for recovery to clear.
 do {
     let dir = cafFolder()
     do { try Finaliser.finalise(directory: dir, afterStep: { step in if step == .encoded("audio.m4a") { throw Interrupt() } }) } catch is Interrupt {}
     check(exists(dir, ".tmp-audio.m4a"), "I2: only a failed encode clears the temporaries; an interruption elsewhere leaves them")
+}
+
+// MARK: - Recovery looks for room first (Gate 2 fix round 2, item 4)
+// --recover gets the stop's check: the three .m4a need finishNeed of the seconds the working files hold
+// (frames of the longer one over 48 000). Too little room: nothing is encoded, the files stay, the same
+// line is printed and the exit status is a refused stop's. Fake free space, as in the stop's tests above.
+
+do {
+    check(Finaliser.refusedStatus == 1, "R2: a refusal exits 1, as a refused stop does")
+    check(Finaliser.tooFullLine(directory: URL(fileURLWithPath: "/x/y")) == tooFull + "/x/y",
+          "R2: it is the same line a refused stop prints")
+    check(Finaliser.workingSeconds(in: cafFolder(micSeconds: 2, callSeconds: 6)) == 6, "R2: the seconds are the longer file's frames over 48 000")
+    check(Finaliser.workingSeconds(in: newFolder()) == nil, "R2: no working files, no seconds")
+}
+
+do {
+    // 3 s on each side: finalising needs 135 000 bytes.
+    let dir = cafFolder()
+    let before = snapshot(dir)
+    var asked: [URL] = []
+    let refused = recoverStatus(directory: dir, freeBytes: { asked.append($0); return 134_999 })
+    check(refused.status == 1 && refused.message == tooFull + dir.path, "R2: with less room than finalising needs, --recover refuses with the line, exit 1")
+    check(snapshot(dir) == before && untouched(dir), "R2: and encodes nothing: both .caf as they were, no .m4a, no temporaries, no marker (\(names(dir)))")
+    check(asked == [dir], "R2: the recording folder is the one asked about")
+    let enough = recoverStatus(directory: dir, freeBytes: { _ in 135_000 })
+    check(enough.status == 0 && enough.message == "Recovered \(dir.path)" && complete(dir),
+          "R2: exactly what finalising needs is room enough, and the same folder then recovers")
+}
+
+do {
+    // The longer file counts: 2 s and 6 s need 270 000 bytes, not 90 000.
+    let dir = cafFolder(micSeconds: 2, callSeconds: 6)
+    check(recoverStatus(directory: dir, freeBytes: { _ in 269_999 }) == (1, tooFull + dir.path) && untouched(dir),
+          "R2: 2 s and 6 s need 270 000 bytes (the longer file): 269 999 is refused")
+    check(recoverStatus(directory: dir, freeBytes: { _ in 270_000 }).status == 0 && complete(dir), "R2: and 270 000 recovers")
+}
+
+do {
+    let dir = cafFolder()
+    let result = recoverStatus(directory: dir, freeBytes: { _ in nil })
+    check(result.status == 0 && complete(dir), "R2: space that cannot be read is not a reason to refuse")
+}
+
+do {
+    // A stale temporary from an interrupted finalise is not counted against the room, and a refusal keeps the rest.
+    let dir = cafFolder()
+    fm.createFile(atPath: dir.appendingPathComponent(".tmp-audio.m4a").path, contents: Data(repeating: 1, count: 4096))
+    fm.createFile(atPath: dir.appendingPathComponent("notes.txt").path, contents: Data("mine".utf8))
+    let cafs = ["mic.caf", "call.caf"].map { name in (name, try? Data(contentsOf: dir.appendingPathComponent(name))) }
+    let result = recoverStatus(directory: dir, freeBytes: { _ in 1 })
+    check(result.status == 1 && result.message == tooFull + dir.path, "R2: a folder with a stale temporary is refused the same way")
+    check(names(dir) == ["call.caf", "mic.caf", "notes.txt"], "R2: its stale temporary is cleared as before; the .caf files and anything else are kept (\(names(dir)))")
+    check(cafs.allSatisfy { (try? Data(contentsOf: dir.appendingPathComponent($0.0))) == $0.1 }, "R2: and the .caf files are byte for byte what they were")
+}
+
+do {
+    // Only a recovery that has to encode needs room: a finished folder asks for nothing.
+    let dir = cafFolder()
+    try recover(directory: dir)
+    let before = snapshot(dir)
+    let result = recoverStatus(directory: dir, freeBytes: { _ in 0 })
+    check(result.status == 0 && snapshot(dir) == before, "R2: a folder that is already complete is not refused, whatever is free")
+
+    // Three verified .m4a beside the working files (a crash before the marker) need no encoding, so no room.
+    let crashed = cafFolder()
+    for name in finals { try fm.copyItem(at: dir.appendingPathComponent(name), to: crashed.appendingPathComponent(name)) }
+    let finished = recoverStatus(directory: crashed, freeBytes: { _ in 0 })
+    check(finished.status == 0 && complete(crashed), "R2: verified .m4a beside the working files are finished with no room at all")
+} catch {
+    check(false, "R2: complete folder: \(error)")
+}
+
+do {
+    // The lock comes first: a recorder still holding the folder is busy (75), not a full disk.
+    let dir = cafFolder()
+    let holder = holdLock(dir, for: 2)
+    let before = snapshot(dir)
+    let result = recoverStatus(directory: dir, lockWait: 0, freeBytes: { _ in 1 })
+    check(result.status == 75 && result.message.contains("is still being recorded or saved") && snapshot(dir) == before,
+          "R2: a folder still locked is busy (75), not refused for room")
+    holder.terminate()
+    holder.waitUntilExit()
+}
+
+do {
+    // Nothing to recover from is that error, whatever is free.
+    let dir = newFolder()
+    let result = recoverStatus(directory: dir, freeBytes: { _ in 1 })
+    check(result.status == 1 && result.message.contains("no working files to recover from") && !result.message.contains("too full"),
+          "R2: a folder with no working files fails for that, not for room")
 }
 
 try? fm.removeItem(at: scratch)
