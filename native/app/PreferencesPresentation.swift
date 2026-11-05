@@ -197,14 +197,12 @@ enum PreferencesPresentation {
     static let folderBusy = "The folder can be changed once the recording has finished"
     static let folderStillFinishing = "Some meetings in the current folder are still being finished. Try again when they are done."
 
-    /// A meeting in the folder is still being finished: queued, processing, recording or finalising, or
-    /// a recording the recorder never finished (`MeetingFolder.recordingUnfinished`, whatever its state
-    /// says). Moving away then would leave it where neither the queue nor recovery looks. Reads the
-    /// folders: call it off the main queue.
+    /// A meeting in the folder is in progress: queued, processing, recording or finalising. Moving away
+    /// then would leave it where neither the queue nor recovery looks. A recording the recorder never
+    /// finished that is failed or never processed does not count: nothing finishes it on its own, in
+    /// this folder or any other (`meetingbox recover` does), so waiting would not help.
     static func stillFinishing(_ meetings: [Meeting]) -> Bool {
-        meetings.contains {
-            [MeetingState.queued, .processing, .recording, .finalising].contains($0.state) || MeetingFolder.recordingUnfinished($0.folder.url)
-        }
+        meetings.contains { [MeetingState.queued, .processing, .recording, .finalising].contains($0.state) }
     }
 
     /// Choose… is offered only while nothing is recording, paused or finalising: the library follows

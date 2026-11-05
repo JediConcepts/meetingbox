@@ -289,16 +289,19 @@ final class AppModel: ObservableObject {
     }
 
     /// The meetings folder. Taken only while nothing is recording, paused or finalising, only an
-    /// existing folder this user can write to, and only once nothing in the current folder is still
-    /// being finished (`PreferencesPresentation.stillFinishing`) and the queue has no work: a meeting
-    /// left behind would be in a folder neither the queue nor recovery looks in. Otherwise
-    /// `folderProblem` says why and nothing changes.
+    /// existing folder this user can write to, and only once nothing in the current folder is in
+    /// progress (`PreferencesPresentation.stillFinishing`) and the queue has no work: a meeting left
+    /// behind would be in a folder neither the queue nor recovery looks in. Otherwise `folderProblem`
+    /// says why and nothing changes.
     ///
     /// The current folder is read off the main queue; the move is then made on the main queue, after
-    /// the session and the queue are checked again (only the latest choice is made). The next recording
-    /// goes there (`ControlHandler` reads the setting at each start), and the one store the session, the
+    /// the session and the queue are checked again. Only the latest choice is made: every choice,
+    /// refused at once or not, overtakes an earlier one still being checked. The next recording goes
+    /// there (`ControlHandler` reads the setting at each start), and the one store the session, the
     /// queue and the library share moves to it.
     func setMeetingsFolder(_ url: URL) {
+        folderMovesAsked += 1
+        let asked = folderMovesAsked
         guard PreferencesPresentation.canChooseFolder(session.phase) else {
             folderProblem = PreferencesPresentation.folderBusy
             return
@@ -307,8 +310,6 @@ final class AppModel: ObservableObject {
             folderProblem = problem
             return
         }
-        folderMovesAsked += 1
-        let asked = folderMovesAsked
         let store = self.store
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let finishing = PreferencesPresentation.stillFinishing(store.scan())

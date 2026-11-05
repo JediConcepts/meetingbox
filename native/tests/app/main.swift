@@ -3576,8 +3576,9 @@ do {
     check(hungPid > 0 && kill(hungPid, 0) != 0, "T9 mic: and the helper is ended")
 }
 
-// The meetings folder moves only once nothing in the current one is still being finished: queued,
-// processing, recording or finalising, or a recording the recorder never finished.
+// The meetings folder moves only once nothing in the current one is in progress: queued, processing,
+// recording or finalising. A recording the recorder never finished that is failed or never processed
+// does not hold it up: nothing would ever finish it, in this folder or any other.
 do {
     check(PreferencesPresentation.folderStillFinishing == "Some meetings in the current folder are still being finished. Try again when they are done.",
           "T9 move: the refusal, word for word")
@@ -3598,9 +3599,11 @@ do {
     }
     let cut = make(root, "2026-11-05_0900", files: ["mic.caf": "x"])
     try! store.update(cut) { $0.state = .failed; $0.error = Session.interrupted }
-    check(PreferencesPresentation.stillFinishing(store.scan()), "T9 move: a recording the recorder never finished is still being finished, whatever its state says")
-    fm.createFile(atPath: cut.appendingPathComponent(Finaliser.marker).path, contents: Data())
-    check(!PreferencesPresentation.stillFinishing(store.scan()), "T9 move: once its marker is written it is finished")
+    _ = make(root, "2026-11-06_0900", files: ["call.caf": "x"]) // no meeting.json: never processed
+    check(MeetingFolder.recordingUnfinished(cut) && !PreferencesPresentation.stillFinishing(store.scan()),
+          "T9 move: a recording the recorder never finished, failed or never processed, does not hold up the move")
+    try! store.update(cut) { $0.state = .finalising }
+    check(PreferencesPresentation.stillFinishing(store.scan()), "T9 move: the same recording still finalising does")
 }
 
 // The recording entries the Dock menu, the main menu's Recording menu and New meeting share: the menu bar
@@ -3755,21 +3758,27 @@ MainActor.assumeIsolated {
     check(settle { model.folderProblem == stillFinishing } && prefs.meetingsFolder.path == meetingsA.path && model.store.root.path == meetingsA.path,
           "T9 move: a queued meeting in the current folder refuses the move, in those words, and nothing changes")
     try! model.store.update(waiting) { $0.state = .done }
-    let cut = make(meetingsA, "2026-10-29_0900", files: ["mic.caf": "x"])
-    model.clearFolderProblem()
-    model.setMeetingsFolder(meetingsB)
-    check(settle { model.folderProblem == stillFinishing } && prefs.meetingsFolder.path == meetingsA.path && model.store.root.path == meetingsA.path,
-          "T9 move: so does a recording the recorder never finished")
-    fm.createFile(atPath: cut.appendingPathComponent(Finaliser.marker).path, contents: Data())
+    // recordings the recorder never finished, one failed and one never processed: nothing would finish
+    // them, here or anywhere else, so they do not hold the move up
+    let cutFailed = make(meetingsA, "2026-10-29_0900", files: ["mic.caf": "x"])
+    try! model.store.update(cutFailed) { $0.state = .failed; $0.error = Session.interrupted }
+    let cutNever = make(meetingsA, "2026-10-28_0900", files: ["call.caf": "x"])
     model.clearFolderProblem()
     model.setMeetingsFolder(meetingsB)
     check(settle { prefs.meetingsFolder.path == meetingsB.path } && model.folderProblem == nil && model.store.root.path == meetingsB.path,
-          "T9 move: with nothing left being finished the folder moves, and the store with it")
+          "T9 move: with nothing in progress the folder moves, past recordings never finished, failed or never processed")
+    check(MeetingFolder.recordingUnfinished(cutFailed) && MeetingFolder.recordingUnfinished(cutNever) && stateOf(cutFailed) == "failed" && stateOf(cutNever) == nil,
+          "T9 move: and those recordings are left exactly as they were")
     check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-03_0900", "2026-11-02_0900"] },
           "T9 folder: the library reads the new folder at once")
+    // a valid choice whose read of the folder is still running is overtaken by a later choice that is refused
+    model.setMeetingsFolder(meetingsA)
     model.setMeetingsFolder(meetingsB.appendingPathComponent("2026-11-03_0900/notes.md"))
     check(model.folderProblem == "meetingbox cannot use that folder" && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
           "T9 folder: one meetingbox cannot use is refused, in those words, and nothing moves")
+    _ = settle({ false }, timeout: 1)
+    check(model.folderProblem == "meetingbox cannot use that folder" && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
+          "T9 move: an earlier choice still being checked never lands after a later refused one")
 
     // the next recording: the microphone and the folder chosen
     model.perform(.start)
