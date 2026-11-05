@@ -27,7 +27,8 @@ one, and only if setup itself installed it there.
 ### Updating
 
 Run `./install.sh` again (or `meetingbox setup`). Setup rebuilds the app when the
-version or its source has changed. A running meetingbox is quit just before it is
+version has changed or, for a build from a checkout (`./install.sh` there), when
+its source or its build recipe has. A running meetingbox is quit just before it is
 replaced and opened again at the end, so an old copy never carries on running.
 Setup will not replace the app while a recording is running, finishing or being
 recovered: it says so and changes nothing. That includes a recording an older
@@ -101,6 +102,9 @@ Three ways to control it, each switched on or off in Preferences:
 
 The menu bar item stays on while the Dock icon is off, so there is always a way in.
 
+The hotkey is not a Preference: it is a shortcut in the Shortcuts app that runs
+`meetingbox` (see On a hotkey).
+
 **Preferences** (meetingbox menu, or Cmd-comma): the menu bar item, the Dock icon,
 the floating button (Always, While recording, Never), open the minutes when they
 are ready (on; never while a recording is running), sounds (on), the microphone
@@ -171,7 +175,9 @@ meetingbox recover ~/Meetings/2026-10-27_1430
 
 `meetingbox process` refuses a folder that was never finished, and says to run this.
 Files meetingbox writes in a meeting folder are readable by you only. meetingbox
-never deletes a meeting folder or its audio.
+never deletes a meeting folder. It deletes a meeting's audio only when asked to,
+with `--no-keep-audio` (or `MB_KEEP_AUDIO=0`) for `meetingbox process`, and only
+after the minutes are written.
 
 ## On a hotkey
 

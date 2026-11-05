@@ -157,6 +157,28 @@ if [ -n "$h_root" ] && [ "$h_copy" = "$h_root" ] && [ "$h_changed" != "$h_copy" 
   pass "source_hash: the same for a copy, different for a changed, added or removed file, empty with no source"
 else fail "source_hash: the same for a copy, different for a changed, added or removed file, empty with no source ($h_root $h_copy $h_changed $h_added $h_removed '$h_none')"; fi
 
+# The build recipe is part of it (fix round 1, U3): the compile lines and the Info.plists live in
+# the script's build_app and install_recorder, so a change there is a different build too. A
+# comment is not: declare -f leaves comments out.
+saved_build="$(declare -f build_app)"
+saved_install="$(declare -f install_recorder)"
+eval "$(printf '%s\n' "$saved_build" | sed 's/LSMinimumSystemVersion<\/key><string>14\.0/LSMinimumSystemVersion<\/key><string>15.0/')"
+h_plist="$(source_hash)"
+eval "$saved_build"
+eval "$(printf '%s\n' "$saved_install" | sed 's/swiftc -O -o/swiftc -Onone -o/')"
+h_flags="$(source_hash)"
+eval "$saved_install"
+h_back="$(source_hash)"
+eval "$(printf '%s\n' "$saved_build" | sed '2a\
+  # only a comment
+')"
+h_comment="$(source_hash)"
+eval "$saved_build"
+if [ "$h_plist" != "$h_root" ] && [ "$h_flags" != "$h_root" ] && [ "$h_flags" != "$h_plist" ] \
+   && [ "$h_back" = "$h_root" ] && [ "$h_comment" = "$h_root" ]; then
+  pass "source_hash covers the build recipe (an Info.plist value, a compile flag), not a comment"
+else fail "source_hash covers the build recipe (an Info.plist value, a compile flag), not a comment ($h_root $h_plist $h_flags $h_back $h_comment)"; fi
+
 rm -rf -- "$plain"; mkdir -p "$plain"; cp -R "$ROOT/native" "$plain/native"
 SOURCE_DIR="$plain"
 build_app >/dev/null 2>&1; rc=$?
@@ -170,20 +192,27 @@ rm -rf -- "$plain"
 build_app >/dev/null 2>&1
 
 # setup rebuilds when the source changed, even at the same VERSION (a dev build once kept the old
-# app). With no source on disk (a clone not made yet) only the version can be compared.
+# app). That is a build from MB_SOURCE_DIR; with no source on disk only the version is compared.
 TRANSCRIPT_BIN="$HOME/t-mb-transcript"; printf '#!/bin/sh\n' > "$TRANSCRIPT_BIN"; chmod +x "$TRANSCRIPT_BIN"
 nr() { if need_recorder; then echo yes; else echo no; fi; }
-same="$(nr)"
+MB_SOURCE_DIR="$ROOT"; same="$(nr)"
 mkdir -p "$plain"; cp -R "$ROOT/native" "$plain/native"; printf '\n// changed\n' >> "$plain/native/app/Session.swift"
-SOURCE_DIR="$plain"; changed="$(nr)"
-SOURCE_DIR="$HOME/no-source"; none="$(nr)"
-SOURCE_DIR="$ROOT"
+MB_SOURCE_DIR="$plain"; SOURCE_DIR="$plain"; changed="$(nr)"
+MB_SOURCE_DIR="$HOME/no-source"; SOURCE_DIR="$HOME/no-source"; none="$(nr)"
+MB_SOURCE_DIR="$ROOT"; SOURCE_DIR="$ROOT"
 cp "$plist" "$HOME/plist-aside"
 /usr/libexec/PlistBuddy -c 'Delete :MBSourceHash' "$plist" >/dev/null 2>&1; unstamped="$(nr)"
 cp "$HOME/plist-aside" "$plist"
 if [ "$same" = no ] && [ "$changed" = yes ] && [ "$none" = no ] && [ "$unstamped" = yes ]; then
   pass "need_recorder: rebuild when the source hash differs or is missing, not when it matches or there is no source"
 else fail "need_recorder: rebuild when the source hash differs or is missing, not when it matches or there is no source ($same $changed $none $unstamped)"; fi
+# A release clone (no MB_SOURCE_DIR) is pinned by its tag, which VERSION names: one left at an
+# older tag, before fetch_source has moved it on, is no reason to rebuild (fix round 1, U2).
+unset MB_SOURCE_DIR
+SOURCE_DIR="$plain"; stale="$(nr)"
+SOURCE_DIR="$ROOT"
+if [ "$stale" = no ]; then pass "need_recorder: a release clone at another source is no reason to rebuild"
+else fail "need_recorder: a release clone at another source is no reason to rebuild ($stale)"; fi
 rm -rf -- "$plain"
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 
@@ -368,6 +397,52 @@ cline="$(grep -n '^codesign --force' "$HOME/calls.log" | head -n 1 | cut -d: -f1
 if [ -n "$qline" ] && [ -n "$cline" ] && [ "$qline" -lt "$cline" ]; then
   pass "resign_app quits a running app before signing it"
 else fail "resign_app quits a running app before signing it: $(cat "$HOME/calls.log")"; fi
+
+# --- busy again by the time the app is to be quit (fix round 1, S1/D1/U1) ---
+# setup checks at its start, then asks, fetches and compiles for minutes. A recording started
+# meanwhile (the hotkey, the menu bar) must stop it before any Apple event reaches the app.
+BUSY_MSG='a recording is still being saved. Wait for it, or run: meetingbox stop'
+eval "$(declare -f swiftc | sed '1s/^swiftc /plain_swiftc /')"
+swiftc() { plain_swiftc "$@"; local rc=$?; [ -n "${BUSY_AFTER_COMPILE:-}" ] && printf '%s' "$HOME/Meetings/late" > "$DIR_FILE"; return "$rc"; }
+: > "$HOME/app-running"; : > "$HOME/app-quits"; rm -f "$DIR_FILE"
+printf 'still here' > "$APP_DIR/marker"
+before="$(snapshot)"
+: > "$HOME/calls.log"
+mktemp() { local d; d="$(command mktemp "$@")" || return 1; echo "mktemp $d" >> "$HOME/calls.log"; printf '%s\n' "$d"; }
+out="$(BUSY_AFTER_COMPILE=1 build_app 2>&1)"; rc=$?
+unset -f mktemp
+made="$(sed -n 's/^mktemp //p' "$HOME/calls.log")"
+leftover=""
+for d in $made; do [ -e "$d" ] && leftover="$leftover $d"; done
+if [ "$rc" -ne 0 ] && grep -q '^swiftc ' "$HOME/calls.log" && ! grep -q '^osascript' "$HOME/calls.log" \
+   && printf '%s\n' "$out" | grep -qF "$BUSY_MSG" && [ "$(snapshot)" = "$before" ] && [ -e "$HOME/app-running" ] \
+   && ! grep -q '^codesign --force' "$HOME/calls.log" && [ -n "$made" ] && [ -z "$leftover" ]; then
+  pass "build_app: a recording started during the compile stops it before the quit, nothing changed or left"
+else fail "build_app: a recording started during the compile stops it before the quit, nothing changed or left (rc $rc): $out $(cat "$HOME/calls.log") $leftover"; fi
+rm -f "$DIR_FILE"
+
+# A recorder from the helper, running by the time resign_app is reached: nothing is signed.
+ps() { printf '  888 %s --record -o %s -n meeting\n' "$REC_BIN" "$HOME/Meetings/y"; }
+: > "$HOME/calls.log"
+out="$(resign_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && ! grep -q '^osascript\|^codesign\|^tccutil\|^security' "$HOME/calls.log" \
+   && printf '%s\n' "$out" | grep -qF "$BUSY_MSG" && [ "$(snapshot)" = "$before" ] && [ -e "$HOME/app-running" ]; then
+  pass "resign_app: a recording running by then stops it before the quit, nothing signed"
+else fail "resign_app: a recording running by then stops it before the quit, nothing signed (rc $rc): $out $(cat "$HOME/calls.log")"; fi
+
+# Keep recording and quit: the app goes, its recorder carries on. Nothing is replaced under it.
+ps() { [ -e "$HOME/app-running" ] || printf '  889 %s --record -o %s -n meeting\n' "$REC_BIN" "$HOME/Meetings/z"; }
+: > "$HOME/app-running"; : > "$HOME/app-quits"; : > "$HOME/calls.log"
+out="$(build_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && grep -qxF "$QUIT" "$HOME/calls.log" && [ ! -e "$HOME/app-running" ] \
+   && printf '%s\n' "$out" | grep -q 'still running' && [ "$(snapshot)" = "$before" ] \
+   && ! grep -q '^codesign --force' "$HOME/calls.log"; then
+  pass "build_app: a recorder that outlives the app is not replaced under"
+else fail "build_app: a recorder that outlives the app is not replaced under (rc $rc): $out $(cat "$HOME/calls.log")"; fi
+unset -f ps
+eval "$(declare -f plain_swiftc | sed '1s/^plain_swiftc /swiftc /')"
+unset -f plain_swiftc
+rm -f "$APP_DIR/marker" "$HOME/app-running" "$HOME/app-quits"
 rm -f "$HOME/app-running" "$HOME/app-quits"
 unset -f app_lock_held osascript sleep
 
@@ -511,13 +586,29 @@ else fail "setup rebuilds when nothing is being recorded or saved (rc $rc): $out
 
 # --- Task 10: what else counts as busy ---
 # A session left open (recording.dir): a v1.3.1 recording, or the app's own. With nothing
-# recording and no app running, the way to clear one left behind is named.
+# recording and no app running: with no 2.0 app installed it is a 1.3.x leftover, and the way to
+# clear it is named; with the 2.0 app installed it is a recording that app did not finish (it
+# stopped with its recorder), and opening meetingbox recovers it, as status says (fix round 1, D2).
 printf '%s' "$BASE_DIR/2026-10-27_1430" > "$DIR_FILE"
-refuses "recording.dir is there (a v1.3.1 session)"
+cp "$APP_DIR/Contents/Info.plist" "$HOME/plist-aside"
+/usr/libexec/PlistBuddy -c 'Delete :MBScriptPath' "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1
+refuses "recording.dir is there, no 2.0 app (a v1.3.1 session)"
 if printf '%s\n' "$out" | grep -qF "nothing is recording into $BASE_DIR/2026-10-27_1430 now" \
-   && printf '%s\n' "$out" | grep -qF "meetingbox reset"; then
-  pass "a session with nothing recording names its folder and how to clear it"
-else fail "a session with nothing recording names its folder and how to clear it: $out"; fi
+   && printf '%s\n' "$out" | grep -qF "meetingbox reset" && ! printf '%s\n' "$out" | grep -q 'open meetingbox'; then
+  pass "a 1.3.x session with nothing recording names its folder and how to clear it"
+else fail "a 1.3.x session with nothing recording names its folder and how to clear it: $out"; fi
+# An app running (app.lock held) has the session in hand: no way to clear it is offered (S3 c).
+app_lock_held() { return 0; }
+refuses "recording.dir is there and an app is running"
+if ! printf '%s\n' "$out" | grep -q 'meetingbox reset\|open meetingbox'; then pass "a session an app is running for is not called clearable"
+else fail "a session an app is running for is not called clearable: $out"; fi
+app_lock_held() { return 1; }
+cp "$HOME/plist-aside" "$APP_DIR/Contents/Info.plist"
+refuses "recording.dir is there, the 2.0 app installed and not running"
+if printf '%s\n' "$out" | grep -qF "the recording in $BASE_DIR/2026-10-27_1430 did not finish; open meetingbox to recover it" \
+   && ! printf '%s\n' "$out" | grep -q 'meetingbox reset'; then
+  pass "a 2.0 session with nothing recording says to open meetingbox to recover it, not to reset"
+else fail "a 2.0 session with nothing recording says to open meetingbox to recover it, not to reset: $out"; fi
 FAKE_PS="$REC_BIN --record -o $BASE_DIR/2026-10-27_1430 -n meeting"
 refuses "recording.dir is there and its recorder is running"
 if ! printf '%s\n' "$out" | grep -q "meetingbox reset"; then pass "a session still recording is not called clearable"
@@ -548,9 +639,17 @@ refuses "a meeting.json in the app's meetings folder says recording"
 if grep -qxF "defaults read com.jediconcepts.meetingbox meetingsFolder" "$HOME/calls.log"; then
   pass "the meetings folder is read from the app's preference"
 else fail "the meetings folder is read from the app's preference: $(cat "$HOME/calls.log")"; fi
+# Run from $HOME, where Moved/*/meeting.json says recording: a relative value would find it.
 FAKE_PREF="Moved"
-if ! recording_busy; then pass "a meetings folder preference that is not a full path is ignored"
+if ! (cd "$HOME" && recording_busy); then pass "a meetings folder preference that is not a full path is ignored"
 else fail "a meetings folder preference that is not a full path is ignored"; fi
+odd="$HOME/$(printf 'odd\nname')"
+mkdir -p "$odd/2026-11-01_1100"
+printf '{"id":"4","state":"recording"}' > "$odd/2026-11-01_1100/meeting.json"
+FAKE_PREF="$odd"
+if ! recording_busy; then pass "a meetings folder preference of more than one line is ignored"
+else fail "a meetings folder preference of more than one line is ignored"; fi
+rm -rf -- "$odd"
 FAKE_PREF=""
 if ! recording_busy; then pass "with no preference, only the default folder is looked at"
 else fail "with no preference, only the default folder is looked at"; fi
@@ -595,6 +694,17 @@ if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'everything is already in p
    && ! installed_by_us "$OLD_APP_DIR" && [ "$last" = "open $APP_DIR" ] && ! grep -q '^install_recorder' "$HOME/calls.log"; then
   pass "with everything in place, setup still removes the recorded old app and ends by opening the app"
 else fail "with everything in place, setup still removes the recorded old app and ends by opening the app (rc $rc): $(cat "$HOME/calls.log") $out"; fi
+
+# An app that is not built for this command (no MBScriptPath: meetingbox 1.3 or earlier) is never
+# opened at the end: opened with no arguments it would start recording on its own (S3 b).
+cp "$APP_DIR/Contents/Info.plist" "$HOME/plist-aside"
+/usr/libexec/PlistBuddy -c 'Delete :MBScriptPath' "$APP_DIR/Contents/Info.plist" >/dev/null 2>&1
+: > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '^prime_permissions' "$HOME/calls.log" && ! grep -q '^open ' "$HOME/calls.log"; then
+  pass "setup does not open an app that is not built for this command"
+else fail "setup does not open an app that is not built for this command (rc $rc): $(cat "$HOME/calls.log")"; fi
+cp "$HOME/plist-aside" "$APP_DIR/Contents/Info.plist"
 unset -f need_recorder
 LSREGISTER=/usr/bin/true
 

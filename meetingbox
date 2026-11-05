@@ -257,9 +257,9 @@ open_privacy() {
 
 on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 
-# Ready means built, and built by this version, so updating meetingbox rebuilds it. setup also
-# rebuilds an app built from other source than is on disk now (need_recorder): a build with the
-# same VERSION would otherwise keep the old app.
+# Ready means built, and built by this version, so updating meetingbox rebuilds it. setup from
+# MB_SOURCE_DIR also rebuilds an app built from other source than is there now (need_recorder):
+# a build with the same VERSION would otherwise keep the old app.
 recorder_ready() {
   [ -x "$APP_BIN" ] || return 1
   # an app built before the helper existed has the right version and no helper
@@ -271,7 +271,9 @@ recorder_ready() {
 }
 
 # The source the app and mb-transcript are built from (the Swift and the icon) as one hash of
-# each file's name, relative to the source folder, and contents. A build is stamped with it
+# each file's name, relative to the source folder, and contents, with the recipe that builds
+# them: the compile lines and the two Info.plists, which live in this script's build_app and
+# install_recorder (declare -f, so comments do not count). A build is stamped with it
 # (MBSourceHash), so it is known by its source whatever VERSION says. Empty with no source.
 source_hash() {
   local f
@@ -282,7 +284,9 @@ source_hash() {
     if [ -f "$f" ]; then set -- "$@" "${f#"$SOURCE_DIR"/}"; fi
   done
   [ "$#" -gt 0 ] || return 0
-  { (cd "$SOURCE_DIR" && shasum -a 256 -- "$@") | LC_ALL=C sort | shasum -a 256 | cut -d' ' -f1; } || true
+  { { (cd "$SOURCE_DIR" && shasum -a 256 -- "$@")
+      printf '%s  (build recipe)\n' "$(declare -f build_app install_recorder | shasum -a 256 | cut -d' ' -f1)"
+    } | LC_ALL=C sort | shasum -a 256 | cut -d' ' -f1; } || true
 }
 
 # The source's commit, short, when the source folder is a git checkout of its own (not a folder
@@ -295,10 +299,13 @@ source_commit() {
   printf '%s' "$c"
 }
 
-# Built from the source on disk now. With no source on disk (a clone not made yet) only the
-# version can be compared, and recorder_ready has.
+# Built from the source on disk now. Only a build from MB_SOURCE_DIR is compared: a release
+# clone is pinned by its tag, which VERSION names (recorder_ready compares that), and one left at
+# an older tag is moved on by fetch_source only once a rebuild is under way. With no source on
+# disk there is nothing to compare either.
 built_from_source() {
   local now
+  [ -n "${MB_SOURCE_DIR:-}" ] || return 0
   now="$(source_hash)"
   [ -z "$now" ] || [ "$now" = "$(plist_value "$APP_DIR/Contents/Info.plist" MBSourceHash)" ]
 }
@@ -418,18 +425,29 @@ refuse_while_busy() {
   fi
   recording_busy || return 0
   warn "a recording is still being saved. Wait for it, or run: meetingbox stop"
-  # recording.dir with nothing recording and no app to finish it: left by an earlier meetingbox.
+  # recording.dir with nothing recording and no app running. Left by meetingbox 1.3 or earlier
+  # (no 2.0 app installed), reset clears it. Left by a 2.0 app that stopped with its recorder,
+  # opening meetingbox recovers it, as status says.
   if has_session && ! capture_running && ! app_lock_held; then
-    info "nothing is recording into $(session_dir) now. If an older meetingbox left it there, clear it with: meetingbox reset"
+    if app_is_client_aware; then
+      info "the recording in $(session_dir) did not finish; open meetingbox to recover it"
+    else
+      info "nothing is recording into $(session_dir) now. If an older meetingbox left it there, clear it with: meetingbox reset"
+    fi
   fi
   return 1
 }
 
-# A running app is asked to quit, as its own Quit menu would, and given 10 s to go. Nothing is
-# recording (every caller has checked), so it quits at once. Only a running app is asked
-# (app.lock is held for its whole life), so this never starts one.
+# A running app is asked to quit, as its own Quit menu would, and given 10 s to go. Every caller
+# is about to replace or remove the app, and setup can spend minutes asking, fetching and
+# compiling first, so a recording started meanwhile is checked for here, before any Apple event
+# is sent (the app's own quit dialog covers the moment between): then it refuses, as
+# refuse_while_busy does. $1: the command, to run again afterwards. Only a running app is asked
+# (app.lock is held for its whole life), so this never starts one. A recorder that outlives the
+# app (Keep recording and quit) leaves everything as it was too.
 quit_app() {
   local i=0
+  refuse_while_busy "$1" || return 1
   app_lock_held || return 0
   info "quitting the meetingbox app"
   osascript -e "quit app id \"$APP_ID\"" >/dev/null 2>&1 || true
@@ -440,6 +458,11 @@ quit_app() {
     fi
     sleep 0.1; i=$((i + 1))
   done
+  if capture_running; then
+    warn "a recording is still running after the app quit, so nothing was changed"
+    info "open meetingbox and stop it, then run: meetingbox $1"
+    return 1
+  fi
 }
 
 # setup ends with the app running. Only an app built for this command is opened: one from
@@ -678,7 +701,7 @@ PLIST
   # left as it was. The new bundle goes only where nothing is left (move_bundle).
   # ~/Applications is the user's own folder, so it is made if missing but never recorded.
   mkdir -p "$(dirname "$APP_DIR")"
-  quit_app || { rm -rf -- "$build_tmp"; return 1; }
+  quit_app setup || { rm -rf -- "$build_tmp"; return 1; }
   claim_path "$APP_DIR" || { rm -rf -- "$build_tmp"; return 1; }
   if ! move_bundle "$bundle" "$APP_DIR"; then
     rm -rf -- "$build_tmp"
@@ -735,7 +758,7 @@ sign_app() {
 resign_app() {
   say "the signing certificate"
   # Signing rewrites the bundle, so a running app is quit first, as for a build.
-  quit_app || return 1
+  quit_app setup || return 1
   if sign_app; then
     register_app
     forget_old_approvals
@@ -1011,7 +1034,13 @@ prime_permissions() {
     if test_recording; then ok "recording works"; return 0; fi
     [ "$tries" -lt 3 ] || break
     tries=$((tries + 1))
-    if grep -q 'start system audio' "$PERM_DIR/log" 2>/dev/null; then
+    # No display (the screen asleep or locked) also fails to start system audio, and is no
+    # missing permission: the screen just has to be woken.
+    if grep -q 'No display found' "$PERM_DIR/log" 2>/dev/null; then
+      warn "The screen is asleep or locked, so the call side cannot be recorded. Wake the screen and try again."
+      pause_for "press enter once the screen is awake, and I will test again"
+      continue
+    elif grep -q 'start system audio' "$PERM_DIR/log" 2>/dev/null; then
       warn "Screen Recording is not on for meetingbox yet"
       rule
       info "1. Opening Privacy settings at ${c_b}Screen & System Audio Recording${c_0}"
@@ -1039,6 +1068,11 @@ prime_permissions() {
     fi
     pause_for "press enter once it is on, and I will test again"
   done
+  if grep -q 'No display found' "$PERM_DIR/log" 2>/dev/null; then
+    warn "still not recording: the screen is asleep or locked"
+    info "wake the screen, then run: ${c_b}meetingbox setup${c_0}"
+    return 1
+  fi
   warn "still not recording"
   info "check Screen & System Audio Recording and Microphone are both on for meetingbox,"
   info "then run: ${c_b}meetingbox setup${c_0}"
@@ -1974,11 +2008,8 @@ reset_cmd() {
   rule
   confirm "go ahead?" no || { info "nothing changed"; return 1; }
 
-  if [ "$level" != state ]; then
-    # A recording may have started while the question was up.
-    refuse_while_busy "$again" || return 1
-    quit_app || return 1
-  fi
+  # A recording may have started while the question was up: quit_app checks again first.
+  if [ "$level" != state ]; then quit_app "$again" || return 1; fi
 
   # recorder and state: through the app when it answers (it has quit for tools and all)
   if [ "$level" = state ] && reset_through_app; then

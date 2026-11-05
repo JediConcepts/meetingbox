@@ -215,6 +215,16 @@ for level in tools all; do
     pass "reset_cmd $level leaves an app that will not quit, and says so"
   else fail "reset_cmd $level leaves an app that will not quit, and says so (rc $rc): $out"; fi
 
+  # A recording started while the question was up: still nothing quit or removed (S3 a).
+  install_app; : > "$HOME/app-running"; : > "$HOME/app-quits"
+  confirm() { echo "confirm $*" >> "$HOME/calls.log"; printf '%s' "$BASE_DIR/late" > "$DIR_FILE"; return 0; }
+  out="$(reset_cmd "$level" 2>&1)"; rc=$?
+  confirm() { echo "confirm $*" >> "$HOME/calls.log"; return 0; }
+  if [ "$rc" -ne 0 ] && grep -q '^confirm' "$HOME/calls.log" && ! grep -q '^osascript\|^tccutil' "$HOME/calls.log" \
+     && kept && [ -e "$HOME/app-running" ] && printf '%s\n' "$out" | grep -qF "$MSG"; then
+    pass "reset_cmd $level checks again once answered: a recording started meanwhile stops it before the quit"
+  else fail "reset_cmd $level checks again once answered: a recording started meanwhile stops it before the quit (rc $rc): $out"; fi
+
   # Not running: nothing to ask.
   install_app
   out="$(reset_cmd "$level" 2>&1)"; rc=$?
@@ -255,5 +265,28 @@ if [ "$rc" -eq 0 ] && grep -q '^app_send stop' "$HOME/calls.log" && [ ! -e "$DIR
 else fail "reset with no app answering stops the recorders and clears the state files itself, naming the folder kept (rc $rc): $out"; fi
 eval "$saved_stop"
 unset -f app_send
+
+# --- setup's permission test with the screen asleep or locked (fix round 1, U4) ---
+# The recorder says no display; that is not a missing permission, so setup neither sends anyone
+# to Privacy & Security nor suggests resetting the permissions.
+SCREEN="The screen is asleep or locked, so the call side cannot be recorded. Wake the screen and try again."
+: > "$HOME/calls.log"
+out="$(
+  test_recording() {
+    mkdir -p "$PERM_DIR"
+    printf 'Failed to start system audio: No display found for audio capture\n%s\n' "$SCREEN" > "$PERM_DIR/log"
+    return 1
+  }
+  pause_for() { echo "pause_for $*" >> "$HOME/calls.log"; }
+  open_privacy() { echo "open_privacy $*" >> "$HOME/calls.log"; }
+  open() { echo "open $*" >> "$HOME/calls.log"; }
+  prime_permissions 2>&1
+)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$SCREEN" && ! printf '%s\n' "$out" | grep -q 'Screen Recording is not on' \
+   && ! printf '%s\n' "$out" | grep -q 'meetingbox reset' && grep -q '^pause_for' "$HOME/calls.log" \
+   && ! grep -q '^open_privacy\|^open ' "$HOME/calls.log"; then
+  pass "prime_permissions: no display says to wake the screen, opens no settings, does not suggest a reset"
+else fail "prime_permissions: no display says to wake the screen, opens no settings, does not suggest a reset (rc $rc): $out $(cat "$HOME/calls.log")"; fi
+rm -f "$PERM_DIR/log"; rmdir "$PERM_DIR" 2>/dev/null
 
 finish
