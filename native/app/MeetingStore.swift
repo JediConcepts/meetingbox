@@ -85,8 +85,9 @@ struct Meeting {
 }
 
 /// The library: scans the Meetings root, owns `meeting.json` writes, and searches transcripts.
-final class MeetingStore {
+final class MeetingStore: @unchecked Sendable {
     let root: URL
+    // Sendable: the writes and the transcript cache are behind these locks, and `scan` only reads.
     private let writeLock = NSLock()
     private let cacheLock = NSLock()
     private var transcripts: [String: String] = [:]

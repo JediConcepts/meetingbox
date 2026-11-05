@@ -127,6 +127,19 @@ struct MeetingFolder {
         return MeetingFolder(url: dest, date: date, title: clean)
     }
 
+    // MARK: unfinished recordings
+
+    /// A recording the recorder has not finished: no `.recording-complete` marker, and a working
+    /// `.caf` still in the folder (`recording_unfinished` in the meetingbox script says the same).
+    /// Its `audio.m4a`, if there is one, is from a finalise that stopped part way. A recording from
+    /// before the marker existed has neither the marker nor the working files, so it is finished.
+    /// Nothing is processed or retried for an unfinished recording: it needs `meetingbox recover`.
+    static func recordingUnfinished(_ dir: URL) -> Bool {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: dir.appendingPathComponent(Finaliser.marker).path) else { return false }
+        return Finaliser.working.contains { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+    }
+
     // MARK: audio
 
     /// `audio.m4a`, else the newest `*_meeting.m4a`, else nil.

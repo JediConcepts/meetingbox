@@ -26,7 +26,7 @@ enum LibraryBadge: Equatable {
 }
 
 /// One meeting in the sidebar: the title, the start time, the length when it is known, a badge when
-/// something is going on or went wrong.
+/// something is going on or went wrong, and for a failed meeting the reason it gives.
 struct LibraryRow: Equatable, Identifiable {
     /// The folder's path, so a row stays the same row across rescans.
     let id: String
@@ -36,6 +36,8 @@ struct LibraryRow: Equatable, Identifiable {
     /// The title is the user's (or an earlier version's), not the start time standing in for one.
     let titled: Bool
     let badge: LibraryBadge?
+    /// Why a failed meeting failed, in one line: the first with text in its record's `error`.
+    let problem: String?
 
     /// What goes under the title: the start time (unless it is the title already) and the length.
     var caption: String {
@@ -64,14 +66,26 @@ enum LibraryAction: CaseIterable, Hashable {
 struct MeetingFiles: Equatable {
     /// What Play opens: `audio.m4a`, else the newest `*_meeting.m4a` of an earlier version.
     var audio: URL? = nil
-    /// `audio.m4a` is there: the one file a processing job runs. (A v1.2 `*_meeting.m4a` plays but is
-    /// not run, so Process is not offered for it.)
+    /// The queue can run this folder: `audio.m4a`, the one file a job runs, is there, and the recording
+    /// is finished. (A v1.2 `*_meeting.m4a` plays but is not run; an unfinished recording, which has a
+    /// working `.caf` and no `.recording-complete`, needs `meetingbox recover` first.)
     var runnable = false
 
     static func read(_ folder: MeetingFolder) -> MeetingFiles {
-        MeetingFiles(audio: folder.audioFile,
-                     runnable: FileManager.default.fileExists(atPath: folder.url.appendingPathComponent("audio.m4a").path))
+        MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url))
     }
+
+    static func canRun(_ dir: URL) -> Bool {
+        FileManager.default.fileExists(atPath: dir.appendingPathComponent("audio.m4a").path) && !MeetingFolder.recordingUnfinished(dir)
+    }
+}
+
+/// The folder is named as it should be but its title could not be written into `meeting.json`: the list
+/// shows the old title until it is, and renaming to the same text again writes only the title.
+struct TitleNotSaved: Error {
+    /// The folder, under its new name.
+    let folder: MeetingFolder
+    let underlying: Error
 }
 
 enum LibraryPresentation {
@@ -115,7 +129,10 @@ enum LibraryPresentation {
     /// `phase` is the session's, `processing` and `stage` the queue's current job and its live stage.
     /// The meeting the session is on is whatever the session says; the job the queue is on is
     /// processing even if its record has not been rescanned yet; any other meeting is what its record says.
-    static func row(_ meeting: Meeting, phase: Session.Phase = .idle, processing: URL? = nil, stage: String? = nil) -> LibraryRow {
+    /// A meeting that was never processed is badged Unprocessed only if `processable`, that is, only when
+    /// Process is offered for it (`canProcess`): a badge is not shown for what the window cannot do.
+    static func row(_ meeting: Meeting, phase: Session.Phase = .idle, processing: URL? = nil, stage: String? = nil,
+                    processable: Bool = true) -> LibraryRow {
         let url = meeting.folder.url
         var badge: LibraryBadge? = nil
         var live = false
@@ -137,7 +154,7 @@ enum LibraryPresentation {
             case .queued: badge = .queued
             case .processing: badge = .processing(stage: meeting.record?.stage)
             case .failed: badge = .failed
-            case .unprocessed: badge = .unprocessed
+            case .unprocessed: badge = processable ? .unprocessed : nil
             }
         }
         let recorded = meeting.record?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -145,12 +162,20 @@ enum LibraryPresentation {
         let titled = !recorded.isEmpty || !(meeting.folder.title ?? "").isEmpty
         // The record's length is for a finished recording; the one in progress shows its timer instead.
         let length = live ? nil : lengthText(meeting.record?.seconds ?? 0)
+        var problem: String? = nil
+        if badge == .failed {
+            problem = (meeting.record?.error ?? "").split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
+        }
         return LibraryRow(id: key(url), title: title, date: dateFormatter.string(from: meeting.folder.date),
-                          length: length, titled: titled, badge: badge)
+                          length: length, titled: titled, badge: badge, problem: problem)
     }
 
-    static func rows(_ meetings: [Meeting], phase: Session.Phase = .idle, processing: URL? = nil, stage: String? = nil) -> [LibraryRow] {
-        meetings.map { row($0, phase: phase, processing: processing, stage: stage) }
+    /// `processable` holds the keys of the meetings Process is offered for; nil takes every meeting to be one.
+    static func rows(_ meetings: [Meeting], phase: Session.Phase = .idle, processing: URL? = nil, stage: String? = nil,
+                     processable: Set<String>? = nil) -> [LibraryRow] {
+        meetings.map { row($0, phase: phase, processing: processing, stage: stage,
+                           processable: processable?.contains(key($0.folder.url)) ?? true) }
     }
 
     // MARK: search
@@ -164,9 +189,14 @@ enum LibraryPresentation {
 
     // MARK: actions
 
+    /// Process is for a meeting that was never processed or whose run failed, and that the queue can run:
+    /// it has the `audio.m4a` a job runs and its recording is finished.
+    static func canProcess(_ meeting: Meeting, files: MeetingFiles) -> Bool {
+        files.runnable && (meeting.state == .unprocessed || meeting.state == .failed)
+    }
+
     /// The meeting the session is on offers what the recording can be asked to do; any other offers
-    /// Rename and Show in Finder, Play audio when there is audio, and Process when it was never
-    /// processed or failed and has the audio a job runs.
+    /// Rename and Show in Finder, Play audio when there is audio, and Process when `canProcess`.
     static func actions(for meeting: Meeting, phase: Session.Phase, files: MeetingFiles) -> [LibraryAction] {
         if let folder = phase.folder, samePlace(folder, meeting.folder.url) {
             switch phase {
@@ -178,7 +208,7 @@ enum LibraryPresentation {
         }
         var list: [LibraryAction] = [.rename, .showInFinder]
         if files.audio != nil { list.append(.playAudio) }
-        if files.runnable, meeting.state == .unprocessed || meeting.state == .failed { list.append(.process) }
+        if canProcess(meeting, files: files) { list.append(.process) }
         return list
     }
 
@@ -202,20 +232,36 @@ enum LibraryPresentation {
         }
     }
 
-    /// Renames the folder, then writes the title into its `meeting.json` too. Busy is decided at the
-    /// moment of the rename, from the session, the queue and the record on the disk, never from a
-    /// list read earlier: call it on the queue the session and the queue run on. Throws `RenameError`.
-    static func rename(_ folder: MeetingFolder, to text: String, store: MeetingStore, phase: Session.Phase, current: URL?) throws -> MeetingFolder {
-        let renamed = try folder.renamed(to: text) {
-            isBusy(folder.url, phase: phase, current: current, recorded: recordedState(folder.url))
+    /// Makes the folder's name and its record's `title` both the typed title, and returns the folder as
+    /// it is then. Normally that is a rename and then a write through `store.update`. If the folder
+    /// already has the title and the record does not (an earlier write failed, or a v1.2 folder has no
+    /// record), only the record is written, the folder is not moved; if both have it, nothing is touched.
+    /// Busy is decided at the moment of the move or the write, from the session, the queue and the record
+    /// on the disk, never from a list read earlier: call it on the queue the session and the queue run on.
+    /// Throws `RenameError`, or `TitleNotSaved` when the folder is where it should be and the title could
+    /// not be written; the same text again then writes only the title.
+    static func rename(_ meeting: Meeting, to text: String, store: MeetingStore, phase: Session.Phase, current: URL?) throws -> MeetingFolder {
+        let folder = meeting.folder
+        guard let clean = MeetingFolder.safeTitle(text) else { throw RenameError.emptyTitle }
+        let busy = { isBusy(folder.url, phase: phase, current: current, recorded: recordedState(folder.url)) }
+        func write(to moved: MeetingFolder) throws {
+            do { try store.update(moved.url) { $0.title = clean } } catch { throw TitleNotSaved(folder: moved, underlying: error) }
         }
-        // The folder's name carries the title already, so a record that cannot be written is not a failed rename.
-        try? store.update(renamed.url) { $0.title = renamed.title }
+        if clean == folder.title {
+            let recorded = meeting.record?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if recorded == clean { return folder }
+            if busy() { throw RenameError.busy }
+            try write(to: folder)
+            return folder
+        }
+        let renamed = try folder.renamed(to: text, isBusy: busy)
+        try write(to: renamed)
         return renamed
     }
 
-    /// The words for a rename that did not happen.
+    /// The words for a rename that did not happen, or did not finish.
     static func renameMessage(_ error: Error) -> String {
+        if error is TitleNotSaved { return "Renamed, but the title could not be saved" }
         switch error as? RenameError {
         case .busy?: return "That meeting is busy"
         case .exists?: return "A meeting with that name already exists"

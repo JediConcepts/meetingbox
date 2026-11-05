@@ -1,10 +1,6 @@
 import AppKit
 import Combine
 
-// The store's mutable state sits behind its own locks (`scan` only reads), so the work that runs off the
-// main queue may hold it.
-extension MeetingStore: @unchecked Sendable {}
-
 /// Everything the meetingbox window remembers: the meetings and which are listed, the selection and the
 /// pane, the search, the text of the selected meeting, and the rename sheet with its text and error.
 /// `AppModel` owns it and `LibraryWindow` draws it; the decisions are `LibraryPresentation`'s.
@@ -48,6 +44,9 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var meetings: [Meeting] = []
     /// The ones the search lets through.
     @Published private(set) var visible: [Meeting] = []
+    /// The keys of the meetings Process is offered for (never processed or failed, with the audio a job
+    /// runs and a finished recording), worked out by each scan off the main queue.
+    @Published private(set) var processable: Set<String> = []
     @Published private(set) var live = Live()
     /// The selected meeting's folder, as a `LibraryPresentation.key`.
     @Published private(set) var selection: String?
@@ -84,11 +83,12 @@ final class LibraryModel: ObservableObject {
     }
 
     var rows: [LibraryRow] {
-        LibraryPresentation.rows(visible, phase: live.phase, processing: live.processing, stage: live.stage)
+        LibraryPresentation.rows(visible, phase: live.phase, processing: live.processing, stage: live.stage, processable: processable)
     }
 
     func row(_ meeting: Meeting) -> LibraryRow {
-        LibraryPresentation.row(meeting, phase: live.phase, processing: live.processing, stage: live.stage)
+        LibraryPresentation.row(meeting, phase: live.phase, processing: live.processing, stage: live.stage,
+                                processable: processable.contains(LibraryPresentation.key(meeting.folder.url)))
     }
 
     /// The selected meeting's text, once it has been read (not the previous selection's).
@@ -111,13 +111,17 @@ final class LibraryModel: ObservableObject {
         let store = self.store
         reader.async { [weak self] in
             let found = store.scan()
-            Task { @MainActor in self?.scanned(found, token) }
+            // Only the meetings that were never processed or failed need their folders looked at.
+            let processable = Set(found.filter { ($0.state == .unprocessed || $0.state == .failed) && MeetingFiles.canRun($0.folder.url) }
+                .map { LibraryPresentation.key($0.folder.url) })
+            Task { @MainActor in self?.scanned(found, processable, token) }
         }
     }
 
-    private func scanned(_ found: [Meeting], _ token: Int) {
+    private func scanned(_ found: [Meeting], _ canProcess: Set<String>, _ token: Int) {
         guard token == scanToken else { return }
         hasScanned = true
+        processable = canProcess
         meetings = found
         indexed = false
         refilter()
@@ -253,34 +257,42 @@ final class LibraryModel: ObservableObject {
     }
 
     /// Renames on this queue, the one the session and the processing queue run on, so that busy is
-    /// decided at the moment of the rename. A title that comes to what the meeting already has closes
-    /// the sheet; a refusal is shown in the sheet, in words.
+    /// decided at the moment of the rename (`LibraryPresentation.rename` says what is written where). A
+    /// refusal is shown in the sheet, in words. If the folder moved but its title could not be saved, the
+    /// sheet stays open with that said and follows the folder, and the same text again writes the title.
     func commitRename() {
         guard let draft = renaming else { return }
         guard let meeting = meetings.first(where: { LibraryPresentation.key($0.folder.url) == draft.key }) else {
             renaming = nil
             return
         }
-        if let clean = MeetingFolder.safeTitle(draft.text), clean == meeting.folder.title {
-            renaming = nil
-            return
-        }
         do {
-            let renamed = try LibraryPresentation.rename(meeting.folder, to: draft.text, store: store, phase: session.phase, current: queue.current)
+            let folder = try LibraryPresentation.rename(meeting, to: draft.text, store: store, phase: session.phase, current: queue.current)
             renaming = nil
-            let renamedMeeting = { (m: Meeting) -> Meeting in
-                guard LibraryPresentation.key(m.folder.url) == draft.key else { return m }
-                var record = m.record
-                record?.title = renamed.title
-                return Meeting(folder: renamed, record: record, state: m.state)
-            }
-            meetings = meetings.map(renamedMeeting)
-            visible = visible.map(renamedMeeting)
-            selection = LibraryPresentation.key(renamed.url)
-            loadContent()
-            reload()
+            moved(meeting, to: folder, titled: true)
+        } catch let failure as TitleNotSaved {
+            moved(meeting, to: failure.folder, titled: false)
+            renaming = RenameDraft(key: LibraryPresentation.key(failure.folder.url), text: draft.text, error: LibraryPresentation.renameMessage(failure))
         } catch {
             renaming?.error = LibraryPresentation.renameMessage(error)
         }
+    }
+
+    /// The list as a rename leaves it, at once and before the rescan that follows: the folder where it
+    /// now is, the selection with it, and the record's title when it was written.
+    private func moved(_ meeting: Meeting, to folder: MeetingFolder, titled: Bool) {
+        let before = LibraryPresentation.key(meeting.folder.url)
+        let patch = { (m: Meeting) -> Meeting in
+            guard LibraryPresentation.key(m.folder.url) == before else { return m }
+            var record = m.record
+            if titled { record?.title = folder.title }
+            return Meeting(folder: folder, record: record, state: m.state)
+        }
+        meetings = meetings.map(patch)
+        visible = visible.map(patch)
+        if processable.remove(before) != nil { processable.insert(LibraryPresentation.key(folder.url)) }
+        if selection == before { selection = LibraryPresentation.key(folder.url) }
+        loadContent()
+        reload()
     }
 }

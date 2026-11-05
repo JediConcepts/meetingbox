@@ -247,24 +247,26 @@ final class ProcessingQueue {
     }
 
     /// "Try again" on a `failed` meeting: written `queued`, attempts and error reset, before anything
-    /// runs, then queued. Any other state is left alone.
+    /// runs, then queued. Any other state is left alone, and so is a recording that never finished
+    /// (`MeetingFolder.recordingUnfinished`): the reason it failed is kept and nothing is queued.
     func retry(_ folder: URL) {
         onTickQueue()
         let dir = ProcessingQueue.normal(folder)
-        guard !known(dir), ProcessingQueue.read(dir)?.state == .failed else { return }
+        guard !known(dir), ProcessingQueue.read(dir)?.state == .failed, !MeetingFolder.recordingUnfinished(dir) else { return }
         queueAgain(dir, from: [.failed])
     }
 
     /// "Process" on a meeting that was never processed, or whose run failed: it needs the
     /// `audio.m4a` a job runs. Written `queued` (attempts and error reset) before anything runs, then
     /// queued. A meeting with no `meeting.json` has the state a scan infers for it, `done` when it has
-    /// notes and `unprocessed` when it has not. Any other state, or no audio, changes nothing at all:
-    /// no record is made for a folder that is refused.
+    /// notes and `unprocessed` when it has not. Any other state, no audio, or a recording that never
+    /// finished (`MeetingFolder.recordingUnfinished`) changes nothing at all: no record is made for a
+    /// folder that is refused, and a record's own failure reason is kept.
     func process(_ folder: URL) {
         onTickQueue()
         let dir = ProcessingQueue.normal(folder)
         let audio = dir.appendingPathComponent("audio.m4a").path
-        guard !known(dir), FileManager.default.fileExists(atPath: audio) else { return }
+        guard !known(dir), FileManager.default.fileExists(atPath: audio), !MeetingFolder.recordingUnfinished(dir) else { return }
         let state = ProcessingQueue.read(dir)?.state
             ?? (FileManager.default.fileExists(atPath: dir.appendingPathComponent("notes.md").path) ? .done : .unprocessed)
         guard state == .unprocessed || state == .failed else { return }

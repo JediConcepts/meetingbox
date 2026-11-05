@@ -2932,17 +2932,62 @@ do {
           "P5: nor is a folder a scan would call done (notes.md and no meeting.json) given a record")
 }
 
+// An unfinished recording (no .recording-complete, a working .caf still there) is never processed or retried:
+// the engine's own definition (recording_unfinished in the meetingbox script), in one place.
+do {
+    let root = freshRoot()
+    func folder(_ files: [String]) -> URL {
+        counter += 1
+        return make(root, "folder\(counter)", files: Dictionary(uniqueKeysWithValues: files.map { ($0, "x") }))
+    }
+    check(MeetingFolder.recordingUnfinished(folder(["audio.m4a", "mic.caf"])), "U1: a working file and no marker: unfinished")
+    check(MeetingFolder.recordingUnfinished(folder(["audio.m4a", "call.caf"])), "U1: either working file")
+    check(!MeetingFolder.recordingUnfinished(folder(["audio.m4a", "mic.caf", "call.caf", Finaliser.marker])), "U1: the marker makes it finished, whatever is left over")
+    check(!MeetingFolder.recordingUnfinished(folder(["audio.m4a", Finaliser.marker])), "U1: marker and no working files: finished")
+    check(!MeetingFolder.recordingUnfinished(folder(["audio.m4a"])), "U1: a recording from before this version has neither: finished")
+    check(!MeetingFolder.recordingUnfinished(folder([])), "U1: an empty folder is not an unfinished recording")
+    check(Finaliser.marker == ".recording-complete" && Finaliser.working == ["mic.caf", "call.caf"], "U1: the names are the recorder's own")
+}
+do {
+    let r = QRig()
+    let q = r.make()
+    // a finalise that failed part way: audio.m4a published, no marker, the working files kept; the record says why
+    let broken = r.meeting("2026-10-30_1400", files: ["audio.m4a": "a", "mic.caf": "c", "call.caf": "c"]) {
+        $0.state = .failed; $0.error = "no room to finish the recording"; $0.attempts = 3
+    }
+    let brokenJSON = try? Data(contentsOf: broken.appendingPathComponent("meeting.json"))
+    let neverRecorded = r.meeting("2026-10-30_1410", files: ["audio.m4a": "a", "call.caf": "c"])
+    q.process(broken); q.retry(broken); q.process(neverRecorded)
+    check(r.runner.calls.isEmpty && q.current == nil, "U2: process and retry queue nothing for an unfinished recording")
+    check((try? Data(contentsOf: broken.appendingPathComponent("meeting.json"))) == brokenJSON && r.error(broken) == "no room to finish the recording"
+          && r.attempts(broken) == 3, "U2: its record is exactly as it was, its own failure reason kept")
+    check(!fm.fileExists(atPath: neverRecorded.appendingPathComponent("meeting.json").path), "U2: no record is made for one that has none")
+
+    // finished: a Stage 2 folder with its marker (leftover working files do not matter), and one from before Stage 2
+    let busy = r.meeting("2026-10-30_1300", files: ["audio.m4a": "a"], queued)
+    q.enqueue(busy)
+    let finished = r.meeting("2026-10-30_1420", files: ["audio.m4a": "a", Finaliser.marker: "", "mic.caf": "c"]) { $0.state = .failed; $0.error = "it broke" }
+    let older = r.meeting("2026-10-30_1430", files: ["audio.m4a": "a"]) { $0.state = .unprocessed }
+    let olderFailed = r.meeting("2026-10-30_1440", files: ["audio.m4a": "a"]) { $0.state = .failed; $0.error = "it broke" }
+    q.retry(finished); q.process(older); q.process(olderFailed)
+    check(r.state(finished) == "queued" && r.state(older) == "queued" && r.state(olderFailed) == "queued" && r.error(finished) == nil,
+          "U3: a finished recording, and one from before Stage 2, are queued")
+}
+
 // The library's decisions: rows, search, actions, busy, rename. Foundation only.
 let libRoot = URL(fileURLWithPath: "/Meetings", isDirectory: true)
 /// A meeting as a scan reports it, without a disk: its record (unless `record` is false) carries `state`.
 func libMeeting(_ name: String, _ state: MeetingState = .done, title: String? = nil, seconds: Int = 0, stage: String? = nil,
-                record: Bool = true) -> Meeting {
+                error: String? = nil, record: Bool = true) -> Meeting {
     let folder = MeetingFolder.parse(libRoot.appendingPathComponent(name, isDirectory: true))!
     var rec = MeetingRecord(title: title, started: folder.date, seconds: seconds, state: state)
     rec.stage = stage
+    rec.error = error
     return Meeting(folder: folder, record: record ? rec : nil, state: state)
 }
 func libURL(_ name: String) -> URL { libRoot.appendingPathComponent(name, isDirectory: true) }
+/// The same folder, however each side spells its path (a scan gives `/private/var/...`, a test makes `/var/...`).
+func isAt(_ url: URL?, _ expected: URL) -> Bool { url.map { LibraryPresentation.key($0) } == LibraryPresentation.key(expected) }
 
 // Rows: title, date, length, badge, in the exact words.
 do {
@@ -2969,6 +3014,23 @@ do {
                                      (3599, "59 min"), (3600, "1 h 00 min"), (3900, "1 h 05 min"), (7260, "2 h 01 min")]
     let wrong = lengths.filter { LibraryPresentation.lengthText($0.0) != $0.1 }.map { "\($0.0) -> \(LibraryPresentation.lengthText($0.0) ?? "nil")" }
     check(wrong.isEmpty, "L1: length in words, from under a minute to hours (\(wrong))")
+}
+do {
+    // why a meeting failed
+    let name = "2026-10-28_1508"
+    func problem(_ m: Meeting) -> String? { LibraryPresentation.row(m).problem }
+    check(problem(libMeeting(name, .failed, error: "transcription failed on both sides")) == "transcription failed on both sides",
+          "F1: a failed meeting carries the reason it failed")
+    check(problem(libMeeting(name, .failed)) == nil && problem(libMeeting(name, .failed, error: "  \n ")) == nil, "F1: no reason, no line")
+    check(problem(libMeeting(name, .failed, error: "\nfirst line\nsecond line")) == "first line", "F1: one line: the first with text")
+    check(problem(libMeeting(name, .done, error: "left over")) == nil && problem(libMeeting(name, .queued, error: "left over")) == nil,
+          "F1: only a failed meeting shows one")
+    check(problem(libMeeting(name, .failed, error: "it broke", record: false)) == nil, "F1: a folder with no record has none")
+    // the Unprocessed badge says there is something to do about it
+    let unprocessed = libMeeting(name, .unprocessed)
+    check(LibraryPresentation.row(unprocessed, processable: true).badge?.text == "Unprocessed"
+          && LibraryPresentation.row(unprocessed, processable: false).badge == nil, "F2: Unprocessed only when Process is offered")
+    check(LibraryPresentation.row(libMeeting(name, .failed), processable: false).badge?.text == "Failed", "F2: Failed is shown whatever Process offers")
 }
 do {
     let name = "2026-10-28_1508"
@@ -3071,6 +3133,12 @@ do {
     check(m.audio?.lastPathComponent == "audio.m4a" && m.runnable, "L5: audio.m4a plays and is what the queue runs")
     check(o.audio?.lastPathComponent == "2026-10-28_1600_meeting.m4a" && !o.runnable, "L5: a v1.2 file plays, but the queue does not run it")
     check(e.audio == nil && !e.runnable, "L5: nothing there, nothing to play")
+    // an unfinished recording plays what there is, but is not run
+    let unfinished = MeetingFolder.parse(make(root, "2026-10-28_1800", files: ["audio.m4a": "a", "mic.caf": "c"]))!
+    let done = MeetingFolder.parse(make(root, "2026-10-28_1810", files: ["audio.m4a": "a", Finaliser.marker: "", "mic.caf": "c"]))!
+    check(MeetingFiles.read(unfinished).audio != nil && !MeetingFiles.read(unfinished).runnable && !MeetingFiles.canRun(unfinished.url),
+          "U4: an unfinished recording has audio to play and nothing for the queue")
+    check(MeetingFiles.read(done).runnable && MeetingFiles.canRun(done.url) && MeetingFiles.canRun(main.url), "U4: a finished one, and one from before Stage 2, are run")
 }
 
 // Busy, and rename, in words.
@@ -3101,7 +3169,8 @@ do {
         return MeetingFolder.parse(dir)!
     }
     func rename(_ f: MeetingFolder, _ title: String, phase: Session.Phase = .idle, current: URL? = nil) -> (MeetingFolder?, Error?) {
-        do { return (try LibraryPresentation.rename(f, to: title, store: store, phase: phase, current: current), nil) }
+        let meeting = store.scan().first { LibraryPresentation.key($0.folder.url) == LibraryPresentation.key(f.url) }!
+        do { return (try LibraryPresentation.rename(meeting, to: title, store: store, phase: phase, current: current), nil) }
         catch { return (nil, error) }
     }
     func says(_ e: Error?) -> String? { e.map(LibraryPresentation.renameMessage) }
@@ -3109,7 +3178,7 @@ do {
     let f1 = folder("2026-10-28_1508", .done)
     let (r1, e1) = rename(f1, "Weekly sync")
     let named = root.appendingPathComponent("2026-10-28 1508 Weekly sync")
-    check(e1 == nil && r1?.url.path == named.path && r1?.title == "Weekly sync" && fm.fileExists(atPath: named.path)
+    check(e1 == nil && isAt(r1?.url, named) && r1?.title == "Weekly sync" && fm.fileExists(atPath: named.path)
           && !fm.fileExists(atPath: f1.url.path), "R2: the folder is renamed to 'YYYY-MM-DD HHMM Title'")
     let json = (try? JSONSerialization.jsonObject(with: Data(contentsOf: named.appendingPathComponent("meeting.json")))) as? [String: Any]
     check(json?["title"] as? String == "Weekly sync" && json?["state"] as? String == "done", "R2: and the title is written to meeting.json beside it, the state kept")
@@ -3158,6 +3227,71 @@ do {
     check(rename(folder("2026-10-29_1450", .unprocessed), "Never run").0?.title == "Never run", "R3: unprocessed too")
 }
 
+// A rename whose folder and title do not agree, or whose title cannot be saved: made right, or said so.
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    func meeting(_ dir: URL) -> Meeting { store.scan().first { LibraryPresentation.key($0.folder.url) == LibraryPresentation.key(dir) }! }
+    func rename(_ dir: URL, _ title: String, phase: Session.Phase = .idle) -> (MeetingFolder?, Error?) {
+        do { return (try LibraryPresentation.rename(meeting(dir), to: title, store: store, phase: phase, current: nil), nil) }
+        catch { return (nil, error) }
+    }
+    func recordTitle(_ dir: URL) -> String? { meeting(dir).record?.title }
+    func recordBytes(_ dir: URL) -> Data? { try? Data(contentsOf: dir.appendingPathComponent("meeting.json")) }
+
+    // the folder has the title but the record says another: the move is skipped, the record is written, the row shows it
+    let a = make(root, "2026-10-28 1508 Weekly sync")
+    try! store.update(a) { $0.title = "Old name"; $0.state = .done }
+    check(LibraryPresentation.row(meeting(a)).title == "Old name", "R6: the row shows the record's title, not the folder's")
+    let inodeA = inode(a)
+    let (ra, ea) = rename(a, "Weekly sync")
+    check(ea == nil && isAt(ra?.url, a) && inode(a) == inodeA && recordTitle(a) == "Weekly sync" && LibraryPresentation.row(meeting(a)).title == "Weekly sync",
+          "R6: renaming to the folder's own title writes only the record, and the row then shows it")
+    // already the same in both: nothing is written
+    let before = recordBytes(a)
+    let (rb, eb) = rename(a, "Weekly sync")
+    check(eb == nil && isAt(rb?.url, a) && recordBytes(a) == before, "R6: the same title in the folder and the record: nothing is touched")
+    // a v1.2 folder: its title is in its name and there is no record: the folder stays, the record is made with the title
+    let v12 = make(root, "2026-10-27 0900 Standup")
+    let inodeV = inode(v12)
+    let (rc, ec) = rename(v12, "Standup")
+    check(ec == nil && isAt(rc?.url, v12) && inode(v12) == inodeV && recordTitle(v12) == "Standup" && meeting(v12).state == .unprocessed,
+          "R6: a titled folder with no record, renamed to its title: not moved, and its record is made, state as a scan infers it")
+    // the record's title is the one shown and it is what is typed, but the folder says another: the folder follows
+    let d = make(root, "2026-10-26 1000 New")
+    try! store.update(d) { $0.title = "Old"; $0.state = .done }
+    let (rd, ed) = rename(d, "Old")
+    let movedD = root.appendingPathComponent("2026-10-26 1000 Old")
+    check(ed == nil && isAt(rd?.url, movedD) && fm.fileExists(atPath: movedD.path) && !fm.fileExists(atPath: d.path) && recordTitle(movedD) == "Old",
+          "R6: a title that is only the record's moves the folder to match")
+    // a busy meeting is not touched, record-only writes included
+    let e = make(root, "2026-10-25 0900 Queued one")
+    try! store.update(e) { $0.title = "Other"; $0.state = .queued }
+    let (re, ee) = rename(e, "Queued one")
+    check(re == nil && ee.map(LibraryPresentation.renameMessage) == "That meeting is busy" && recordTitle(e) == "Other", "R6: a busy meeting's record is not written either")
+    check(rename(e, "  ").1.map(LibraryPresentation.renameMessage) == "Type a title", "R6: an empty title is still 'Type a title' first")
+
+    // the title cannot be saved after the folder has moved: a folder nobody can write into (a real permission failure)
+    let g = make(root, "2026-10-24_1900")
+    try! store.update(g) { $0.state = .done }
+    let inodeG = inode(g)
+    chmod(g.path, 0o500)
+    let (rg, eg) = rename(g, "Late title")
+    let movedG = root.appendingPathComponent("2026-10-24 1900 Late title")
+    let notSaved = eg as? TitleNotSaved
+    check(rg == nil && isAt(notSaved?.folder.url, movedG) && notSaved?.folder.title == "Late title"
+          && eg.map(LibraryPresentation.renameMessage) == "Renamed, but the title could not be saved",
+          "R7: the folder moved but the title could not be written: an error that says so and names the moved folder")
+    check(fm.fileExists(atPath: movedG.path) && !fm.fileExists(atPath: g.path) && inode(movedG) == inodeG && recordTitle(movedG) == nil,
+          "R7: the folder is on disk under its new name and its record is as it was")
+    chmod(movedG.path, 0o700)
+    let (rh, eh) = rename(movedG, "Late title")
+    check(eh == nil && isAt(rh?.url, movedG) && inode(movedG) == inodeG && recordTitle(movedG) == "Late title",
+          "R7: once it can be written, the same text writes the title and moves nothing again")
+    check(LibraryPresentation.renameMessage(RenameError.busy) == "That meeting is busy" && LibraryPresentation.renameMessage(RenameError.exists) == "A meeting with that name already exists"
+          && LibraryPresentation.renameMessage(RenameError.emptyTitle) == "Type a title", "R7: the three other messages are as they were")
+}
+
 // LibraryModel: the window's state, driven as the views drive it. The work it hands to background
 // queues comes back to the main queue, so these wait on the main run loop. Never Show in Finder or Play
 // (they would open the real Finder).
@@ -3189,8 +3323,8 @@ MainActor.assumeIsolated {
     model.reload()
     check(settle { model.hasScanned && model.meetings.count == 3 }, "W1: reload reads the meetings off the main queue and publishes them")
     check(model.rows.map(\.id) == [keyA, keyB, keyC] && model.visible.count == 3, "W1: newest first, all listed")
-    check(model.rows.map { $0.badge?.text } == [nil, "Unprocessed", "Unprocessed"],
-          "W1: a record that says done has no badge, folders with no record and no notes are unprocessed (\(model.rows.map { $0.badge?.text ?? "-" }))")
+    check(model.rows.map { $0.badge?.text } == [nil, nil, "Unprocessed"],
+          "W1: done has no badge; a folder with no notes is Unprocessed only if it has the audio to process (\(model.rows.map { $0.badge?.text ?? "-" }))")
 
     // selection reads the files off the main queue; another meeting's text is never shown for this one
     model.select(keyA)
@@ -3234,7 +3368,8 @@ MainActor.assumeIsolated {
     check(model.renaming == nil && fm.fileExists(atPath: renamedC.path) && !fm.fileExists(atPath: c.path), "R4: the folder is renamed and the sheet closes")
     check(model.selection == LibraryPresentation.key(renamedC) && model.selectedMeeting?.folder.title == "Budget review",
           "R4: the selection follows the folder at once")
-    check(model.rows.last?.title == "Budget review", "R4: titled in its row at once")
+    check(model.rows.last?.title == "Budget review" && model.rows.last?.badge?.text == "Unprocessed",
+          "R4: titled in its row at once, and still badged (the folder has the audio to process)")
     check(settle { model.meetings.last?.record?.title == "Budget review" && model.shownContent?.key == model.selection },
           "R4: the list is read again, now with the title in meeting.json, and the text follows")
     model.beginRename()
@@ -3295,6 +3430,30 @@ MainActor.assumeIsolated {
     model.perform(.resume)
     check(controlled == [.pause, .stop, .resume], "S1: Pause, Stop and Resume go through the control path, never the session")
     check(session.phase == .idle, "S1: the model did not touch the session")
+
+    // a rename whose title cannot be saved: the sheet stays and says so, the list shows the disk, and the same text finishes it
+    let half = make(root, "2026-10-22_0900")
+    model.reload()
+    check(settle { model.meetings.contains { LibraryPresentation.key($0.folder.url) == LibraryPresentation.key(half) } }, "R8: the new folder is read")
+    model.select(LibraryPresentation.key(half))
+    model.beginRename()
+    model.renameText("Half done")
+    let halfInode = inode(half)
+    chmod(half.path, 0o500)
+    model.commitRename()
+    let moved = root.appendingPathComponent("2026-10-22 0900 Half done")
+    check(model.renaming?.error == "Renamed, but the title could not be saved" && fm.fileExists(atPath: moved.path) && !fm.fileExists(atPath: half.path),
+          "R8: the folder moved, and the sheet stays open saying the title could not be saved (\(model.renaming?.error ?? "closed"))")
+    check(model.renaming?.key == LibraryPresentation.key(moved) && model.selection == LibraryPresentation.key(moved) && isAt(model.selectedMeeting?.folder.url, moved),
+          "R8: the sheet and the selection follow the folder to its new name")
+    check(settle { model.meetings.contains { $0.folder.url.lastPathComponent == "2026-10-22 0900 Half done" && $0.record?.title == nil } },
+          "R8: the list is read again and shows what is on the disk")
+    chmod(moved.path, 0o700)
+    model.commitRename()
+    check(model.renaming == nil && inode(moved) == halfInode && fm.fileExists(atPath: moved.path), "R8: the same text again closes the sheet and moves nothing")
+    check(settle { model.meetings.first { $0.folder.url.lastPathComponent == "2026-10-22 0900 Half done" }?.record?.title == "Half done" },
+          "R8: and the title is in meeting.json")
+    check(model.rows.first { $0.id == LibraryPresentation.key(moved) }?.title == "Half done", "R8: the row shows it")
 }
 
 // The window comes forward for finished minutes unless a recording is running.

@@ -24,8 +24,9 @@ final class LibraryWindow: NSObject {
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: 980, height: 640))
         window.contentMinSize = NSSize(width: 720, height: 420)
-        // Where the user left it; centred the first time.
-        if !window.setFrameAutosaveName("meetingbox.library") { window.center() }
+        // Centred first, then the saved frame: where the user left it wins, and the first open is centred.
+        window.center()
+        window.setFrameAutosaveName("meetingbox.library")
         // Read again whenever it becomes the window in front: what a job or another process did meanwhile shows.
         // No queue: told on the thread that made it key (the main one).
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: nil) { [weak model] _ in
@@ -141,6 +142,9 @@ struct LibraryDetail: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(row.title).font(.title2).bold().lineLimit(2)
                     Text(subtitle(row)).foregroundStyle(.secondary)
+                    if let problem = row.problem {
+                        Text(problem).foregroundStyle(.secondary).lineLimit(2)
+                    }
                 }
                 HStack {
                     ForEach(actions, id: \.self) { action in
