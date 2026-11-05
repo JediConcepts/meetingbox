@@ -86,14 +86,32 @@ struct Meeting {
 
 /// The library: scans the Meetings root, owns `meeting.json` writes, and searches transcripts.
 final class MeetingStore: @unchecked Sendable {
-    let root: URL
-    // Sendable: the writes and the transcript cache are behind these locks, and `scan` only reads.
+    // Sendable: the root, the writes and the transcript cache are behind these locks, and `scan` only reads.
+    private let rootLock = NSLock()
+    private var currentRoot: URL
     private let writeLock = NSLock()
     private let cacheLock = NSLock()
     private var transcripts: [String: String] = [:]
     private let indexQueue = DispatchQueue(label: "meetingbox.store.index", qos: .utility)
 
-    init(root: URL) { self.root = root }
+    init(root: URL) { currentRoot = root }
+
+    /// The Meetings folder. The app moves it when the meetings folder setting changes (never while a
+    /// recording is running), so the session, the queue and the library, which share this one store,
+    /// all follow at once. A scan already running finishes on the root it began with; `update` takes a
+    /// folder's full path and does not depend on it.
+    var root: URL {
+        get {
+            rootLock.lock()
+            defer { rootLock.unlock() }
+            return currentRoot
+        }
+        set {
+            rootLock.lock()
+            currentRoot = newValue
+            rootLock.unlock()
+        }
+    }
 
     private static func recordURL(_ folder: URL) -> URL { folder.appendingPathComponent("meeting.json") }
 
@@ -107,6 +125,7 @@ final class MeetingStore: @unchecked Sendable {
     /// Every meeting folder under the root, newest first. Read-only: it never writes or repairs anything.
     func scan() -> [Meeting] {
         let fm = FileManager.default
+        let root = self.root
         guard let items = try? fm.contentsOfDirectory(
             at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
         var found: [Meeting] = []

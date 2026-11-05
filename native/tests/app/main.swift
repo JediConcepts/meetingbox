@@ -1,6 +1,8 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AVFoundation
+import Combine
+import CoreServices
 
 setvbuf(stdout, nil, _IOLBF, 0) // a crash then leaves every line before it
 var failures = 0
@@ -3472,6 +3474,292 @@ do {
     check(strong, "M1: bold is bold")
     check(String(LibraryPresentation.minutes("").characters) == "" && String(LibraryPresentation.minutes("a [b](").characters).contains("b"),
           "M1: an empty text, and a broken link, still give text")
+}
+
+// MARK: - Preferences, the Dock icon and quitting (Task 9)
+
+// The Dock icon only when asked for; the menu bar item when asked for or when there is no Dock icon,
+// and then the setting is written back on, so the checkbox shows what is on screen.
+do {
+    let all = [(true, true), (true, false), (false, true), (false, false)].map {
+        PreferencesPresentation.visibility(showInDock: $0.0, showMenuBar: $0.1)
+    }
+    check(all.map(\.dockIcon) == [true, true, false, false], "T9 dock: the Dock icon only when Show in Dock is on")
+    check(all.map(\.menuBarItem) == [true, false, true, true], "T9 dock: the menu bar item when asked for, or when there is no Dock icon")
+    check(all.map(\.writeBackMenuBar) == [false, false, false, true], "T9 dock: only with both off is the menu bar setting written back on")
+    check(all.map(\.menuBarLocked) == [false, false, true, true], "T9 dock: without the Dock icon the menu bar checkbox cannot be turned off")
+    check(FloatingMode.allCases.map(PreferencesPresentation.floatingTitle) == ["Always", "While recording", "Never"],
+          "T9 floating: the three modes, in words")
+}
+
+// Quitting asks only while a recording is running or paused (a start in its grace is already recording).
+do {
+    let dir = libURL("2026-11-05_0900")
+    check(!PreferencesPresentation.asksToQuit(.idle) && PreferencesPresentation.asksToQuit(.recording(dir))
+          && PreferencesPresentation.asksToQuit(.paused(dir)) && !PreferencesPresentation.asksToQuit(.finalising(dir)),
+          "T9 quit: asks while recording or paused, never when idle or finalising")
+    check(PreferencesPresentation.quitMessage == "A recording is running."
+          && PreferencesPresentation.quitInformation == "Stop and quit finishes the recording first. Keep recording and quit leaves it running, and meetingbox picks it up when it opens again.",
+          "T9 quit: the question and its explanation, word for word")
+    check(PreferencesPresentation.quitButtons == ["Stop and quit", "Keep recording and quit", "Cancel"], "T9 quit: the three buttons, in this order")
+    check([0, 1, 2, 3, -1].map { PreferencesPresentation.quitChoice(button: $0) } == [.stopAndQuit, .keepRecordingAndQuit, .cancel, .cancel, .cancel],
+          "T9 quit: each button is its choice, and anything else cancels")
+    check(PreferencesPresentation.quitPlan(.stopAndQuit) == QuitPlan(stop: true, reply: .later), "T9 quit: Stop and quit sends Stop and waits")
+    check(PreferencesPresentation.quitPlan(.keepRecordingAndQuit) == QuitPlan(stop: false, reply: .now), "T9 quit: Keep recording and quit quits at once and touches nothing")
+    check(PreferencesPresentation.quitPlan(.cancel) == QuitPlan(stop: false, reply: .cancel), "T9 quit: Cancel changes nothing")
+
+    // Log out, restart and shut down never ask (it would hold up the Mac): they keep recording and quit.
+    let system = [UInt32(kAELogOut), UInt32(kAEReallyLogOut), UInt32(kAEShowRestartDialog), UInt32(kAEShowShutdownDialog),
+                  UInt32(kAERestart), UInt32(kAEShutDown), UInt32(kAEQuitAll)]
+    check(PreferencesPresentation.systemQuitReasons == Set(system), "T9 quit: the log out, restart and shut down reasons are the SDK's")
+    var asked = 0
+    let ask = { () -> QuitChoice in asked += 1; return .stopAndQuit }
+    let keep = QuitPlan(stop: false, reply: .now)
+    check(system.allSatisfy { PreferencesPresentation.quit(phase: .recording(dir), reason: $0, ask: ask) == keep }
+          && PreferencesPresentation.quit(phase: .paused(dir), reason: UInt32(kAEReallyLogOut), ask: ask) == keep && asked == 0,
+          "T9 quit: log out, restart or shut down while recording keeps recording and quits, without asking")
+    check(PreferencesPresentation.quit(phase: .idle, reason: nil, ask: ask) == keep
+          && PreferencesPresentation.quit(phase: .finalising(dir), reason: nil, ask: ask) == keep && asked == 0,
+          "T9 quit: idle or finalising quits at once, without asking")
+    check(PreferencesPresentation.quit(phase: .recording(dir), reason: nil, ask: ask) == QuitPlan(stop: true, reply: .later) && asked == 1,
+          "T9 quit: Cmd-Q or the menu while recording asks, and does what was chosen")
+    check(PreferencesPresentation.quit(phase: .paused(dir), reason: 0x6162_6364, ask: { .cancel }) == QuitPlan(stop: false, reply: .cancel),
+          "T9 quit: any other quit event while paused asks too")
+}
+
+// The microphone list: the recorder's `--record -l` lines, "System default" first.
+do {
+    let listing = "  Built-in Microphone (default)\n  USB Mic\n  Studio (default) Mic\n\n   \nNo audio input devices found.\n  USB Mic\n"
+    check(PreferencesPresentation.microphoneNames(listing) == ["Built-in Microphone", "USB Mic", "Studio (default) Mic"],
+          "T9 mic: each indented line is a device, its (default) marker taken off, once each")
+    check(PreferencesPresentation.microphoneNames("No audio input devices found.\n").isEmpty, "T9 mic: none found is none")
+    func titles(_ c: MicrophoneChoice) -> [String] { c.options.map(\.title) }
+    let plain = PreferencesPresentation.microphoneChoice(devices: ["Built-in Microphone", "USB Mic"], saved: nil)
+    check(titles(plain) == ["System default", "Built-in Microphone", "USB Mic"] && plain.options.map(\.name) == [nil, "Built-in Microphone", "USB Mic"]
+          && plain.selected == 0, "T9 mic: System default first and chosen when nothing is saved")
+    let usb = PreferencesPresentation.microphoneChoice(devices: ["Built-in Microphone", "USB Mic"], saved: "USB Mic")
+    check(titles(usb) == titles(plain) && usb.selected == 2, "T9 mic: a saved microphone that is connected is chosen")
+    let gone = PreferencesPresentation.microphoneChoice(devices: ["Built-in Microphone"], saved: "USB Mic")
+    check(titles(gone) == ["System default", "Built-in Microphone", "USB Mic (not connected)"] && gone.selected == 2 && gone.options[2].name == "USB Mic",
+          "T9 mic: a saved microphone that is not connected still shows, says so, and stays chosen")
+    let none = PreferencesPresentation.microphoneChoice(devices: [], saved: "USB Mic")
+    check(titles(none) == ["System default", "USB Mic (not connected)"] && none.selected == 1, "T9 mic: with no devices at all too")
+    let unknown = PreferencesPresentation.microphoneChoice(devices: nil, saved: nil)
+    check(titles(unknown) == ["System default"] && unknown.selected == 0, "T9 mic: a listing that failed shows only System default")
+    let unknownSaved = PreferencesPresentation.microphoneChoice(devices: nil, saved: "USB Mic")
+    check(titles(unknownSaved) == ["System default", "USB Mic"] && unknownSaved.selected == 1,
+          "T9 mic: a listing that failed keeps a saved microphone chosen, without claiming it is gone")
+
+    // Listing runs the helper with --record -l; anything that goes wrong is no listing.
+    func helper(_ body: String) -> URL {
+        counter += 1
+        let u = scratch.appendingPathComponent("helper\(counter)")
+        try! ("#!/bin/sh\n" + body + "\n").write(to: u, atomically: true, encoding: .utf8)
+        chmod(u.path, 0o755)
+        return u
+    }
+    let argsFile = scratch.appendingPathComponent("helper-args")
+    let good = helper("echo \"$@\" > '\(argsFile.path)'\nprintf '  Built-in Microphone (default)\\n  USB Mic\\n'")
+    check(PreferencesPresentation.listMicrophones(helper: good) == ["Built-in Microphone", "USB Mic"], "T9 mic: the helper's list is read")
+    check((try? String(contentsOf: argsFile, encoding: .utf8)) == "--record -l\n", "T9 mic: the helper is run as --record -l")
+    check(PreferencesPresentation.listMicrophones(helper: helper("echo 'No audio input devices found.'")) == [], "T9 mic: a helper that finds none gives none")
+    check(PreferencesPresentation.listMicrophones(helper: helper("printf '  USB Mic\\n'\nexit 1")) == nil, "T9 mic: a helper that fails gives no listing")
+    check(PreferencesPresentation.listMicrophones(helper: scratch.appendingPathComponent("no-such-helper")) == nil, "T9 mic: a missing helper gives no listing")
+}
+
+// The meetings folder: an existing folder this user can write to, nothing else; never while recording.
+do {
+    let ok = freshRoot()
+    check(PreferencesPresentation.folderProblem(ok) == nil, "T9 folder: an existing folder this user can write to is accepted")
+    let file = ok.appendingPathComponent("a-file")
+    fm.createFile(atPath: file.path, contents: Data())
+    let locked = freshRoot()
+    chmod(locked.path, 0o500)
+    let refused = [file, ok.appendingPathComponent("not-there"), locked, URL(string: "https://example.com/Meetings")!]
+        .map(PreferencesPresentation.folderProblem)
+    check(refused.allSatisfy { $0 == "meetingbox cannot use that folder" }, "T9 folder: a file, a missing folder, a read-only folder and a web address are refused, in those words")
+    chmod(locked.path, 0o700)
+    let dir = libURL("2026-11-05_0900")
+    check(PreferencesPresentation.canChooseFolder(.idle) && !PreferencesPresentation.canChooseFolder(.recording(dir))
+          && !PreferencesPresentation.canChooseFolder(.paused(dir)) && !PreferencesPresentation.canChooseFolder(.finalising(dir)),
+          "T9 folder: Choose… only while nothing is recording, paused or finalising")
+}
+
+// A recording that finished while the app was closed (quit while finalising, or stopped from the command
+// with no app): the recorder has gone and its audio is complete. The next launch settles it once: queued,
+// its length from the audio, the state files cleared, nothing signalled.
+for state in [MeetingState.finalising, .recording] {
+    let r = Rig()
+    let dir = r.meeting("2026-11-05_0800") { $0.state = state; $0.seconds = 1190 }
+    r.writeState(dir)
+    r.rec.durations[dir.path] = 1199.6
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered == [dir] && r.stateOf(dir) == "queued" && (r.json(dir)["seconds"] as? Int) == 1200 && s.phase == .idle,
+          "T9 adopt: a recording that finished while the app was closed is verified and queued (\(state.rawValue))")
+    check(r.finished.count == 1 && r.finished[0].1 && r.rec.signals.isEmpty && r.rec.launches.isEmpty && !fm.fileExists(atPath: r.dirFile.path),
+          "T9 adopt: once, with no signal and no new recorder, and its state files cleared (\(state.rawValue))")
+}
+
+// AppModel over a fake recorder and runner: every change applies at once, the folder moves the library
+// and the next recording, Stop and quit waits for the recording to finish, and Keep recording and quit
+// (and everything that runs as the app goes) never touches the recorder.
+MainActor.assumeIsolated {
+    func stateOf(_ dir: URL) -> String? {
+        ((try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meeting.json")))) as? [String: Any])?["state"] as? String
+    }
+    let state = shortTemp()
+    let root = freshRoot()
+    let meetingsA = root.appendingPathComponent("A", isDirectory: true)
+    let meetingsB = root.appendingPathComponent("B", isDirectory: true)
+    try! fm.createDirectory(at: meetingsA, withIntermediateDirectories: true)
+    try! fm.createDirectory(at: meetingsB, withIntermediateDirectories: true)
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = meetingsA
+    prefs.sounds = false // never a real sound from a test
+    prefs.showInDock = false
+    prefs.showMenuBar = false
+    let rec = FakeRecorder()
+    let runner = FakeRunner()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: runner, freeBytes: { _ in 50 * GB })
+    check(prefs.showMenuBar && model.visibility == Visibility(dockIcon: false, menuBarItem: true, writeBackMenuBar: false),
+          "T9 app: with both off at launch the menu bar item is back, and the setting says so")
+
+    var told = 0
+    model.onVisibilityChange = { told += 1 }
+    var changes = 0
+    let watch = model.objectWillChange.sink { _ in changes += 1 }
+    model.setShowInDock(true)
+    check(told == 1 && prefs.showInDock && model.visibility.dockIcon && model.visibility.menuBarItem, "T9 app: Show in Dock on: the Dock icon at once")
+    model.setShowMenuBar(false)
+    check(told == 2 && !prefs.showMenuBar && !model.visibility.menuBarItem, "T9 app: Show in menu bar off: the item goes at once")
+    model.setShowInDock(false)
+    check(told == 3 && !model.visibility.dockIcon && model.visibility.menuBarItem && prefs.showMenuBar,
+          "T9 app: the Dock icon off with the menu bar item off: the item comes back, and the setting is written back")
+    model.setShowInDock(true)
+    check(told == 4 && model.visibility == Visibility(dockIcon: true, menuBarItem: true, writeBackMenuBar: false), "T9 app: both on again")
+
+    var before = changes
+    model.setFloating(.always)
+    check(changes > before && prefs.floating == .always && model.presentation.panel.visible, "T9 app: floating Always shows the button at once")
+    before = changes
+    model.setFloating(.never)
+    check(changes > before && prefs.floating == .never && !model.presentation.panel.visible, "T9 app: floating Never hides it at once")
+    model.setFloating(.whileRecording)
+    before = changes
+    model.setOpenMinutes(false)
+    check(changes > before && !prefs.openMinutes, "T9 app: open the minutes when ready, off")
+    before = changes
+    model.setSounds(false)
+    check(changes > before && !prefs.sounds, "T9 app: sounds off")
+
+    check(model.presentation.menu.first { $0.action == .preferences }?.enabled == false, "T9 app: no Preferences… until there is a window to open")
+    var opened = 0
+    model.onOpenPreferences = { opened += 1 }
+    check(model.presentation.menu.first { $0.action == .preferences }?.enabled == true, "T9 app: then Preferences… is offered")
+    model.perform(.preferences)
+    check(opened == 1, "T9 app: and opens the window")
+
+    model.launch()
+    model.setMicrophone("USB Mic")
+    check(prefs.microphone == "USB Mic" && model.microphoneChoice.options[model.microphoneChoice.selected].name == "USB Mic",
+          "T9 app: the microphone is saved and shown chosen")
+
+    // the meetings folder: the library moves with it at once
+    _ = make(meetingsA, "2026-11-01_0900", files: ["notes.md": "a"])
+    _ = make(meetingsB, "2026-11-02_0900", files: ["notes.md": "b"])
+    _ = make(meetingsB, "2026-11-03_0900", files: ["notes.md": "b"])
+    model.library.reload()
+    check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-01_0900"] }, "T9 folder: the library starts on the folder setting")
+    model.setMeetingsFolder(meetingsB)
+    check(model.folderProblem == nil && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
+          "T9 folder: a new folder is saved and the store moves to it")
+    check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-03_0900", "2026-11-02_0900"] },
+          "T9 folder: the library reads the new folder at once")
+    model.setMeetingsFolder(meetingsB.appendingPathComponent("2026-11-03_0900/notes.md"))
+    check(model.folderProblem == "meetingbox cannot use that folder" && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
+          "T9 folder: one meetingbox cannot use is refused, in those words, and nothing moves")
+
+    // the next recording: the microphone and the folder chosen
+    model.perform(.start)
+    check(settle { model.session.phase.folder != nil }, "T9 app: Start records")
+    let pid = rec.nextPid
+    let recording = model.session.phase.folder ?? meetingsB
+    check(rec.launches.count == 1 && rec.launches[0].mic == "USB Mic" && rec.launches[0].dir.deletingLastPathComponent().path == meetingsB.path,
+          "T9 app: the next recording uses the microphone and the folder chosen")
+    model.setMeetingsFolder(meetingsA)
+    check(model.folderProblem == PreferencesPresentation.folderBusy && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
+          "T9 folder: not while a recording is running")
+
+    // Stop and quit: Stop through the one path, then the answer once the session is idle again
+    var replied = false
+    model.stopForQuit { replied = true }
+    check(settle { rec.sent(SIGINT) == 1 } && !replied && model.session.phase == .finalising(recording),
+          "T9 quit: Stop and quit sends Stop through the one path, and waits while it finalises")
+    rec.exit(pid, 0, verifies: true)
+    check(settle { replied }, "T9 quit: and answers once the recording is finished")
+    check(model.session.phase == .idle && rec.signals.count == 1 && rec.signals[0].pid == pid && ["queued", "processing"].contains(stateOf(recording) ?? "-"),
+          "T9 quit: finished and queued, and Stop was the only signal")
+
+    // a job already running keeps its own folder when the setting moves on
+    check(settle { runner.calls.count == 1 }, "T9 folder: the finished recording is being processed")
+    let meetingsC = root.appendingPathComponent("C", isDirectory: true)
+    try! fm.createDirectory(at: meetingsC, withIntermediateDirectories: true)
+    _ = make(meetingsC, "2026-10-31_0900", files: ["notes.md": "c"])
+    model.setMeetingsFolder(meetingsC)
+    check(model.folderProblem == nil && prefs.meetingsFolder.path == meetingsC.path && model.store.root.path == meetingsC.path,
+          "T9 folder: idle again, the folder can be changed")
+    check(model.queue.current?.lastPathComponent == recording.lastPathComponent, "T9 folder: the job in progress is still its own meeting's")
+    runner.finish(0, 0)
+    check(settle { stateOf(recording) == "done" }, "T9 folder: and it finishes in its own folder")
+    check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-10-31_0900"] }, "T9 folder: the library is on the third folder")
+    // the session's sweep for interrupted recordings looks in the folder set now
+    let orphan = make(meetingsC, "2026-11-04_0900")
+    try! model.store.update(orphan) { $0.state = .recording }
+    model.session.adopt()
+    check(settle { stateOf(orphan) == "queued" || stateOf(orphan) == "processing" } && rec.recovered.map(\.lastPathComponent) == ["2026-11-04_0900"],
+          "T9 folder: an interrupted recording in the new folder is found and recovered")
+    watch.cancel()
+    model.shutDown()
+
+    // Keep recording and quit: nothing is sent to the recorder, by the quit, the shutdown or any deinit
+    let state2 = shortTemp()
+    let prefs2 = Preferences(defaults: testDefaults(), home: root)
+    prefs2.meetingsFolder = meetingsB
+    prefs2.sounds = false
+    let rec2 = FakeRecorder()
+    let runner2 = FakeRunner()
+    weak var goneModel: AppModel?
+    weak var goneSession: Session?
+    var pid2: Int32 = 0
+    var folder2: URL? = nil
+    do {
+        let m = AppModel(stateDir: state2, preferences: prefs2, recorder: rec2, runner: runner2, freeBytes: { _ in 50 * GB })
+        m.launch()
+        m.perform(.start)
+        _ = settle { m.session.phase.folder != nil }
+        _ = settle({ false }, timeout: 2.6) // the start's grace passes, so nothing of it is left waiting
+        folder2 = m.session.phase.folder
+        pid2 = rec2.nextPid
+        if PreferencesPresentation.quitPlan(.keepRecordingAndQuit).stop { m.stopForQuit {} }
+        m.shutDown() // what applicationWillTerminate does
+        goneModel = m
+        goneSession = m.session
+    }
+    check(settle { goneModel == nil && goneSession == nil }, "T9 keep: the model and its session are let go, so their deinits have run")
+    check(folder2 != nil && rec2.signals.isEmpty && rec2.alive.contains(pid2), "T9 keep: the recorder was sent nothing and is still recording")
+    check((try? String(contentsOf: state2.appendingPathComponent("recording.dir"), encoding: .utf8)) == folder2?.path
+          && folder2.flatMap(stateOf) == "recording" && !fm.fileExists(atPath: state2.appendingPathComponent("control.sock").path),
+          "T9 keep: recording.dir and meeting.json still say recording; only the socket has gone")
+    let next = AppModel(stateDir: state2, preferences: prefs2, recorder: rec2, runner: runner2, freeBytes: { _ in 50 * GB })
+    next.launch()
+    check(folder2.map { next.session.phase == .recording($0) } == true && rec2.launches.count == 1,
+          "T9 keep: the next launch adopts the recording, starting nothing new")
+    next.perform(.stop)
+    check(settle { rec2.sent(SIGINT) == 1 } && rec2.signals.first?.pid == pid2, "T9 keep: and its Stop reaches the same recorder")
+    next.shutDown()
+    try? fm.removeItem(at: state)
+    try? fm.removeItem(at: state2)
 }
 
 try? fm.removeItem(at: scratch)

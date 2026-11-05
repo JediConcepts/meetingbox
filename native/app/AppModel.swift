@@ -7,7 +7,8 @@ import Combine
 /// hopping here with `Task { @MainActor in ... }`; the core itself runs on the main queue, its tick
 /// queue. The menu bar item, the floating button and the meetingbox window are views over this; every
 /// recording action they offer comes back through `perform`, and from there through `ControlHandler`,
-/// the one path the socket uses too. The window's own state is `library`.
+/// the one path the socket uses too. The window's own state is `library`. The Preferences window
+/// changes settings only through the `set...` methods here, which apply each change at once.
 @MainActor
 final class AppModel: ObservableObject {
     /// What the views show, changed only by `StatusEvent`s (StatusReducer.swift, where the rules are
@@ -30,15 +31,28 @@ final class AppModel: ObservableObject {
     private var clock: DispatchSourceTimer?
     /// Bring the meetingbox window forward (AppDelegate makes it the first time).
     var onOpenLibrary: (@MainActor () -> Void)?
+    /// Bring the Preferences window forward. Until it is set, the menu does not offer Preferences….
+    var onOpenPreferences: (@MainActor () -> Void)?
+    /// The Dock icon or the menu bar item setting changed: AppDelegate shows `visibility`.
+    var onVisibilityChange: (@MainActor () -> Void)?
+    /// The microphones the recorder lists, nil until listed or when listing failed.
+    @Published private(set) var microphones: [String]?
+    /// Why the folder last chosen was not taken, until another is taken or the window opens again.
+    @Published private(set) var folderProblem: String?
+    private var microphonesAsked = 0
+    /// Told once the session is idle again (Stop and quit).
+    private var idleWaiters: [@MainActor () -> Void] = []
 
-    init(stateDir: URL, preferences: Preferences) {
+    /// The recorder, the processing runner and the free space are the real ones unless a test gives its own.
+    init(stateDir: URL, preferences: Preferences, recorder: RecorderControl = ChildRecorder(), runner: PipelineRunner? = nil,
+         freeBytes: @escaping (URL) -> Int64? = { AppModel.freeBytes(near: $0) }) {
         self.stateDir = stateDir
         self.preferences = preferences
         let store = MeetingStore(root: preferences.meetingsFolder)
-        let session = Session(stateDir: stateDir, recorder: ChildRecorder(), store: store, now: Date.init,
-                              freeBytes: { AppModel.freeBytes(near: $0) })
+        let session = Session(stateDir: stateDir, recorder: recorder, store: store, now: Date.init,
+                              freeBytes: freeBytes)
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")
-        let queue = ProcessingQueue(store: store, runner: ScriptRunner.fromBundle() ?? ScriptRunner(script: script))
+        let queue = ProcessingQueue(store: store, runner: runner ?? ScriptRunner.fromBundle() ?? ScriptRunner(script: script))
         self.store = store
         self.session = session
         self.queue = queue
@@ -46,6 +60,8 @@ final class AppModel: ObservableObject {
         self.library = LibraryModel(store: store, session: session, queue: queue)
         // The window's Pause, Resume and Stop take the path the menu's do.
         library.control = { [weak self] action in self?.perform(action) }
+        // Settings from before (or written by hand) with neither the Dock icon nor the menu bar item.
+        normaliseVisibility()
     }
 
     /// In this order: take up a recording left by a crash (Task 4), pick up the processing queue
@@ -56,6 +72,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 self?.apply(.phase(phase))
                 self?.syncClock()
+                self?.tellIdleWaiters()
             }
         }
         // Only verified audio is queued; a failed recording is never processed.
@@ -94,8 +111,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// At quit: the socket goes. A recorder keeps running (it is its own process) and the next
-    /// launch adopts it; the kernel releases `app.lock` when the process ends.
+    /// At quit: the socket goes, and nothing else. A recorder keeps running (it is its own process)
+    /// and the next launch adopts it; the kernel releases `app.lock` when the process ends. Never
+    /// stop or signal the recorder here: Keep recording and quit, and log out, end up here too.
     func shutDown() {
         server?.stop()
         server = nil
@@ -105,6 +123,7 @@ final class AppModel: ObservableObject {
     var presentation: StatusPresentation {
         var input = status
         input.floating = preferences.floating
+        input.preferencesAvailable = onOpenPreferences != nil
         return StatusPresentation(input)
     }
 
@@ -130,8 +149,10 @@ final class AppModel: ObservableObject {
     func perform(_ action: MenuAction) {
         apply(.acted)
         switch action {
-        case .info, .separator, .preferences:
-            break // the preferences window comes with Task 9
+        case .info, .separator:
+            break
+        case .preferences:
+            onOpenPreferences?()
         case .start:
             send(.start(mic: nil, dir: nil))
         case .pause:
@@ -189,6 +210,125 @@ final class AppModel: ObservableObject {
         timer.setEventHandler { [weak self] in Task { @MainActor in self?.syncClock() } }
         timer.resume()
         clock = timer
+    }
+
+    // MARK: settings (the Preferences window)
+
+    /// What the Dock icon and the menu bar item settings come to (PreferencesPresentation.swift).
+    var visibility: Visibility {
+        PreferencesPresentation.visibility(showInDock: preferences.showInDock, showMenuBar: preferences.showMenuBar)
+    }
+
+    /// With neither on, the menu bar item is shown, and its setting written back so the checkbox says so.
+    private func normaliseVisibility() {
+        if visibility.writeBackMenuBar { preferences.showMenuBar = true }
+    }
+
+    /// Each setter tells the views first (`objectWillChange`), then writes the setting: the menu bar
+    /// item and the floating button redraw from it, and the Preferences window shows it.
+    func setShowMenuBar(_ on: Bool) {
+        objectWillChange.send()
+        preferences.showMenuBar = on
+        normaliseVisibility()
+        onVisibilityChange?()
+    }
+
+    func setShowInDock(_ on: Bool) {
+        objectWillChange.send()
+        preferences.showInDock = on
+        normaliseVisibility()
+        onVisibilityChange?()
+    }
+
+    func setFloating(_ mode: FloatingMode) {
+        objectWillChange.send()
+        preferences.floating = mode
+    }
+
+    /// Read when a job finishes.
+    func setOpenMinutes(_ on: Bool) {
+        objectWillChange.send()
+        preferences.openMinutes = on
+    }
+
+    /// Read when a sound would play.
+    func setSounds(_ on: Bool) {
+        objectWillChange.send()
+        preferences.sounds = on
+    }
+
+    /// Nil for the system default. `ControlHandler` reads it at each start, so it applies from the next recording.
+    func setMicrophone(_ name: String?) {
+        objectWillChange.send()
+        preferences.microphone = name
+    }
+
+    /// The microphone menu: the listed devices and the saved setting.
+    var microphoneChoice: MicrophoneChoice {
+        PreferencesPresentation.microphoneChoice(devices: microphones, saved: preferences.microphone)
+    }
+
+    /// Lists the microphones with the app's own recorder helper (`--record -l`), off the main queue.
+    /// A listing overtaken by a newer one is dropped; one that fails leaves nil.
+    func refreshMicrophones(helper: URL = ChildRecorder.helperExecutable(in: Bundle.main.bundleURL)) {
+        microphonesAsked += 1
+        let asked = microphonesAsked
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let found = PreferencesPresentation.listMicrophones(helper: helper)
+            Task { @MainActor in
+                guard let self = self, asked == self.microphonesAsked else { return }
+                self.microphones = found
+            }
+        }
+    }
+
+    /// The window opens with no complaint left from last time.
+    func clearFolderProblem() {
+        if folderProblem != nil { folderProblem = nil }
+    }
+
+    /// The meetings folder. Taken only while nothing is recording, paused or finalising, and only an
+    /// existing folder this user can write to; otherwise `folderProblem` says why and nothing changes.
+    /// Then the next recording goes there (`ControlHandler` reads the setting at each start), and the
+    /// one store the session, the queue and the library share moves to it, so the library reads it at
+    /// once. A job already queued or processing keeps the full path of its own folder.
+    func setMeetingsFolder(_ url: URL) {
+        guard PreferencesPresentation.canChooseFolder(session.phase) else {
+            folderProblem = PreferencesPresentation.folderBusy
+            return
+        }
+        if let problem = PreferencesPresentation.folderProblem(url) {
+            folderProblem = problem
+            return
+        }
+        objectWillChange.send()
+        folderProblem = nil
+        preferences.meetingsFolder = URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: true)
+        store.root = preferences.meetingsFolder
+        library.reload()
+    }
+
+    // MARK: quitting
+
+    /// Stop and quit: Stop goes through `perform`, the path every recording command takes, and
+    /// `done` is told once the session is idle again (finalised and queued, or failed with its files
+    /// kept). It waits on the session's phase changes; nothing polls or sleeps on the main queue.
+    func stopForQuit(then done: @escaping @MainActor () -> Void) {
+        idleWaiters.append(done)
+        if session.phase == .idle {
+            Task { @MainActor in self.tellIdleWaiters() } // nothing to stop: told on the next turn
+            return
+        }
+        perform(.stop)
+    }
+
+    /// On each phase change: the session itself is asked, so a change delivered late never answers
+    /// for a later recording.
+    private func tellIdleWaiters() {
+        guard session.phase == .idle, !idleWaiters.isEmpty else { return }
+        let waiters = idleWaiters
+        idleWaiters = []
+        waiters.forEach { $0() }
     }
 
     /// The start, stop and done sounds, unless they are turned off.

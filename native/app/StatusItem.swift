@@ -25,6 +25,12 @@ final class StatusItem: NSObject {
         refresh()
     }
 
+    /// In the menu bar or not, as `AppModel.visibility` says (AppDelegate sets it, at once).
+    var isShown: Bool {
+        get { item.isVisible }
+        set { if item.isVisible != newValue { item.isVisible = newValue } }
+    }
+
     private func refresh() {
         let now = model.presentation
         guard now != shown else { return }
