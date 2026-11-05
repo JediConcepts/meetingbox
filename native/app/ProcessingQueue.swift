@@ -196,6 +196,8 @@ final class ProcessingQueue {
 
     /// The meeting being processed, or waited on.
     private(set) var current: URL?
+    /// A job is running or waited on, or more are queued behind it.
+    var hasWork: Bool { current != nil || !pending.isEmpty }
     /// The last stage in its progress file.
     private(set) var stage: String?
     var onChange: (() -> Void)?

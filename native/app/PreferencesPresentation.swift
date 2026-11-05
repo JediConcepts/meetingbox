@@ -87,6 +87,31 @@ enum PreferencesPresentation {
         reason.map(systemQuitReasons.contains) ?? false
     }
 
+    /// kCoreEventClass, kAEQuitApplication and keyAEQuitReason (AERegistry.h).
+    private static let coreEventClass = fourCharCode("aevt")
+    private static let quitApplication = fourCharCode("quit")
+    private static let quitReasonKeyword = fourCharCode("why?")
+
+    /// The reason a quit Apple event gives, from an attribute or a parameter, read as an enumeration
+    /// or as a type code, whichever form it carries. Nil for no event (Cmd-Q, the menus), an event
+    /// that is not a quit, or a quit that gives no reason.
+    static func quitReason(_ event: NSAppleEventDescriptor?) -> UInt32? {
+        guard let event = event, event.eventClass == coreEventClass, event.eventID == quitApplication,
+              let why = event.attributeDescriptor(forKeyword: quitReasonKeyword) ?? event.paramDescriptor(forKeyword: quitReasonKeyword)
+              else { return nil }
+        for code in [why.enumCodeValue, why.typeCodeValue] where code != 0 { return code }
+        return nil
+    }
+
+    // MARK: recording entries
+
+    /// The recording entries of the menu bar item's menu that apply now (Start recording, or Pause or
+    /// Resume, and Stop), in its order: what the Dock menu and the main menu's Recording menu offer,
+    /// and what New meeting in the window follows. One source, so they never disagree.
+    static func recordingEntries(_ menu: [MenuEntry]) -> [MenuEntry] {
+        menu.filter { [MenuAction.start, .pause, .resume, .stop].contains($0.action) }
+    }
+
     /// Stop and quit sends Stop and answers later, once the session is idle; Keep recording and quit
     /// quits now and touches nothing; Cancel does not quit.
     static func quitPlan(_ choice: QuitChoice) -> QuitPlan {
@@ -128,9 +153,10 @@ enum PreferencesPresentation {
         return names
     }
 
-    /// Runs `helper --record -l` and reads its devices. Nil when it cannot be run or does not exit 0.
-    /// Waits for the helper: call it off the main queue.
-    static func listMicrophones(helper: URL) -> [String]? {
+    /// Runs `helper --record -l` and reads its devices. Nil when it cannot be run, does not exit 0, or
+    /// has not finished within `timeout`; then it is ended with SIGKILL (the recorder ignores SIGTERM
+    /// from its first line), from a background queue. Waits for the helper: call it off the main queue.
+    static func listMicrophones(helper: URL, timeout: TimeInterval = 5) -> [String]? {
         guard FileManager.default.isExecutableFile(atPath: helper.path) else { return nil }
         let process = Process()
         let out = Pipe()
@@ -140,8 +166,13 @@ enum PreferencesPresentation {
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return nil }
+        let giveUp = DispatchWorkItem {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: giveUp)
         let data = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        giveUp.cancel()
         guard process.terminationReason == .exit, process.terminationStatus == 0 else { return nil }
         return microphoneNames(String(decoding: data, as: UTF8.self))
     }
@@ -164,6 +195,17 @@ enum PreferencesPresentation {
 
     static let folderRefused = "meetingbox cannot use that folder"
     static let folderBusy = "The folder can be changed once the recording has finished"
+    static let folderStillFinishing = "Some meetings in the current folder are still being finished. Try again when they are done."
+
+    /// A meeting in the folder is still being finished: queued, processing, recording or finalising, or
+    /// a recording the recorder never finished (`MeetingFolder.recordingUnfinished`, whatever its state
+    /// says). Moving away then would leave it where neither the queue nor recovery looks. Reads the
+    /// folders: call it off the main queue.
+    static func stillFinishing(_ meetings: [Meeting]) -> Bool {
+        meetings.contains {
+            [MeetingState.queued, .processing, .recording, .finalising].contains($0.state) || MeetingFolder.recordingUnfinished($0.folder.url)
+        }
+    }
 
     /// Choose… is offered only while nothing is recording, paused or finalising: the library follows
     /// the folder, and the recording in progress must stay in it.

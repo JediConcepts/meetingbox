@@ -18,6 +18,8 @@ final class LibraryWindow: NSObject {
         let hosting = NSHostingController(rootView: LibraryView(model: model.library, app: model))
         hosting.title = "meetingbox"
         hosting.sizingOptions = [] // the window's size is the user's (saved below), not the content's
+        // The view's toolbar (New meeting) becomes the window's; the title stays the one set below.
+        if #available(macOS 14.0, *) { hosting.sceneBridgingOptions = [.toolbars] }
         window = NSWindow(contentViewController: hosting)
         super.init()
         window.title = "meetingbox"
@@ -55,9 +57,32 @@ struct LibraryView: View {
             LibraryDetail(model: model, app: app)
         }
         .frame(minWidth: 720, minHeight: 420)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                NewMeetingButton(app: app)
+            }
+        }
         .sheet(isPresented: Binding(get: { model.renaming != nil }, set: { if !$0 { model.cancelRename() } })) {
             RenameSheet(model: model)
         }
+    }
+}
+
+/// New meeting, at the top of the window: the menus' Start recording, through `AppModel.newMeeting`,
+/// enabled only while nothing is recording (the selected recording's own controls cover Pause and
+/// Stop). Only this view follows the app's changes, so the rest of the window is not redrawn every second.
+struct NewMeetingButton: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        Button {
+            app.newMeeting()
+        } label: {
+            Label("New meeting", systemImage: "record.circle")
+        }
+        .labelStyle(.titleAndIcon)
+        .disabled(!app.canStartNewMeeting)
+        .help("Start recording a new meeting")
     }
 }
 

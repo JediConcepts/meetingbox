@@ -1,5 +1,6 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift ../../app/RecordingMenu.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
+import AppKit
 import AVFoundation
 import Combine
 import CoreServices
@@ -3565,6 +3566,82 @@ do {
     check(PreferencesPresentation.listMicrophones(helper: helper("echo 'No audio input devices found.'")) == [], "T9 mic: a helper that finds none gives none")
     check(PreferencesPresentation.listMicrophones(helper: helper("printf '  USB Mic\\n'\nexit 1")) == nil, "T9 mic: a helper that fails gives no listing")
     check(PreferencesPresentation.listMicrophones(helper: scratch.appendingPathComponent("no-such-helper")) == nil, "T9 mic: a missing helper gives no listing")
+    // A helper that hangs is ended after the time limit (5 s in the app; 1 s here), and gives no listing.
+    let pidFile = scratch.appendingPathComponent("helper-pid")
+    let hang = helper("echo $$ > '\(pidFile.path)'\nexec sleep 30")
+    let began = Date()
+    check(PreferencesPresentation.listMicrophones(helper: hang, timeout: 1) == nil && Date().timeIntervalSince(began) < 10,
+          "T9 mic: a helper that hangs is given up on, and gives no listing")
+    let hungPid = Int32((try? String(contentsOf: pidFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+    check(hungPid > 0 && kill(hungPid, 0) != 0, "T9 mic: and the helper is ended")
+}
+
+// The meetings folder moves only once nothing in the current one is still being finished: queued,
+// processing, recording or finalising, or a recording the recorder never finished.
+do {
+    check(PreferencesPresentation.folderStillFinishing == "Some meetings in the current folder are still being finished. Try again when they are done.",
+          "T9 move: the refusal, word for word")
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    _ = make(root, "2026-11-01_0900", files: ["notes.md": "minutes from before meeting.json"])
+    let failed = make(root, "2026-11-02_0900")
+    try! store.update(failed) { $0.state = .failed; $0.error = "it broke" }
+    _ = make(root, "2026-11-03_0900", files: ["audio.m4a": "a"])
+    check(!PreferencesPresentation.stillFinishing(store.scan()), "T9 move: done, failed and never processed meetings are finished with")
+    for busy in [MeetingState.queued, .processing, .recording, .finalising] {
+        let other = freshRoot()
+        let otherStore = MeetingStore(root: other)
+        _ = make(other, "2026-11-01_0900", files: ["notes.md": "a"])
+        let dir = make(other, "2026-11-04_0900")
+        try! otherStore.update(dir) { $0.state = busy }
+        check(PreferencesPresentation.stillFinishing(otherStore.scan()), "T9 move: a \(busy.rawValue) meeting is still being finished")
+    }
+    let cut = make(root, "2026-11-05_0900", files: ["mic.caf": "x"])
+    try! store.update(cut) { $0.state = .failed; $0.error = Session.interrupted }
+    check(PreferencesPresentation.stillFinishing(store.scan()), "T9 move: a recording the recorder never finished is still being finished, whatever its state says")
+    fm.createFile(atPath: cut.appendingPathComponent(Finaliser.marker).path, contents: Data())
+    check(!PreferencesPresentation.stillFinishing(store.scan()), "T9 move: once its marker is written it is finished")
+}
+
+// The recording entries the Dock menu, the main menu's Recording menu and New meeting share: the menu bar
+// item's own recording entries that apply now, in its order, and nothing else.
+do {
+    let phases: [(String, Session.Phase, [MenuAction])] = [("idle", .idle, [.start]), ("recording", .recording(meetingA), [.pause, .stop]),
+                                                          ("paused", .paused(meetingA), [.resume, .stop]), ("finalising", .finalising(meetingA), [])]
+    for (name, phase, actions) in phases {
+        for p in [present(phase), present(phase, processing: meetingB, ready: meetingB, failure: Failure("start", "No microphone"), preferences: true)] {
+            let entries = PreferencesPresentation.recordingEntries(p.menu)
+            let statusOwn = p.menu.filter { [MenuAction.start, .pause, .resume, .stop].contains($0.action) }
+            check(entries.map(\.action) == actions && entries == statusOwn,
+                  "T9 recording entries: \(name) gives the menu bar item's own \(actions.map(\.title)) (\(entries.map(\.title)))")
+        }
+    }
+}
+
+// The quit reason, in whichever form the quit event carries it: an enumeration or a type code, as an
+// attribute or as a parameter.
+do {
+    func quitEvent(_ id: UInt32 = UInt32(kAEQuitApplication)) -> NSAppleEventDescriptor {
+        NSAppleEventDescriptor.appleEvent(withEventClass: AEEventClass(kCoreEventClass), eventID: AEEventID(id), targetDescriptor: nil,
+                                          returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+    }
+    let key = AEKeyword(kAEQuitReason)
+    let logOut = UInt32(kAEReallyLogOut), shutDown = UInt32(kAEShutDown)
+    let enumAttribute = quitEvent()
+    enumAttribute.setAttribute(NSAppleEventDescriptor(enumCode: logOut), forKeyword: key)
+    let typeAttribute = quitEvent()
+    typeAttribute.setAttribute(NSAppleEventDescriptor(typeCode: logOut), forKeyword: key)
+    let enumParameter = quitEvent()
+    enumParameter.setParam(NSAppleEventDescriptor(enumCode: shutDown), forKeyword: key)
+    let typeParameter = quitEvent()
+    typeParameter.setParam(NSAppleEventDescriptor(typeCode: shutDown), forKeyword: key)
+    check([enumAttribute, typeAttribute, enumParameter, typeParameter].map { PreferencesPresentation.quitReason($0) } == [logOut, logOut, shutDown, shutDown] as [UInt32?],
+          "T9 quit: the reason is read as an enumeration or a type code, from an attribute or a parameter")
+    let open = quitEvent(UInt32(kAEOpenApplication))
+    open.setAttribute(NSAppleEventDescriptor(enumCode: logOut), forKeyword: key)
+    check(PreferencesPresentation.quitReason(nil) == nil && PreferencesPresentation.quitReason(quitEvent()) == nil
+          && PreferencesPresentation.quitReason(open) == nil,
+          "T9 quit: no event (Cmd-Q, the menus), a quit with no reason, and an event that is not a quit give no reason")
 }
 
 // The meetings folder: an existing folder this user can write to, nothing else; never while recording.
@@ -3665,15 +3742,29 @@ MainActor.assumeIsolated {
     check(prefs.microphone == "USB Mic" && model.microphoneChoice.options[model.microphoneChoice.selected].name == "USB Mic",
           "T9 app: the microphone is saved and shown chosen")
 
-    // the meetings folder: the library moves with it at once
+    // the meetings folder: not while the current one still has meetings being finished
+    let stillFinishing = "Some meetings in the current folder are still being finished. Try again when they are done."
     _ = make(meetingsA, "2026-11-01_0900", files: ["notes.md": "a"])
     _ = make(meetingsB, "2026-11-02_0900", files: ["notes.md": "b"])
     _ = make(meetingsB, "2026-11-03_0900", files: ["notes.md": "b"])
     model.library.reload()
     check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-01_0900"] }, "T9 folder: the library starts on the folder setting")
+    let waiting = make(meetingsA, "2026-10-30_0900")
+    try! model.store.update(waiting) { $0.state = .queued } // left queued on disk; the queue has not taken it up
     model.setMeetingsFolder(meetingsB)
-    check(model.folderProblem == nil && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
-          "T9 folder: a new folder is saved and the store moves to it")
+    check(settle { model.folderProblem == stillFinishing } && prefs.meetingsFolder.path == meetingsA.path && model.store.root.path == meetingsA.path,
+          "T9 move: a queued meeting in the current folder refuses the move, in those words, and nothing changes")
+    try! model.store.update(waiting) { $0.state = .done }
+    let cut = make(meetingsA, "2026-10-29_0900", files: ["mic.caf": "x"])
+    model.clearFolderProblem()
+    model.setMeetingsFolder(meetingsB)
+    check(settle { model.folderProblem == stillFinishing } && prefs.meetingsFolder.path == meetingsA.path && model.store.root.path == meetingsA.path,
+          "T9 move: so does a recording the recorder never finished")
+    fm.createFile(atPath: cut.appendingPathComponent(Finaliser.marker).path, contents: Data())
+    model.clearFolderProblem()
+    model.setMeetingsFolder(meetingsB)
+    check(settle { prefs.meetingsFolder.path == meetingsB.path } && model.folderProblem == nil && model.store.root.path == meetingsB.path,
+          "T9 move: with nothing left being finished the folder moves, and the store with it")
     check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-03_0900", "2026-11-02_0900"] },
           "T9 folder: the library reads the new folder at once")
     model.setMeetingsFolder(meetingsB.appendingPathComponent("2026-11-03_0900/notes.md"))
@@ -3701,26 +3792,101 @@ MainActor.assumeIsolated {
     check(model.session.phase == .idle && rec.signals.count == 1 && rec.signals[0].pid == pid && ["queued", "processing"].contains(stateOf(recording) ?? "-"),
           "T9 quit: finished and queued, and Stop was the only signal")
 
-    // a job already running keeps its own folder when the setting moves on
+    // while the finished recording is processed the folder stays; once it is done the move takes up
+    // what is waiting in the new folder by itself (nothing here calls resume or adopt)
     check(settle { runner.calls.count == 1 }, "T9 folder: the finished recording is being processed")
     let meetingsC = root.appendingPathComponent("C", isDirectory: true)
     try! fm.createDirectory(at: meetingsC, withIntermediateDirectories: true)
     _ = make(meetingsC, "2026-10-31_0900", files: ["notes.md": "c"])
-    model.setMeetingsFolder(meetingsC)
-    check(model.folderProblem == nil && prefs.meetingsFolder.path == meetingsC.path && model.store.root.path == meetingsC.path,
-          "T9 folder: idle again, the folder can be changed")
-    check(model.queue.current?.lastPathComponent == recording.lastPathComponent, "T9 folder: the job in progress is still its own meeting's")
-    runner.finish(0, 0)
-    check(settle { stateOf(recording) == "done" }, "T9 folder: and it finishes in its own folder")
-    check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-10-31_0900"] }, "T9 folder: the library is on the third folder")
-    // the session's sweep for interrupted recordings looks in the folder set now
+    let queuedC = make(meetingsC, "2026-10-28_0900", files: ["audio.m4a": "a"])
+    try! model.store.update(queuedC) { $0.state = .queued }
     let orphan = make(meetingsC, "2026-11-04_0900")
     try! model.store.update(orphan) { $0.state = .recording }
-    model.session.adopt()
-    check(settle { stateOf(orphan) == "queued" || stateOf(orphan) == "processing" } && rec.recovered.map(\.lastPathComponent) == ["2026-11-04_0900"],
-          "T9 folder: an interrupted recording in the new folder is found and recovered")
+    model.clearFolderProblem()
+    model.setMeetingsFolder(meetingsC)
+    check(settle { model.folderProblem == stillFinishing } && prefs.meetingsFolder.path == meetingsB.path && model.store.root.path == meetingsB.path,
+          "T9 move: not while a meeting is being processed")
+    runner.finish(0, 0)
+    check(settle { stateOf(recording) == "done" }, "T9 folder: the job finishes in its own folder")
+    model.clearFolderProblem()
+    model.setMeetingsFolder(meetingsC)
+    check(settle { prefs.meetingsFolder.path == meetingsC.path } && model.folderProblem == nil && model.store.root.path == meetingsC.path,
+          "T9 move: once it is done, the folder moves")
+    check(settle { runner.calls.count == 2 } && runner.calls[1].audio.deletingLastPathComponent().lastPathComponent == "2026-10-28_0900",
+          "T9 move: the move itself takes up a meeting left queued in the new folder")
+    check(settle { rec.recovered.map(\.lastPathComponent) == ["2026-11-04_0900"] && ["queued", "processing"].contains(stateOf(orphan) ?? "-") },
+          "T9 move: and recovers a recording left interrupted there")
+    check(settle { model.library.meetings.map(\.folder.url.lastPathComponent) == ["2026-11-04_0900", "2026-10-31_0900", "2026-10-28_0900"] },
+          "T9 move: the library is on the new folder")
     watch.cancel()
     model.shutDown()
+
+    // the Dock menu, the main menu's Recording menu, New meeting, and Stop and quit when idle or paused,
+    // on a model of its own
+    let state3 = shortTemp()
+    let prefs3 = Preferences(defaults: testDefaults(), home: root)
+    prefs3.meetingsFolder = meetingsA
+    prefs3.sounds = false
+    let rec3 = FakeRecorder()
+    let m3 = AppModel(stateDir: state3, preferences: prefs3, recorder: rec3, runner: FakeRunner(), freeBytes: { _ in 50 * GB })
+    m3.launch()
+    var idleReplied = false
+    m3.stopForQuit { idleReplied = true }
+    check(settle { idleReplied } && rec3.signals.isEmpty && rec3.launches.isEmpty && m3.session.phase == .idle,
+          "T9 quit: Stop and quit with nothing recording answers at once and sends nothing")
+    let menus = RecordingMenu(model: m3)
+    /// The Dock asks for a fresh menu each time it opens; the main menu's Recording menu is kept up to date.
+    @MainActor func dockTitles() -> [String] { menus.dockMenu().items.map(\.title) }
+    @MainActor func mainTitles() -> [String] { menus.menu.items.map(\.title) }
+    /// Chooses an item as AppKit does: its action, sent to its target.
+    @MainActor func choose(_ menu: NSMenu, _ title: String) {
+        guard let item = menu.items.first(where: { $0.title == title }) else { return }
+        _ = (item.target as? NSObject)?.perform(item.action, with: item)
+    }
+    @MainActor func paused() -> Bool { if case .paused = m3.session.phase { return true }; return false }
+    @MainActor func recordingNow() -> Bool { if case .recording = m3.session.phase { return true }; return false }
+    /// Both menus offer exactly these, and New meeting is enabled only with Start recording among them.
+    @MainActor func offers(_ titles: [String]) -> Bool {
+        dockTitles() == titles && mainTitles() == titles && m3.canStartNewMeeting == titles.contains("Start recording")
+    }
+    check(offers(["Start recording"]), "T9 recording entries: idle: the Dock and Recording menus offer Start recording, and New meeting is enabled")
+    m3.newMeeting()
+    check(settle { recordingNow() } && rec3.launches.count == 1, "T9 new meeting: it starts a recording through the one path")
+    check(settle { offers(["Pause", "Stop"]) }, "T9 recording entries: recording: both menus offer Pause and Stop, and New meeting is disabled")
+    m3.newMeeting()
+    _ = settle({ false }, timeout: 0.3)
+    check(rec3.launches.count == 1 && recordingNow(), "T9 new meeting: while recording it starts nothing")
+    choose(menus.dockMenu(), "Pause")
+    check(settle { paused() } && rec3.sent(SIGUSR1) == 1, "T9 dock menu: Pause pauses, through the one path")
+    check(settle { offers(["Resume", "Stop"]) }, "T9 recording entries: paused: both menus offer Resume and Stop, and New meeting is disabled")
+    choose(menus.menu, "Resume")
+    check(settle { recordingNow() } && rec3.sent(SIGUSR2) == 1, "T9 recording menu: Resume resumes, through the one path")
+    check(settle { offers(["Pause", "Stop"]) }, "T9 recording entries: recording again: both menus follow, with no tick or choice needed")
+    choose(menus.menu, "Pause")
+    check(settle { paused() } && rec3.sent(SIGUSR1) == 2, "T9 recording menu: Pause pauses again")
+    // Stop and quit while paused; an idle delivered late, as for an earlier recording, does not answer for this one
+    let pid3 = rec3.nextPid
+    let folder3 = m3.session.phase.folder ?? meetingsA
+    var pausedReplied = false
+    m3.stopForQuit { pausedReplied = true }
+    check(settle { rec3.sent(SIGINT) == 1 } && !pausedReplied && m3.session.phase == .finalising(folder3),
+          "T9 quit: Stop and quit while paused sends Stop and waits while it finalises")
+    check(settle { offers([]) }, "T9 recording entries: finalising: both menus offer nothing, and New meeting is disabled")
+    m3.session.onChange?(.idle)
+    _ = settle({ false }, timeout: 0.3)
+    check(!pausedReplied, "T9 quit: an idle delivered late, while this recording finalises, does not answer")
+    rec3.exit(pid3, 0, verifies: true)
+    check(settle { pausedReplied } && m3.session.phase == .idle, "T9 quit: it answers once the paused recording is finished")
+    check(settle { offers(["Start recording"]) }, "T9 recording entries: idle again: Start recording, and New meeting is enabled")
+    choose(menus.dockMenu(), "Start recording")
+    check(settle { recordingNow() } && rec3.launches.count == 2, "T9 dock menu: Start recording starts a recording, through the one path")
+    check(settle { offers(["Pause", "Stop"]) }, "T9 recording entries: and both menus follow it")
+    choose(menus.menu, "Stop")
+    check(settle { rec3.sent(SIGINT) == 2 } && rec3.signals.last?.pid == rec3.nextPid, "T9 recording menu: Stop stops it, through the one path")
+    rec3.exit(rec3.nextPid, 0, verifies: true)
+    _ = settle { m3.session.phase == .idle }
+    m3.shutDown()
+    try? fm.removeItem(at: state3)
 
     // Keep recording and quit: nothing is sent to the recorder, by the quit, the shutdown or any deinit
     let state2 = shortTemp()
@@ -3741,13 +3907,15 @@ MainActor.assumeIsolated {
         _ = settle({ false }, timeout: 2.6) // the start's grace passes, so nothing of it is left waiting
         folder2 = m.session.phase.folder
         pid2 = rec2.nextPid
-        if PreferencesPresentation.quitPlan(.keepRecordingAndQuit).stop { m.stopForQuit {} }
+        // Keep recording and quit sends nothing ("T9 quit: Keep recording and quit quits at once and
+        // touches nothing"); what is left to prove is that the shutdown and the deinits send nothing either.
         m.shutDown() // what applicationWillTerminate does
         goneModel = m
         goneSession = m.session
     }
     check(settle { goneModel == nil && goneSession == nil }, "T9 keep: the model and its session are let go, so their deinits have run")
-    check(folder2 != nil && rec2.signals.isEmpty && rec2.alive.contains(pid2), "T9 keep: the recorder was sent nothing and is still recording")
+    check(folder2 != nil && rec2.signals.isEmpty && rec2.alive.contains(pid2),
+          "T9 keep: shutDown and the model's and session's deinits sent the recorder nothing; it is still recording")
     check((try? String(contentsOf: state2.appendingPathComponent("recording.dir"), encoding: .utf8)) == folder2?.path
           && folder2.flatMap(stateOf) == "recording" && !fm.fileExists(atPath: state2.appendingPathComponent("control.sock").path),
           "T9 keep: recording.dir and meeting.json still say recording; only the socket has gone")

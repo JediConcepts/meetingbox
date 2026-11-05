@@ -40,6 +40,7 @@ final class AppModel: ObservableObject {
     /// Why the folder last chosen was not taken, until another is taken or the window opens again.
     @Published private(set) var folderProblem: String?
     private var microphonesAsked = 0
+    private var folderMovesAsked = 0
     /// Told once the session is idle again (Stop and quit).
     private var idleWaiters: [@MainActor () -> Void] = []
 
@@ -287,11 +288,16 @@ final class AppModel: ObservableObject {
         if folderProblem != nil { folderProblem = nil }
     }
 
-    /// The meetings folder. Taken only while nothing is recording, paused or finalising, and only an
-    /// existing folder this user can write to; otherwise `folderProblem` says why and nothing changes.
-    /// Then the next recording goes there (`ControlHandler` reads the setting at each start), and the
-    /// one store the session, the queue and the library share moves to it, so the library reads it at
-    /// once. A job already queued or processing keeps the full path of its own folder.
+    /// The meetings folder. Taken only while nothing is recording, paused or finalising, only an
+    /// existing folder this user can write to, and only once nothing in the current folder is still
+    /// being finished (`PreferencesPresentation.stillFinishing`) and the queue has no work: a meeting
+    /// left behind would be in a folder neither the queue nor recovery looks in. Otherwise
+    /// `folderProblem` says why and nothing changes.
+    ///
+    /// The current folder is read off the main queue; the move is then made on the main queue, after
+    /// the session and the queue are checked again (only the latest choice is made). The next recording
+    /// goes there (`ControlHandler` reads the setting at each start), and the one store the session, the
+    /// queue and the library share moves to it.
     func setMeetingsFolder(_ url: URL) {
         guard PreferencesPresentation.canChooseFolder(session.phase) else {
             folderProblem = PreferencesPresentation.folderBusy
@@ -301,11 +307,49 @@ final class AppModel: ObservableObject {
             folderProblem = problem
             return
         }
+        folderMovesAsked += 1
+        let asked = folderMovesAsked
+        let store = self.store
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let finishing = PreferencesPresentation.stillFinishing(store.scan())
+            Task { @MainActor in self?.moveMeetingsFolder(to: url, asked: asked, finishing: finishing) }
+        }
+    }
+
+    private func moveMeetingsFolder(to url: URL, asked: Int, finishing: Bool) {
+        guard asked == folderMovesAsked else { return } // a later choice overtook this one
+        guard PreferencesPresentation.canChooseFolder(session.phase) else {
+            folderProblem = PreferencesPresentation.folderBusy
+            return
+        }
+        guard !finishing, !queue.hasWork else {
+            folderProblem = PreferencesPresentation.folderStillFinishing
+            return
+        }
         objectWillChange.send()
         folderProblem = nil
         preferences.meetingsFolder = URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: true)
         store.root = preferences.meetingsFolder
         library.reload()
+        // What waits in the new folder is taken up now, as at launch. Both are safe to repeat: resume
+        // skips what the queue already holds, and adopt does nothing unless the session is idle (it is:
+        // checked above, on this queue) and skips recoveries already running.
+        queue.resume()
+        session.adopt()
+    }
+
+    // MARK: recording entries (the Dock menu, the main menu's Recording menu, New meeting)
+
+    /// The menu bar item's recording entries that apply now (`PreferencesPresentation.recordingEntries`).
+    var recordingEntries: [MenuEntry] { PreferencesPresentation.recordingEntries(presentation.menu) }
+
+    /// New meeting in the window is enabled exactly when the menus offer Start recording: while idle.
+    var canStartNewMeeting: Bool { recordingEntries.contains { $0.action == .start && $0.enabled } }
+
+    /// New meeting: the menus' Start recording, through `perform`. Nothing while a recording is under way.
+    func newMeeting() {
+        guard canStartNewMeeting else { return }
+        perform(.start)
     }
 
     // MARK: quitting

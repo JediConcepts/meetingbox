@@ -11,6 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var floatingPanel: FloatingPanel?
     private var libraryWindow: LibraryWindow?
     private var preferencesWindow: PreferencesWindow?
+    /// The main menu's Recording menu and the Dock menu.
+    private var recordingMenu: RecordingMenu?
     private var lock: AppLock?
     private var model: AppModel?
 
@@ -31,7 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onOpenPreferences = { [weak self] in self?.showPreferences() }
         model.onVisibilityChange = { [weak self] in self?.applyVisibility() }
         self.model = model
-        NSApp.mainMenu = makeMainMenu()
+        let recordingMenu = RecordingMenu(model: model)
+        self.recordingMenu = recordingMenu
+        NSApp.mainMenu = makeMainMenu(recording: recordingMenu.menu)
         // The views first, so they hear every change the launch makes.
         statusItem = StatusItem(model: model)
         floatingPanel = FloatingPanel(model: model)
@@ -54,6 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// The Dock menu: the recording entries that apply now, so recording never depends on the menu
+    /// bar item being shown. Asked for each time it opens.
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        recordingMenu?.dockMenu()
+    }
+
     // MARK: quitting
 
     /// The one guard: the menu's Quit, Cmd-Q, the Dock menu's Quit and a quit Apple event all come
@@ -71,7 +81,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stall the queue (hence `AppModel.perform` never waits).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model = model else { return .terminateNow }
-        let plan = PreferencesPresentation.quit(phase: model.session.phase, reason: AppDelegate.quitReason()) {
+        let reason = PreferencesPresentation.quitReason(NSAppleEventManager.shared().currentAppleEvent)
+        let plan = PreferencesPresentation.quit(phase: model.session.phase, reason: reason) {
             AppDelegate.askToQuit()
         }
         if plan.stop {
@@ -82,16 +93,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .later: return .terminateLater
         case .cancel: return .terminateCancel
         }
-    }
-
-    /// The reason a quit Apple event gives (`keyAEQuitReason`), as log out, restart and shut down send
-    /// it; nil for any other quit (Cmd-Q, the menus).
-    private static func quitReason() -> UInt32? {
-        guard let event = NSAppleEventManager.shared().currentAppleEvent,
-              event.eventClass == AEEventClass(kCoreEventClass), event.eventID == AEEventID(kAEQuitApplication) else { return nil }
-        let reason = event.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason))
-            ?? event.paramDescriptor(forKeyword: AEKeyword(kAEQuitReason))
-        return reason?.enumCodeValue
     }
 
     /// "A recording is running.", with Stop and quit, Keep recording and quit, and Cancel (Escape).
@@ -139,8 +140,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// The app menu (Preferences… on Cmd-comma, Hide, and Quit on Cmd-Q, which goes through the quit
-    /// guard), and Edit and Window menus so text fields and windows take the usual keys.
-    private func makeMainMenu() -> NSMenu {
+    /// guard); the Recording menu (`RecordingMenu`, the recording entries that apply now); and Edit and
+    /// Window menus so text fields and windows take the usual keys.
+    private func makeMainMenu(recording: NSMenu) -> NSMenu {
         func item(_ title: String, _ action: Selector?, _ key: String, _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
             let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
             menuItem.keyEquivalentModifierMask = modifiers
@@ -161,6 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item("Hide meetingbox", #selector(NSApplication.hide(_:)), "h"), .separator(),
             item("Quit meetingbox", #selector(NSApplication.terminate(_:)), "q"),
         ]))
+        let recordingHolder = NSMenuItem(title: recording.title, action: nil, keyEquivalent: "")
+        recordingHolder.submenu = recording
+        main.addItem(recordingHolder)
         main.addItem(submenu("Edit", [
             item("Undo", Selector(("undo:")), "z"), item("Redo", Selector(("redo:")), "z", [.command, .shift]), .separator(),
             item("Cut", #selector(NSText.cut(_:)), "x"), item("Copy", #selector(NSText.copy(_:)), "c"),
