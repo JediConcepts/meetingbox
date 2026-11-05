@@ -66,50 +66,59 @@ struct PreferencesView: View {
         let shown = app.visibility
         let microphone = app.microphoneChoice
         let folder = app.preferences.meetingsFolder.path
-        Form {
-            Section {
-                Toggle("Show in the menu bar", isOn: Binding(get: { shown.menuBarItem }, set: { app.setShowMenuBar($0) }))
-                    .disabled(shown.menuBarLocked)
-                if shown.menuBarLocked {
-                    Text("Always shown while meetingbox is not in the Dock")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+        VStack(spacing: 16) {
+            Form {
+                Section {
+                    Toggle("Show in the menu bar", isOn: Binding(get: { shown.menuBarItem }, set: { app.setShowMenuBar($0) }))
+                        .disabled(shown.menuBarLocked)
+                    if shown.menuBarLocked {
+                        Text("Always shown while meetingbox is not in the Dock")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Toggle("Show in the Dock", isOn: Binding(get: { shown.dockIcon }, set: { app.setShowInDock($0) }))
+                    Picker("Floating button:", selection: Binding(get: { app.preferences.floating }, set: { app.setFloating($0) })) {
+                        ForEach(FloatingMode.allCases, id: \.self) { mode in
+                            Text(PreferencesPresentation.floatingTitle(mode)).tag(mode)
+                        }
+                    }
                 }
-                Toggle("Show in the Dock", isOn: Binding(get: { shown.dockIcon }, set: { app.setShowInDock($0) }))
-                Picker("Floating button:", selection: Binding(get: { app.preferences.floating }, set: { app.setFloating($0) })) {
-                    ForEach(FloatingMode.allCases, id: \.self) { mode in
-                        Text(PreferencesPresentation.floatingTitle(mode)).tag(mode)
+                Section {
+                    Toggle("Open the minutes when they are ready", isOn: Binding(get: { app.preferences.openMinutes }, set: { app.setOpenMinutes($0) }))
+                    Toggle("Play sounds", isOn: Binding(get: { app.preferences.sounds }, set: { app.setSounds($0) }))
+                }
+                Section {
+                    Picker("Microphone:", selection: Binding(get: { microphone.selected }, set: { index in
+                        if microphone.options.indices.contains(index) { app.setMicrophone(microphone.options[index].name) }
+                    })) {
+                        ForEach(Array(microphone.options.enumerated()), id: \.offset) { entry in
+                            Text(entry.element.title).tag(entry.offset)
+                        }
+                    }
+                    LabeledContent("Meetings folder:") {
+                        HStack {
+                            Text((folder as NSString).abbreviatingWithTildeInPath)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(folder)
+                            Button("Choose…", action: choose)
+                                .disabled(!PreferencesPresentation.canChooseFolder(app.status.phase))
+                        }
+                    }
+                    if let problem = app.folderProblem {
+                        Text(problem).foregroundStyle(.red)
                     }
                 }
             }
-            Section {
-                Toggle("Open the minutes when they are ready", isOn: Binding(get: { app.preferences.openMinutes }, set: { app.setOpenMinutes($0) }))
-                Toggle("Play sounds", isOn: Binding(get: { app.preferences.sounds }, set: { app.setSounds($0) }))
-            }
-            Section {
-                Picker("Microphone:", selection: Binding(get: { microphone.selected }, set: { index in
-                    if microphone.options.indices.contains(index) { app.setMicrophone(microphone.options[index].name) }
-                })) {
-                    ForEach(Array(microphone.options.enumerated()), id: \.offset) { entry in
-                        Text(entry.element.title).tag(entry.offset)
-                    }
-                }
-                LabeledContent("Meetings folder:") {
-                    HStack {
-                        Text((folder as NSString).abbreviatingWithTildeInPath)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(folder)
-                        Button("Choose…", action: choose)
-                            .disabled(!PreferencesPresentation.canChooseFolder(app.status.phase))
-                    }
-                }
-                if let problem = app.folderProblem {
-                    Text(problem).foregroundStyle(.red)
-                }
+            .formStyle(.columns)
+            // Which build this is, at the foot, selectable so it can be copied into a report.
+            if let build = BuildInfo.main {
+                Text(build.line)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
             }
         }
-        .formStyle(.columns)
         .padding(20)
         .frame(width: 480)
     }

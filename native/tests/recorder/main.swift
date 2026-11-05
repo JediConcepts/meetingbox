@@ -1,4 +1,4 @@
-// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift ../../recorder/DiskFloor.swift ../../recorder/Stop.swift
+// sources: ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../recorder/Health.swift ../../recorder/DiskFloor.swift ../../recorder/Stop.swift ../../recorder/CaptureError.swift
 // The recorder writes crash-safe working files (mic.caf, call.caf) and turns them
 // into the three .m4a at stop, or later through recovery. Synthetic sine audio in
 // temporary folders only: no devices, no permissions.
@@ -789,6 +789,23 @@ do {
     let result = recoverStatus(directory: dir, freeBytes: { _ in 1 })
     check(result.status == 1 && result.message.contains("no working files to recover from") && !result.message.contains("too full"),
           "R2: a folder with no working files fails for that, not for room")
+}
+
+// MARK: - System audio that cannot start: why, in words (Task 10, item 7)
+// The app shows the recorder's last line. No display (the screen asleep or locked) is not a
+// missing permission, so it must not send anyone to Privacy & Security.
+
+do {
+    let asleep = CaptureError.systemAudioFailure(CaptureError.noDisplay)
+    let lines = asleep.components(separatedBy: "\n")
+    check(lines.first == "Failed to start system audio: No display found for audio capture"
+          && lines.last == "The screen is asleep or locked, so the call side cannot be recorded. Wake the screen and try again."
+          && !asleep.contains("Grant Screen Recording"),
+          "T10: no display says the screen is asleep or locked, last, and not to grant a permission")
+    let denied = CaptureError.systemAudioFailure(NSError(domain: "SCStreamErrorDomain", code: -3801,
+                                                          userInfo: [NSLocalizedDescriptionKey: "The user declined TCCs"]))
+    check(denied == "Failed to start system audio: The user declined TCCs\nGrant Screen Recording permission in System Settings → Privacy & Security.",
+          "T10: any other failure still points at Screen Recording, as before")
 }
 
 try? fm.removeItem(at: scratch)

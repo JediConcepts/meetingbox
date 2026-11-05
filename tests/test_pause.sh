@@ -39,13 +39,15 @@ if [ "$rc" -ne 0 ] && [ ! -s "$HOME/sent" ] && ! grep -q '^nc ' "$HOME/calls.log
 else fail "pause refuses a recording an older recorder is making ($rc): $out"; fi
 rm -f "$dir/2026-10-29_0900_meeting.m4a"
 
-# --- reset still clears a marker left behind ---
+# --- with no app answering, reset still clears a marker left behind ---
+# (an app that answers keeps its own: see test_install_record.sh)
 touch "$PAUSE_FILE"
+nc() { echo "nc $*" >> "$HOME/calls.log"; return 1; }
 confirm() { return 0; }
 stop_recorders() { :; }
 adopt_own_app() { :; }
 reset_cmd state >/dev/null 2>&1
-if [ ! -e "$PAUSE_FILE" ]; then pass "reset removes the marker"
-else fail "reset removes the marker"; fi
+if [ ! -e "$PAUSE_FILE" ]; then pass "reset with no app answering removes the marker"
+else fail "reset with no app answering removes the marker"; fi
 
 finish

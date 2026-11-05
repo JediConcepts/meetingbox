@@ -190,13 +190,15 @@ out="$(mb status)"
 if printf '%s' "$out" | grep -q "idle" && ! grep -q '^open ' "$HOME/calls.log"; then pass "status with nothing at all: idle"
 else fail "status with nothing at all: idle ($out)"; fi
 
-# A command that finds no app opens it in the background and retries for 10 s.
+# A command that finds no app opens it in the background and retries for 10 s. The app is
+# installed, so setup is not the answer (Task 10, item 6): it is starting or quitting.
+STARTING="meetingbox is starting or quitting. Try again in a moment."
 reset_calls; : > "$HOME/app-down"; reply "ok recording /x"
 out="$(mb start)"; rc=$?
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox did not start. Run: meetingbox setup" \
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$STARTING" && ! printf '%s' "$out" | grep -q 'setup' \
    && grep -qxF "open -g $APP_DIR" "$HOME/calls.log" && [ "$(slept)" = 10 ] && [ ! -s "$HOME/sent" ]; then
-  pass "no app: opens \$APP_DIR, retries for 10 s, then says meetingbox did not start"
-else fail "no app: opens \$APP_DIR, retries for 10 s, then says meetingbox did not start ($rc, slept $(slept): $out)"; fi
+  pass "no app: opens \$APP_DIR, retries for 10 s, then says it is starting or quitting"
+else fail "no app: opens \$APP_DIR, retries for 10 s, then says it is starting or quitting ($rc, slept $(slept): $out)"; fi
 if [ "$(grep -c '^open ' "$HOME/calls.log")" = 1 ]; then pass "no app: opened once, not on every retry"
 else fail "no app: opened once, not on every retry ($(grep -c '^open ' "$HOME/calls.log"))"; fi
 
@@ -272,9 +274,30 @@ if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox is running but n
 else fail "M6: an app that opens but never answers in 10 s ($rc, slept $(slept): $out)"; fi
 reset_calls; : > "$HOME/app-down"; rm -f "$STATE_DIR/app.lock"
 out="$(mb start)"
-if printf '%s' "$out" | grep -qF "meetingbox did not start. Run: meetingbox setup" && [ ! -e "$STATE_DIR/app.lock" ]; then
-  pass "M6: the lock probe creates no app.lock, and with none the app simply did not start"
+if printf '%s' "$out" | grep -qF "$STARTING" && [ ! -e "$STATE_DIR/app.lock" ]; then
+  pass "M6: the lock probe creates no app.lock, and with none the app is starting or quitting"
 else fail "M6: the lock probe creates no app.lock ($out)"; fi
+# The lock let go during the wait (an app that was quitting): still not a reason to run setup.
+reset_calls; : > "$HOME/app-down"; : > "$HOME/lock-held"; : > "$STATE_DIR/app.lock"
+cat > "$STUB/sleep" <<'SH'
+#!/bin/bash
+echo "sleep $*" >> "$HOME/calls.log"
+[ "$(grep -c '^sleep ' "$HOME/calls.log")" -ge 3 ] && rm -f "$HOME/lock-held"
+exit 0
+SH
+out="$(mb stop)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "$STARTING" && ! printf '%s' "$out" | grep -q 'setup'; then
+  pass "an app that finished quitting during the wait: starting or quitting, not setup"
+else fail "an app that finished quitting during the wait: starting or quitting, not setup ($rc: $out)"; fi
+cat > "$STUB/sleep" <<'SH'
+#!/bin/bash
+echo "sleep $*" >> "$HOME/calls.log"
+# with $HOME/app-up-at-3: the app finishes starting at the third sleep
+[ -e "$HOME/app-up-at-3" ] && [ "$(grep -c '^sleep ' "$HOME/calls.log")" -ge 3 ] && rm -f "$HOME/app-down"
+exit 0
+SH
+chmod +x "$STUB/sleep"
+rm -f "$STATE_DIR/app.lock"
 
 # I1: a start the app reports as failed exits non-zero with the reason, for toggle too.
 reset_calls; reply 'error No input device matching "USB"'

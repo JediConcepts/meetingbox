@@ -124,4 +124,136 @@ if [ "$rc" -ne 0 ] && [ "$(cat "$TRANSCRIPT_BIN")" = bin ]; then
   pass "install_recorder will not replace an mb-transcript it did not make"
 else fail "install_recorder will not replace an mb-transcript it did not make"; fi
 
+# --- a Shortcuts app in the way (Task 10, item 3) ---
+# A shortcut added to the Dock becomes ~/Applications/<its name>.app, so a shortcut called
+# meetingbox sits where the app goes. The refusal says what it is.
+HINT="this is a Shortcuts app named meetingbox; rename the shortcut or remove it from the Dock"
+bundle_with_id() {   # path id
+  mkdir -p "$1/Contents"
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>%s</string></dict></plist>\n' "$2" > "$1/Contents/Info.plist"
+}
+bundle_with_id "$HOME/Apps/meetingbox.app" com.apple.shortcuts.droplet
+out="$(claim_path "$HOME/Apps/meetingbox.app" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$HINT" && printf '%s\n' "$out" | grep -q 'meetingbox did not create it' \
+   && [ -f "$HOME/Apps/meetingbox.app/Contents/Info.plist" ] && ! installed_by_us "$HOME/Apps/meetingbox.app"; then
+  pass "claim_path refuses a Shortcuts droplet and says what it is"
+else fail "claim_path refuses a Shortcuts droplet and says what it is (rc $rc): $out"; fi
+bundle_with_id "$HOME/Apps/other.app" com.example.other
+out="$(claim_path "$HOME/Apps/other.app" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && ! printf '%s\n' "$out" | grep -q 'Shortcuts' && [ -d "$HOME/Apps/other.app" ]; then
+  pass "anything else in the way is refused without the Shortcuts hint"
+else fail "anything else in the way is refused without the Shortcuts hint (rc $rc): $out"; fi
+
+# --- uninstall and reset --tools (Task 10) ---
+# They refuse while a recording is running, finalising or recovering, as setup does; otherwise,
+# once asked, they quit the app, then remove the app setup recorded and the control socket.
+# reset on its own leaves the app installed.
+APP_DIR="$HOME/Applications/meetingbox.app"; APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
+REC_APP="$APP_DIR/Contents/Helpers/meetingbox-recorder.app"; REC_BIN="$REC_APP/Contents/MacOS/meetingbox-recorder"
+OLD_APP_DIR="$SRC_DIR/meetingbox.app"; OLD_REC_BIN="$OLD_APP_DIR/Contents/MacOS/audio-capture"
+BASE_DIR="$HOME/Meetings"
+mkdir -p "$BASE_DIR/2026-10-27_1430" "$BIN_DIR"
+printf 'audio' > "$BASE_DIR/2026-10-27_1430/audio.m4a"
+FAKE_PS=""
+ps() { [ -n "$FAKE_PS" ] && printf '  777 %s\n' "$FAKE_PS"; return 0; }
+sleep() { :; }
+brew() { return 1; }
+app_lock_held() { [ -e "$HOME/app-running" ]; }
+osascript() {
+  echo "osascript $*" >> "$HOME/calls.log"
+  [ -d "$APP_DIR" ] && echo "the app was still there" >> "$HOME/calls.log"
+  [ -e "$HOME/app-quits" ] && rm -f "$HOME/app-running"
+  return 0
+}
+QUIT="osascript -e quit app id \"com.jediconcepts.meetingbox\""
+MSG='a recording is still being saved. Wait for it, or run: meetingbox stop'
+install_app() {
+  mkdir -p "$STATE_DIR"   # an uninstall before removes it once it is empty
+  bundle_with_id "$APP_DIR" "$APP_ID"
+  mkdir -p "$APP_DIR/Contents/MacOS"; printf 'app' > "$APP_BIN"
+  record_install "$APP_DIR"
+  : > "$CONTROL_SOCK"
+  printf 'x' > "$BIN_DIR/meetingbox"
+  rm -f "$HOME/app-running" "$HOME/app-quits" "$DIR_FILE" "$PAUSE_FILE"
+  : > "$HOME/calls.log"
+}
+kept() { [ -d "$APP_DIR" ] && installed_by_us "$APP_DIR" && [ -e "$CONTROL_SOCK" ] && [ -s "$BASE_DIR/2026-10-27_1430/audio.m4a" ]; }
+
+for level in tools all; do
+  busy_refuses() {   # $1: what is going on, $2: what it says
+    out="$(reset_cmd "$level" 2>&1)"; rc=$?
+    if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "$2" && kept \
+       && ! grep -q '^osascript\|^confirm\|^tccutil' "$HOME/calls.log"; then
+      pass "reset_cmd $level refuses before asking, and changes nothing: $1"
+    else fail "reset_cmd $level refuses before asking, and changes nothing: $1 (rc $rc): $out"; fi
+  }
+  install_app; FAKE_PS="$REC_BIN --record -o $BASE_DIR/x -n meeting"; busy_refuses "a recorder is running" "$MSG"
+  install_app; FAKE_PS="$APP_BIN --recover $BASE_DIR/x"; busy_refuses "a recovery is running" "$MSG"
+  install_app; FAKE_PS="$OLD_REC_BIN -o $BASE_DIR/y -n meeting"
+  busy_refuses "a recorder from the old app is running" "an older meetingbox is still recording into $BASE_DIR/y"
+  FAKE_PS=""
+  install_app; printf '%s' "$BASE_DIR/x" > "$DIR_FILE"; busy_refuses "recording.dir is there" "$MSG"
+  install_app; mkdir -p "$BASE_DIR/z"; printf '{"state":"finalising"}' > "$BASE_DIR/z/meeting.json"
+  busy_refuses "a meeting.json says finalising" "$MSG"
+  rm -rf -- "$BASE_DIR/z"
+
+  # The app is running: it is quit after the question, before anything is removed.
+  install_app; : > "$HOME/app-running"; : > "$HOME/app-quits"
+  out="$(reset_cmd "$level" 2>&1)"; rc=$?
+  cline="$(grep -n '^confirm' "$HOME/calls.log" | head -n 1 | cut -d: -f1)"
+  qline="$(grep -nxF "$QUIT" "$HOME/calls.log" | cut -d: -f1)"
+  if [ "$rc" -eq 0 ] && [ -n "$cline" ] && [ -n "$qline" ] && [ "$cline" -lt "$qline" ] \
+     && grep -qx 'the app was still there' "$HOME/calls.log" && [ ! -e "$APP_DIR" ] && ! installed_by_us "$APP_DIR" \
+     && [ ! -e "$CONTROL_SOCK" ] && [ -s "$BASE_DIR/2026-10-27_1430/audio.m4a" ]; then
+    pass "reset_cmd $level quits the app once asked, then removes the recorded app and control.sock, keeping the meetings"
+  else fail "reset_cmd $level quits the app once asked, then removes the recorded app and control.sock, keeping the meetings (rc $rc): $out $(cat "$HOME/calls.log")"; fi
+
+  # An app that does not quit is not removed from under itself.
+  install_app; : > "$HOME/app-running"
+  out="$(reset_cmd "$level" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && grep -qxF "$QUIT" "$HOME/calls.log" && kept && printf '%s\n' "$out" | grep -q 'did not quit'; then
+    pass "reset_cmd $level leaves an app that will not quit, and says so"
+  else fail "reset_cmd $level leaves an app that will not quit, and says so (rc $rc): $out"; fi
+
+  # Not running: nothing to ask.
+  install_app
+  out="$(reset_cmd "$level" 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && ! grep -q '^osascript' "$HOME/calls.log" && [ ! -e "$APP_DIR" ] && [ ! -e "$CONTROL_SOCK" ]; then
+    pass "reset_cmd $level with the app not running asks nothing and removes it"
+  else fail "reset_cmd $level with the app not running asks nothing and removes it (rc $rc): $out"; fi
+done
+
+# reset on its own: the app stays installed and is not quit.
+install_app; : > "$HOME/app-running"
+out="$(reset_cmd state 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && kept && ! grep -q '^osascript' "$HOME/calls.log" && grep -q '^tccutil reset ScreenCapture' "$HOME/calls.log"; then
+  pass "reset leaves the app installed and running, and resets the permissions"
+else fail "reset leaves the app installed and running, and resets the permissions (rc $rc): $out"; fi
+
+# --- reset through the app (Task 10, item 5) ---
+# A running app owns recording.dir and paused: reset asks it to stop rather than clearing them
+# behind it, and falls back to clearing them only when no app answers.
+APP_ANSWER=""
+app_send() { echo "app_send $*" >> "$HOME/calls.log"; [ -n "$APP_ANSWER" ] || return 1; printf '%s' "$APP_ANSWER"; }
+saved_stop="$(declare -f stop_recorders)"
+stop_recorders() { echo "stop_recorders $*" >> "$HOME/calls.log"; }
+for answer in "ok finalising $BASE_DIR/2026-10-27_1430" "error not recording"; do
+  install_app; printf '%s' "$BASE_DIR/2026-10-27_1430" > "$DIR_FILE"; : > "$PAUSE_FILE"
+  APP_ANSWER="$answer"
+  out="$(reset_cmd state 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(grep '^app_send' "$HOME/calls.log")" = "app_send stop" ] && [ -e "$DIR_FILE" ] && [ -e "$PAUSE_FILE" ] \
+     && ! grep -q '^stop_recorders' "$HOME/calls.log" && grep -q '^tccutil reset ScreenCapture' "$HOME/calls.log"; then
+    pass "reset with the app answering '$answer' asks it to stop and leaves its state files to it"
+  else fail "reset with the app answering '$answer' asks it to stop and leaves its state files to it (rc $rc): $out $(cat "$HOME/calls.log")"; fi
+done
+install_app; printf '%s' "$BASE_DIR/2026-10-27_1430" > "$DIR_FILE"; : > "$PAUSE_FILE"
+APP_ANSWER=""
+out="$(reset_cmd state 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q '^app_send stop' "$HOME/calls.log" && [ ! -e "$DIR_FILE" ] && [ ! -e "$PAUSE_FILE" ] \
+   && grep -q '^stop_recorders' "$HOME/calls.log" && printf '%s\n' "$out" | grep -qF "$BASE_DIR/2026-10-27_1430"; then
+  pass "reset with no app answering stops the recorders and clears the state files itself, naming the folder kept"
+else fail "reset with no app answering stops the recorders and clears the state files itself, naming the folder kept (rc $rc): $out"; fi
+eval "$saved_stop"
+unset -f app_send
+
 finish

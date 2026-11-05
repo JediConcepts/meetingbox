@@ -13,6 +13,8 @@ final class StatusItem: NSObject {
     private let menu = NSMenu()
     private var shown: StatusPresentation?
     private var subscription: AnyCancellable?
+    /// The menu's last line: which build this is.
+    private let buildLine = BuildInfo.main?.line
 
     init(model: AppModel) {
         self.model = model
@@ -37,12 +39,14 @@ final class StatusItem: NSObject {
         let before = shown
         shown = now
         if before?.button != now.button { draw(now.button) }
-        if before?.menu != now.menu {
+        let entries = StatusPresentation.withBuild(now.menu, buildLine)
+        let previous = before.map { StatusPresentation.withBuild($0.menu, buildLine) }
+        if previous != entries {
             // Only titles changed (a stream flapped): update the open menu in place, so nothing is taken from under the pointer.
-            if let old = before?.menu, MenuEntry.sameShape(old, now.menu), menu.items.count == now.menu.count {
-                for (item, entry) in zip(menu.items, now.menu) where item.title != entry.title { item.title = entry.title }
+            if let old = previous, MenuEntry.sameShape(old, entries), menu.items.count == entries.count {
+                for (item, entry) in zip(menu.items, entries) where item.title != entry.title { item.title = entry.title }
             } else {
-                rebuild(now.menu)
+                rebuild(entries)
             }
         }
     }

@@ -126,6 +126,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openPreferences(_ sender: Any?) { showPreferences() }
 
+    /// The standard About panel, with the build line (`BuildInfo`) under the name: it says the
+    /// version and the build, so the panel's own "(build number)" is left out.
+    @objc private func showAbout(_ sender: Any?) {
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [:]
+        if let build = BuildInfo.main {
+            let centred = NSMutableParagraphStyle()
+            centred.alignment = .center
+            options[.credits] = NSAttributedString(string: build.line, attributes: [
+                .paragraphStyle: centred,
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+            options[.version] = ""
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
+
     /// The Dock icon and the menu bar item as `AppModel.visibility` says, at once. Only the app runs
     /// this, never the recorder or recovery.
     private func applyVisibility() {
@@ -139,9 +157,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if policy == .accessory { preferencesWindow?.keepInFront() }
     }
 
-    /// The app menu (Preferences… on Cmd-comma, Hide, and Quit on Cmd-Q, which goes through the quit
-    /// guard); the Recording menu (`RecordingMenu`, the recording entries that apply now); and Edit and
-    /// Window menus so text fields and windows take the usual keys.
+    /// The app menu (About meetingbox, Preferences… on Cmd-comma, Hide, and Quit on Cmd-Q, which goes
+    /// through the quit guard); the Recording menu (`RecordingMenu`, the recording entries that apply
+    /// now); and Edit and Window menus so text fields and windows take the usual keys.
     private func makeMainMenu(recording: NSMenu) -> NSMenu {
         func item(_ title: String, _ action: Selector?, _ key: String, _ modifiers: NSEvent.ModifierFlags = .command) -> NSMenuItem {
             let menuItem = NSMenuItem(title: title, action: action, keyEquivalent: key)
@@ -155,10 +173,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             holder.submenu = menu
             return holder
         }
+        let about = item("About meetingbox", #selector(showAbout(_:)), "")
+        about.target = self
         let preferences = item("Preferences…", #selector(openPreferences(_:)), ",")
         preferences.target = self
         let main = NSMenu()
         main.addItem(submenu("meetingbox", [
+            about, .separator(),
             preferences, .separator(),
             item("Hide meetingbox", #selector(NSApplication.hide(_:)), "h"), .separator(),
             item("Quit meetingbox", #selector(NSApplication.terminate(_:)), "q"),

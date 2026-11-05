@@ -236,10 +236,7 @@ func runRecorder(_ arguments: [String]) async -> Never {
     do {
         try await systemRecorder.start()
     } catch {
-        abort("""
-        Failed to start system audio: \(error.localizedDescription)
-        Grant Screen Recording permission in System Settings → Privacy & Security.
-        """)
+        abort(CaptureError.systemAudioFailure(error))
     }
 
     let micRecorder = MicRecorder(onError: { health.error(from: .mic) }) { buffer, hostTime in

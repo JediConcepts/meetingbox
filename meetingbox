@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="2.0.0"
 
 # --------------------------------------------------------------- configuration
 
@@ -72,6 +72,11 @@ SOURCE_DIR="${MB_SOURCE_DIR:-$SRC_DIR/meetingbox}"
 APP_BIN="$APP_DIR/Contents/MacOS/meetingbox"
 REC_APP="$APP_DIR/Contents/Helpers/meetingbox-recorder.app"
 REC_BIN="$REC_APP/Contents/MacOS/meetingbox-recorder"
+# meetingbox 1.3.1 and earlier installed the app in $SRC_DIR and ran the recorder from it. setup
+# removes that app once the new one is in place, and only if setup recorded it. Nothing that
+# replaces or removes the app goes ahead while a recorder from it is still running.
+OLD_APP_DIR="$SRC_DIR/meetingbox.app"
+OLD_REC_BIN="$OLD_APP_DIR/Contents/MacOS/audio-capture"
 # Merges the mic and call transcripts into one labelled Me and Them. Built from
 # native/transcript alongside the app.
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
@@ -209,12 +214,29 @@ claim_path() {
   if [ -e "$1" ] || [ -L "$1" ]; then
     installed_by_us "$1" || {
       warn "$1 already exists and meetingbox did not create it, so I will not replace it"
+      # A shortcut added to the Dock becomes ~/Applications/<its name>.app.
+      if [ "$(plist_value "$1/Contents/Info.plist" CFBundleIdentifier)" = com.apple.shortcuts.droplet ]; then
+        info "this is a Shortcuts app named meetingbox; rename the shortcut or remove it from the Dock"
+      fi
       info "move it somewhere else, then run: meetingbox setup"
       return 1
     }
     remove_installed "$1"
   fi
   record_install "$1"
+}
+
+# One value from an Info.plist, or nothing.
+plist_value() { /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true; }
+
+# Moves a bundle to a path that must not exist yet. mv onto a folder that exists would put the
+# bundle inside it (meetingbox.app/meetingbox.app), so anything there is refused instead.
+move_bundle() {
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    warn "$2 is still there, so nothing was moved into it"
+    return 1
+  fi
+  mv -- "$1" "$2"
 }
 
 # A meetingbox.app from v1.2.0, built before setup kept its list, is still ours:
@@ -235,7 +257,9 @@ open_privacy() {
 
 on_path() { case ":$PATH:" in *":$BIN_DIR:"*) return 0 ;; *) return 1 ;; esac; }
 
-# Ready means built, and built by this version, so updating meetingbox rebuilds it.
+# Ready means built, and built by this version, so updating meetingbox rebuilds it. setup also
+# rebuilds an app built from other source than is on disk now (need_recorder): a build with the
+# same VERSION would otherwise keep the old app.
 recorder_ready() {
   [ -x "$APP_BIN" ] || return 1
   # an app built before the helper existed has the right version and no helper
@@ -244,6 +268,39 @@ recorder_ready() {
   local built
   built="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
   [ "$built" = "$VERSION" ]
+}
+
+# The source the app and mb-transcript are built from (the Swift and the icon) as one hash of
+# each file's name, relative to the source folder, and contents. A build is stamped with it
+# (MBSourceHash), so it is known by its source whatever VERSION says. Empty with no source.
+source_hash() {
+  local f
+  [ -d "$SOURCE_DIR/native" ] || return 0
+  set --
+  for f in "$SOURCE_DIR"/native/recorder/*.swift "$SOURCE_DIR"/native/app/*.swift \
+           "$SOURCE_DIR"/native/transcript/*.swift "$SOURCE_DIR/native/app/icon.png"; do
+    if [ -f "$f" ]; then set -- "$@" "${f#"$SOURCE_DIR"/}"; fi
+  done
+  [ "$#" -gt 0 ] || return 0
+  { (cd "$SOURCE_DIR" && shasum -a 256 -- "$@") | LC_ALL=C sort | shasum -a 256 | cut -d' ' -f1; } || true
+}
+
+# The source's commit, short, when the source folder is a git checkout of its own (not a folder
+# inside another checkout). Empty otherwise, for example for a git archive.
+source_commit() {
+  local c
+  [ -e "$SOURCE_DIR/.git" ] || return 0
+  c="$(git -C "$SOURCE_DIR" rev-parse --short HEAD 2>/dev/null)" || return 0
+  case "$c" in ""|*[!0-9a-f]*) return 0 ;; esac
+  printf '%s' "$c"
+}
+
+# Built from the source on disk now. With no source on disk (a clone not made yet) only the
+# version can be compared, and recorder_ready has.
+built_from_source() {
+  local now
+  now="$(source_hash)"
+  [ -z "$now" ] || [ "$now" = "$(plist_value "$APP_DIR/Contents/Info.plist" MBSourceHash)" ]
 }
 
 # Start the recorder through `open`, so it runs as meetingbox.app in its own
@@ -296,17 +353,110 @@ pids_with_prefix() {
     index($0, ENVIRON["NEEDLE"]) == 1 { print pid }'
 }
 
-# A recording is being made or saved: a recorder or a recovery is running, or a
-# meeting's meeting.json says recording or finalising. Rebuilding or re-signing
-# the app underneath it could cost the meeting.
+# Recorders still running from the old app (OLD_REC_BIN), "<pid> <folder>" for each. Neither
+# this command nor the new app can stop one: it is found here by its command line.
+old_app_recorders() {
+  ps -axo pid=,command= | NEEDLE="$OLD_REC_BIN -o " awk '
+    { pid = $1; sub(/^ *[0-9]+ /, "") }
+    index($0, ENVIRON["NEEDLE"]) == 1 {
+      rest = substr($0, length(ENVIRON["NEEDLE"]) + 1)
+      n = index(rest, " -n ")
+      dir = n ? substr(rest, 1, n - 1) : rest
+      print pid " " dir
+    }'
+}
+
+# A recorder or a recovery is running: the app's, the command's own, or one from the old app.
+capture_running() {
+  [ -n "$(recorder_pids "")" ] || [ -n "$(recover_pids)" ] || [ -n "$(old_app_recorders)" ]
+}
+
+# The app's meetings folder, when its preference holds a full path; nothing otherwise.
+app_meetings_folder() {
+  local d
+  d="$(defaults read "$APP_ID" meetingsFolder 2>/dev/null)" || return 0
+  case "$d" in
+    *"
+"*) return 0 ;;
+    /*) printf '%s' "$d" ;;
+  esac
+}
+
+# A recording is being made or saved: a recorder or a recovery is running, a session is open
+# (recording.dir, kept by the app while it records or finalises, and by meetingbox 1.3.1 while
+# it recorded), or a meeting.json says recording or finalising, in the meetings folder this
+# command uses or the one the app's preferences name. Rebuilding or re-signing the app
+# underneath it could cost the meeting.
 recording_busy() {
-  [ -n "$(recorder_pids "")" ] && return 0
-  [ -n "$(recover_pids)" ] && return 0
-  for j in "$BASE_DIR"/*/meeting.json; do
-    [ -f "$j" ] || continue
-    grep -Eq '"state"[[:space:]]*:[[:space:]]*"(recording|finalising)"' "$j" && return 0
+  local root j
+  capture_running && return 0
+  has_session && return 0
+  for root in "$BASE_DIR" "$(app_meetings_folder)"; do
+    [ -n "$root" ] || continue
+    for j in "$root"/*/meeting.json; do
+      [ -f "$j" ] || continue
+      grep -Eq '"state"[[:space:]]*:[[:space:]]*"(recording|finalising)"' "$j" && return 0
+    done
   done
   return 1
+}
+
+# setup, uninstall and reset --tools replace or remove the app, so none of them goes ahead while
+# a recording is being made, finished or recovered. For a recorder from the old app the folder is
+# named, and how to stop it keeping its audio. $1: the command, to run again afterwards.
+refuse_while_busy() {
+  local old p d
+  old="$(old_app_recorders)"
+  if [ -n "$old" ]; then
+    while IFS= read -r p; do
+      d="${p#* }"; p="${p%% *}"
+      warn "an older meetingbox is still recording into $d"
+      info "to stop it and keep what it recorded: kill -INT $p"
+    done <<< "$old"
+    info "then run: meetingbox $1"
+    return 1
+  fi
+  recording_busy || return 0
+  warn "a recording is still being saved. Wait for it, or run: meetingbox stop"
+  # recording.dir with nothing recording and no app to finish it: left by an earlier meetingbox.
+  if has_session && ! capture_running && ! app_lock_held; then
+    info "nothing is recording into $(session_dir) now. If an older meetingbox left it there, clear it with: meetingbox reset"
+  fi
+  return 1
+}
+
+# A running app is asked to quit, as its own Quit menu would, and given 10 s to go. Nothing is
+# recording (every caller has checked), so it quits at once. Only a running app is asked
+# (app.lock is held for its whole life), so this never starts one.
+quit_app() {
+  local i=0
+  app_lock_held || return 0
+  info "quitting the meetingbox app"
+  osascript -e "quit app id \"$APP_ID\"" >/dev/null 2>&1 || true
+  while app_lock_held; do
+    if [ "$i" -ge 100 ]; then
+      warn "the meetingbox app did not quit. Quit it from its menu, then try again"
+      return 1
+    fi
+    sleep 0.1; i=$((i + 1))
+  done
+}
+
+# setup ends with the app running. Only an app built for this command is opened: one from
+# meetingbox 1.3 or earlier, opened with no arguments, starts recording on its own.
+open_app() {
+  app_is_client_aware || return 0
+  open "$APP_DIR" >/dev/null 2>&1 || warn "could not open $APP_DIR"
+}
+
+# Once the new app is in place, the old one goes, only if setup recorded it and nothing is
+# recording from it. Unregistered first, so macOS stops offering it for the bundle ID.
+remove_old_app() {
+  installed_by_us "$OLD_APP_DIR" || return 0
+  recorder_ready || return 0
+  [ -z "$(old_app_recorders)" ] || return 0
+  if [ -x "$LSREGISTER" ]; then "$LSREGISTER" -u "$OLD_APP_DIR" >/dev/null 2>&1 || true; fi
+  if remove_installed "$OLD_APP_DIR"; then ok "removed the old app, $OLD_APP_DIR"; fi
 }
 
 stop_recorders() { for p in $(recorder_pids "$1"); do stop_proc "$p" "${2:-150}"; done; }
@@ -337,7 +487,7 @@ stop_proc() {
 # while the toolchain is still downloading, so test for the compiler itself.
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
-need_recorder()       { ! recorder_ready; }
+need_recorder()       { ! recorder_ready || ! built_from_source; }
 # fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
 # reports the licence missing on every machine.
 need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
@@ -437,11 +587,21 @@ install_recorder() {
 # The whole bundle is made in a temporary folder first. The installed app is
 # replaced only once the new one is complete, so a failed build leaves the user
 # with the app they had, still able to record.
+#
+# Every build says which it is, in both Info.plists: the version, the time it was
+# built as YYYYMMDDHHMM (CFBundleVersion, numeric so it only grows), the hash of the
+# source it was built from (MBSourceHash) and, from a git checkout, the commit
+# (MBCommit). The app shows them as one line (BuildInfo.swift), and so does
+# `meetingbox version`.
 build_app() {
-  local had_ad_hoc=0 build_tmp bundle helper iconset s
+  local had_ad_hoc=0 build_tmp bundle helper iconset s hash built commit commit_key=""
   # from the app being replaced, before it is
   [ -d "$APP_DIR" ] && ! app_signed_by_us && had_ad_hoc=1
   adopt_own_app
+  hash="$(source_hash)"
+  built="$(date +%Y%m%d%H%M)"
+  commit="$(source_commit)"
+  if [ -n "$commit" ]; then commit_key="<key>MBCommit</key><string>$commit</string>"; fi
   build_tmp="$(mktemp -d)" || return 1
   bundle="$build_tmp/meetingbox.app"
   helper="$bundle/Contents/Helpers/meetingbox-recorder.app"
@@ -479,7 +639,9 @@ build_app() {
   <key>CFBundleIconFile</key><string>meetingbox</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$built</string>
+  <key>MBSourceHash</key><string>$hash</string>
+  $commit_key
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
@@ -501,7 +663,9 @@ PLIST
   <key>CFBundleExecutable</key><string>meetingbox-recorder</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$built</string>
+  <key>MBSourceHash</key><string>$hash</string>
+  $commit_key
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>meetingbox records your side of the meeting.</string>
@@ -509,11 +673,14 @@ PLIST
 </dict>
 </plist>
 PLIST
-  # Complete: now, and only now, replace the installed app.
+  # Complete: now, and only now, replace the installed app. A running copy is quit
+  # first, so an old one never runs on after an install; one that will not quit is
+  # left as it was. The new bundle goes only where nothing is left (move_bundle).
   # ~/Applications is the user's own folder, so it is made if missing but never recorded.
   mkdir -p "$(dirname "$APP_DIR")"
+  quit_app || { rm -rf -- "$build_tmp"; return 1; }
   claim_path "$APP_DIR" || { rm -rf -- "$build_tmp"; return 1; }
-  if ! mv "$bundle" "$APP_DIR"; then
+  if ! move_bundle "$bundle" "$APP_DIR"; then
     rm -rf -- "$build_tmp"
     warn "could not put meetingbox.app in $(dirname "$APP_DIR")"
     return 1
@@ -567,6 +734,8 @@ sign_app() {
 # setup's step for an app that is built but not signed by the certificate
 resign_app() {
   say "the signing certificate"
+  # Signing rewrites the bundle, so a running app is quit first, as for a build.
+  quit_app || return 1
   if sign_app; then
     register_app
     forget_old_approvals
@@ -895,10 +1064,7 @@ setup() {
   say "setup ${c_dim}v$VERSION${c_0}"
   rule
 
-  if recording_busy; then
-    warn "a recording is still being saved. Wait for it, or run: meetingbox stop"
-    return 1
-  fi
+  refuse_while_busy setup || return 1
 
   v="$(macos_major)"
   if [ -z "$v" ]; then
@@ -933,11 +1099,13 @@ setup() {
   rule
   if [ -z "$todo" ]; then
     say "everything is already in place"
+    remove_old_app
     prime_permissions || return 1
     prime_speech
     install -m 755 "$0" "$BIN_DIR/meetingbox" 2>/dev/null || true
     make_shortcut_hint
     say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
+    open_app
     return 0
   fi
 
@@ -976,6 +1144,7 @@ setup() {
   case " $todo " in *" native "*) install_speech_analyzer || info "carrying on with whisper" ;; esac
   case " $todo " in *" license "*) accept_fm_license || true ;; esac
 
+  remove_old_app
   rule
   install -m 755 "$0" "$BIN_DIR/meetingbox" 2>/dev/null \
     && ok "meetingbox -> $BIN_DIR/meetingbox" || true
@@ -984,6 +1153,7 @@ setup() {
   prime_speech
   make_shortcut_hint
   say "ready. Run ${c_b}meetingbox${c_0} to start a recording."
+  open_app
 }
 
 doctor() {
@@ -1077,6 +1247,9 @@ app_lock_held() {
   [ "$rc" -eq 75 ]
 }
 NOT_ANSWERING="meetingbox is running but not answering. Quit it and open it again."
+# Installed, not holding its lock, and still not answering after the wait: it was quitting, or
+# is still starting. setup would not help, so it is not offered.
+STARTING_OR_QUITTING="meetingbox is starting or quitting. Try again in a moment."
 
 # Sends a request to the app, opening it in the background if it is not running and
 # trying again for up to $APP_WAIT seconds. Only a failed connection is retried: a
@@ -1094,7 +1267,7 @@ app_request() {
     while :; do
       if [ "$i" -ge $((APP_WAIT * 2)) ]; then
         if app_lock_held; then die "$NOT_ANSWERING"; fi
-        die "meetingbox did not start. Run: meetingbox setup"
+        die "$STARTING_OR_QUITTING"
       fi
       sleep 0.5; i=$((i + 1))
       if reply="$(app_send "$1")"; then break; fi
@@ -1743,9 +1916,28 @@ old_recorder() {
     && cmp -s "$BIN_DIR/audio-capture" "$SRC_DIR/audio-capture/audio-capture"
 }
 
+# A running app owns the recording state (recording.dir and paused), so reset asks it to stop
+# rather than clearing them behind it: it finishes the recording and clears them itself. False
+# when no app answers, and reset clears them as before.
+reset_through_app() {
+  local reply
+  reply="$(app_send stop)" || return 1
+  case "$reply" in
+    "ok finalising "*)    ok "meetingbox is finishing the recording in ${reply#ok finalising }" ;;
+    "error not recording") ok "meetingbox is running and not recording" ;;
+    "ok "*|"error "*)     info "meetingbox: ${reply#* }" ;;
+    *)                    return 1 ;;
+  esac
+}
+
 reset_cmd() {
   level="$1"   # state | tools | all
-  [ "$level" = state ] || adopt_own_app
+  case "$level" in tools) again="reset --tools" ;; all) again="uninstall" ;; *) again="reset" ;; esac
+  if [ "$level" != state ]; then
+    # The app is about to go: not while a recording is being made, finished or recovered.
+    refuse_while_busy "$again" || return 1
+    adopt_own_app
+  fi
   say "reset"
   rule
   info "this will:"
@@ -1753,6 +1945,7 @@ reset_cmd() {
   info "  reset the Screen Recording and Microphone permissions for meetingbox,"
   info "  so macOS asks again next time"
   if [ "$level" != state ]; then
+    info "  quit the meetingbox app, if it is running"
     ours="$(cat "$INSTALLED" 2>/dev/null || true)"
     info "  delete what setup installed:"
     n=0
@@ -1781,14 +1974,26 @@ reset_cmd() {
   rule
   confirm "go ahead?" no || { info "nothing changed"; return 1; }
 
-  # recorder and state. Same 15s as stop, so a long recording can finish its file.
-  stop_recorders ""
-  if has_session; then
-    info "the unfinished recording is kept in $(session_dir)"
+  if [ "$level" != state ]; then
+    # A recording may have started while the question was up.
+    refuse_while_busy "$again" || return 1
+    quit_app || return 1
   fi
-  rm -f "$PID_FILE" "$DIR_FILE" "$PAUSE_FILE"   # recording.pid is from v1.2.0 and earlier
+
+  # recorder and state: through the app when it answers (it has quit for tools and all)
+  if [ "$level" = state ] && reset_through_app; then
+    :
+  else
+    # Same 15s as stop, so a long recording can finish its file.
+    stop_recorders ""
+    if has_session; then
+      info "the unfinished recording is kept in $(session_dir)"
+    fi
+    rm -f "$DIR_FILE" "$PAUSE_FILE"
+    ok "recording state cleared"
+  fi
+  rm -f "$PID_FILE"   # recording.pid is from v1.2.0 and earlier
   clear_permcheck; release_lock
-  ok "recording state cleared"
 
   # permissions, only meetingbox's own
   if [ -d "$APP_DIR" ]; then
@@ -1811,6 +2016,8 @@ reset_cmd() {
     while IFS= read -r p; do
       case "$p" in /*) remove_installed "$p" || true ;; esac
     done <<< "$ours"
+    # The app has quit (quit_app), so its socket goes too: one left by a crash would otherwise stay.
+    rm -f "$CONTROL_SOCK"
     remove_signing_identity || true
     # a half finished download of the model setup was fetching
     if printf '%s\n' "$ours" | grep -qxF -- "$WHISPER_FILE"; then rm -f "$WHISPER_FILE.part"; fi
@@ -1823,6 +2030,8 @@ reset_cmd() {
 
   if [ "$level" = all ]; then
     rm -f "$BIN_DIR/meetingbox"
+    # the app's lock file, free now it has quit, so the folder can go too
+    app_lock_held || rm -f "$STATE_DIR/app.lock"
     [ -s "$INSTALLED" ] || rm -f "$INSTALLED"
     rmdir "$STATE_DIR" 2>/dev/null || true
     ok "meetingbox removed"
@@ -1832,6 +2041,42 @@ reset_cmd() {
 
   rule
   say "done. Run ${c_b}meetingbox setup${c_0} to set it up again."
+}
+
+# ----------------------------------------------------------------------- version
+
+# The app's build as the app shows it (About meetingbox, Preferences, its menu: BuildInfo.swift),
+# from its Info.plist: "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)", the commit
+# only when known. An app from before builds were stamped gives its version alone.
+app_build_line() {
+  local p="$APP_DIR/Contents/Info.plist" v b h c
+  v="$(plist_value "$p" CFBundleShortVersionString)"
+  b="$(plist_value "$p" CFBundleVersion)"
+  h="$(plist_value "$p" MBSourceHash)"
+  c="$(plist_value "$p" MBCommit)"
+  case "$b" in
+    [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+    *) printf 'meetingbox %s' "$v"; return 0 ;;
+  esac
+  if [ "${#h}" -lt 7 ]; then printf 'meetingbox %s' "$v"; return 0; fi
+  printf 'meetingbox %s (build %s-%s-%s %s:%s, %s%s)' "$v" \
+    "${b:0:4}" "${b:4:2}" "${b:6:2}" "${b:8:2}" "${b:10:2}" "${h:0:7}" "${c:+, $c}"
+}
+
+# This command's version and, when meetingbox's app is installed, its build. The two differ after
+# the command is updated and before setup has rebuilt the app.
+print_version() {
+  local p="$APP_DIR/Contents/Info.plist"
+  printf 'meetingbox %s\n' "$VERSION"
+  [ "$(plist_value "$p" CFBundleIdentifier)" = "$APP_ID" ] || return 0
+  if [ -n "$(plist_value "$p" CFBundleShortVersionString)" ]; then
+    printf 'app: %s\n' "$(app_build_line)"
+  else
+    printf 'app: version unknown\n'
+  fi
+  if [ "$(plist_value "$p" CFBundleShortVersionString)" != "$VERSION" ]; then
+    printf '%s\n' "The app and the command differ. Run: meetingbox setup"
+  fi
 }
 
 usage() {
@@ -1849,6 +2094,7 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox reset                 clear a stuck recording, ask for permissions again
   meetingbox reset --tools         also remove what setup built, to start setup afresh
   meetingbox uninstall             remove meetingbox (recordings are kept)
+  meetingbox version               this command's version, and which build the app is
   meetingbox help
 
 Options
@@ -1882,7 +2128,7 @@ while [ $# -gt 0 ]; do
     --keep-audio)    KEEP_AUDIO=1; shift ;;
     --no-keep-audio) KEEP_AUDIO=0; shift ;;
     --tools)   RESET_TOOLS=1; shift ;;
-    -v|--version) printf 'meetingbox %s\n' "$VERSION"; exit 0 ;;
+    -v|--version) print_version; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     -*) die "unknown option: $1" ;;
     *)  if [ -z "$cmd" ]; then cmd="$1"; else argfile="$1"; fi; shift ;;
@@ -1914,6 +2160,7 @@ case "${cmd:-toggle}" in
   reset)
     if [ "$RESET_TOOLS" = 1 ]; then reset_cmd tools; else reset_cmd state; fi ;;
   uninstall) reset_cmd all ;;
+  version) print_version ;;
   help)    usage ;;
   *)       die "unknown command: $cmd (try: meetingbox help)" ;;
 esac

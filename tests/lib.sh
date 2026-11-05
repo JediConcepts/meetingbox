@@ -11,7 +11,6 @@ HOME="$(mktemp -d)" || exit 1
 # never the real HOME, and never empty: every test path is built from it
 [ -n "$HOME" ] && [ "$HOME" != "$REAL_HOME" ] || exit 1
 export HOME
-LSREGISTER=/usr/bin/true
 : > "$HOME/calls.log"
 
 PASSED=0
@@ -34,9 +33,15 @@ for v in $(compgen -e | grep '^MB_' | grep -v '^MB_TEST_BIN$'); do unset "$v"; d
 sed '/^# -* main$/,$d' "$ROOT/meetingbox" > "$HOME/meetingbox.functions"
 . "$HOME/meetingbox.functions"
 set +e   # the script sets -e; a failing check must not end the test file
+# After the script's own settings, which would otherwise put the real one back: a test never
+# registers its scratch bundles with LaunchServices.
+LSREGISTER=/usr/bin/true
 
 tccutil()  { echo "tccutil $*" >> "$HOME/calls.log"; return 0; }
 confirm()  { echo "confirm $*" >> "$HOME/calls.log"; return 0; }
 codesign() { echo "codesign $*" >> "$HOME/calls.log"; return 0; }
 security() { echo "security $*" >> "$HOME/calls.log"; return 0; }
 openssl()  { echo "openssl $*" >> "$HOME/calls.log"; return 0; }
+# The app's preferences live with the real user, whatever HOME says: never read them. Unset
+# unless a test says otherwise.
+defaults() { echo "defaults $*" >> "$HOME/calls.log"; return 1; }

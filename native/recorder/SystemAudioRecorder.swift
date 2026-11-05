@@ -58,13 +58,3 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate, @un
         onError()
     }
 }
-
-enum CaptureError: LocalizedError {
-    case noDisplay
-
-    var errorDescription: String? {
-        switch self {
-        case .noDisplay: return "No display found for audio capture"
-        }
-    }
-}

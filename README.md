@@ -16,16 +16,29 @@ chmod +x install.sh
 That is the whole thing. `install.sh` puts `meetingbox` on your PATH and hands
 over to `meetingbox setup`, which checks what is missing, tells you what it wants
 to install, and does it when you say yes. Click through two Apple prompts and you
-are done.
+are done: setup ends by opening the meetingbox app.
 
 Nothing to configure. No audio devices to create. No reboot.
+
+The app is `~/Applications/meetingbox.app`. Up to 1.3.1 it lived in
+`~/.local/share/meetingbox`; once the new one is in place, setup removes the old
+one, and only if setup itself installed it there.
+
+### Updating
+
+Run `./install.sh` again (or `meetingbox setup`). Setup rebuilds the app when the
+version or its source has changed. A running meetingbox is quit just before it is
+replaced and opened again at the end, so an old copy never carries on running.
+Setup will not replace the app while a recording is running, finishing or being
+recovered: it says so and changes nothing. That includes a recording an older
+meetingbox is still making; setup names its folder and how to stop it.
 
 ### What setup will do
 
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v1.3.1
+meetingbox setup v2.0.0
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
@@ -42,7 +55,7 @@ meetingbox 4 things to install. I can do all of them from here.
 | It installs | Why | Cost |
 |---|---|---|
 | Xcode Command Line Tools | compiles the recorder | one Apple installer window |
-| the recorder, built from meetingbox's own source (`native/recorder`), plus `mb-transcript` (`native/transcript`) | records you and the far side, and merges the two transcripts | a few seconds to compile |
+| the meetingbox app with its recorder, built from meetingbox's own source (`native/app`, `native/recorder`), plus `mb-transcript` (`native/transcript`) | the app you control recordings from; records you and the far side, and merges the two transcripts | a minute or two to compile |
 | a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, and macOS may ask for your login password once |
 | [speech-analyzer](https://github.com/simonw/speech-analyzer-cli) | Apple's on device transcriber | a few seconds, no model download |
 | or whisper.cpp instead | if you would rather run your own model | 1.6GB download |
@@ -72,37 +85,99 @@ still missing and tests again when you press enter. For Screen Recording, turn o
 listed, drag in the meetingbox app from the Finder window setup opens. No need to
 restart anything.
 
+## The app
+
+meetingbox is a Mac app. Recording, the timer, the list of meetings and the
+minutes all live in it, and it processes one meeting at a time in the background,
+so a new recording can start while the last one is still being written up.
+
+Three ways to control it, each switched on or off in Preferences:
+
+| Control | What it does | Default |
+|---|---|---|
+| The menu bar item | A dot and the timer while recording; click for Start, Pause or Resume, Stop, the recording folder, and how each side of the call is coming through | on |
+| The floating button | A small pill on top of every window, with the dot, the timer, Pause, Stop and the folder. Drag it where you like | shown while recording |
+| The meetingbox window | Opened from the Dock icon: your meetings, their minutes and transcripts | the Dock icon is on |
+
+The menu bar item stays on while the Dock icon is off, so there is always a way in.
+
+**Preferences** (meetingbox menu, or Cmd-comma): the menu bar item, the Dock icon,
+the floating button (Always, While recording, Never), open the minutes when they
+are ready (on; never while a recording is running), sounds (on), the microphone
+(System default unless you pick one) and the meetings folder (`~/Meetings` unless
+you choose another; it can be changed once nothing is recording or being
+finished). At the foot it says which build you are running.
+
+**The meetingbox window** lists your meetings, newest first, with a search box.
+Pick one for its minutes and transcript, play its audio, or show it in Finder. A
+recording that was never processed has a Process button. **Rename** gives a
+meeting a real title, and its folder is renamed to match with the date kept first
+so it still sorts: `2026-10-28 1508 Budget review`. A meeting cannot be renamed
+while it is recording or being processed, and a title another meeting already has
+is refused.
+
+Quitting while a recording is running asks first: Stop and quit, Keep recording
+and quit (the recording carries on, and meetingbox picks it up when it opens
+again), or Cancel.
+
+**Which build is this?** About meetingbox, the foot of Preferences and the last
+line of the menu bar item's menu all say, for example
+`meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)`: the version, when
+it was built, the start of a hash of the source it was built from, and the commit
+when it was built from a git checkout. `meetingbox version` prints the same, and
+says when the app and the command differ.
+
 ## Use it
+
+The app, the hotkey and the command all drive the same recording, and always
+agree on what is going on.
 
 ```bash
 meetingbox          # start
-meetingbox          # stop, transcribe, write the minutes
+meetingbox          # stop; the minutes follow
 meetingbox pause    # stop recording for a bit, same file
 meetingbox resume   # carry on
+meetingbox status   # what is going on, and the folder
 ```
 
-The recorded length counts recorded time only, and `meetingbox status` shows
-when a recording is paused.
+The command is a client of the app: it opens the app if it is not running and
+hands over. `meetingbox stop` returns at once, as soon as the recording is
+stopped. The app then finishes the audio, transcribes and writes the minutes,
+showing how far it has got (Transcribing, Finding speakers, Writing minutes) in
+the menu bar and the meetingbox window, and the minutes open in the window when
+they are ready. The recorded length counts recorded time only.
 
-### If the recorder is interrupted
+`meetingbox process <file>` still runs in the terminal, for scripting.
+
+## Crash safety
 
 While it records, meetingbox writes uncompressed working files, `mic.caf` and
 `call.caf`, which keep every second captured even if the recorder is killed or the
-Mac crashes. They take about 0.7 GB an hour together, so leave that much free.
-When you stop, they become the three `.m4a` files below and are removed once those
-are checked and readable. A stop that finds a recorder which was interrupted
-finishes the recording from its working files. To do it by hand for any folder:
+Mac crashes. They take about 0.7 GB an hour together. A recording will not start
+with less than 2 GB free; below about 1 GB the menu bar warns that disk space is
+low, and close to full the recording is stopped and finished cleanly rather than
+lost. When you stop, the working files become the three `.m4a` files below and are
+removed only once those are checked and readable. Nothing is processed before then.
+
+The recorder runs on its own, so if the app crashes or is force quit, the
+recording carries on, and the next time the app opens it picks the recording up
+with the right timer. If the recorder stopped too, the app finishes the recording
+from its working files and queues it; if nothing can be rebuilt, the meeting is
+marked failed and every file is kept. To finish an interrupted recording by hand:
 
 ```bash
 meetingbox recover ~/Meetings/2026-10-27_1430
 ```
 
 `meetingbox process` refuses a folder that was never finished, and says to run this.
-Files meetingbox writes in a meeting folder are readable by you only.
+Files meetingbox writes in a meeting folder are readable by you only. meetingbox
+never deletes a meeting folder or its audio.
 
-### On a hotkey
+## On a hotkey
 
-Shortcuts app, new shortcut, add a **Run Shell Script** action, shell `/bin/bash`:
+The hotkey is unchanged from earlier versions: it runs the `meetingbox` command,
+which hands over to the app. Shortcuts app, new shortcut, add a **Run Shell
+Script** action, shell `/bin/bash`:
 
 ```bash
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -115,6 +190,10 @@ because nothing else claims it.
 
 The `PATH` line matters. Shortcuts hands a script a bare environment, so without
 it nothing is found.
+
+If you add the shortcut to the Dock, call it something other than meetingbox. A
+shortcut in the Dock becomes an app in `~/Applications` under its own name, which
+is where the meetingbox app goes, and setup will not replace it.
 
 Raycast users: `extras/raycast-meeting-toggle.sh`, drop it in a script directory
 and bind a hotkey.
@@ -195,20 +274,24 @@ meetingbox                       toggle
 meetingbox start | stop | status
 meetingbox pause | resume
 meetingbox process <audio|txt>   run an existing file through the pipeline
+meetingbox recover <folder>      finish a recording that was interrupted
 meetingbox doctor                what is installed and what is not
 meetingbox mics                  microphones the recorder can see
 meetingbox reset                 clear a stuck recording, ask for permissions again
 meetingbox reset --tools         also remove what setup built, to start setup afresh
 meetingbox uninstall             remove meetingbox (recordings are kept)
+meetingbox version               this command's version, and which build the app is
 meetingbox help
 ```
 
 Options: `--mic "USB"`, `--dir`, `--locale`, `--whisper`, `--native`, `--model`,
-`--no-keep-audio`. Each has an `MB_*` environment equivalent.
+`--no-keep-audio`. Each has an `MB_*` environment equivalent. `--mic` and `--dir`
+go to the app with each start; without them the app uses its Preferences.
 
 meetingbox plays a short sound when a recording starts (Tink), when it stops (Pop)
 and when the minutes are ready (Glass), so a hotkey press is heard to work.
-`MB_SOUNDS=0` turns them off.
+Play sounds in Preferences turns them off (`MB_SOUNDS=0` for `meetingbox process`
+in the terminal).
 
 In the minutes, each decision and action ends with the words from the transcript
 that show it, so you can check it. Apple's on device model is small and can still
@@ -218,7 +301,14 @@ mistake a story about the past for a decision; the quote makes that easy to spot
 a list in `~/.meetingbox/installed` as it goes, so a whisper model, a
 speech-analyzer or a folder that was already on your Mac is left where it is.
 Both commands show the exact paths, and anything they are leaving alone, before
-asking.
+asking. Neither goes ahead while a recording is running, finishing or being
+recovered. Once you say yes they quit the meetingbox app, then remove it (if setup
+installed it) and its socket in `~/.meetingbox`. Your meetings are never touched.
+
+`meetingbox reset` on its own leaves the app installed. If the app is running, it
+asks the app to stop any recording (the app finishes it and clears its own state)
+rather than clearing that state behind it; only with no app answering does it
+stop a recorder and clear the state itself.
 
 ## When it misbehaves
 
@@ -227,6 +317,11 @@ Start with `meetingbox doctor`.
 | Symptom | Cause |
 |---|---|
 | Recorder stops immediately | Screen Recording or Microphone not granted to **meetingbox**. Turn it on in Privacy & Security, retry |
+| "The screen is asleep or locked, so the call side cannot be recorded" | The call side comes through screen capture, which needs a display awake. Wake the screen (or unlock the Mac) and start again |
+| "meetingbox is starting or quitting. Try again in a moment." | The command reached the app while it was opening or closing. Run the command again |
+| "this is a Shortcuts app named meetingbox" | A shortcut called meetingbox was added to the Dock, so it sits where the app goes. Rename the shortcut or remove it from the Dock, then run `meetingbox setup` |
+| "an older meetingbox is still recording into ..." | A recording started before the update is still running. Stop it as setup says (its audio is kept), then run setup again |
+| Not sure which build is running | `meetingbox version`, or About meetingbox. If the app and the command differ, run `meetingbox setup` |
 | Permissions look granted but still fail | `meetingbox reset`, then `meetingbox setup` to be asked afresh |
 | Asked for permission again after an update | Expected once, on the move from 1.2 to 1.3 (Screen Recording and Microphone). Setup clears the old 1.2 approvals first, because they still show as on in Privacy settings but no longer apply to the newly signed app. From then on the signing certificate keeps the grants across rebuilds. If it keeps happening, run `meetingbox doctor`. If the 'signing certificate' line is missing, run `meetingbox setup`, which makes it and re-signs the app |
 | Apple's transcriber did not build | Setup builds it with `swiftc` directly, so a broken SwiftPM ("Invalid manifest") no longer matters. If `swiftc` itself fails, reinstall the Command Line Tools: `sudo rm -rf /Library/Developer/CommandLineTools && xcode-select --install`. meetingbox carries on with whisper meanwhile |

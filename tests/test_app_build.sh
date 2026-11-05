@@ -11,9 +11,21 @@ if [ "$APP_DIR" = "$HOME/Applications/meetingbox.app" ] \
   pass "the app is ~/Applications/meetingbox.app, its executable is meetingbox"
 else fail "the app is ~/Applications/meetingbox.app, its executable is meetingbox ($APP_DIR, $APP_BIN)"; fi
 
-if ! grep -q 'SRC_DIR/meetingbox\.app' "$ROOT/meetingbox" && ! grep -q 'MacOS/audio-capture' "$ROOT/meetingbox"; then
-  pass "nothing in the script refers to the old app any more"
-else fail "nothing in the script refers to the old app any more: $(grep -n 'SRC_DIR/meetingbox\.app\|MacOS/audio-capture' "$ROOT/meetingbox")"; fi
+# The old app (meetingbox 1.3.1 and earlier, in $SRC_DIR) is named once, so that a recorder still
+# running from it is found and the app removed once the new one is in place. It is never run.
+if [ "$(grep -c 'SRC_DIR/meetingbox\.app' "$ROOT/meetingbox")" = 1 ] \
+   && grep -q '^OLD_APP_DIR="\$SRC_DIR/meetingbox\.app"$' "$ROOT/meetingbox" \
+   && [ "$(grep -c 'MacOS/audio-capture' "$ROOT/meetingbox")" = 1 ] \
+   && grep -q '^OLD_REC_BIN="\$OLD_APP_DIR/Contents/MacOS/audio-capture"$' "$ROOT/meetingbox" \
+   && ! grep -q '"\$OLD_APP_DIR" --args\|"\$OLD_REC_BIN" \|open .*OLD_APP_DIR' "$ROOT/meetingbox"; then
+  pass "the old app is named once, to find its recorders and to remove it, and is never run"
+else fail "the old app is named once, to find its recorders and to remove it, and is never run: $(grep -n 'SRC_DIR/meetingbox\.app\|MacOS/audio-capture\|OLD_APP_DIR\|OLD_REC_BIN' "$ROOT/meetingbox")"; fi
+
+# --- the version (Task 10) ---
+out="$(bash "$ROOT/meetingbox" --version 2>&1)"
+if [ "$VERSION" = 2.0.0 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = "meetingbox 2.0.0" ]; then
+  pass "VERSION is 2.0.0"
+else fail "VERSION is 2.0.0 ($VERSION: $out)"; fi
 
 # The executable starts the app when given no mode, so every call that only
 # wants the recorder must say --record.
@@ -116,6 +128,65 @@ if plutil -lint "$plist" >/dev/null 2>&1 \
   pass "Info.plist has the shared contract's keys and no URL scheme"
 else fail "Info.plist has the shared contract's keys and no URL scheme: $(cat "$plist" 2>/dev/null)"; fi
 
+# --- every build says which it is (Task 10, items 9 and 12) ---
+# The version; the build time as YYYYMMDDHHMM, numeric so it only grows; a hash of the Swift
+# source it was built from; and the commit, when the source is a git checkout of its own.
+commit="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+if [ -e "$ROOT/.git" ] && [ -n "$commit" ]; then want_commit="$commit"; else want_commit=""; fi
+built="$(pb CFBundleVersion)"
+if printf '%s' "$built" | grep -qE '^20[0-9]{10}$' \
+   && [ -n "$(source_hash)" ] && [ "$(pb MBSourceHash)" = "$(source_hash)" ] \
+   && [ "$(pb MBCommit)" = "$want_commit" ]; then
+  pass "build_app stamps the build time, the source hash and the commit into the Info.plist"
+else fail "build_app stamps the build time, the source hash and the commit into the Info.plist ($built, $(pb MBSourceHash), $(pb MBCommit)): $(cat "$plist" 2>/dev/null)"; fi
+
+# The source hash names files relative to the source folder and nothing else: a copy hashes the
+# same, a changed, added or removed file does not. A copy with no .git has no commit.
+plain="$HOME/plain"
+mkdir -p "$plain"
+cp -R "$ROOT/native" "$plain/native"
+h_root="$(source_hash)"
+SOURCE_DIR="$plain"; h_copy="$(source_hash)"
+printf '\n// changed\n' >> "$plain/native/app/Main.swift"; h_changed="$(source_hash)"
+: > "$plain/native/recorder/Extra.swift"; h_added="$(source_hash)"
+rm -f "$plain/native/recorder/Extra.swift" "$plain/native/transcript/main.swift"; h_removed="$(source_hash)"
+SOURCE_DIR="$HOME/no-source"; h_none="$(source_hash)"
+SOURCE_DIR="$ROOT"
+if [ -n "$h_root" ] && [ "$h_copy" = "$h_root" ] && [ "$h_changed" != "$h_copy" ] && [ "$h_added" != "$h_changed" ] \
+   && [ "$h_removed" != "$h_changed" ] && [ -z "$h_none" ] && [ "$h_root" = "$(source_hash)" ]; then
+  pass "source_hash: the same for a copy, different for a changed, added or removed file, empty with no source"
+else fail "source_hash: the same for a copy, different for a changed, added or removed file, empty with no source ($h_root $h_copy $h_changed $h_added $h_removed '$h_none')"; fi
+
+rm -rf -- "$plain"; mkdir -p "$plain"; cp -R "$ROOT/native" "$plain/native"
+SOURCE_DIR="$plain"
+build_app >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && ! pb MBCommit >/dev/null && [ "$(pb MBSourceHash)" = "$h_root" ]; then
+  pass "a build from a folder that is not a git checkout has no MBCommit"
+else fail "a build from a folder that is not a git checkout has no MBCommit (rc $rc): $(cat "$plist" 2>/dev/null)"; fi
+SOURCE_DIR="$ROOT"
+rm -rf -- "$plain"
+# built again from $ROOT, its calls alone in the log, for the checks that follow
+: > "$HOME/calls.log"
+build_app >/dev/null 2>&1
+
+# setup rebuilds when the source changed, even at the same VERSION (a dev build once kept the old
+# app). With no source on disk (a clone not made yet) only the version can be compared.
+TRANSCRIPT_BIN="$HOME/t-mb-transcript"; printf '#!/bin/sh\n' > "$TRANSCRIPT_BIN"; chmod +x "$TRANSCRIPT_BIN"
+nr() { if need_recorder; then echo yes; else echo no; fi; }
+same="$(nr)"
+mkdir -p "$plain"; cp -R "$ROOT/native" "$plain/native"; printf '\n// changed\n' >> "$plain/native/app/Session.swift"
+SOURCE_DIR="$plain"; changed="$(nr)"
+SOURCE_DIR="$HOME/no-source"; none="$(nr)"
+SOURCE_DIR="$ROOT"
+cp "$plist" "$HOME/plist-aside"
+/usr/libexec/PlistBuddy -c 'Delete :MBSourceHash' "$plist" >/dev/null 2>&1; unstamped="$(nr)"
+cp "$HOME/plist-aside" "$plist"
+if [ "$same" = no ] && [ "$changed" = yes ] && [ "$none" = no ] && [ "$unstamped" = yes ]; then
+  pass "need_recorder: rebuild when the source hash differs or is missing, not when it matches or there is no source"
+else fail "need_recorder: rebuild when the source hash differs or is missing, not when it matches or there is no source ($same $changed $none $unstamped)"; fi
+rm -rf -- "$plain"
+TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
+
 sizes=1
 for s in 16 32 64 128 256 512 1024; do
   grep -q "^sips -z $s $s $ROOT/native/app/icon.png --out " "$HOME/calls.log" || sizes=0
@@ -148,13 +219,15 @@ if plutil -lint "$hplist" >/dev/null 2>&1 \
    && [ "$(hp CFBundlePackageType)" = APPL ] \
    && [ "$(hp LSUIElement)" = true ] \
    && [ "$(hp CFBundleShortVersionString)" = "$VERSION" ] \
-   && [ "$(hp CFBundleVersion)" = "$VERSION" ] \
+   && [ -n "$(pb CFBundleVersion)" ] && [ "$(hp CFBundleVersion)" = "$(pb CFBundleVersion)" ] \
+   && [ -n "$(pb MBSourceHash)" ] && [ "$(hp MBSourceHash)" = "$(pb MBSourceHash)" ] \
+   && [ "$(hp MBCommit)" = "$(pb MBCommit)" ] \
    && [ -n "$(hp NSMicrophoneUsageDescription)" ] \
    && [ "$(hp NSMicrophoneUsageDescription)" = "$(pb NSMicrophoneUsageDescription)" ] \
    && [ -n "$(hp NSAudioCaptureUsageDescription)" ] \
    && [ "$(hp NSAudioCaptureUsageDescription)" = "$(pb NSAudioCaptureUsageDescription)" ]; then
-  pass "the helper's Info.plist has its own identifier and executable, LSUIElement, the version and both usage strings"
-else fail "the helper's Info.plist has its own identifier and executable, LSUIElement, the version and both usage strings: $(cat "$hplist" 2>/dev/null)"; fi
+  pass "the helper's Info.plist has its own identifier and executable, LSUIElement, the app's version, build, source hash and commit, and both usage strings"
+else fail "the helper's Info.plist has its own identifier and executable, LSUIElement, the app's version, build, source hash and commit, and both usage strings: $(cat "$hplist" 2>/dev/null)"; fi
 
 # Signed inside out: the helper first, then the app around it, never with --deep.
 : > "$HOME/calls.log"
@@ -226,7 +299,80 @@ if [ "$rc" -eq 0 ] && [ ! -e "$APP_DIR/marker" ] && [ -x "$APP_BIN" ] && install
   pass "a good build replaces the installed app whole"
 else fail "a good build replaces the installed app whole (rc $rc)"; fi
 
-# --- the old app stays, and stays on the record, until the acceptance step ---
+# --- a bundle is never moved into another (Task 10, item 8) ---
+# mv onto a folder that exists puts the bundle inside it. Here the claim is made to leave the
+# installed app where it is (as a removal that failed would), so only the move's own check stands.
+mkdir -p "$HOME/mv"; mkdir -p "$HOME/mv/a.app/Contents" "$HOME/mv/b.app/Contents"
+move_bundle "$HOME/mv/a.app" "$HOME/mv/b.app" 2>/dev/null; rc1=$?
+move_bundle "$HOME/mv/a.app" "$HOME/mv/c.app" 2>/dev/null; rc2=$?
+if [ "$rc1" -ne 0 ] && [ ! -e "$HOME/mv/b.app/a.app" ] && [ "$rc2" -eq 0 ] && [ -d "$HOME/mv/c.app/Contents" ] && [ ! -e "$HOME/mv/a.app" ]; then
+  pass "move_bundle refuses a destination that exists and moves to one that does not"
+else fail "move_bundle refuses a destination that exists and moves to one that does not ($rc1 $rc2)"; fi
+rm -rf -- "$HOME/mv"
+
+saved_remove="$(declare -f remove_installed)"
+remove_installed() { return 0; }
+printf 'still here' > "$APP_DIR/marker"
+before="$(snapshot)"
+: > "$HOME/calls.log"
+out="$(build_app 2>&1)"; rc=$?
+eval "$saved_remove"
+if [ "$rc" -ne 0 ] && [ ! -e "$APP_DIR/meetingbox.app" ] && [ "$(snapshot)" = "$before" ] && ! grep -q '^codesign --force' "$HOME/calls.log"; then
+  pass "build_app refuses to move the new app into one still in its place, and signs nothing"
+else fail "build_app refuses to move the new app into one still in its place, and signs nothing (rc $rc): $out $(ls "$APP_DIR")"; fi
+rm -f "$APP_DIR/marker"
+
+# --- a running app is quit before it is replaced, never left running old (Task 10, item 10) ---
+# Asked as its own Quit would be, once the new bundle is complete; one that will not quit is not
+# replaced. app.lock held is how a running app is told.
+app_lock_held() { [ -e "$HOME/app-running" ]; }
+osascript() {
+  echo "osascript $*" >> "$HOME/calls.log"
+  [ -e "$HOME/app-quits" ] && rm -f "$HOME/app-running"
+  return 0
+}
+sleep() { echo "sleep $*" >> "$HOME/calls.log"; }
+QUIT="osascript -e quit app id \"com.jediconcepts.meetingbox\""
+: > "$HOME/app-running"; : > "$HOME/app-quits"; : > "$HOME/calls.log"
+build_app >/dev/null 2>&1; rc=$?
+qline="$(grep -nxF "$QUIT" "$HOME/calls.log" | cut -d: -f1)"
+sline="$(grep -n '^swiftc ' "$HOME/calls.log" | cut -d: -f1)"
+cline="$(grep -n '^codesign --force' "$HOME/calls.log" | head -n 1 | cut -d: -f1)"
+if [ "$rc" -eq 0 ] && [ -n "$qline" ] && [ -n "$sline" ] && [ -n "$cline" ] && [ "$sline" -lt "$qline" ] && [ "$qline" -lt "$cline" ] \
+   && [ ! -e "$HOME/app-running" ] && [ -x "$APP_BIN" ]; then
+  pass "build_app quits a running app after the compile and before the swap"
+else fail "build_app quits a running app after the compile and before the swap (rc $rc): $(cat "$HOME/calls.log")"; fi
+
+rm -f "$HOME/app-quits"; : > "$HOME/app-running"
+printf 'still here' > "$APP_DIR/marker"
+before="$(snapshot)"
+: > "$HOME/calls.log"
+out="$(build_app 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && grep -qxF "$QUIT" "$HOME/calls.log" && printf '%s\n' "$out" | grep -q 'did not quit' \
+   && [ "$(snapshot)" = "$before" ] && ! grep -q '^codesign --force' "$HOME/calls.log"; then
+  pass "an app that does not quit is not replaced, and the build says so"
+else fail "an app that does not quit is not replaced, and the build says so (rc $rc): $out"; fi
+rm -f "$APP_DIR/marker" "$HOME/app-running"
+
+: > "$HOME/calls.log"
+build_app >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q '^osascript' "$HOME/calls.log"; then
+  pass "an app that is not running is not asked to quit"
+else fail "an app that is not running is not asked to quit (rc $rc)"; fi
+
+# re-signing changes the bundle too, so a running app is quit first there as well
+: > "$HOME/app-running"; : > "$HOME/app-quits"; : > "$HOME/calls.log"
+resign_app >/dev/null 2>&1
+qline="$(grep -nxF "$QUIT" "$HOME/calls.log" | cut -d: -f1)"
+cline="$(grep -n '^codesign --force' "$HOME/calls.log" | head -n 1 | cut -d: -f1)"
+if [ -n "$qline" ] && [ -n "$cline" ] && [ "$qline" -lt "$cline" ]; then
+  pass "resign_app quits a running app before signing it"
+else fail "resign_app quits a running app before signing it: $(cat "$HOME/calls.log")"; fi
+rm -f "$HOME/app-running" "$HOME/app-quits"
+unset -f app_lock_held osascript sleep
+
+# --- the old app stays, and stays on the record, while install_recorder builds the new one;
+# setup removes it once the new one is in place (below) ---
 SRC_DIR="$HOME/src"; TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 fetch_source() { return 0; }
 for recorded in 1 0; do
@@ -327,6 +473,12 @@ mkdir -p "$BIN_DIR"
 BASE_DIR="$HOME/Meetings"
 FAKE_PS=""
 ps() { [ -n "$FAKE_PS" ] && printf '  777 %s\n' "$FAKE_PS"; return 0; }
+# Nothing real is opened or quit: setup now ends by opening the app.
+open() { echo "open $*" >> "$HOME/calls.log"; return 0; }
+osascript() { echo "osascript $*" >> "$HOME/calls.log"; return 0; }
+app_lock_held() { return 1; }
+FAKE_PREF=""
+defaults() { echo "defaults $*" >> "$HOME/calls.log"; [ -n "$FAKE_PREF" ] && printf '%s\n' "$FAKE_PREF"; }
 
 refuses() {   # $1: what is going on
   : > "$HOME/calls.log"
@@ -356,5 +508,153 @@ out="$(setup 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && ! printf '%s\n' "$out" | grep -qF "$MSG" && grep -q '^install_recorder' "$HOME/calls.log"; then
   pass "setup rebuilds when nothing is being recorded or saved"
 else fail "setup rebuilds when nothing is being recorded or saved (rc $rc): $out"; fi
+
+# --- Task 10: what else counts as busy ---
+# A session left open (recording.dir): a v1.3.1 recording, or the app's own. With nothing
+# recording and no app running, the way to clear one left behind is named.
+printf '%s' "$BASE_DIR/2026-10-27_1430" > "$DIR_FILE"
+refuses "recording.dir is there (a v1.3.1 session)"
+if printf '%s\n' "$out" | grep -qF "nothing is recording into $BASE_DIR/2026-10-27_1430 now" \
+   && printf '%s\n' "$out" | grep -qF "meetingbox reset"; then
+  pass "a session with nothing recording names its folder and how to clear it"
+else fail "a session with nothing recording names its folder and how to clear it: $out"; fi
+FAKE_PS="$REC_BIN --record -o $BASE_DIR/2026-10-27_1430 -n meeting"
+refuses "recording.dir is there and its recorder is running"
+if ! printf '%s\n' "$out" | grep -q "meetingbox reset"; then pass "a session still recording is not called clearable"
+else fail "a session still recording is not called clearable: $out"; fi
+FAKE_PS=""; rm -f "$DIR_FILE"
+
+# A recorder from the old app (meetingbox 1.3.1 and earlier, the *_meeting.m4a kind among them),
+# still running after an upgrade: neither this command nor the new app can stop it, so its
+# folder is named, and how to stop it keeping its audio.
+OLD_APP_DIR="$HOME/src/meetingbox.app"; OLD_REC_BIN="$OLD_APP_DIR/Contents/MacOS/audio-capture"
+FAKE_PS="$OLD_REC_BIN -o $BASE_DIR/2026-10-27 0900 -n meeting"
+: > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s\n' "$out" | grep -qF "an older meetingbox is still recording into $BASE_DIR/2026-10-27 0900" \
+   && printf '%s\n' "$out" | grep -qF "kill -INT 777" \
+   && ! grep -q '^install_recorder\|^resign_app\|^prime_permissions\|^open\|^osascript' "$HOME/calls.log"; then
+  pass "setup refuses while a recorder from the old app runs, naming its folder and how to stop it"
+else fail "setup refuses while a recorder from the old app runs, naming its folder and how to stop it (rc $rc): $out"; fi
+if recording_busy; then pass "recording_busy counts a recorder from the old app"
+else fail "recording_busy counts a recorder from the old app"; fi
+FAKE_PS=""
+
+# The app's meetings folder, when its preference holds a full path, is looked at as well.
+mkdir -p "$HOME/Moved/2026-11-01_1000"
+printf '{"id":"3","state":"recording"}' > "$HOME/Moved/2026-11-01_1000/meeting.json"
+FAKE_PREF="$HOME/Moved"
+refuses "a meeting.json in the app's meetings folder says recording"
+if grep -qxF "defaults read com.jediconcepts.meetingbox meetingsFolder" "$HOME/calls.log"; then
+  pass "the meetings folder is read from the app's preference"
+else fail "the meetings folder is read from the app's preference: $(cat "$HOME/calls.log")"; fi
+FAKE_PREF="Moved"
+if ! recording_busy; then pass "a meetings folder preference that is not a full path is ignored"
+else fail "a meetings folder preference that is not a full path is ignored"; fi
+FAKE_PREF=""
+if ! recording_busy; then pass "with no preference, only the default folder is looked at"
+else fail "with no preference, only the default folder is looked at"; fi
+rm -rf -- "$HOME/Moved"
+
+# --- setup ends by opening the app, and removes the old one once the new one is in place ---
+printf '#!/bin/sh\necho "lsregister $*" >> "%s/calls.log"\n' "$HOME" > "$HOME/lsregister"; chmod +x "$HOME/lsregister"
+LSREGISTER="$HOME/lsregister"
+recorder_ready() { [ -e "$HOME/built" ]; }
+install_recorder() { echo "install_recorder" >> "$HOME/calls.log"; [ -n "${BUILD_FAILS:-}" ] && return 1; : > "$HOME/built"; }
+mkdir -p "$OLD_APP_DIR/Contents/MacOS"; printf 'old' > "$OLD_APP_DIR/Contents/MacOS/audio-capture"
+
+record_install "$OLD_APP_DIR"; rm -f "$HOME/built"; : > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+last="$(grep -v '^defaults ' "$HOME/calls.log" | tail -n 1)"
+if [ "$rc" -eq 0 ] && [ ! -e "$OLD_APP_DIR" ] && ! installed_by_us "$OLD_APP_DIR" \
+   && grep -qxF "lsregister -u $OLD_APP_DIR" "$HOME/calls.log" && [ "$last" = "open $APP_DIR" ] \
+   && [ "$(grep -n '^install_recorder' "$HOME/calls.log" | cut -d: -f1)" -lt "$(grep -n '^prime_permissions' "$HOME/calls.log" | cut -d: -f1)" ]; then
+  pass "setup removes the recorded old app once the new one is built, and ends by opening the app"
+else fail "setup removes the recorded old app once the new one is built, and ends by opening the app (rc $rc): $(cat "$HOME/calls.log") $out"; fi
+
+mkdir -p "$OLD_APP_DIR/Contents/MacOS"; printf 'old' > "$OLD_APP_DIR/Contents/MacOS/audio-capture"
+forget_install "$OLD_APP_DIR"; rm -f "$HOME/built"; : > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$OLD_APP_DIR/Contents/MacOS/audio-capture")" = old ] && ! grep -q "lsregister -u" "$HOME/calls.log"; then
+  pass "an old app setup did not record is left alone"
+else fail "an old app setup did not record is left alone (rc $rc): $out"; fi
+
+record_install "$OLD_APP_DIR"; rm -f "$HOME/built"; : > "$HOME/calls.log"
+out="$(BUILD_FAILS=1 setup 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(cat "$OLD_APP_DIR/Contents/MacOS/audio-capture")" = old ] && installed_by_us "$OLD_APP_DIR" \
+   && ! grep -q '^open \|^osascript' "$HOME/calls.log"; then
+  pass "when the new app is not built, the old one stays, on the record, and nothing is opened"
+else fail "when the new app is not built, the old one stays, on the record, and nothing is opened (rc $rc): $out"; fi
+
+# Nothing to install: the old app still goes once the new one is in place, and the app is opened.
+need_recorder() { return 1; }
+: > "$HOME/built"; : > "$HOME/calls.log"
+out="$(setup 2>&1)"; rc=$?
+last="$(grep -v '^defaults ' "$HOME/calls.log" | tail -n 1)"
+if [ "$rc" -eq 0 ] && printf '%s\n' "$out" | grep -q 'everything is already in place' && [ ! -e "$OLD_APP_DIR" ] \
+   && ! installed_by_us "$OLD_APP_DIR" && [ "$last" = "open $APP_DIR" ] && ! grep -q '^install_recorder' "$HOME/calls.log"; then
+  pass "with everything in place, setup still removes the recorded old app and ends by opening the app"
+else fail "with everything in place, setup still removes the recorded old app and ends by opening the app (rc $rc): $(cat "$HOME/calls.log") $out"; fi
+unset -f need_recorder
+LSREGISTER=/usr/bin/true
+
+# --- meetingbox version (Task 10, item 12) ---
+# The command's version, then the app's line as the app shows it, read from its Info.plist.
+# The whole script runs here, in the scratch HOME, so its own functions answer, not the stubs.
+writeinfo() {   # version build hash [commit]
+  cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>$APP_ID</string>
+<key>CFBundleShortVersionString</key><string>$1</string>
+<key>CFBundleVersion</key><string>$2</string>
+<key>MBSourceHash</key><string>$3</string>
+${4:+<key>MBCommit</key><string>$4</string>}
+</dict></plist>
+PLIST
+}
+HASH=1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809
+writeinfo 2.0.0 202611051430 "$HASH" 9602459
+out="$(bash "$ROOT/meetingbox" version 2>&1)"; rc=$?
+want="$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)')"
+if [ "$rc" -eq 0 ] && [ "$out" = "$want" ]; then pass "meetingbox version: the command's version and the app's build line, with its commit"
+else fail "meetingbox version: the command's version and the app's build line, with its commit (rc $rc): $out"; fi
+out2="$(bash "$ROOT/meetingbox" --version 2>&1)"
+if [ "$out2" = "$want" ]; then pass "meetingbox --version says the same"
+else fail "meetingbox --version says the same: $out2"; fi
+
+writeinfo 2.0.0 202611051430 "$HASH"
+out="$(bash "$ROOT/meetingbox" version 2>&1)"
+if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)')" ]; then
+  pass "meetingbox version: no commit, no commit in the line"
+else fail "meetingbox version: no commit, no commit in the line: $out"; fi
+
+writeinfo 1.3.1 202611051430 "$HASH"
+out="$(bash "$ROOT/meetingbox" version 2>&1)"
+if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 1.3.1 (build 2026-11-05 14:30, 1a2b3c4)\nThe app and the command differ. Run: meetingbox setup')" ]; then
+  pass "meetingbox version: an app of another version is pointed out"
+else fail "meetingbox version: an app of another version is pointed out: $out"; fi
+
+# An app from before builds were stamped has a version only.
+cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>$APP_ID</string>
+<key>CFBundleShortVersionString</key><string>2.0.0</string><key>CFBundleVersion</key><string>2.0.0</string></dict></plist>
+PLIST
+out="$(bash "$ROOT/meetingbox" version 2>&1)"
+if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0')" ]; then
+  pass "meetingbox version: an app with no build stamp gives its version alone"
+else fail "meetingbox version: an app with no build stamp gives its version alone: $out"; fi
+
+mv "$APP_DIR" "$HOME/app-aside"
+out="$(bash "$ROOT/meetingbox" version 2>&1)"
+if [ "$out" = "meetingbox 2.0.0" ]; then pass "meetingbox version with no app installed: the command's version alone"
+else fail "meetingbox version with no app installed: the command's version alone: $out"; fi
+mv "$HOME/app-aside" "$APP_DIR"
+
+writeinfo 2.0.0 202611051430 "$HASH" 9602459
+out="$(bash "$ROOT/meetingbox" status 2>&1)"
+if ! printf '%s\n' "$out" | grep -q 'build\|differ'; then pass "status does not change: no build line"
+else fail "status does not change: no build line: $out"; fi
 
 finish

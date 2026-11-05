@@ -99,6 +99,14 @@ struct StatusInput: Equatable {
 }
 
 struct StatusPresentation: Equatable {
+    /// The menu with the build line (`BuildInfo.line`) as its last line, disabled, after a
+    /// separator; the menu as it was when there is no line.
+    static func withBuild(_ menu: [MenuEntry], _ line: String?) -> [MenuEntry] {
+        guard let line = line else { return menu }
+        return menu + [MenuEntry(title: "", enabled: false, action: .separator),
+                       MenuEntry(title: line, enabled: false, action: .info)]
+    }
+
     static let writingMinutes = "Writing minutes"
     static let minutesReady = "Minutes ready"
     static let microphoneOK = "Microphone: capturing"

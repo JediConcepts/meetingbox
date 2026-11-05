@@ -1,4 +1,4 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift ../../app/RecordingMenu.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift ../../app/RecordingMenu.swift ../../app/BuildInfo.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AppKit
 import AVFoundation
@@ -3937,6 +3937,46 @@ MainActor.assumeIsolated {
     next.shutDown()
     try? fm.removeItem(at: state)
     try? fm.removeItem(at: state2)
+}
+
+// MARK: - Which build this is (Task 10, item 12)
+
+do {
+    let hash = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    let full: [String: Any] = ["CFBundleShortVersionString": "2.0.0", "CFBundleVersion": "202611051430",
+                               "MBSourceHash": hash, "MBCommit": "9602459"]
+    check(BuildInfo(full)?.line == "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)",
+          "T10 build: version, build time, the first 7 of the source hash and the commit, in one line")
+    var noCommit = full
+    noCommit["MBCommit"] = nil
+    check(BuildInfo(noCommit)?.line == "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)",
+          "T10 build: no commit (not a git checkout), no commit in the line")
+    var emptyCommit = full
+    emptyCommit["MBCommit"] = ""
+    check(BuildInfo(emptyCommit)?.line == "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)", "T10 build: an empty commit is no commit")
+    // A build from before builds were stamped: the version alone, as `meetingbox version` gives it.
+    check(BuildInfo(["CFBundleShortVersionString": "2.0.0", "CFBundleVersion": "2.0.0"])?.line == "meetingbox 2.0.0",
+          "T10 build: a version number in place of the build time gives the version alone")
+    var noHash = full
+    noHash["MBSourceHash"] = nil
+    check(BuildInfo(noHash)?.line == "meetingbox 2.0.0", "T10 build: no source hash gives the version alone")
+    var shortHash = full
+    shortHash["MBSourceHash"] = "1a2b3c"
+    check(BuildInfo(shortHash)?.line == "meetingbox 2.0.0", "T10 build: a source hash shorter than 7 gives the version alone")
+    var badBuild = full
+    badBuild["CFBundleVersion"] = "2026110514301"
+    check(BuildInfo(badBuild)?.line == "meetingbox 2.0.0", "T10 build: a build time that is not 12 digits gives the version alone")
+    check(BuildInfo(["CFBundleVersion": "202611051430", "MBSourceHash": hash]) == nil, "T10 build: no version, no line")
+    check(BuildInfo(nil) == nil, "T10 build: no Info.plist, no line")
+
+    // The menu bar item's menu: the line last, disabled, after a separator; nothing without one.
+    let menu = StatusPresentation(StatusInput()).menu
+    let withLine = StatusPresentation.withBuild(menu, "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)")
+    check(withLine.count == menu.count + 2 && Array(withLine.prefix(menu.count)) == menu
+          && withLine[menu.count] == MenuEntry(title: "", enabled: false, action: .separator)
+          && withLine.last == MenuEntry(title: "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)", enabled: false, action: .info),
+          "T10 build: the menu bar item's menu ends with the build line, disabled, after a separator")
+    check(StatusPresentation.withBuild(menu, nil) == menu, "T10 build: no build line, the menu as it was")
 }
 
 try? fm.removeItem(at: scratch)
