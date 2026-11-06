@@ -96,12 +96,20 @@ if [ "$rc" -eq 0 ] && grep -qxF "recorder --recover $dir" "$HOME/calls.log" && p
    && [ -e "$dir/.recording-complete" ]; then
   pass "recover_cmd runs the recorder's --recover on the folder"
 else fail "recover_cmd runs the recorder's --recover on the folder ($rc: $out)"; fi
+# The minutes come from the app's Process, which keeps the meeting's record; process alone does not.
+if printf '%s\n' "$out" | grep -qF "recovered $dir" \
+   && printf '%s\n' "$out" | grep -qF "to get its minutes, open meetingbox and choose Process on it (or run: meetingbox process $dir)"; then
+  pass "recover_cmd: once recovered, says to choose Process in meetingbox (or run process)"
+else fail "recover_cmd: once recovered, says to choose Process in meetingbox (or run process) ($out)"; fi
 
 new_session; rm -f "$DIR_FILE"; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
 out="$(FAKE_RECOVER_FAIL=1; (recover_cmd "$dir") 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'could not read mic.caf' && [ -e "$dir/mic.caf" ]; then
   pass "recover_cmd: a failed recovery says why and keeps the .caf"
 else fail "recover_cmd: a failed recovery says why and keeps the .caf ($rc: $out)"; fi
+if printf '%s\n' "$out" | grep -qF "could not recover $dir. Its recording files are kept"; then
+  pass "recover_cmd: a failed recovery says its recording files are kept"
+else fail "recover_cmd: a failed recovery says its recording files are kept ($out)"; fi
 
 recorder_pids() { [ "$1" = "$dir" ] && printf '4242\n'; }
 : > "$HOME/calls.log"

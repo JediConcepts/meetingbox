@@ -117,8 +117,8 @@ Pick one for its minutes and transcript, play its audio, or show it in Finder. A
 recording that was never processed has a Process button. **Rename** gives a
 meeting a real title, and its folder is renamed to match with the date kept first
 so it still sorts: `2026-10-28 1508 Budget review`. A meeting cannot be renamed
-while it is recording or being processed, and a title another meeting already has
-is refused.
+while it is recording or being processed. A rename that would give two meetings the
+same folder name is refused.
 
 Quitting while a recording is running asks first: Stop and quit, Keep recording
 and quit (the recording carries on, and meetingbox picks it up when it opens
@@ -217,6 +217,8 @@ and bind a hotkey.
   notes.md          the minutes
   notes-raw.md      per slice notes, before the final pass
   brief.json        {summary, decisions, actions, open_questions, numbers_and_dates}
+  meeting.json      the title and state the app keeps; do not delete it
+  capture.log       what the recorder reported while recording and saving
 ```
 
 Each side is transcribed on its own and the two are merged by time, so the

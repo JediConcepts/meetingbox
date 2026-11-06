@@ -30,10 +30,11 @@ func recoverStatus(directory: URL, lockWait: TimeInterval = 5,
     }
 }
 
-/// A point in finalising that a test can interrupt, to stand in for a crash there.
+/// A point in finalising that a test can interrupt, to stand in for a crash there, or record.
 enum FinaliseStep: Equatable {
     case encoded(String)    // .tmp-<name> written
-    case published(String)  // <name> in place
+    case published(String)  // <name> in place: one of the three .m4a, or the marker
+    case removed(String)    // a working file or temporary removed, once the marker is in place
 }
 
 /// Finalising, shared by a clean stop and recovery, in this order and safe to repeat:
@@ -44,6 +45,10 @@ enum FinaliseStep: Equatable {
 ///      (keeping verified output from an earlier attempt, replacing unverified), write
 ///      the marker atomically, and only then remove the working files;
 ///   4. otherwise change nothing and fail.
+/// Each .tmp-<name> and the marker's temporary are synced to the disk before they take their names,
+/// and the folder after the marker, before any working file is removed: a power cut never leaves
+/// the marker beside audio that was still only in memory, with the working files gone. A sync that
+/// fails fails the finalise, and the working files are kept.
 /// Verified means every file opens with AVURLAsset with a duration over zero, and the
 /// three durations agree within one second.
 enum Finaliser {
@@ -94,10 +99,11 @@ enum Finaliser {
     static func finalise(directory: URL, lockWait: TimeInterval = 0,
                          afterStep: (FinaliseStep) throws -> Void = { _ in },
                          encode: Encoder = Finaliser.encode,
+                         sync: Syncer = Finaliser.sync,
                          freeBytes: (URL) -> Int64? = Finaliser.freeSpaceUnknown) throws {
         let lock = try FolderLock(directory, wait: lockWait)
         try withExtendedLifetime(lock) {
-            try finaliseLocked(directory: directory, afterStep: afterStep, encode: encode, freeBytes: freeBytes)
+            try finaliseLocked(directory: directory, afterStep: afterStep, encode: encode, sync: sync, freeBytes: freeBytes)
         }
     }
 
@@ -105,12 +111,26 @@ enum Finaliser {
     /// A test can give its own, to fail the way a full disk does.
     typealias Encoder = (_ name: String, _ output: URL, _ mic: URL, _ call: URL) throws -> Void
 
+    /// Puts a file's data, or a folder's names, on the disk itself. A test gives its own, to see
+    /// the order of the syncs or to fail one.
+    typealias Syncer = (_ url: URL) throws -> Void
+
+    /// F_FULLFSYNC, which has the drive write out its own cache too, or fsync where the volume does
+    /// not offer that. Throws if neither works: nothing is removed on the strength of a failed sync.
+    static func sync(_ url: URL) throws {
+        let fd = open(url.path, O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else { throw posixError("open \(url.path) to save it to the disk") }
+        defer { Darwin.close(fd) }
+        guard fcntl(fd, F_FULLFSYNC) == 0 || fsync(fd) == 0 else { throw posixError("save \(url.path) to the disk") }
+    }
+
     /// For a caller that already holds the folder's lock (the recorder at stop). The recorder's
     /// stop does its own room check first (`DiskFloor.refusal`) and gives no `freeBytes`; recovery
     /// gives one and is refused, before anything is encoded, if the volume holds less than
     /// `finishNeed` of the seconds in the working files.
     static func finaliseLocked(directory: URL, afterStep: (FinaliseStep) throws -> Void = { _ in },
                                encode: Encoder = Finaliser.encode,
+                               sync: Syncer = Finaliser.sync,
                                freeBytes: (URL) -> Int64? = Finaliser.freeSpaceUnknown) throws {
         let fm = FileManager.default
         func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
@@ -118,8 +138,8 @@ enum Finaliser {
 
         // 1 and 2: the recording is already in place.
         if verify(directory: directory) {
-            if !has(marker) { try writeMarker(in: directory) }
-            removeWorkingFiles(in: directory)
+            if !has(marker) { try writeMarker(in: directory, sync: sync, afterStep: afterStep) }
+            try removeWorkingFiles(in: directory, sync: sync, afterStep: afterStep)
             return
         }
 
@@ -161,12 +181,17 @@ enum Finaliser {
                     throw RecordingError("\(url(name).path) already exists and does not match the working files")
                 }
                 try fm.removeItem(at: url(temp(name)))
-            } else if has(name) {
-                // Unreadable output from an earlier attempt: replace it in one step.
-                guard rename(url(temp(name)).path, url(name).path) == 0 else { throw posixError("replace \(name)") }
             } else {
-                guard renamex_np(url(temp(name)).path, url(name).path, UInt32(RENAME_EXCL)) == 0 else {
-                    throw posixError("publish \(name)")
+                // On the disk before it takes its name, so a published name never stands for
+                // audio that was still only in memory.
+                try sync(url(temp(name)))
+                if has(name) {
+                    // Unreadable output from an earlier attempt: replace it in one step.
+                    guard rename(url(temp(name)).path, url(name).path) == 0 else { throw posixError("replace \(name)") }
+                } else {
+                    guard renamex_np(url(temp(name)).path, url(name).path, UInt32(RENAME_EXCL)) == 0 else {
+                        throw posixError("publish \(name)")
+                    }
                 }
             }
             try afterStep(.published(name))
@@ -174,8 +199,8 @@ enum Finaliser {
         guard verify(directory: directory) else {
             throw RecordingError("the recording in \(directory.path) did not verify after publishing")
         }
-        try writeMarker(in: directory)
-        removeWorkingFiles(in: directory)
+        try writeMarker(in: directory, sync: sync, afterStep: afterStep)
+        try removeWorkingFiles(in: directory, sync: sync, afterStep: afterStep)
     }
 
     /// The seconds of audio the working files hold: the frames of the longer one over 48 000, as
@@ -264,8 +289,8 @@ enum Finaliser {
         return Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength)))
     }
 
-    /// Written whole under a temporary name, then renamed into place.
-    private static func writeMarker(in directory: URL) throws {
+    /// Written whole under a temporary name, synced to the disk, then renamed into place.
+    private static func writeMarker(in directory: URL, sync: Syncer, afterStep: (FinaliseStep) throws -> Void) throws {
         let tempURL = directory.appendingPathComponent(markerTemp)
         try? FileManager.default.removeItem(at: tempURL)
         let lines = finals.map { name in
@@ -276,15 +301,22 @@ enum Finaliser {
             throw RecordingError("could not write \(tempURL.path)")
         }
         try makePrivate(tempURL)
+        try sync(tempURL)
         guard rename(tempURL.path, directory.appendingPathComponent(marker).path) == 0 else { throw posixError("write the marker") }
+        try afterStep(.published(marker))
     }
 
-    /// Only the working files this recorder makes, and only once the marker exists.
-    private static func removeWorkingFiles(in directory: URL) {
-        guard FileManager.default.fileExists(atPath: directory.appendingPathComponent(marker).path) else { return }
-        for name in working + finals.map(temp) + [markerTemp] {
-            let url = directory.appendingPathComponent(name)
-            if FileManager.default.fileExists(atPath: url.path) { try? FileManager.default.removeItem(at: url) }
+    /// Only the working files this recorder makes, and only once the marker exists. The folder is
+    /// synced first, so the published names and the marker are on the disk before anything goes.
+    private static func removeWorkingFiles(in directory: URL, sync: Syncer, afterStep: (FinaliseStep) throws -> Void) throws {
+        let fm = FileManager.default
+        func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
+        guard fm.fileExists(atPath: url(marker).path) else { return }
+        let present = (working + finals.map(temp) + [markerTemp]).filter { fm.fileExists(atPath: url($0).path) }
+        guard !present.isEmpty else { return }
+        try sync(directory)
+        for name in present {
+            if (try? fm.removeItem(at: url(name))) != nil { try afterStep(.removed(name)) }
         }
     }
 

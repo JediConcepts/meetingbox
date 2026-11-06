@@ -158,6 +158,10 @@ do {
     try child.run()
     var waited = 0
     while !exists(dir, "ready") && waited < 1000 { usleep(10_000); waited += 1 }
+    // A live recorder holds the folder's lock for its whole life: recovery beside it is busy.
+    let live = snapshot(dir)
+    check(recoverStatus(directory: dir, lockWait: 0, freeBytes: ample).status == 75 && snapshot(dir) == live,
+          "kill -9: while the recorder lives, --recover exits 75 and changes nothing")
     kill(child.processIdentifier, SIGKILL)
     child.waitUntilExit()
     try? fm.removeItem(at: dir.appendingPathComponent("ready"))
@@ -242,6 +246,45 @@ do {
     check(false, "three verified .m4a without the marker: \(error)")
 }
 
+// The same crash points with both .caf still there, as a real crash leaves them (parked item 1):
+// recovery accepts what verifies beside the working files and never rewrites verified audio.
+do {
+    let dir = cafFolder()
+    do {
+        try Finaliser.finalise(directory: dir) { step in
+            if step == .published("call.m4a") { throw Interrupt() }
+        }
+        check(false, "interrupted after publishing all three, .caf present: hook did not fire")
+    } catch is Interrupt {}
+    check(names(dir) == ["audio.m4a", "call.caf", "call.m4a", "mic.caf", "mic.m4a"],
+          "interrupted after publishing all three: the three .m4a beside both .caf, no marker (\(names(dir)))")
+    let kept = finals.map { inode(dir, $0) }
+    try recover(directory: dir)
+    check(complete(dir), "interrupted after publishing all three, .caf present: recover ends complete")
+    check(finals.map { inode(dir, $0) } == kept, "interrupted after publishing all three, .caf present: verified audio not rewritten")
+} catch {
+    check(false, "interrupted after publishing all three, .caf present: \(error)")
+}
+
+do {
+    let dir = cafFolder()
+    do {
+        try Finaliser.finalise(directory: dir) { step in
+            if step == .published(".recording-complete") { throw Interrupt() }
+        }
+        check(false, "marker beside the .caf: hook did not fire")
+    } catch is Interrupt {}
+    check(names(dir) == [".recording-complete", "audio.m4a", "call.caf", "call.m4a", "mic.caf", "mic.m4a"],
+          "interrupted after the marker: the marker and the three .m4a beside both .caf (\(names(dir)))")
+    let kept = (finals + [".recording-complete"]).map { inode(dir, $0) }
+    try recover(directory: dir)
+    check(complete(dir), "marker beside the .caf: recover ends complete")
+    check((finals + [".recording-complete"]).map { inode(dir, $0) } == kept,
+          "marker beside the .caf: verified audio and the marker not rewritten")
+} catch {
+    check(false, "marker beside the .caf: \(error)")
+}
+
 // A finished folder is left exactly as it is.
 do {
     let dir = cafFolder()
@@ -311,6 +354,122 @@ do {
           "a recorder does not wait for a locked folder")
     holder.terminate()
     holder.waitUntilExit()
+}
+
+// MARK: - The finished audio is on the disk before the working files go (final review, A2)
+// A power cut just after a stop must never leave the marker beside .m4a whose audio was still only
+// in memory, with the .caf already removed. Each .tmp-<name> and the marker's temporary are synced
+// before they take their names, and the folder after the marker, before any working file is removed.
+// A hook records every sync, rename and removal, in order.
+
+struct SyncFailed: Error {}
+
+/// One finalise's steps on the disk, in order: each sync (then the real one), rename and removal.
+/// `failing` names a sync that fails instead, as a disk that will not flush would.
+final class DiskSteps {
+    let dir: URL
+    let failing: String?
+    private(set) var log: [String] = []
+    init(_ dir: URL, failing: String? = nil) { self.dir = dir; self.failing = failing }
+    func sync(_ url: URL) throws {
+        let name = url.path == dir.path ? "folder" : url.lastPathComponent
+        log.append("sync \(name)")
+        if name == failing { throw SyncFailed() }
+        try Finaliser.sync(url)
+    }
+    func step(_ step: FinaliseStep) {
+        switch step {
+        case .encoded: break
+        case .published(let name): log.append("rename \(name)")
+        case .removed(let name): log.append("remove \(name)")
+        }
+    }
+}
+let markerSynced = ["sync .tmp-recording-complete", "rename .recording-complete", "sync folder"]
+let cafRemoved = ["remove mic.caf", "remove call.caf"]
+
+do {
+    // Encoding, as a stop or a recovery from the working files does.
+    let dir = cafFolder()
+    let disk = DiskSteps(dir)
+    try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
+    let published = finals.flatMap { ["sync .tmp-\($0)", "rename \($0)"] }
+    check(disk.log == published + markerSynced + cafRemoved,
+          "A2: encoding, each .tmp-<name> and the marker's temporary are synced before their renames, the folder after the marker, then the .caf go (\(disk.log))")
+    check(complete(dir), "A2: encoding with the syncs ends complete")
+} catch {
+    check(false, "A2: encoding: \(error)")
+}
+
+do {
+    // Three verified .m4a beside the .caf (a crash before the marker): only the marker is written.
+    let source = cafFolder()
+    try recover(directory: source)
+    let dir = cafFolder()
+    for name in finals { try fm.copyItem(at: source.appendingPathComponent(name), to: dir.appendingPathComponent(name)) }
+    let disk = DiskSteps(dir)
+    try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
+    check(disk.log == markerSynced + cafRemoved,
+          "A2: accepting verified .m4a, the marker's temporary is synced before its rename and the folder after it, then the .caf go (\(disk.log))")
+    check(complete(dir), "A2: accepting verified .m4a with the syncs ends complete")
+} catch {
+    check(false, "A2: accepting verified .m4a: \(error)")
+}
+
+do {
+    // The marker already beside the .caf (a crash before they were removed).
+    let dir = cafFolder()
+    do {
+        try Finaliser.finalise(directory: dir) { step in
+            if step == .published(".recording-complete") { throw Interrupt() }
+        }
+    } catch is Interrupt {}
+    let disk = DiskSteps(dir)
+    try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
+    check(disk.log == ["sync folder"] + cafRemoved, "A2: with the marker already there, the folder is synced before the .caf go (\(disk.log))")
+    check(complete(dir), "A2: the marker already there ends complete")
+} catch {
+    check(false, "A2: the marker already there: \(error)")
+}
+
+do {
+    // A finished folder has nothing to remove, so nothing is synced, renamed or removed.
+    let dir = cafFolder()
+    try recover(directory: dir)
+    let disk = DiskSteps(dir)
+    try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
+    check(disk.log.isEmpty && complete(dir), "A2: a finished folder: no sync, rename or removal (\(disk.log))")
+} catch {
+    check(false, "A2: a finished folder: \(error)")
+}
+
+// A sync that fails is a failed finalise, not a silent pass: it throws, nothing follows it, and
+// the working files are kept for a later recovery.
+for failing in [".tmp-call.m4a", ".tmp-recording-complete", "folder"] {
+    do {
+        let dir = cafFolder()
+        let disk = DiskSteps(dir, failing: failing)
+        var thrown: Error?
+        do { try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync) } catch { thrown = error }
+        check(thrown is SyncFailed && disk.log.last == "sync \(failing)" && exists(dir, "mic.caf") && exists(dir, "call.caf"),
+              "A2: a failed sync of \(failing) fails the finalise, nothing follows it, the .caf are kept (\(disk.log))")
+        check(exists(dir, ".recording-complete") == (failing == "folder"),
+              "A2: a failed sync of \(failing): the marker is in place only once its own sync worked")
+        try recover(directory: dir)
+        check(complete(dir), "A2: after a failed sync of \(failing), a later recover ends complete")
+    } catch {
+        check(false, "A2: a failed sync of \(failing): \(error)")
+    }
+}
+
+do {
+    // The real sync: F_FULLFSYNC, or fsync where that is not offered; it throws when it cannot.
+    let dir = cafFolder()
+    check((try? Finaliser.sync(dir.appendingPathComponent("mic.caf"))) != nil && (try? Finaliser.sync(dir)) != nil,
+          "A2: the real sync flushes a file and a folder")
+    var message = ""
+    do { try Finaliser.sync(dir.appendingPathComponent("gone.m4a")) } catch { message = error.localizedDescription }
+    check(message.hasPrefix("could not") && message.contains("gone.m4a"), "A2: a sync that cannot be made throws, naming the file (\(message))")
 }
 
 // MARK: - Health

@@ -20,6 +20,22 @@ chime start; wait
 if [ ! -s "$HOME/calls.log" ]; then pass "MB_SOUNDS=0 keeps it quiet"; else fail "MB_SOUNDS=0 keeps it quiet"; fi
 SOUNDS=1
 
+# --- Minutes ready: a banner from the script only when it ran on its own (D5) ---
+# The app runs a job with MB_ATTEMPT set and shows its own Minutes ready, so no second banner.
+osascript() { echo "osascript $*" >> "$HOME/calls.log"; }
+have() { case "$1" in afplay|osascript) return 0 ;; *) return 1 ;; esac; }
+BANNER='osascript -e display notification "Minutes ready" with title "meetingbox"'
+: > "$HOME/calls.log"
+notify "meetingbox" "Minutes ready"
+if grep -qxF "$BANNER" "$HOME/calls.log"; then pass "run from the terminal, Minutes ready shows a banner"
+else fail "run from the terminal, Minutes ready shows a banner: $(cat "$HOME/calls.log")"; fi
+: > "$HOME/calls.log"
+( MB_ATTEMPT=a1; notify "meetingbox" "Minutes ready" )
+if [ ! -s "$HOME/calls.log" ]; then pass "run by the app (MB_ATTEMPT set), no banner from the script"
+else fail "run by the app (MB_ATTEMPT set), no banner from the script: $(cat "$HOME/calls.log")"; fi
+unset -f osascript
+have() { case "$1" in afplay) return 0 ;; *) return 1 ;; esac; }
+
 # --- start and stop go to the app, which plays their sounds; the script plays none ---
 chime() { echo "chime $1" >> "$HOME/calls.log"; }
 notify() { echo "notify $*" >> "$HOME/calls.log"; }

@@ -435,7 +435,8 @@ ps() { [ -e "$HOME/app-running" ] || printf '  889 %s --record -o %s -n meeting\
 : > "$HOME/app-running"; : > "$HOME/app-quits"; : > "$HOME/calls.log"
 out="$(build_app 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ] && grep -qxF "$QUIT" "$HOME/calls.log" && [ ! -e "$HOME/app-running" ] \
-   && printf '%s\n' "$out" | grep -q 'still running' && [ "$(snapshot)" = "$before" ] \
+   && printf '%s\n' "$out" | grep -qF 'the app has quit but a recording is still running, so nothing was replaced or removed' \
+   && [ "$(snapshot)" = "$before" ] \
    && ! grep -q '^codesign --force' "$HOME/calls.log"; then
   pass "build_app: a recorder that outlives the app is not replaced under"
 else fail "build_app: a recorder that outlives the app is not replaced under (rc $rc): $out $(cat "$HOME/calls.log")"; fi
@@ -563,8 +564,16 @@ refuses() {   # $1: what is going on
     pass "setup refuses and builds nothing: $1"
   else fail "setup refuses and builds nothing: $1 (rc $rc): $out"; fi
 }
+# The refusal ends with how to carry on, once and last, after any hint (parked 14).
+rerun_last() {   # $1: what is going on
+  if [ "$(printf '%s\n' "$out" | tail -n 1 | sed 's/^ *//')" = "then run: meetingbox setup" ] \
+     && [ "$(printf '%s\n' "$out" | grep -c 'then run: meetingbox setup')" = 1 ]; then
+    pass "setup's refusal ends with 'then run: meetingbox setup', once: $1"
+  else fail "setup's refusal ends with 'then run: meetingbox setup', once: $1: $out"; fi
+}
 
 FAKE_PS="$APP_BIN --record -o $BASE_DIR/x -n meeting"; refuses "a recorder is running"
+rerun_last "a recorder is running"
 FAKE_PS="$APP_BIN --recover $BASE_DIR/x"; refuses "a recovery is running"
 FAKE_PS="$REC_BIN --record -o $BASE_DIR/x -n meeting"; refuses "a recorder from the helper is running"
 FAKE_PS="$REC_BIN --recover $BASE_DIR/x"; refuses "a recovery from the helper is running"
@@ -605,6 +614,7 @@ else fail "a session an app is running for is not called clearable: $out"; fi
 app_lock_held() { return 1; }
 cp "$HOME/plist-aside" "$APP_DIR/Contents/Info.plist"
 refuses "recording.dir is there, the 2.0 app installed and not running"
+rerun_last "after the hint to open meetingbox"
 if printf '%s\n' "$out" | grep -qF "the recording in $BASE_DIR/2026-10-27_1430 did not finish; open meetingbox to recover it" \
    && ! printf '%s\n' "$out" | grep -q 'meetingbox reset'; then
   pass "a 2.0 session with nothing recording says to open meetingbox to recover it, not to reset"

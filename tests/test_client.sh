@@ -27,10 +27,12 @@ printf '%s\n' "$line" >> "$HOME/sent"
 [ -e "$HOME/reply" ] && cat "$HOME/reply"
 exit 0
 SH
-# open: logs; with $HOME/open-starts-app the app then answers.
+# open: logs; with $HOME/open-starts-app the app then answers; with $HOME/open-fails it prints
+# that file's text and exits 1, as open does for an app that cannot be opened.
 cat > "$STUB/open" <<'SH'
 #!/bin/bash
 echo "open $*" >> "$HOME/calls.log"
+[ -e "$HOME/open-fails" ] && { cat "$HOME/open-fails" >&2; exit 1; }
 [ -e "$HOME/open-starts-app" ] && rm -f "$HOME/app-down"
 [ -e "$HOME/open-holds-lock" ] && : > "$HOME/lock-held"
 exit 0
@@ -59,7 +61,7 @@ chmod +x "$STUB"/*
 mb() { PATH="$STUB:$PATH" bash "$ROOT/meetingbox" "$@" 2>&1; }
 reset_calls() {
   : > "$HOME/calls.log"; : > "$HOME/sent"
-  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/open-holds-lock" "$HOME/app-up-at-3" "$HOME/lock-held" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
+  rm -f "$HOME/app-down" "$HOME/open-starts-app" "$HOME/open-fails" "$HOME/open-holds-lock" "$HOME/app-up-at-3" "$HOME/lock-held" "$HOME/ps-out" "$HOME/reply" "$DIR_FILE" "$PAUSE_FILE"
 }
 reply() { printf '%s\n' "$1" > "$HOME/reply"; }
 sent() { cat "$HOME/sent"; }
@@ -207,6 +209,17 @@ out="$(mb start)"; rc=$?
 if [ "$rc" -eq 0 ] && [ "$(sent)" = "start" ] && printf '%s' "$out" | grep -qF "/Meetings/late"; then
   pass "no app: once it is opened, the request goes through, once"
 else fail "no app: once it is opened, the request goes through, once ($rc: $(sent): $out)"; fi
+
+# D3: an app that cannot be opened (a damaged bundle) is said at once, with open's own reason,
+# and setup is the answer: the command does not wait out the 10 s for an app that will not come.
+OPEN_SAYS="The application $APP_DIR cannot be opened for an unexpected reason, error=kLSNoExecutableErr"
+reset_calls; : > "$HOME/app-down"; reply "ok recording /x"; printf '%s\n' "$OPEN_SAYS" > "$HOME/open-fails"
+out="$(mb start)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox could not be opened ($OPEN_SAYS). Run: meetingbox setup" \
+   && grep -qxF "open -g $APP_DIR" "$HOME/calls.log" && [ "$(slept)" = 0 ] && [ ! -s "$HOME/sent" ] \
+   && ! printf '%s' "$out" | grep -qF "$STARTING"; then
+  pass "D3: an app that cannot be opened fails at once with open's reason and says to run setup"
+else fail "D3: an app that cannot be opened fails at once with open's reason and says to run setup ($rc, slept $(slept): $out)"; fi
 
 # Connected, but no answer: the request may have arrived, so it is never sent twice.
 reset_calls; rm -f "$HOME/reply"
