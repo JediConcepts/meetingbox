@@ -177,6 +177,9 @@ struct LibraryDetail: View {
                         Button(action.title) { model.perform(action) }
                     }
                 }
+                if let problem = model.problem {
+                    Text(problem).foregroundStyle(.secondary)
+                }
                 if actions.contains(.pause) || actions.contains(.resume) {
                     RecordingTimer(app: app)
                 } else {

@@ -105,6 +105,10 @@ struct PreferencesView: View {
                                 .disabled(!PreferencesPresentation.canChooseFolder(app.status.phase))
                         }
                     }
+                    Text(PreferencesPresentation.folderMovesNothing)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if let problem = app.folderProblem {
                         Text(problem).foregroundStyle(.red)
                     }

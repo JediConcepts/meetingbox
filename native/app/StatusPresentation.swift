@@ -157,8 +157,11 @@ struct StatusPresentation: Equatable {
         // What is being done, in the window's words: saving the recording, then the queue's stage.
         let busyLabel: String? = finalising ? StatusPresentation.savingRecording
             : i.processing != nil ? LibraryBadge.processing(stage: i.stage).text : nil
-        // The warning: a failure, else a line about a meeting that went wrong.
-        let warning = failureLine ?? (i.notice?.amber == true ? i.notice?.line : nil)
+        // The warning: a failure, else a line about a meeting that went wrong. While a recording runs or
+        // is paused that line is about another meeting (this one has not ended), so it waits in the menu
+        // and the recording keeps the icon and its timer; it takes the icon once the recording ends. A
+        // failure (a pause that did not happen) is about this recording, and takes it at once.
+        let warning = failureLine ?? (i.notice?.amber == true && !live ? i.notice?.line : nil)
         // A dot is red while recording and plain while paused; either turns amber when capture is wrong.
         let dot: StatusTint = live && !healthy ? .amber : (recording ? .red : .plain)
         let timer = Preferences.timerText(i.seconds)

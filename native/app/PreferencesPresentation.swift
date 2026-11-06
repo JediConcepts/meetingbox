@@ -200,6 +200,8 @@ enum PreferencesPresentation {
 
     // MARK: the meetings folder
 
+    /// Under the meetings folder: a new folder is where new recordings go and what the window lists.
+    static let folderMovesNothing = "Choosing a new folder moves nothing: meetings already recorded stay where they are, and the window lists only the folder chosen here."
     static let folderRefused = "meetingbox cannot use that folder"
     static let folderBusy = "The folder can be changed once the recording has finished"
     static let folderStillFinishing = "Some meetings in the current folder are still being finished. Try again when they are done."

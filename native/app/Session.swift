@@ -88,7 +88,11 @@ final class Session {
     /// After SIGTERM, this long before SIGKILL.
     static let killGrace: TimeInterval = 10
     static let interrupted = "the recording was interrupted; its files are kept"
-    static let diskStopped = "recording stopped because the disk was nearly full, so that it could be finished"
+    /// Why the disk stop ended a recording, as its `stopReason` and the lines that begin "Recording
+    /// stopped" give it, so they do not say it twice.
+    static let diskStopReason = "the disk was nearly full, so that it could be finished"
+    /// The disk stop's `error`, which adopt reads to know the stop was the disk's.
+    static let diskStopped = "recording stopped because " + diskStopReason
     /// What `diskStopped` said before the stop floor rose with the length of the recording. A
     /// meeting.json written by that build still carries it, so adopt takes it as the same stop.
     static let diskStoppedLegacy = "recording stopped because the disk was nearly full (under 200 MB free)"
@@ -353,26 +357,29 @@ final class Session {
 
     /// At launch: takes up the recording `recording.dir` names (alive: carry on; dead: recover),
     /// then recovers every orphan, a meeting still marked recording or finalising that nothing is
-    /// recording any more.
+    /// recording any more, in the meetings folder and in every other folder a recording was started
+    /// in (`MeetingStore.roots`).
     func adopt() {
         guard phase == .idle else { return }
         needsAdopt = false
         let named = namedFolder()
         if let dir = named { adoptNamed(dir) }
-        for meeting in store.scan() where meeting.state == .recording || meeting.state == .finalising {
-            // Spelt from the store's root, as `start` spelt it for the recorder's command line
-            // (a directory listing may resolve /var to /private/var).
-            let dir = Session.folderURL(store.root.appendingPathComponent(meeting.folder.url.lastPathComponent).path)
-            if let n = named, Session.same(n, dir) { continue }
-            if orphansInFlight.contains(dir.path) { continue }
-            // Found busy not long ago: the tick tries it again when its time comes.
-            if let since = busyFolders[dir.path], now().timeIntervalSince(since) < Session.busyRetry { continue }
-            switch recorder.find(dir: dir) {
-            case .found: continue
-            case .unknown: needsAdopt = true; continue
-            case .notFound: break
+        for root in store.roots {
+            for meeting in store.scan(in: root) where meeting.state == .recording || meeting.state == .finalising {
+                // Spelt from its root, as `start` spelt it for the recorder's command line
+                // (a directory listing may resolve /var to /private/var).
+                let dir = Session.folderURL(root.appendingPathComponent(meeting.folder.url.lastPathComponent).path)
+                if let n = named, Session.same(n, dir) { continue }
+                if orphansInFlight.contains(dir.path) { continue }
+                // Found busy not long ago: the tick tries it again when its time comes.
+                if let since = busyFolders[dir.path], now().timeIntervalSince(since) < Session.busyRetry { continue }
+                switch recorder.find(dir: dir) {
+                case .found: continue
+                case .unknown: needsAdopt = true; continue
+                case .notFound: break
+                }
+                recoverOrphan(dir)
             }
-            recoverOrphan(dir)
         }
         updateTimer()
     }
@@ -514,7 +521,7 @@ final class Session {
             if let free = free, free < Session.stopFloor(recordedSeconds: recorded) {
                 diskStop = true
                 try? store.update(dir) { $0.error = Session.diskStopped }
-                ended(dir, Session.diskStopped)
+                ended(dir, Session.diskStopReason)
                 stop()
                 return
             }

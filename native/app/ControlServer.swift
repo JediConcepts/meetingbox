@@ -213,6 +213,9 @@ final class ControlHandler {
 
 
     /// The request's folder beats the meetings folder setting, and its mic the microphone setting.
+    /// A request's folder is used in its standardised spelling, the one Preferences.otherRoots keeps,
+    /// so the launch's sweep spells a meeting there as the recorder's command line does; once the
+    /// recording has started there, the folder is remembered (unless it is the meetings folder).
     /// While the last recording is being saved nothing starts, in Session's words, and the app is
     /// told, for its failure sound.
     private func start(mic: String?, dir: String?) -> Handled {
@@ -223,12 +226,14 @@ final class ControlHandler {
         let root: URL
         if let dir = dir {
             guard dir.hasPrefix("/") else { return .reply(ControlHandler.oneLine("error the folder must be a full path: \(dir)")) }
-            root = URL(fileURLWithPath: dir, isDirectory: true)
+            root = URL(fileURLWithPath: URL(fileURLWithPath: dir, isDirectory: true).standardizedFileURL.path, isDirectory: true)
         } else {
             root = preferences.meetingsFolder
         }
         do {
-            return .starting(try session.start(root: root, mic: mic ?? preferences.microphone))
+            let started = try session.start(root: root, mic: mic ?? preferences.microphone)
+            if dir != nil { preferences.addOtherRoot(root) }
+            return .starting(started)
         } catch {
             return .reply(ControlHandler.oneLine("error \(error.localizedDescription)"))
         }

@@ -47,8 +47,10 @@ enum FinaliseStep: Equatable {
 ///   4. otherwise change nothing and fail.
 /// Each .tmp-<name> and the marker's temporary are synced to the disk before they take their names,
 /// and the folder after the marker, before any working file is removed: a power cut never leaves
-/// the marker beside audio that was still only in memory, with the working files gone. A sync that
-/// fails fails the finalise, and the working files are kept.
+/// the marker beside audio that was still only in memory, with the working files gone. Verified
+/// output this finalise did not write (an earlier attempt's, perhaps by a build that did not sync it)
+/// is flushed where it is, and so is a marker already in place, before any working file goes. A sync
+/// that fails fails the finalise, and the working files are kept.
 /// Verified means every file opens with AVURLAsset with a duration over zero, and the
 /// three durations agree within one second.
 enum Finaliser {
@@ -136,9 +138,16 @@ enum Finaliser {
         func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
         func has(_ name: String) -> Bool { fm.fileExists(atPath: url(name).path) }
 
-        // 1 and 2: the recording is already in place.
+        // 1 and 2: the recording is already in place. Before the .caf go, each .m4a is flushed where
+        // it is, then the marker (written now, or flushed where it is), then the folder.
         if verify(directory: directory) {
-            if !has(marker) { try writeMarker(in: directory, sync: sync, afterStep: afterStep) }
+            let cafLeft = working.contains(where: has)
+            if cafLeft { for name in finals { try sync(url(name)) } }
+            if !has(marker) {
+                try writeMarker(in: directory, sync: sync, afterStep: afterStep)
+            } else if cafLeft {
+                try sync(url(marker))
+            }
             try removeWorkingFiles(in: directory, sync: sync, afterStep: afterStep)
             return
         }
@@ -181,6 +190,7 @@ enum Finaliser {
                     throw RecordingError("\(url(name).path) already exists and does not match the working files")
                 }
                 try fm.removeItem(at: url(temp(name)))
+                try sync(url(name)) // kept as it is, so flushed where it is
             } else {
                 // On the disk before it takes its name, so a published name never stands for
                 // audio that was still only in memory.

@@ -1302,9 +1302,10 @@ app_request() {
     app_is_client_aware || die "the installed meetingbox app is older than this command. Run: meetingbox setup"
     # Running but not listening yet (starting or quitting) or not at all: opening it again
     # changes nothing, so only wait. NOT_ANSWERING is said when the wait runs out. An app that
-    # cannot be opened at all (a damaged bundle) is said at once, in open's words: setup puts it back.
+    # cannot be opened at all (a damaged bundle) is said at once, in open's words (less a closing
+    # full stop, inside the brackets): setup puts it back.
     if ! app_lock_held && ! why="$(open -g "$APP_DIR" 2>&1)"; then
-      die "meetingbox could not be opened ($why). Run: meetingbox setup"
+      die "meetingbox could not be opened (${why%.}). Run: meetingbox setup"
     fi
     while :; do
       if [ "$i" -ge $((APP_WAIT * 2)) ]; then

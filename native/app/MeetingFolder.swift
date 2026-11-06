@@ -28,7 +28,10 @@ struct MeetingFolder {
         return String(s[rr])
     }
 
-    static func parse(_ url: URL) -> MeetingFolder? {
+    /// Nil for a name that is not a meeting folder's, or a date that cannot be (2026-02-31). A time the
+    /// clocks skip, such as 01:30 when summer time begins, is still the meeting made then: the name came
+    /// from another zone or from before the clocks changed, and it parses to the nearest real moment.
+    static func parse(_ url: URL, calendar: Calendar = .current) -> MeetingFolder? {
         let name = url.lastPathComponent
         let whole = NSRange(name.startIndex..., in: name)
         var title: String? = nil
@@ -46,10 +49,9 @@ struct MeetingFolder {
         guard (0...23).contains(h), (0...59).contains(mi), (0...59).contains(s) else { return nil }
         var c = DateComponents()
         c.year = y; c.month = mo; c.day = d; c.hour = h; c.minute = mi; c.second = s
-        let cal = Calendar.current
-        guard c.isValidDate(in: cal), let date = cal.date(from: c) else { return nil }
+        guard let date = calendar.date(from: c) else { return nil }
         // Round-trip so that 2026-02-31 is refused rather than rolled into March.
-        let back = cal.dateComponents([.year, .month, .day], from: date)
+        let back = calendar.dateComponents([.year, .month, .day], from: date)
         guard back.year == y, back.month == mo, back.day == d else { return nil }
         return MeetingFolder(url: url, date: date, title: title)
     }
@@ -94,7 +96,9 @@ struct MeetingFolder {
     // MARK: titles and renaming
 
     /// A title that is safe as a folder name: `/`, `:`, `\` and control characters
-    /// become `-`, leading dots go, 80 characters at most. Nil when nothing is left.
+    /// become `-`, leading dots go, 80 characters at most. Nil when nothing is left. A final
+    /// extension with a letter in it would make the Finder take the folder for a file or a package
+    /// ("Q3 board deck.key" for a Keynote file), so its dot becomes `-` too ("Budget v2.0" stays).
     static func safeTitle(_ raw: String) -> String? {
         var scalars = String.UnicodeScalarView()
         for u in raw.unicodeScalars {
@@ -109,6 +113,13 @@ struct MeetingFolder {
         while s.hasPrefix(".") { s.removeFirst() }
         s = s.trimmingCharacters(in: .whitespaces)
         if s.count > 80 { s = String(s.prefix(80)).trimmingCharacters(in: .whitespaces) }
+        // An extension is one word after the last dot; "Dr. Smith" and a closing full stop are not.
+        if let dot = s.lastIndex(of: ".") {
+            let ext = s[s.index(after: dot)...]
+            if !ext.isEmpty, !ext.contains(where: \.isWhitespace), ext.contains(where: \.isLetter) {
+                s.replaceSubrange(dot...dot, with: "-")
+            }
+        }
         return s.isEmpty ? nil : s
     }
 

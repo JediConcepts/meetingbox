@@ -229,6 +229,13 @@ if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox could not be ope
    && ! printf '%s' "$out" | grep -qF "$STARTING"; then
   pass "D3: an app that cannot be opened fails at once with open's reason and says to run setup"
 else fail "D3: an app that cannot be opened fails at once with open's reason and says to run setup ($rc, slept $(slept): $out)"; fi
+# open's message often ends in a full stop: one is dropped, so the brackets never close on " .)".
+reset_calls; : > "$HOME/app-down"; reply "ok recording /x"; printf '%s\n' "The file $APP_DIR does not exist." > "$HOME/open-fails"
+out="$(mb start)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "meetingbox could not be opened (The file $APP_DIR does not exist). Run: meetingbox setup" \
+   && ! printf '%s' "$out" | grep -qF "exist.)"; then
+  pass "D3: a reason that ends in a full stop loses it inside the brackets"
+else fail "D3: a reason that ends in a full stop loses it inside the brackets ($rc: $out)"; fi
 
 # Connected, but no answer: the request may have arrived, so it is never sent twice.
 reset_calls; rm -f "$HOME/reply"

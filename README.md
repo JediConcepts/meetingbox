@@ -110,15 +110,20 @@ the floating button (Always, While recording, Never), open the minutes when they
 are ready (on; never while a recording is running), sounds (on), the microphone
 (System default unless you pick one) and the meetings folder (`~/Meetings` unless
 you choose another; it can be changed once nothing is recording or being
-finished). At the foot it says which build you are running.
+finished). Choosing a new folder moves nothing: meetings already recorded stay
+where they are, and the window lists only the folder chosen here. At the foot it
+says which build you are running.
 
 **The meetingbox window** lists your meetings, newest first, with a search box.
-Pick one for its minutes and transcript, play its audio, or show it in Finder. A
+Pick one for its minutes and transcript, play its audio in QuickTime Player (not
+while a recording is running, which would record it), or show it in Finder. A
 recording that was never processed has a Process button. **Rename** gives a
 meeting a real title, and its folder is renamed to match with the date kept first
-so it still sorts: `2026-10-28 1508 Budget review`. A meeting cannot be renamed
-while it is recording or being processed. A rename that would give two meetings the
-same folder name is refused.
+so it still sorts: `2026-10-28 1508 Budget review`. A title ending in something
+like a file extension (`deck.key`) has that dot made a `-`, so the Finder never
+takes the folder for a file. A meeting cannot be renamed while it is recording or
+being processed. A rename that would give two meetings the same folder name is
+refused.
 
 Quitting while a recording is running asks first: Stop and quit, Keep recording
 and quit (the recording carries on, and meetingbox picks it up when it opens
@@ -176,8 +181,9 @@ marked failed and every file is kept. A recording that stops without being asked
 (the recorder stopped, or the disk nearly filled), one that could not be finished,
 and minutes that could not be written are each said in the menu bar item, in amber
 and with the failure sound when sounds are on; click the line to open that
-meeting. The window says why, and for a recording never finished, how to finish
-it. To finish an interrupted recording by hand:
+meeting. While another recording is running the line waits in the menu, and the
+icon keeps showing that recording until it ends. The window says why, and for a
+recording never finished, how to finish it. To finish an interrupted recording by hand:
 
 ```bash
 meetingbox recover ~/Meetings/2026-10-27_1430
@@ -304,7 +310,9 @@ meetingbox help
 
 Options: `--mic "USB"`, `--dir`, `--locale`, `--whisper`, `--native`, `--model`,
 `--no-keep-audio`. Each has an `MB_*` environment equivalent. `--mic` and `--dir`
-go to the app with each start; without them the app uses its Preferences.
+go to the app with each start; without them the app uses its Preferences. The app
+remembers each `--dir` folder: a meeting there is picked up after a crash and
+opens when its minutes are ready, but the window lists only the meetings folder.
 
 meetingbox plays a short sound when a recording starts (Tink), when it stops (Pop)
 and when the minutes are ready (Glass), so a hotkey press is heard to work.

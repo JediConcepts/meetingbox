@@ -33,6 +33,7 @@ final class Preferences {
         static let openMinutes = "openMinutes"
         static let sounds = "sounds"
         static let meetingsFolder = "meetingsFolder"
+        static let otherRoots = "otherRoots"
         static let microphone = "microphone"
         static let floatingX = "floatingX"
         static let floatingY = "floatingY"
@@ -78,6 +79,22 @@ final class Preferences {
             return home.appendingPathComponent("Meetings", isDirectory: true)
         }
         set { defaults.set(newValue.path, forKey: Key.meetingsFolder) }
+    }
+
+    /// The other folders recordings were started in (a start's own folder: `dir=`, from `--dir` or
+    /// `MB_DIR`), as standardised full paths, each once, never the meetings folder as it was then. The
+    /// queue's resume and the session's sweep look in them too; the window lists the meetings folder
+    /// alone. One that is not there is skipped where it is looked in, and kept here.
+    var otherRoots: [String] {
+        get { (defaults.stringArray(forKey: Key.otherRoots) ?? []).filter { $0.hasPrefix("/") } }
+        set { defaults.set(newValue, forKey: Key.otherRoots) }
+    }
+
+    /// Remembers the folder a recording was started in, unless it is the meetings folder or known already.
+    func addOtherRoot(_ root: URL) {
+        let path = root.standardizedFileURL.path
+        guard path != meetingsFolder.standardizedFileURL.path, !otherRoots.contains(path) else { return }
+        otherRoots.append(path)
     }
 
     /// A microphone name to match, or nil for the system default.

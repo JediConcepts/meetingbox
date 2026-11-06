@@ -220,8 +220,15 @@ enum LibraryPresentation {
     }
 
     /// The meeting the session is on offers what the recording can be asked to do; any other offers
-    /// Rename and Show in Finder, Play audio when there is audio, and Process when `canProcess`.
+    /// Rename and Show in Finder, Play audio when there is audio, and Process when `canProcess`. Nothing
+    /// is played while a recording runs or is paused: the recorder takes in the Mac's own sound, so the
+    /// meeting played would be recorded into this one.
     static func actions(for meeting: Meeting, phase: Session.Phase, files: MeetingFiles) -> [LibraryAction] {
+        let capturing: Bool
+        switch phase {
+        case .recording, .paused: capturing = true
+        case .idle, .finalising: capturing = false
+        }
         if let folder = phase.folder, samePlace(folder, meeting.folder.url) {
             switch phase {
             case .recording: return [.pause, .stop, .showInFinder]
@@ -231,10 +238,16 @@ enum LibraryPresentation {
             }
         }
         var list: [LibraryAction] = [.rename, .showInFinder]
-        if files.audio != nil { list.append(.playAudio) }
+        if files.audio != nil && !capturing { list.append(.playAudio) }
         if canProcess(meeting, files: files) { list.append(.process) }
         return list
     }
+
+    /// Play audio opens the recording in QuickTime Player, by its bundle identifier, and never in the
+    /// `.m4a` default application: that is often Music, which adds the file to its library and may
+    /// upload it. Without QuickTime Player nothing is opened, and the window says why.
+    static let quickTimePlayer = "com.apple.QuickTimePlayerX"
+    static let needsQuickTime = "QuickTime Player is needed to play recordings"
 
     // MARK: busy and rename
 

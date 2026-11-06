@@ -99,7 +99,13 @@ final class MeetingStore: @unchecked Sendable {
     private var transcripts: [String: String] = [:]
     private let indexQueue = DispatchQueue(label: "meetingbox.store.index", qos: .utility)
 
-    init(root: URL) { currentRoot = root }
+    /// The other folders recordings were started in (Preferences.otherRoots in the app), read each time.
+    private let otherRoots: () -> [URL]
+
+    init(root: URL, otherRoots: @escaping () -> [URL] = { [] }) {
+        currentRoot = root
+        self.otherRoots = otherRoots
+    }
 
     /// The Meetings folder. The app moves it when the meetings folder setting changes (never while a
     /// recording is running), so the session, the queue and the library, which share this one store,
@@ -132,39 +138,55 @@ final class MeetingStore: @unchecked Sendable {
         s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil).lowercased()
     }
 
+    /// The meetings folder, then each other folder a recording was started in that is not the same
+    /// folder, each once. The queue's resume and the session's sweep look in all of them; the window
+    /// lists `root` alone. One that is not there (a disk not plugged in) is skipped by the scan, and stays.
+    var roots: [URL] {
+        var all = [root]
+        var seen: Set<String> = [root.standardizedFileURL.path]
+        for other in otherRoots() where seen.insert(other.standardizedFileURL.path).inserted {
+            all.append(other)
+        }
+        return all
+    }
+
     // MARK: scan
 
     /// Every meeting folder under the root, newest first. Read-only: it never writes or repairs anything.
-    func scan() -> [Meeting] {
-        let fm = FileManager.default
-        let root = self.root
-        guard let items = try? fm.contentsOfDirectory(
+    func scan() -> [Meeting] { scan(in: root) }
+
+    /// Every meeting folder in every one of `roots`, newest first.
+    func scanEveryRoot() -> [Meeting] { MeetingStore.newestFirst(roots.flatMap(scan(in:))) }
+
+    /// Every meeting folder directly in `root`, newest first; none when it cannot be listed.
+    func scan(in root: URL) -> [Meeting] {
+        guard let items = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else { return [] }
-        var found: [Meeting] = []
-        for item in items {
-            guard (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false,
-                  let folder = MeetingFolder.parse(item) else { continue }
-            var record: MeetingRecord? = nil
-            if let data = try? Data(contentsOf: MeetingStore.recordURL(item)),
-               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
-                record = MeetingRecord(json: obj)
-            }
-            let state: MeetingState
-            if let record = record {
-                state = record.state
-            } else if fm.fileExists(atPath: item.appendingPathComponent("notes.md").path) {
-                state = .done // an earlier version of meetingbox already wrote the minutes
-            } else {
-                state = .unprocessed
-            }
-            found.append(Meeting(folder: folder, record: record, state: state))
+        return MeetingStore.newestFirst(items.compactMap(MeetingStore.meeting(at:)))
+    }
+
+    /// The meeting in this folder, as a scan would find it; nil when it is not a meeting folder.
+    static func meeting(at item: URL) -> Meeting? {
+        guard (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false,
+              let folder = MeetingFolder.parse(item) else { return nil }
+        let record = MeetingStore.record(in: item)
+        let state: MeetingState
+        if let record = record {
+            state = record.state
+        } else if FileManager.default.fileExists(atPath: item.appendingPathComponent("notes.md").path) {
+            state = .done // an earlier version of meetingbox already wrote the minutes
+        } else {
+            state = .unprocessed
         }
-        found.sort {
+        return Meeting(folder: folder, record: record, state: state)
+    }
+
+    private static func newestFirst(_ meetings: [Meeting]) -> [Meeting] {
+        meetings.sorted {
             $0.folder.date != $1.folder.date
                 ? $0.folder.date > $1.folder.date
                 : $0.folder.url.lastPathComponent > $1.folder.url.lastPathComponent
         }
-        return found
     }
 
     // MARK: update

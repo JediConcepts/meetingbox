@@ -38,6 +38,24 @@ final class LibraryModel: ObservableObject {
         var error: String? = nil
     }
 
+    /// How the window hands something to another application: the only two ways it does. A test gives
+    /// its own, so nothing is really opened.
+    struct Opener {
+        /// Opens the file in the application with this bundle identifier; false when there is no such
+        /// application, and then nothing is opened.
+        var open: (URL, String) -> Bool
+        /// Shows the item selected in a Finder window, without opening it.
+        var reveal: (URL) -> Void
+
+        static let system = Opener(
+            open: { file, bundleID in
+                guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return false }
+                NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+                return true
+            },
+            reveal: { NSWorkspace.shared.activateFileViewerSelecting([$0]) })
+    }
+
     /// The first scan has come back, so an empty list means no meetings rather than not yet read.
     @Published private(set) var hasScanned = false
     /// Every meeting, newest first, as the last scan found them.
@@ -54,10 +72,17 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var searchText = ""
     @Published var pane: Pane = .minutes
     @Published private(set) var renaming: RenameDraft?
+    /// Why the last action did nothing (Play audio without QuickTime Player), until the next action or
+    /// another meeting is chosen.
+    @Published private(set) var problem: String?
+    /// A meeting the window was asked to show (`show`) that is not in the meetings folder: one recorded
+    /// in a folder of its own. It is read with each scan while it is selected, and never listed.
+    @Published private(set) var outside: Meeting?
 
     private let store: MeetingStore
     private let session: Session
     private let queue: ProcessingQueue
+    private let opener: Opener
     /// Pause, resume and stop: `AppModel.perform`, so they take the path every recording command takes.
     var control: (@MainActor (MenuAction) -> Void)?
 
@@ -68,18 +93,26 @@ final class LibraryModel: ObservableObject {
     private var loadToken = 0
     /// The store has read the transcripts of the meetings in `meetings`. Cleared by each scan.
     private var indexed = false
+    /// The folder `show` was last asked for, until another meeting is chosen.
+    private var shown: URL?
 
-    init(store: MeetingStore, session: Session, queue: ProcessingQueue) {
+    init(store: MeetingStore, session: Session, queue: ProcessingQueue, opener: Opener = .system) {
         self.store = store
         self.session = session
         self.queue = queue
+        self.opener = opener
     }
 
     // MARK: what the views read
 
     var selectedMeeting: Meeting? {
-        guard let selection = selection else { return nil }
-        return meetings.first { LibraryPresentation.key($0.folder.url) == selection }
+        selection.flatMap(meeting(withKey:))
+    }
+
+    /// A listed meeting, or the one shown from outside the meetings folder.
+    private func meeting(withKey key: String) -> Meeting? {
+        if let listed = meetings.first(where: { LibraryPresentation.key($0.folder.url) == key }) { return listed }
+        return outside.flatMap { LibraryPresentation.key($0.folder.url) == key ? $0 : nil }
     }
 
     var rows: [LibraryRow] {
@@ -112,26 +145,34 @@ final class LibraryModel: ObservableObject {
 
     // MARK: loading
 
-    /// Scans the Meetings folder off the main queue. Called after a job, after a rename, when the
-    /// window becomes key, and when the session changes phase (a new recording appears at once).
+    /// Scans the Meetings folder off the main queue, and reads the meeting `show` was asked for when it
+    /// is not in it. Called after a job, after a rename, when the window becomes key, and when the
+    /// session changes phase (a new recording appears at once).
     func reload() {
         scanToken += 1
         let token = scanToken
         let store = self.store
+        let shown = self.shown
         reader.async { [weak self] in
             let found = store.scan()
+            let outside = shown.flatMap { dir in
+                found.contains { LibraryPresentation.samePlace($0.folder.url, dir) } ? nil : MeetingStore.meeting(at: dir)
+            }
             // Only the meetings that were never processed or failed need their folders looked at.
-            let processable = Set(found.filter { ($0.state == .unprocessed || $0.state == .failed) && MeetingFiles.canRun($0.folder.url) }
+            let processable = Set((found + [outside].compactMap { $0 })
+                .filter { ($0.state == .unprocessed || $0.state == .failed) && MeetingFiles.canRun($0.folder.url) }
                 .map { LibraryPresentation.key($0.folder.url) })
-            Task { @MainActor in self?.scanned(found, processable, token) }
+            Task { @MainActor in self?.scanned(found, outside, processable, token) }
         }
     }
 
-    private func scanned(_ found: [Meeting], _ canProcess: Set<String>, _ token: Int) {
+    private func scanned(_ found: [Meeting], _ outside: Meeting?, _ canProcess: Set<String>, _ token: Int) {
         guard token == scanToken else { return }
         hasScanned = true
         processable = canProcess
         meetings = found
+        // Not if another meeting has been chosen since this scan began.
+        self.outside = outside.flatMap { o in shown.map { LibraryPresentation.samePlace($0, o.folder.url) } == true ? o : nil }
         indexed = false
         refilter()
         loadContent()
@@ -202,15 +243,24 @@ final class LibraryModel: ObservableObject {
     func select(_ key: String?) {
         guard key != selection else { return }
         selection = key
+        problem = nil
+        if let dir = shown, LibraryPresentation.key(dir) != key {
+            shown = nil
+            outside = nil
+        }
         loadContent()
     }
 
     /// The window is asked to show this meeting's minutes (a job finished, or "Minutes ready" was
-    /// chosen): the search is cleared so the meeting is in the list, and the list is read again.
+    /// chosen): the search is cleared so the meeting is in the list, and the list is read again. A
+    /// meeting outside the meetings folder (recorded in a folder of its own) is read with it and shown,
+    /// but not listed.
     func show(_ dir: URL) {
         searchText = ""
         pane = .minutes
         selection = LibraryPresentation.key(dir)
+        shown = dir
+        problem = nil
         refilter()
         loadContent()
         reload()
@@ -230,15 +280,19 @@ final class LibraryModel: ObservableObject {
 
     func perform(_ action: LibraryAction) {
         guard let meeting = selectedMeeting else { return }
+        problem = nil
         switch action {
         case .pause: control?(.pause)
         case .resume: control?(.resume)
         case .stop: control?(.stop)
         case .rename: beginRename()
         case .showInFinder:
-            NSWorkspace.shared.open(meeting.folder.url)
+            // Selected in a Finder window, never opened: a folder can look like a package to the Finder.
+            opener.reveal(meeting.folder.url)
         case .playAudio:
-            if let audio = shownContent?.files.audio { NSWorkspace.shared.open(audio) }
+            // Only while it is offered (never during a recording or a pause), and only in QuickTime Player.
+            guard actions(for: meeting).contains(.playAudio), let audio = shownContent?.files.audio else { return }
+            if !opener.open(audio, LibraryPresentation.quickTimePlayer) { problem = LibraryPresentation.needsQuickTime }
         case .process:
             // A failed meeting goes through retry; one that was never processed is written queued first.
             if meeting.state == .failed { queue.retry(meeting.folder.url) } else { queue.process(meeting.folder.url) }
@@ -271,7 +325,7 @@ final class LibraryModel: ObservableObject {
     /// sheet stays open with that said and follows the folder, and the same text again writes the title.
     func commitRename() {
         guard let draft = renaming else { return }
-        guard let meeting = meetings.first(where: { LibraryPresentation.key($0.folder.url) == draft.key }) else {
+        guard let meeting = meeting(withKey: draft.key) else {
             renaming = nil
             return
         }
@@ -299,6 +353,10 @@ final class LibraryModel: ObservableObject {
         }
         meetings = meetings.map(patch)
         visible = visible.map(patch)
+        if let o = outside, LibraryPresentation.key(o.folder.url) == before {
+            outside = patch(o)
+            shown = folder.url
+        }
         if processable.remove(before) != nil { processable.insert(LibraryPresentation.key(folder.url)) }
         if selection == before { selection = LibraryPresentation.key(folder.url) }
         loadContent()

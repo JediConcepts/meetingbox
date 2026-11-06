@@ -56,7 +56,10 @@ final class AppModel: ObservableObject {
         self.playSound = playSound
         self.stateDir = stateDir
         self.preferences = preferences
-        let store = MeetingStore(root: preferences.meetingsFolder)
+        // The other folders recordings were started in are read from the setting each time they are looked in.
+        let store = MeetingStore(root: preferences.meetingsFolder, otherRoots: { [preferences] in
+            preferences.otherRoots.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        })
         let session = Session(stateDir: stateDir, recorder: recorder, store: store, now: Date.init,
                               freeBytes: freeBytes)
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")

@@ -387,6 +387,9 @@ final class DiskSteps {
 }
 let markerSynced = ["sync .tmp-recording-complete", "rename .recording-complete", "sync folder"]
 let cafRemoved = ["remove mic.caf", "remove call.caf"]
+/// Verified .m4a that this finalise did not write (an earlier attempt, perhaps by an earlier build that
+/// did not sync them) are flushed where they are, before anything is removed.
+let finalsFlushed = finals.map { "sync \($0)" }
 
 do {
     // Encoding, as a stop or a recovery from the working files does.
@@ -409,11 +412,29 @@ do {
     for name in finals { try fm.copyItem(at: source.appendingPathComponent(name), to: dir.appendingPathComponent(name)) }
     let disk = DiskSteps(dir)
     try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
-    check(disk.log == markerSynced + cafRemoved,
-          "A2: accepting verified .m4a, the marker's temporary is synced before its rename and the folder after it, then the .caf go (\(disk.log))")
+    check(disk.log == finalsFlushed + markerSynced + cafRemoved,
+          "A2: accepting verified .m4a, each is flushed, then the marker's temporary before its rename and the folder after it, then the .caf go (\(disk.log))")
     check(complete(dir), "A2: accepting verified .m4a with the syncs ends complete")
 } catch {
     check(false, "A2: accepting verified .m4a: \(error)")
+}
+
+do {
+    // One verified .m4a from an earlier attempt beside the .caf: it is kept, and flushed where it is
+    // before the .caf go; the other two are encoded and published as usual.
+    let source = cafFolder()
+    try recover(directory: source)
+    let dir = cafFolder()
+    try fm.copyItem(at: source.appendingPathComponent("audio.m4a"), to: dir.appendingPathComponent("audio.m4a"))
+    let kept = inode(dir, "audio.m4a")
+    let disk = DiskSteps(dir)
+    try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
+    let expected = ["sync audio.m4a", "rename audio.m4a", "sync .tmp-mic.m4a", "rename mic.m4a", "sync .tmp-call.m4a", "rename call.m4a"]
+        + markerSynced + cafRemoved
+    check(disk.log == expected && inode(dir, "audio.m4a") == kept && complete(dir),
+          "A2: a verified .m4a kept from an earlier attempt is flushed before the .caf go, and not rewritten (\(disk.log))")
+} catch {
+    check(false, "A2: a verified .m4a kept from an earlier attempt: \(error)")
 }
 
 do {
@@ -426,10 +447,34 @@ do {
     } catch is Interrupt {}
     let disk = DiskSteps(dir)
     try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync)
-    check(disk.log == ["sync folder"] + cafRemoved, "A2: with the marker already there, the folder is synced before the .caf go (\(disk.log))")
+    check(disk.log == finalsFlushed + ["sync .recording-complete", "sync folder"] + cafRemoved,
+          "A2: with the marker already there, each .m4a and the marker are flushed, then the folder, before the .caf go (\(disk.log))")
     check(complete(dir), "A2: the marker already there ends complete")
 } catch {
     check(false, "A2: the marker already there: \(error)")
+}
+
+// On the route that accepts verified output, a flush that fails fails the finalise too: nothing
+// follows it, and the .caf are kept for a later recovery.
+for (failing, withMarker) in [("mic.m4a", false), ("call.m4a", true), (".recording-complete", true)] {
+    do {
+        let dir = cafFolder()
+        do {
+            try Finaliser.finalise(directory: dir) { step in
+                if step == .published(withMarker ? ".recording-complete" : "call.m4a") { throw Interrupt() }
+            }
+        } catch is Interrupt {}
+        let disk = DiskSteps(dir, failing: failing)
+        var thrown: Error?
+        do { try Finaliser.finalise(directory: dir, afterStep: disk.step, sync: disk.sync) } catch { thrown = error }
+        check(thrown is SyncFailed && disk.log.last == "sync \(failing)" && exists(dir, "mic.caf") && exists(dir, "call.caf")
+              && exists(dir, ".recording-complete") == withMarker,
+              "A2: accepting verified output, a failed flush of \(failing) fails the finalise and the .caf are kept (\(disk.log))")
+        try recover(directory: dir)
+        check(complete(dir), "A2: after a failed flush of \(failing), a later recover ends complete")
+    } catch {
+        check(false, "A2: a failed flush of \(failing): \(error)")
+    }
 }
 
 do {

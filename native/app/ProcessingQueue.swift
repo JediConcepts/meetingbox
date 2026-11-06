@@ -293,10 +293,11 @@ final class ProcessingQueue {
         if requeued { enqueue(dir) }
     }
 
-    /// Picks up every meeting left `queued` or `processing`, oldest first. Safe to call again.
+    /// Picks up every meeting left `queued` or `processing`, oldest first, in the meetings folder and
+    /// in every other folder a recording was started in (`MeetingStore.roots`). Safe to call again.
     func resume() {
         onTickQueue()
-        for meeting in store.scan().reversed() {
+        for meeting in store.scanEveryRoot().reversed() {
             guard let state = meeting.record?.state, state == .queued || state == .processing else { continue }
             let dir = ProcessingQueue.normal(meeting.folder.url)
             if !known(dir) { pending.append(dir) }

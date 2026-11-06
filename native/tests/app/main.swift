@@ -60,6 +60,17 @@ do {
     check(MeetingFolder.parse(root.appendingPathComponent(".DS_Store")) == nil, "parse rejects .DS_Store")
     check(a!.displayTitle == "28 October 2026, 15:08", "displayTitle of untitled folder")
     check(c!.displayTitle == "Standup", "displayTitle of titled folder")
+    // C4: a time the clocks skip (01:30 on 29 March 2026 in London) is still a meeting; impossible dates are not
+    var london = Calendar(identifier: .gregorian)
+    london.timeZone = TimeZone(identifier: "Europe/London")!
+    let skipped = MeetingFolder.parse(root.appendingPathComponent("2026-03-29_0130"), calendar: london)
+    check(skipped.map { london.dateComponents([.year, .month, .day], from: $0.date) == DateComponents(year: 2026, month: 3, day: 29) } == true,
+          "C4: a folder named for a time the clocks skip (2026-03-29_0130 in London) is parsed, on its day")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-03-29 0130 Early call"), calendar: london)?.title == "Early call",
+          "C4: titled too")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-02-31_1000"), calendar: london) == nil
+          && MeetingFolder.parse(root.appendingPathComponent("2026-10-28_1060"), calendar: london) == nil,
+          "C4: 31 February and minute 60 are still refused")
 }
 
 // create
@@ -87,6 +98,14 @@ do {
     check(MeetingFolder.safeTitle("   ") == nil, "safeTitle blank is nil")
     check(MeetingFolder.safeTitle("...") == nil, "safeTitle dots is nil")
     check(MeetingFolder.safeTitle(String(repeating: "a", count: 81))?.count == 80, "safeTitle cuts to 80")
+    // C6: a final extension with a letter in it would make the folder a file or a package to the Finder
+    check(MeetingFolder.safeTitle("Q3 board deck.key") == "Q3 board deck-key", "C6: safeTitle: Q3 board deck.key gives Q3 board deck-key")
+    check(MeetingFolder.safeTitle("Launch plan.app") == "Launch plan-app" && MeetingFolder.safeTitle("Notes.pages") == "Notes-pages",
+          "C6: safeTitle: .app and .pages too")
+    check(MeetingFolder.safeTitle("Budget v2.0") == "Budget v2.0", "C6: safeTitle: Budget v2.0 is unchanged (no letter after the dot)")
+    check(MeetingFolder.safeTitle("Call with Dr. Smith") == "Call with Dr. Smith" && MeetingFolder.safeTitle("Ends with a dot.") == "Ends with a dot.",
+          "C6: safeTitle: a dot inside a sentence, or a closing one, is not an extension")
+    check(MeetingFolder.safeTitle("v1.2 review.key") == "v1.2 review-key", "C6: safeTitle: only the final dot changes")
 }
 
 // rename
@@ -356,9 +375,10 @@ final class Rig {
     var finished: [(URL, Bool)] = []
     var changes: [Session.Phase] = []
 
-    init() {
+    /// `otherRoots`: the store's other folders that recordings were started in (Preferences.otherRoots in the app).
+    init(otherRoots: @escaping () -> [URL] = { [] }) {
         state = root.appendingPathComponent("state")
-        store = MeetingStore(root: root.appendingPathComponent("Meetings"))
+        store = MeetingStore(root: root.appendingPathComponent("Meetings"), otherRoots: otherRoots)
         try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
     }
     @discardableResult
@@ -3157,8 +3177,13 @@ do {
     check(acts(live, none, .recording(here)) == [.pause, .stop, .showInFinder], "L5: recording: Pause, Stop, Show in Finder")
     check(acts(live, none, .paused(here)) == [.resume, .stop, .showInFinder], "L5: paused: Resume, Stop, Show in Finder")
     check(acts(live, none, .finalising(here)) == [.showInFinder], "L5: finalising: only Show in Finder")
-    check(acts(libMeeting(name, .done), audio, .recording(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .playAudio],
-          "L5: another meeting is unaffected by a recording")
+    // C5: nothing is played while a recording or a pause is under way: system audio would take it in
+    check(acts(libMeeting(name, .done), audio, .recording(libURL("2026-10-28_1600"))) == [.rename, .showInFinder],
+          "L5, C5: while another meeting records, no Play audio")
+    check(acts(libMeeting(name, .unprocessed), audio, .paused(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .process],
+          "L5, C5: nor while it is paused; Process is still offered")
+    check(acts(libMeeting(name, .done), audio, .finalising(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .playAudio],
+          "L5, C5: once it is only being saved, Play audio again")
 }
 do {
     // what is on disk
@@ -4132,14 +4157,18 @@ do {
     let dir = try! s.start(root: r.store.root, mic: nil)
     r.free = 199 * MB
     r.at(30)
-    check(ended.count == 1 && ended[0].0 == dir && ended[0].1 == Session.diskStopped && stopReason(r, dir) == Session.diskStopped,
-          "B2: the disk stop is announced with its reason, and the reason is kept")
+    // 8(a): the reason does not say "recording stopped" again; the error keeps its own words.
+    let bare = "the disk was nearly full, so that it could be finished"
+    check(Session.diskStopReason == bare && StatusPresentation.recordingStopped(Session.diskStopReason) == "Recording stopped: \(bare)",
+          "8(a): the disk stop's reason is bare, so the line reads Recording stopped: the disk was nearly full…")
+    check(ended.count == 1 && ended[0].0 == dir && ended[0].1 == bare && stopReason(r, dir) == bare && r.json(dir)["error"] as? String == Session.diskStopped,
+          "B2: the disk stop is announced with its reason, and the reason is kept (\(ended.map(\.1)))")
     r.rec.exit(r.rec.nextPid, 0, verifies: true)
     r.at(31)
-    check(ended.count == 1 && r.stateOf(dir) == "queued" && stopReason(r, dir) == Session.diskStopped && r.json(dir)["error"] == nil,
+    check(ended.count == 1 && r.stateOf(dir) == "queued" && stopReason(r, dir) == bare && r.json(dir)["error"] == nil,
           "B2: once queued the reason stays (the error goes), and it is announced once")
     let after = processToDone(r, dir)
-    check(after.processing == Session.diskStopped && after.done == Session.diskStopped, "B2: through processing and done (\(after))")
+    check(after.processing == bare && after.done == bare, "B2: through processing and done (\(after))")
 }
 do {
     // an adopted recorder that stops is announced however long ago it started
@@ -4312,11 +4341,11 @@ do {
     s.apply(.phase(.recording(meetingA)))
     check(s.notice?.line == notWritten, "B3: resuming does not")
 
-    // shown while a new recording goes on: the warning, with the timer beside it
+    // shown while a new recording goes on: the line is in the menu, and the icon stays the recording's (8(b))
     let live = present(.recording(meetingA), seconds: 7, notice: Notice(kind: .unfinished, folder: meetingB, line: notWritten))
-    check(live.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "00:07", help: notWritten)
+    check(live.button == StatusButton(symbol: "circle.fill", tint: .red, title: "00:07", help: "Recording")
           && lines(live) == ["(Microphone: capturing)", "(System audio: capturing)", notWritten, "-", "Pause", "Stop", "Show recording folder"] + tail,
-          "B3: during a recording the line is there and the timer stays beside the warning (\(lines(live)))")
+          "B3, 8(b): during a recording the line is in the menu and the recording keeps the icon and the timer (\(lines(live)))")
     // a failed start still wins the icon, and both lines are in the menu
     let both = present(notice: Notice(kind: .unfinished, folder: meetingB, line: notWritten), failure: Failure("start", "x"))
     check(both.button.help == "Could not start: x" && lines(both) == ["(Could not start: x)", notWritten, "-", "Start recording"] + tail,
@@ -4410,9 +4439,10 @@ do {
           "9(d): a folder with spaces or quotes is quoted for the shell (\(notes(titled, unfinished: true).last ?? "nil"))")
     let early = meeting("2026-10-28_1600", .done, stopReason: Session.recorderStopped)
     check(notes(early, unfinished: false) == ["Recording stopped early: the recorder stopped unexpectedly"], "B2: the window says why a recording stopped early")
-    let both = meeting("2026-10-28_1700", .failed, error: tooFull, stopReason: Session.diskStopped)
+    let both = meeting("2026-10-28_1700", .failed, error: tooFull, stopReason: Session.diskStopReason)
     check(notes(both, unfinished: true) == [tooFull, "To finish it, run: meetingbox recover /Meetings/2026-10-28_1700, then choose Process here.",
-                                            "Recording stopped early: \(Session.diskStopped)"], "B2, 9(d): all three, in that order")
+                                            "Recording stopped early: the disk was nearly full, so that it could be finished"],
+          "B2, 9(d), 8(a): all three, in that order, and the stop reason reads Recording stopped early: the disk was nearly full…")
     // what is on disk
     let root = freshRoot()
     let unfinishedFolder = MeetingFolder.parse(make(root, "2026-10-28_1800", files: ["mic.caf": "c"]))!
@@ -4502,6 +4532,245 @@ MainActor.assumeIsolated {
     model.play("Basso")
     check(played.count == 8, "app: no sound at all with sounds off")
     model.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// MARK: - Final fix round, part 3: the library and the folders
+
+// 8(b): a line about another meeting that arrives while one records or is paused waits in the menu; the
+// recording keeps the icon and its timer, and the line takes the icon once that recording ends.
+do {
+    let notWritten = "Minutes could not be written: processing failed (exit 1)"
+    let stopped = "Recording stopped: the recorder stopped unexpectedly"
+    var s = StatusInput()
+    s.apply(.phase(.recording(meetingB)))
+    s.apply(.tick(seconds: 65, health: allOk))
+    s.apply(.unfinished(meetingA, line: notWritten))
+    let during = StatusPresentation(s)
+    check(during.button == StatusButton(symbol: "circle.fill", tint: .red, title: "01:05", help: "Recording"),
+          "8(b): a failure about A while B records leaves B's recording icon and timer (\(during.button))")
+    check(action(notWritten, in: during) == .openMinutes(meetingA) && during.menu.first { $0.title == notWritten }?.enabled == true,
+          "8(b): the line is in the menu, and opens A")
+    s.apply(.phase(.paused(meetingB)))
+    s.apply(.recordingStopped(meetingA, reason: Session.recorderStopped))
+    let paused = StatusPresentation(s)
+    check(paused.button == StatusButton(symbol: "pause.circle", tint: .plain, title: "01:05", help: "Paused") && action(stopped, in: paused) == .openMinutes(meetingA),
+          "8(b): a Recording stopped line about A while B is paused leaves B's paused icon and timer, and is in the menu (\(paused.button))")
+    // a failed pause is about this recording: it keeps its amber icon
+    s.apply(.phase(.recording(meetingB)))
+    s.apply(.failed(Failure("pause", "x")))
+    check(StatusPresentation(s).button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "01:05", help: "Could not pause: x"),
+          "8(b): a failed pause still turns the icon amber, with the timer")
+    s.apply(.acted)
+    check(StatusPresentation(s).button.symbol == "circle.fill" && s.notice?.folder == meetingA, "8(b): once it is cleared, the recording's icon again, and A's line is still there")
+    // B stops: A's line takes the icon until A is opened
+    s.apply(.phase(.finalising(meetingB)))
+    check(StatusPresentation(s).button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "", help: stopped),
+          "8(b): after B stops, A's line turns the icon amber")
+    s.apply(.phase(.idle))
+    check(StatusPresentation(s).button.tint == .amber && StatusPresentation(s).button.help == stopped, "8(b): and keeps it once B is saved")
+    s.apply(.minutesOpened(meetingA))
+    check(s.notice == nil && StatusPresentation(s).button.symbol == "record.circle", "8(b): until A is opened")
+}
+
+// C8: the Preferences window says that choosing a new folder moves nothing.
+check(PreferencesPresentation.folderMovesNothing
+      == "Choosing a new folder moves nothing: meetings already recorded stay where they are, and the window lists only the folder chosen here.",
+      "C8: the words under the meetings folder")
+
+// C2: every folder a recording was started in (dir=, --dir, MB_DIR) is remembered, as a standardised full
+// path, once, and never the meetings folder.
+do {
+    let home = URL(fileURLWithPath: "/Users/someone", isDirectory: true)
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: home)
+    check(p.otherRoots.isEmpty, "C2: Preferences: no other folders at first")
+    p.addOtherRoot(URL(fileURLWithPath: "/Volumes/Work/x/../Calls/", isDirectory: true))
+    p.addOtherRoot(URL(fileURLWithPath: "/Volumes/Work/Calls", isDirectory: true))
+    p.addOtherRoot(URL(fileURLWithPath: "/Users/someone/./Meetings/", isDirectory: true))
+    p.addOtherRoot(URL(fileURLWithPath: "/Volumes/Archive", isDirectory: true))
+    check(p.otherRoots == ["/Volumes/Work/Calls", "/Volumes/Archive"],
+          "C2: Preferences: other folders are standardised full paths, each once, never the meetings folder (\(p.otherRoots))")
+    check(Preferences(defaults: d, home: home).otherRoots == ["/Volumes/Work/Calls", "/Volumes/Archive"], "C2: Preferences: and they persist")
+}
+do {
+    let (r, h, prefs) = handlerRig()
+    let parent = freshRoot()
+    let work = parent.appendingPathComponent("Work Calls", isDirectory: true)
+    let reply = h.reply(for: .start(mic: nil, dir: parent.path + "/x/../Work Calls/"))
+    let made = names(work)
+    check(made.count == 1 && reply == "ok recording \(work.path)/\(made.first ?? "-")" && r.rec.launches.first?.dir.path == "\(work.path)/\(made.first ?? "-")",
+          "C2: a start with its own folder records there, the folder spelt as a standardised path (\(reply))")
+    check(prefs.otherRoots == [work.standardizedFileURL.path], "C2: a dir= start remembers its folder (\(prefs.otherRoots))")
+    func finish(_ t: TimeInterval) {
+        _ = h.reply(for: .stop)
+        r.rec.exit(r.rec.nextPid, 0, verifies: true)
+        r.at(t)
+    }
+    finish(1)
+    _ = h.reply(for: .start(mic: nil, dir: work.path))
+    finish(2)
+    _ = h.reply(for: .start(mic: nil, dir: r.store.root.path + "/"))
+    finish(3)
+    _ = h.reply(for: .start(mic: nil, dir: nil))
+    finish(4)
+    check(r.rec.launches.count == 4 && prefs.otherRoots == [work.standardizedFileURL.path],
+          "C2: the same folder again, the meetings folder and no folder add nothing (\(prefs.otherRoots))")
+    check(h.reply(for: .start(mic: nil, dir: "Calls")).hasPrefix("error ") && prefs.otherRoots.count == 1, "C2: nor does a start that is refused")
+}
+
+// C2: the sweep at launch looks in every other folder too, spelling each meeting's folder from that root
+// as the start did, so a live recorder there is left alone; a folder that is not there is skipped.
+do {
+    var others: [URL] = []
+    let r = Rig(otherRoots: { others })
+    let work = r.root.appendingPathComponent("Work Calls", isDirectory: true)
+    let unplugged = r.root.appendingPathComponent("Unplugged", isDirectory: true)
+    others = [unplugged, work, r.store.root]
+    try! fm.createDirectory(at: work, withIntermediateDirectories: true)
+    func meeting(_ name: String, _ state: MeetingState) -> URL {
+        let dir = Session.folderURL(work.appendingPathComponent(name).path)
+        try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try! r.store.update(dir) { $0.state = state }
+        return dir
+    }
+    let orphan = meeting("2026-10-28_0900", .finalising)
+    let live = meeting("2026-10-28_1000", .recording)
+    r.rec.alive.insert(4242)
+    r.rec.running[live.path] = 4242
+    let inMeetings = r.meeting("2026-10-28_1100") { $0.state = .recording }
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered.map(\.path).sorted() == [inMeetings.path, orphan.path].sorted() && r.stateOf(orphan) == "queued" && r.stateOf(inMeetings) == "queued",
+          "C2: the sweep recovers an orphan in another folder, as well as the meetings folder's, once each (\(r.rec.recovered.map(\.lastPathComponent)))")
+    check(r.stateOf(live) == "recording" && r.rec.signals.isEmpty && s.phase == .idle, "C2: and leaves a live recorder in another folder alone")
+    check(r.store.scan().map { $0.folder.url.lastPathComponent } == ["2026-10-28_1100"], "C2: the store's own scan is still the meetings folder alone")
+}
+
+// C2: the queue's resume takes up what was left queued in another folder, oldest first across the folders.
+do {
+    let base = freshRoot()
+    let meetings = base.appendingPathComponent("Meetings", isDirectory: true)
+    let work = base.appendingPathComponent("Work", isDirectory: true)
+    try! fm.createDirectory(at: meetings, withIntermediateDirectories: true)
+    try! fm.createDirectory(at: work, withIntermediateDirectories: true)
+    let store = MeetingStore(root: meetings, otherRoots: { [base.appendingPathComponent("Gone"), work] })
+    let older = make(work, "2026-10-27_0900", files: ["audio.m4a": "a"])
+    try! store.update(older) { $0.state = .queued }
+    let newer = make(meetings, "2026-10-28_0900", files: ["audio.m4a": "a"])
+    try! store.update(newer) { $0.state = .queued }
+    let runner = FakeRunner()
+    let q = ProcessingQueue(store: store, runner: runner, tickQueue: nil)
+    q.resume()
+    check(runner.folders == ["2026-10-27_0900"], "C2: resume takes up a meeting left queued in another folder, oldest first (\(runner.folders))")
+    runner.finish(0, 0)
+    check(runner.folders == ["2026-10-27_0900", "2026-10-28_0900"], "C2: then the meetings folder's (\(runner.folders))")
+}
+
+// C1, C5, C6 and C2 in the window: Play opens the recording in QuickTime Player and nothing else; Show in
+// Finder selects the folder; nothing plays during a recording; a meeting outside the folder can be shown.
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let queue = ProcessingQueue(store: r.store, runner: FakeRunner(), tickQueue: nil)
+    var opened: [(file: URL, app: String)] = []
+    var revealed: [URL] = []
+    var found = true
+    let opener = LibraryModel.Opener(open: { file, app in opened.append((file, app)); return found }, reveal: { revealed.append($0) })
+    let model = LibraryModel(store: r.store, session: session, queue: queue, opener: opener)
+    let a = make(r.store.root, "2026-10-28_1508", files: ["audio.m4a": "a", "notes.md": "the minutes"])
+    try! r.store.update(a) { $0.state = .done }
+    model.reload()
+    model.select(LibraryPresentation.key(a))
+    check(settle { model.shownContent?.files.audio != nil }, "C1: the audio is found")
+    model.perform(.playAudio)
+    check(opened.count == 1 && isAt(opened.first?.file, a.appendingPathComponent("audio.m4a")) && opened.first?.app == "com.apple.QuickTimePlayerX"
+          && revealed.isEmpty && model.problem == nil,
+          "C1: Play audio opens the recording in QuickTime Player, by its bundle id, and nothing else is opened (\(opened.map(\.app)))")
+    found = false
+    model.perform(.playAudio)
+    check(opened.count == 2 && model.problem == "QuickTime Player is needed to play recordings" && revealed.isEmpty,
+          "C1: without QuickTime Player it says so, and opens nothing else")
+    model.perform(.showInFinder)
+    check(revealed.count == 1 && isAt(revealed.first, a) && opened.count == 2 && model.problem == nil,
+          "C6: Show in Finder selects the folder in the Finder, opening nothing; the message goes")
+    found = true
+    model.update(StatusInput(phase: .recording(libURL("2026-10-29_0900"))))
+    model.perform(.playAudio)
+    model.update(StatusInput(phase: .paused(libURL("2026-10-29_0900"))))
+    model.perform(.playAudio)
+    check(opened.count == 2, "C5: nothing is played while a recording runs or is paused")
+    model.update(StatusInput())
+
+    // C2: a meeting recorded in a folder of its own: shown when asked for, never listed
+    let outsideRoot = freshRoot()
+    let outside = make(outsideRoot, "2026-10-27_1400", files: ["audio.m4a": "o", "notes.md": "elsewhere"])
+    try! r.store.update(outside) { $0.state = .done }
+    model.show(outside)
+    check(model.selection == LibraryPresentation.key(outside), "C2: show selects a meeting outside the meetings folder")
+    check(settle { isAt(model.selectedMeeting?.folder.url, outside) && model.shownContent?.key == LibraryPresentation.key(outside) }
+          && model.shownContent?.minutes.map { String($0.characters) } == "elsewhere",
+          "C2: and reads it, so its Minutes ready opens on its minutes")
+    check(model.meetings.map(\.folder.url.lastPathComponent) == ["2026-10-28_1508"] && !model.rows.contains { $0.id == LibraryPresentation.key(outside) },
+          "C2: the list is still the meetings folder alone")
+    model.perform(.playAudio)
+    check(opened.count == 3 && isAt(opened.last?.file, outside.appendingPathComponent("audio.m4a")), "C2: its actions work on it")
+    model.reload()
+    check(settle { model.hasScanned && model.meetings.count == 1 } && isAt(model.selectedMeeting?.folder.url, outside), "C2: it stays shown across a rescan")
+    model.select(LibraryPresentation.key(a))
+    check(isAt(model.selectedMeeting?.folder.url, a), "C2: choosing a listed meeting moves away from it")
+}
+
+// C2 after a relaunch: a meeting left queued, and one left finalising, in a folder a start used are taken
+// up; a remembered folder that is not there is skipped and kept; Minutes ready opens such a meeting.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let meetings = root.appendingPathComponent("Meetings", isDirectory: true)
+    let work = root.appendingPathComponent("Work Calls", isDirectory: true)
+    let unplugged = root.appendingPathComponent("Unplugged", isDirectory: true)
+    try! fm.createDirectory(at: meetings, withIntermediateDirectories: true)
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = meetings
+    prefs.sounds = false
+    prefs.openMinutes = false
+    let rec = FakeRecorder()
+    let runner = FakeRunner()
+    var recorded: URL? = nil
+    do {
+        let first = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: runner, freeBytes: { _ in 50 * GB })
+        first.launch()
+        let reply = first.handler.reply(for: .start(mic: nil, dir: work.path))
+        recorded = first.session.phase.folder
+        check(reply.hasPrefix("ok recording \(work.path)/") && prefs.otherRoots == [work.path], "C2 app: a start with its own folder is remembered (\(reply))")
+        _ = first.handler.reply(for: .stop)
+        rec.exit(rec.nextPid, 0, verifies: true)
+        check(settle { runner.calls.count == 1 }, "C2 app: it is finished and processed where it is")
+        runner.finish(0, 0)
+        check(settle { first.status.notice?.kind == .minutesReady }, "C2 app: its minutes are ready")
+        first.shutDown()
+    }
+    prefs.addOtherRoot(unplugged)
+    let queuedThere = make(work, "2026-10-27_0900", files: ["audio.m4a": "a"])
+    let orphanThere = make(work, "2026-10-26_0900")
+    let store = MeetingStore(root: meetings)
+    try! store.update(queuedThere) { $0.state = .queued }
+    try! store.update(orphanThere) { $0.state = .finalising }
+    let rec2 = FakeRecorder()
+    let runner2 = FakeRunner()
+    let next = AppModel(stateDir: state, preferences: prefs, recorder: rec2, runner: runner2, freeBytes: { _ in 50 * GB })
+    next.launch()
+    check(settle { runner2.folders == ["2026-10-27_0900"] }, "C2 app: after a relaunch, resume takes up the meeting left queued there (\(runner2.folders))")
+    check(settle { rec2.recovered.map(\.lastPathComponent) == ["2026-10-26_0900"] && store.scan().isEmpty
+                   && (MeetingStore.record(in: orphanThere)?.state == .queued) },
+          "C2 app: and the sweep recovers the one left finalising there, and queues it (\(rec2.recovered.map(\.lastPathComponent)))")
+    check(prefs.otherRoots == [work.path, unplugged.path], "C2 app: a remembered folder that is not there is skipped, and kept")
+    next.library.reload()
+    check(settle { next.library.hasScanned } && next.library.meetings.isEmpty, "C2 app: the window still lists the meetings folder alone")
+    if let recorded = recorded { next.perform(.openMinutes(recorded)) }
+    check(settle { isAt(next.library.selectedMeeting?.folder.url, recorded ?? meetings) && next.library.shownContent != nil },
+          "C2 app: Minutes ready on such a meeting opens it in the window")
+    next.shutDown()
     try? fm.removeItem(at: state)
 }
 
