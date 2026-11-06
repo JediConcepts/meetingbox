@@ -16,7 +16,7 @@ enum LibraryBadge: Equatable {
         switch self {
         case .recording: return "Recording"
         case .paused: return "Paused"
-        case .finalising: return "Finalising"
+        case .finalising: return "Saving"
         case .queued: return "Queued"
         case .processing(let stage): return stage.map(ProcessingQueue.label) ?? "Processing"
         case .failed: return "Failed"
@@ -70,9 +70,11 @@ struct MeetingFiles: Equatable {
     /// is finished. (A v1.2 `*_meeting.m4a` plays but is not run; an unfinished recording, which has a
     /// working `.caf` and no `.recording-complete`, needs `meetingbox recover` first.)
     var runnable = false
+    /// The recording was never finished (`MeetingFolder.recordingUnfinished`): `meetingbox recover` finishes it.
+    var unfinished = false
 
     static func read(_ folder: MeetingFolder) -> MeetingFiles {
-        MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url))
+        MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url), unfinished: MeetingFolder.recordingUnfinished(folder.url))
     }
 
     static func canRun(_ dir: URL) -> Bool {
@@ -176,6 +178,28 @@ enum LibraryPresentation {
                      processable: Set<String>? = nil) -> [LibraryRow] {
         meetings.map { row($0, phase: phase, processing: processing, stage: stage,
                            processable: processable?.contains(key($0.folder.url)) ?? true) }
+    }
+
+    /// What the detail says under a meeting's title and caption: why it failed (`row.problem`); for a
+    /// failed recording that was never finished, how to finish it (there is no Recover in the window);
+    /// and why a recording stopped early, when it did (`stopReason`).
+    static func notes(for meeting: Meeting, row: LibraryRow, files: MeetingFiles) -> [String] {
+        var lines: [String] = []
+        if let problem = row.problem { lines.append(problem) }
+        if row.badge == .failed && files.unfinished {
+            lines.append("To finish it, run: meetingbox recover \(shellWord(meeting.folder.url.path)), then choose Process here.")
+        }
+        if let reason = meeting.record?.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            lines.append("Recording stopped early: \(reason)")
+        }
+        return lines
+    }
+
+    /// A path as one word for the shell: as it is when nothing in it needs quoting, else in single quotes.
+    private static func shellWord(_ path: String) -> String {
+        let plain = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+:@%,")
+        if !path.isEmpty, path.unicodeScalars.allSatisfy(plain.contains) { return path }
+        return "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     // MARK: search

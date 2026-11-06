@@ -50,15 +50,16 @@ enum ControlRequest: Equatable {
 /// Turns requests into the session's answers. Serial: every reply is computed on `queue`, the
 /// session's tick queue, so two requests that arrive together are answered one after the other.
 /// Every recording command, whatever it comes from, goes through here. Sounds and windows are the
-/// app's: it hears about starts, stops and `show` through the closures, called on `queue`.
+/// app's: it hears about starts, stops, refusals and `show` through the closures, called on `queue`.
 ///
 /// A start counts only once its recorder has stayed up for `startGrace`: one that exits at once (a
-/// missing permission, no microphone matching) is reported with its reason, not as recording.
+/// missing permission, no microphone matching) is reported with its reason, not as recording. While
+/// the last recording is still being saved, start and toggle are refused: nothing new starts.
 final class ControlHandler {
     /// What a request comes to: a reply now, or a start decided once the recorder has survived.
     enum Handled: Equatable { case reply(String), starting(URL) }
-    /// How long a new recorder must stay up before its start is reported.
-    static let startGrace: TimeInterval = 2
+    /// How long a new recorder must stay up before its start is reported (the session's own grace).
+    static let startGrace: TimeInterval = Session.startGrace
     /// After the grace, how long more to wait for a recorder that died to be settled.
     static let settleLimit: TimeInterval = 10
     static let cannotReach = "error cannot reach the recorder right now, try again"
@@ -72,6 +73,9 @@ final class ControlHandler {
     var onStopped: ((URL) -> Void)?
     /// `show`: bring the app forward.
     var onShow: (() -> Void)?
+    /// A start or toggle was refused because the last recording is still being saved (for the
+    /// failure sound).
+    var onRefused: (() -> Void)?
     /// The folder of the last recording a stop was asked for (on `queue`), so a start still settling
     /// for it is told apart from one that failed.
     private var stoppedFolder: URL?
@@ -96,8 +100,9 @@ final class ControlHandler {
     /// which is the main queue in the app. Call on `queue`. A reply completes at once. A start is
     /// re-checked on `queue` every `pollInterval`, by the socket's rules (settled once `startGrace` has
     /// passed, given up on once `settleLimit` more has), and completes with its final line, on `queue`.
-    /// Unlike the socket, a start that the same caller then stops, or pauses, within the grace is not
-    /// reported as a failure or announced as a start: the menu puts Stop one click away from Start.
+    /// As on the socket, a start that is then stopped within the grace is not reported as a failure;
+    /// unlike the socket, one that is paused within it is not announced as a start either: the menu
+    /// puts Pause and Stop one click away from Start.
     func perform(_ request: ControlRequest, completion: @escaping (String) -> Void) {
         switch handle(request) {
         case .reply(let text):
@@ -116,9 +121,7 @@ final class ControlHandler {
             let now = Date()
             let settled = now >= settleAt
             let outcome: String?
-            if stoppedFolder == dir {
-                outcome = status() // stopped on request: not a failed start, and no start sound
-            } else if case .paused(let paused) = session.phase, paused == dir {
+            if case .paused(let paused) = session.phase, paused == dir {
                 outcome = settled ? status() : nil // paused within the grace: no start sound; wait for the recorder to prove itself
             } else {
                 outcome = startOutcome(dir, settled: settled, giveUp: now >= giveUpAt)
@@ -146,7 +149,12 @@ final class ControlHandler {
         case .start(let mic, let dir):
             return start(mic: mic, dir: dir)
         case .toggle(let mic, let dir):
-            return session.phase == .idle ? start(mic: mic, dir: dir) : .reply(stop())
+            // While the last recording is being saved, toggle neither stops it again nor starts
+            // another: it is refused as a start is.
+            switch session.phase {
+            case .idle, .finalising: return start(mic: mic, dir: dir)
+            case .recording, .paused: return .reply(stop())
+            }
         case .pause:
             return .reply(whileRecording(wanted: { if case .paused = $0 { return true }; return false }) { session.pause() })
         case .resume:
@@ -161,8 +169,11 @@ final class ControlHandler {
 
     /// Where a start stands, nil while undecided. Call on `queue`. `settled`: the grace has passed;
     /// `giveUp`: stop waiting for a dead recorder to be settled. The start sound goes only with `ok`.
+    /// A start that any client then stopped (a second press of the hotkey, or Stop) is answered with
+    /// the status, not as a failed start, and plays no start sound.
     func startOutcome(_ dir: URL, settled: Bool, giveUp: Bool) -> String? {
         dispatchPrecondition(condition: .onQueue(queue))
+        if stoppedFolder == dir { return status() }
         switch session.phase {
         case .recording(let d) where d == dir, .paused(let d) where d == dir:
             guard settled else { return nil }
@@ -202,7 +213,13 @@ final class ControlHandler {
 
 
     /// The request's folder beats the meetings folder setting, and its mic the microphone setting.
+    /// While the last recording is being saved nothing starts, in Session's words, and the app is
+    /// told, for its failure sound.
     private func start(mic: String?, dir: String?) -> Handled {
+        if case .finalising = session.phase {
+            onRefused?()
+            return .reply(ControlHandler.oneLine("error \(Session.stillSaving)"))
+        }
         let root: URL
         if let dir = dir {
             guard dir.hasPrefix("/") else { return .reply(ControlHandler.oneLine("error the folder must be a full path: \(dir)")) }

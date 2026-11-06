@@ -78,7 +78,7 @@ struct NewMeetingButton: View {
         Button {
             app.newMeeting()
         } label: {
-            Label("New meeting", systemImage: "record.circle")
+            Label(app.newMeetingTitle, systemImage: "record.circle")
         }
         .labelStyle(.titleAndIcon)
         .disabled(!app.canStartNewMeeting)
@@ -167,8 +167,9 @@ struct LibraryDetail: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(row.title).font(.title2).bold().lineLimit(2)
                     Text(subtitle(row)).foregroundStyle(.secondary)
-                    if let problem = row.problem {
-                        Text(problem).foregroundStyle(.secondary).lineLimit(2)
+                    // In full and selectable: one may be a command to copy into Terminal.
+                    ForEach(model.notes(for: meeting), id: \.self) { note in
+                        Text(note).foregroundStyle(.secondary).textSelection(.enabled)
                     }
                 }
                 HStack {

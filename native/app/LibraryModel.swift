@@ -97,8 +97,17 @@ final class LibraryModel: ObservableObject {
     }
 
     func actions(for meeting: Meeting) -> [LibraryAction] {
-        let files = content?.key == LibraryPresentation.key(meeting.folder.url) ? (content?.files ?? MeetingFiles()) : MeetingFiles()
-        return LibraryPresentation.actions(for: meeting, phase: live.phase, files: files)
+        LibraryPresentation.actions(for: meeting, phase: live.phase, files: files(of: meeting))
+    }
+
+    /// What the detail says under the meeting's title (`LibraryPresentation.notes`).
+    func notes(for meeting: Meeting) -> [String] {
+        LibraryPresentation.notes(for: meeting, row: row(meeting), files: files(of: meeting))
+    }
+
+    /// What the meeting's folder holds, once it has been read for the detail; nothing until then.
+    private func files(of meeting: Meeting) -> MeetingFiles {
+        content?.key == LibraryPresentation.key(meeting.folder.url) ? (content?.files ?? MeetingFiles()) : MeetingFiles()
     }
 
     // MARK: loading

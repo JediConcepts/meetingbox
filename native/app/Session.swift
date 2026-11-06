@@ -28,7 +28,8 @@ protocol RecorderControl {
 enum FindResult: Equatable { case found(Int32), notFound, unknown }
 
 /// `busy`: another process holds the folder (`--recover` exited 75), so nothing is known about it.
-enum RecoverResult: Equatable { case recovered, failed, busy }
+/// `failed` carries the last line `--recover` printed, nil when it printed none.
+enum RecoverResult: Equatable { case recovered, failed(String?), busy }
 
 struct SessionError: LocalizedError {
     let message: String
@@ -96,11 +97,30 @@ final class Session {
         error == diskStopped || error == diskStoppedLegacy
     }
     static let diskStoppedFailed = "recording stopped because the disk was nearly full; the recording was interrupted; its files are kept"
+    /// Why a recording that could not be finished failed: the disk stop if that ended it (with what
+    /// recovery said, when it said something), else the recorder's own reason, else recovery's last
+    /// line (a refusal for room says to free space), else the generic reason.
+    static func failureReason(diskStop: Bool, exitReason: String?, recovery: String?) -> String {
+        if diskStop { return recovery.map { "recording stopped because the disk was nearly full; \($0)" } ?? diskStoppedFailed }
+        return exitReason ?? recovery ?? interrupted
+    }
+    /// A start, or a toggle, while the last recording is still being saved: nothing new starts.
+    static let stillSaving = "the last recording is still being saved, so nothing new was started. Try again in a moment"
+    /// Why a recording ended when its recorder went without being asked to.
+    static let recorderStopped = "the recorder stopped unexpectedly"
+    /// A recorder this session starts must stay up this long before its start counts. One that dies
+    /// sooner is a failed start, which the start's own reply reports (`ControlHandler` waits this long).
+    static let startGrace: TimeInterval = 2
+    /// A folder whose recovery found it busy is tried again no sooner than this after.
+    static let busyRetry: TimeInterval = 15
 
     private(set) var phase: Phase = .idle
     var onChange: ((Phase) -> Void)?
     /// The folder, and whether its audio verified (queued) or not (failed).
     var onFinished: ((URL, Bool) -> Void)?
+    /// A recording ended without being asked to (its recorder went, or the disk stop): the folder and
+    /// why. The reason is also kept in its meeting.json as `stopReason`.
+    var onEnded: ((URL, String) -> Void)?
 
     private let stateDir: URL
     private let recorder: RecorderControl
@@ -147,9 +167,14 @@ final class Session {
     private var needsAdopt = false
     /// Orphans whose recovery is running, so a second `adopt` does not start another.
     private var orphansInFlight: Set<String> = []
+    /// Folders whose recovery found them busy (`--recover` exited 75), by full path, and when. The
+    /// tick tries each again once `busyRetry` has passed, until it comes to a definite outcome. A full
+    /// path, so a folder is tried again whichever root it is under.
+    private var busyFolders: [String: Date] = [:]
 
     /// What finalising came to. `busy`: another process holds the folder, so nothing is written.
-    private enum Outcome: Equatable { case verified(seconds: Int?), failed, busy }
+    /// `failed` carries recovery's last line, when it said something.
+    private enum Outcome: Equatable { case verified(seconds: Int?), failed(String?), busy }
     /// `tickQueue` runs the 1 s timer and receives finished background work; nil means no timer
     /// (tests call `tick()`). `workQueue` runs recovery and verification off that queue; nil runs
     /// them inline.
@@ -180,6 +205,7 @@ final class Session {
     /// Makes a new meeting folder, writes `recording.dir` and `meeting.json`, then launches the recorder.
     @discardableResult
     func start(root: URL, mic: String?) throws -> URL {
+        if case .finalising = phase { throw SessionError(Session.stillSaving) }
         if let dir = phase.folder { throw SessionError("already recording in \(dir.path)") }
         // A recorder this session has not adopted (yet) may still be writing where recording.dir points.
         if let named = namedFolder(), recorder.find(dir: named) != .notFound {
@@ -292,10 +318,22 @@ final class Session {
         return ours
     }
 
-    /// The recorder exited while recording or paused: handled as a stop, straight to settling.
+    /// The recorder exited while recording or paused: handled as a stop, straight to settling, and
+    /// announced as an end nobody asked for. Not when the disk stop has already said why, nor for a
+    /// recorder this session started that dies inside the start grace: that is a failed start, which
+    /// the start's own reply reports.
     private func recorderGone(_ dir: URL) {
+        let failedStart = !adopted && now().timeIntervalSince(started) < Session.startGrace
         beginFinalising(dir)
+        if !diskStop && !failedStart { ended(dir, Session.recorderStopped) }
         advanceFinalising(dir, alive: false)
+    }
+
+    /// Keeps why a recording ended without being asked to, in meeting.json (`stopReason`, which
+    /// nothing later clears), and says so.
+    private func ended(_ dir: URL, _ reason: String) {
+        try? store.update(dir) { $0.stopReason = reason }
+        onEnded?(dir, reason)
     }
 
     /// Recorded time only: pauses do not count, and the clock stops at stop.
@@ -327,31 +365,66 @@ final class Session {
             let dir = Session.folderURL(store.root.appendingPathComponent(meeting.folder.url.lastPathComponent).path)
             if let n = named, Session.same(n, dir) { continue }
             if orphansInFlight.contains(dir.path) { continue }
+            // Found busy not long ago: the tick tries it again when its time comes.
+            if let since = busyFolders[dir.path], now().timeIntervalSince(since) < Session.busyRetry { continue }
             switch recorder.find(dir: dir) {
             case .found: continue
             case .unknown: needsAdopt = true; continue
             case .notFound: break
             }
-            orphansInFlight.insert(dir.path)
-            let rec = recorder
-            offQueue({ Session.finalise(rec, dir, tryClean: false) }) { [weak self] outcome in
-                guard let self = self else { return }
-                self.orphansInFlight.remove(dir.path)
-                switch outcome {
-                case .busy:
-                    return // someone else is finalising it; a later adopt looks again
-                case .verified(let seconds):
-                    self.record(dir, verified: true, seconds: seconds, reason: nil)
-                    self.onFinished?(dir, true)
-                case .failed:
-                    let wasDiskStop = Session.isDiskStopped(Session.readRecord(dir)?.error)
-                    self.record(dir, verified: false, seconds: nil,
-                                reason: wasDiskStop ? Session.diskStoppedFailed : Session.interrupted)
-                    self.onFinished?(dir, false)
-                }
-            }
+            recoverOrphan(dir)
         }
         updateTimer()
+    }
+
+    /// Recovers a folder nothing is recording into any more, off the tick queue, and records what
+    /// it came to. A busy folder is left as it is and tried again from the tick.
+    private func recoverOrphan(_ dir: URL) {
+        busyFolders.removeValue(forKey: dir.path)
+        orphansInFlight.insert(dir.path)
+        let rec = recorder
+        offQueue({ Session.finalise(rec, dir, tryClean: false) }) { [weak self] outcome in
+            guard let self = self else { return }
+            self.orphansInFlight.remove(dir.path)
+            switch outcome {
+            case .busy:
+                self.tryAgainLater(dir) // someone else holds it: nothing is written
+            case .verified(let seconds):
+                self.record(dir, verified: true, seconds: seconds, reason: nil)
+                self.onFinished?(dir, true)
+            case .failed(let said):
+                let wasDiskStop = Session.isDiskStopped(Session.readRecord(dir)?.error)
+                self.record(dir, verified: false, seconds: nil,
+                            reason: Session.failureReason(diskStop: wasDiskStop, exitReason: nil, recovery: said))
+                self.onFinished?(dir, false)
+            }
+        }
+    }
+
+    /// A recovery found the folder busy: the tick tries it again once `busyRetry` has passed.
+    private func tryAgainLater(_ dir: URL) {
+        busyFolders[dir.path] = now()
+        updateTimer()
+    }
+
+    /// From the tick: each folder found busy at least `busyRetry` ago is recovered again, unless it
+    /// has gone or something else has settled it meanwhile. One a recorder still records into, or
+    /// that `find` cannot tell about, waits another `busyRetry`.
+    private func retryBusy() {
+        let t = now()
+        let due = busyFolders.filter { t.timeIntervalSince($0.value) >= Session.busyRetry }.keys.sorted()
+        for path in due {
+            busyFolders.removeValue(forKey: path)
+            let dir = Session.folderURL(path)
+            if orphansInFlight.contains(path) { continue }
+            guard FileManager.default.fileExists(atPath: dir.path) else { continue }
+            if let state = Session.readRecord(dir)?.state, state != .recording && state != .finalising { continue }
+            if let live = phase.folder, Session.same(live, dir) { busyFolders[path] = t; continue }
+            switch recorder.find(dir: dir) {
+            case .notFound: recoverOrphan(dir)
+            case .found, .unknown: busyFolders[path] = t
+            }
+        }
     }
 
     /// `recording.dir` may name a folder under any root (start dir=, --dir, MB_DIR). `find` is always
@@ -416,8 +489,10 @@ final class Session {
 
     // MARK: the 1 s tick
 
-    /// Drives the finalising wait, health, the disk floor, and a recorder that died on its own.
+    /// Drives the finalising wait, health, the disk floor, a recorder that died on its own, and the
+    /// retries of recoveries that found their folder busy (whatever the phase).
     func tick() {
+        if !busyFolders.isEmpty { retryBusy() }
         guard let folder = phase.folder else {
             if needsAdopt { adopt() }
             return
@@ -439,6 +514,7 @@ final class Session {
             if let free = free, free < Session.stopFloor(recordedSeconds: recorded) {
                 diskStop = true
                 try? store.update(dir) { $0.error = Session.diskStopped }
+                ended(dir, Session.diskStopped)
                 stop()
                 return
             }
@@ -560,34 +636,41 @@ final class Session {
         if tryClean, rec.verify(dir: dir) != nil { return .verified(seconds: nil) }
         switch rec.recover(dir: dir) {
         case .busy: return .busy
-        case .failed: return .failed
+        case .failed(let said): return .failed(said)
         case .recovered:
             // Recovered audio is the truth about how long the recording is (pauses are not in it).
-            guard let duration = rec.verify(dir: dir) else { return .failed }
+            guard let duration = rec.verify(dir: dir) else { return .failed(nil) }
             return .verified(seconds: Int(duration.rounded()))
         }
     }
 
+    /// A busy folder stays finalising in meeting.json while the session goes idle, so a new recording
+    /// can start; the tick tries its recovery again.
     private func finish(_ dir: URL, _ outcome: Outcome, exitReason: String?) {
         guard phase == .finalising(dir) else { return }
         switch outcome {
         case .busy:
-            break // another process owns the folder now: write nothing, keep no claim on it
+            tryAgainLater(dir) // another process owns the folder now: write nothing
         case .verified(let seconds):
             record(dir, verified: true, seconds: seconds ?? frozenSeconds, reason: nil)
-        case .failed:
-            record(dir, verified: false, seconds: frozenSeconds, reason: diskStop ? Session.diskStoppedFailed : exitReason)
+        case .failed(let said):
+            record(dir, verified: false, seconds: frozenSeconds,
+                   reason: Session.failureReason(diskStop: diskStop, exitReason: exitReason, recovery: said))
         }
         clearStateFiles()
         _ = resetHealth()
         adopted = false
         diskStop = false
         set(.idle)
-        if outcome != .busy { onFinished?(dir, outcome != .failed) }
+        switch outcome {
+        case .busy: break
+        case .verified: onFinished?(dir, true)
+        case .failed: onFinished?(dir, false)
+        }
     }
 
-    /// Queued carries no error; failed carries the reason (the disk stop if that ended it, else the
-    /// recorder's own reason or its signal, else the generic one).
+    /// Queued carries no error; failed carries the reason (`failureReason`). Neither touches
+    /// `stopReason`, which says why the recording ended early, whatever came of it.
     private func record(_ dir: URL, verified: Bool, seconds: Int?, reason: String?) {
         try? store.update(dir) { r in
             if let s = seconds { r.seconds = s }
@@ -609,9 +692,9 @@ final class Session {
         onChange?(p)
     }
 
-    /// The timer runs while there is a recording, or an adopt to try again.
+    /// The timer runs while there is a recording, an adopt to try again, or a busy folder to recover.
     private func updateTimer() {
-        if phase == .idle && !needsAdopt {
+        if phase == .idle && !needsAdopt && busyFolders.isEmpty {
             timer?.cancel()
             timer = nil
         } else if timer == nil, let q = tickQueue {

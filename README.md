@@ -147,9 +147,14 @@ meetingbox status   # what is going on, and the folder
 The command is a client of the app: it opens the app if it is not running and
 hands over. `meetingbox stop` returns at once, as soon as the recording is
 stopped. The app then finishes the audio, transcribes and writes the minutes,
-showing how far it has got (Transcribing, Finding speakers, Writing minutes) in
-the menu bar and the meetingbox window, and the minutes open in the window when
-they are ready. The recorded length counts recorded time only.
+showing how far it has got (Saving the recording, Transcribing, Finding speakers,
+Writing minutes) in the menu bar and the meetingbox window, and the minutes open in
+the window when they are ready. The recorded length counts recorded time only.
+
+While the last recording is still being saved, a new one does not start: the
+command says so and exits with an error, the app plays its failure sound (when
+sounds are on), and the menus show Saving the last recording… where Start would
+be. Try again in a moment.
 
 `meetingbox process <file>` still runs in the terminal, for scripting.
 
@@ -167,7 +172,12 @@ The recorder runs on its own, so if the app crashes or is force quit, the
 recording carries on, and the next time the app opens it picks the recording up
 with the right timer. If the recorder stopped too, the app finishes the recording
 from its working files and queues it; if nothing can be rebuilt, the meeting is
-marked failed and every file is kept. To finish an interrupted recording by hand:
+marked failed and every file is kept. A recording that stops without being asked
+(the recorder stopped, or the disk nearly filled), one that could not be finished,
+and minutes that could not be written are each said in the menu bar item, in amber
+and with the failure sound when sounds are on; click the line to open that
+meeting. The window says why, and for a recording never finished, how to finish
+it. To finish an interrupted recording by hand:
 
 ```bash
 meetingbox recover ~/Meetings/2026-10-27_1430

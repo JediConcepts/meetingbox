@@ -135,8 +135,17 @@ else fail "meetingbox on its own sends toggle, and a start reads as recording ($
 reset_calls; reply "ok finalising /Meetings/t"
 out="$(mb)"; rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "the minutes will open in the meetingbox window"; then
-  pass "a toggle that stops says where the minutes will be"
-else fail "a toggle that stops says where the minutes will be ($rc: $out)"; fi
+  pass "a toggle that stops a recording says where the minutes will be"
+else fail "a toggle that stops a recording says where the minutes will be ($rc: $out)"; fi
+# While the last recording is still being saved the app refuses toggle (B1): the hotkey's press
+# fails loudly, in the app's words, and nothing reads as stopped.
+reset_calls; reply "error the last recording is still being saved, so nothing new was started. Try again in a moment"
+out="$(mb)"; rc=$?
+if [ "$rc" -ne 0 ] && [ "$(sent)" = "toggle" ] \
+   && printf '%s' "$out" | grep -qF "the last recording is still being saved, so nothing new was started. Try again in a moment" \
+   && ! printf '%s' "$out" | grep -q "stopped"; then
+  pass "a toggle while the last recording is being saved exits non-zero, says so, and says nothing stopped"
+else fail "a toggle while the last recording is being saved exits non-zero, says so, and says nothing stopped ($rc: $(sent): $out)"; fi
 
 # --- pause and resume ---
 reset_calls; reply "ok paused /Meetings/p"

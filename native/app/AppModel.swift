@@ -13,7 +13,8 @@ import Combine
 final class AppModel: ObservableObject {
     /// What the views show, changed only by `StatusEvent`s (StatusReducer.swift, where the rules are
     /// tested): the phase, the recorded time and health, the job being processed and its stage, the
-    /// meeting whose minutes are ready, and what the user asked for last that did not work.
+    /// line about a meeting (its minutes are ready, or it went wrong), and what the user asked for last
+    /// that did not work.
     @Published private(set) var status = StatusInput()
     var phase: Session.Phase { status.phase }
     var processing: URL? { status.processing }
@@ -44,9 +45,15 @@ final class AppModel: ObservableObject {
     /// Told once the session is idle again (Stop and quit).
     private var idleWaiters: [@MainActor () -> Void] = []
 
-    /// The recorder, the processing runner and the free space are the real ones unless a test gives its own.
+    /// Plays a system sound by name, through `play`.
+    private let playSound: (String) -> Void
+
+    /// The recorder, the processing runner, the free space and the sound player are the real ones
+    /// unless a test gives its own.
     init(stateDir: URL, preferences: Preferences, recorder: RecorderControl = ChildRecorder(), runner: PipelineRunner? = nil,
-         freeBytes: @escaping (URL) -> Int64? = { AppModel.freeBytes(near: $0) }) {
+         freeBytes: @escaping (URL) -> Int64? = { AppModel.freeBytes(near: $0) },
+         playSound: @escaping (String) -> Void = { NSSound(named: NSSound.Name($0))?.play() }) {
+        self.playSound = playSound
         self.stateDir = stateDir
         self.preferences = preferences
         let store = MeetingStore(root: preferences.meetingsFolder)
@@ -76,8 +83,18 @@ final class AppModel: ObservableObject {
                 self?.tellIdleWaiters()
             }
         }
-        // Only verified audio is queued; a failed recording is never processed.
-        session.onFinished = { dir, ok in if ok { queue.enqueue(dir) } }
+        // Only verified audio is queued; a failed recording is never processed, and is said.
+        session.onFinished = { [weak self] dir, ok in
+            if ok {
+                queue.enqueue(dir)
+            } else {
+                Task { @MainActor in self?.wentWrong(.unfinished(dir, line: StatusPresentation.recordingNotFinished)) }
+            }
+        }
+        // A recording that ended without being asked to (its recorder went, or the disk stop).
+        session.onEnded = { [weak self] dir, reason in
+            Task { @MainActor in self?.wentWrong(.recordingStopped(dir, reason: reason)) }
+        }
         queue.onChange = { [weak self] in
             let (current, stage) = (queue.current, queue.stage)
             Task { @MainActor in self?.apply(.processing(current, stage: stage)) }
@@ -86,7 +103,10 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self = self else { return }
                 self.library.reload()
-                guard ok else { return }
+                guard ok else {
+                    self.wentWrong(.unfinished(dir, line: StatusPresentation.minutesNotWritten(AppModel.failureReason(dir))))
+                    return
+                }
                 self.apply(.minutesReady(dir))
                 self.play("Glass")
                 // The window comes forward on the minutes, unless a recording is running.
@@ -98,6 +118,8 @@ final class AppModel: ObservableObject {
         }
         handler.onStarted = { [weak self] _ in Task { @MainActor in self?.play("Tink") } }
         handler.onStopped = { [weak self] _ in Task { @MainActor in self?.play("Pop") } }
+        // A start or toggle refused while the last recording is saved, from the menus or the command.
+        handler.onRefused = { [weak self] in Task { @MainActor in self?.play("Basso") } }
         // `show` from the socket (a second launch, or the command): the window.
         handler.onShow = { [weak self] in Task { @MainActor in self?.showLibrary() } }
 
@@ -126,6 +148,20 @@ final class AppModel: ObservableObject {
         input.floating = preferences.floating
         input.preferencesAvailable = onOpenPreferences != nil
         return StatusPresentation(input)
+    }
+
+    /// Something went wrong with a meeting that nobody asked for: its line in the menu bar, with the
+    /// amber icon, and the failure sound.
+    private func wentWrong(_ event: StatusEvent) {
+        apply(event)
+        play("Basso")
+    }
+
+    /// Why a job failed, in one line, as its meeting.json has it.
+    private static func failureReason(_ dir: URL) -> String {
+        let error = MeetingStore.record(in: dir)?.error ?? ""
+        return error.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
+            ?? "processing failed"
     }
 
     /// Only a change publishes, so the views are not told every second that nothing happened.
@@ -185,11 +221,11 @@ final class AppModel: ObservableObject {
     }
 
     /// A failed start, and a pause or resume that could not reach the recorder, are shown (the icon
-    /// and the menu's first line). The races, such as a pause that lost to the recorder ending, only go
-    /// to the log.
+    /// and the menu's first line). The races, such as a pause that lost to the recorder ending, or a
+    /// start that lost to another start of the recording now running, only go to the log.
     private func answered(_ request: ControlRequest, _ reply: String) {
         guard reply.hasPrefix("error ") else { return }
-        if let failure = Failure.from(request, reply: reply) {
+        if let failure = Failure.from(request, reply: reply, phase: session.phase) {
             apply(.failed(failure))
         } else {
             NSLog("meetingbox: %@ was refused: %@", String(describing: request), String(reply.dropFirst("error ".count)))
@@ -347,6 +383,9 @@ final class AppModel: ObservableObject {
     /// New meeting in the window is enabled exactly when the menus offer Start recording: while idle.
     var canStartNewMeeting: Bool { recordingEntries.contains { $0.action == .start && $0.enabled } }
 
+    /// New meeting's words: Saving the last recording… while it is, else New meeting.
+    var newMeetingTitle: String { PreferencesPresentation.newMeetingTitle(recordingEntries) }
+
     /// New meeting: the menus' Start recording, through `perform`. Nothing while a recording is under way.
     func newMeeting() {
         guard canStartNewMeeting else { return }
@@ -376,10 +415,10 @@ final class AppModel: ObservableObject {
         waiters.forEach { $0() }
     }
 
-    /// The start, stop and done sounds, unless they are turned off.
+    /// The start, stop, done and failure sounds, unless they are turned off.
     func play(_ name: String) {
         guard preferences.sounds else { return }
-        NSSound(named: NSSound.Name(name))?.play()
+        playSound(name)
     }
 
     /// Free bytes on the volume holding `url`, or on its nearest existing parent; nil when unreadable.

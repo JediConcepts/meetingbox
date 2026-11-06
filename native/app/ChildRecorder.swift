@@ -134,7 +134,9 @@ final class ChildRecorder: RecorderControl {
     /// busy. With the helper missing it runs from the app's own executable, which is safe because
     /// recovery never touches the window server, and says so in capture.log. A recovery that cannot
     /// be started at all (neither executable runs) is failed, with the reason in capture.log: never
-    /// busy, or an interrupted meeting would stay unrecovered and block setup for good.
+    /// busy, or an interrupted meeting would stay unrecovered and block setup for good. A failure
+    /// carries the last line the recovery printed (a refusal for room says to free space), or the
+    /// reason it could not be started; never an earlier line of capture.log.
     func recover(dir: URL) -> RecoverResult {
         let log = try? ChildRecorder.openLog(in: dir)
         defer { try? log?.close() }
@@ -145,6 +147,8 @@ final class ChildRecorder: RecorderControl {
             note(ChildRecorder.helperMissingNote)
             program = legacyExecutable
         }
+        // Where the recovery's own lines begin.
+        let from = log.flatMap { try? $0.seekToEnd() }
         let process = Process()
         process.executableURL = program
         process.arguments = ["--recover", dir.path]
@@ -154,16 +158,28 @@ final class ChildRecorder: RecorderControl {
         do {
             try process.run()
         } catch {
-            note("meetingbox: cannot recover: the recorder could not be started (\(error.localizedDescription))")
-            return .failed
+            let reason = "meetingbox: cannot recover: the recorder could not be started (\(error.localizedDescription))"
+            note(reason)
+            return .failed(reason)
         }
         process.waitUntilExit()
-        guard process.terminationReason == .exit else { return .failed }
-        switch process.terminationStatus {
-        case 0: return .recovered
-        case ChildRecorder.busyExit: return .busy
-        default: return .failed
+        if process.terminationReason == .exit {
+            switch process.terminationStatus {
+            case 0: return .recovered
+            case ChildRecorder.busyExit: return .busy
+            default: break
+            }
         }
+        return .failed(from.flatMap { ChildRecorder.lastLine(of: ChildRecorder.logURL(dir), from: $0) })
+    }
+
+    /// The last line with text in the file from byte `offset` on, nil when there is none.
+    private static func lastLine(of url: URL, from offset: UInt64) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: offset)) != nil, let data = try? handle.readToEnd() else { return nil }
+        return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }.last { !$0.isEmpty }
     }
 
     /// Written to capture.log when a recovery has to run from the app's own executable.

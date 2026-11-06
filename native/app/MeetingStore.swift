@@ -21,6 +21,9 @@ struct MeetingRecord {
     var error: String?
     var attempts: Int?
     var attempt: String?
+    /// Why a recording ended without being asked to (its recorder went, or the disk stop). Written
+    /// once, when it ends; queued, processing, done and a new attempt leave it as it is.
+    var stopReason: String?
 
     init(id: String = UUID().uuidString, title: String? = nil, started: Date = Date(), seconds: Int = 0,
          state: MeetingState) {
@@ -56,6 +59,7 @@ struct MeetingRecord {
         self.error = json["error"] as? String
         self.attempts = (json["attempts"] as? NSNumber)?.intValue
         self.attempt = json["attempt"] as? String
+        self.stopReason = json["stopReason"] as? String
     }
 
     /// Writes every known field into `json`, removing keys whose value is nil. Other keys are untouched.
@@ -75,6 +79,7 @@ struct MeetingRecord {
         put("error", error)
         put("attempts", attempts)
         put("attempt", attempt)
+        put("stopReason", stopReason)
     }
 }
 
@@ -114,6 +119,13 @@ final class MeetingStore: @unchecked Sendable {
     }
 
     private static func recordURL(_ folder: URL) -> URL { folder.appendingPathComponent("meeting.json") }
+
+    /// The folder's record as `meeting.json` has it now; nil when there is no usable one.
+    static func record(in folder: URL) -> MeetingRecord? {
+        guard let data = try? Data(contentsOf: recordURL(folder)),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        return MeetingRecord(json: obj)
+    }
 
     /// Folded for searching: case and accents ignored, so "cafe" finds "Café".
     private static func fold(_ s: String) -> String {

@@ -271,6 +271,7 @@ final class FakeRecorder: RecorderControl {
     var recoverResult = true
     var recoverBusy = false              // --recover exits 75: someone else holds the folder lock
     var recoverLies = false              // recover says yes without making anything verify
+    var recoverSays: String? = nil       // the last line a failed --recover printed
     var recovered: [URL] = []
     var onRecover: ((URL) -> Void)? = nil
     var verified: Set<String> = []       // folders whose audio verifies
@@ -319,7 +320,7 @@ final class FakeRecorder: RecorderControl {
         if recoverBusy { return .busy }
         if recoverLies { return .recovered }
         if recoverResult { verified.insert(dir.path) }
-        return recoverResult ? .recovered : .failed
+        return recoverResult ? .recovered : .failed(recoverSays)
     }
     func verify(dir: URL) -> Double? { verified.contains(dir.path) ? (durations[dir.path] ?? 1.0) : nil }
 
@@ -821,6 +822,9 @@ do {
     check(r.rec.recovered == [orphan] && r.raw(orphan) == before && r.finished.isEmpty, "A: a busy orphan is left alone")
     r.rec.recoverBusy = false
     s.adopt()
+    check(r.rec.recovered.count == 1, "A3: a later adopt does not try a busy folder again sooner than 15 s after")
+    r.clock.t = 15
+    s.adopt()
     check(r.rec.recovered.count == 2 && r.stateOf(orphan) == "queued", "A: and a later adopt keeps no claim on it")
 }
 do {
@@ -1288,7 +1292,7 @@ do {
     check(child.lastMessage(dir: dir) == "arg USB Mic", "M2/E: lastMessage skips health and progress lines (\"Stopping...\")")
     check(text.contains("arg --record\narg -o\narg \(dir.path)\narg -n\narg meeting\narg -d\narg USB Mic\n"),
           "the recorder gets --record -o <dir> -n meeting -d <mic>")
-    check(child.recover(dir: dir) == .failed, "recover fails when --recover exits 1")
+    check(child.recover(dir: dir) == .failed("recovering \(dir.path)"), "recover fails when --recover exits 1, with the last line it printed")
     fm.createFile(atPath: dir.appendingPathComponent("busy").path, contents: Data())
     check(child.recover(dir: dir) == .busy, "A: recover is busy when --recover exits 75")
     fm.createFile(atPath: dir.appendingPathComponent("can-recover").path, contents: Data())
@@ -1432,7 +1436,7 @@ do {
         try? fm.removeItem(at: ran)
     }
     // its exit statuses mean what they always meant: only 75 is busy
-    for (status, expected) in [(75, RecoverResult.busy), (1, .failed), (3, .failed), (0, .recovered)] {
+    for (status, expected) in [(75, RecoverResult.busy), (1, .failed(nil)), (3, .failed(nil)), (0, .recovered)] {
         let dir = newDir()
         let legacy = script("b\(status)/meetingbox", "exit \(status)")
         check(ChildRecorder(executable: absent, legacyExecutable: legacy).recover(dir: dir) == expected,
@@ -1450,16 +1454,21 @@ do {
     do {
         let dir = newDir()
         let result = ChildRecorder(executable: absent, legacyExecutable: bin.appendingPathComponent("no-such/meetingbox")).recover(dir: dir)
-        check(result == .failed, "I1: no executable to run is failed, never busy")
+        var said: String? = nil
+        if case .failed(let line) = result { said = line }
+        check(said?.hasPrefix("meetingbox: cannot recover: the recorder could not be started") == true, "I1: no executable to run is failed, never busy, and says why")
         let lines = log(dir)
-        check(lines.count == 2 && lines[0] == missingNote && lines[1].hasPrefix("meetingbox: cannot recover: the recorder could not be started"),
+        check(lines.count == 2 && lines[0] == missingNote && lines[1] == said,
               "I1: and capture.log says why (\(lines))")
     }
     do {
         let dir = newDir()
         let flatApp = script("d/meetingbox", "exit 0", mode: 0o644)
-        check(ChildRecorder(executable: absent, legacyExecutable: flatApp).recover(dir: dir) == .failed,
-              "I1: an app executable that cannot run is failed too")
+        var failed = false
+        if case .failed(let line?) = ChildRecorder(executable: absent, legacyExecutable: flatApp).recover(dir: dir) {
+            failed = line.hasPrefix("meetingbox: cannot recover: the recorder could not be started")
+        }
+        check(failed, "I1: an app executable that cannot run is failed too, and says why")
     }
     // the helper there and working: the app's executable is not used, and nothing is said
     do {
@@ -2219,8 +2228,9 @@ do {
     check(h.reply(for: .start(mic: nil, dir: nil)) == "error already recording in \(dir.path)", "reply: a second start says already recording in <dir>")
     check(h.reply(for: .toggle(mic: nil, dir: nil)) == "ok finalising \(dir.path)", "reply: toggle while recording stops")
     check(stopped == [dir], "reply: a stop is announced once (for the stop sound)")
-    check(h.reply(for: .toggle(mic: nil, dir: nil)) == "ok finalising \(dir.path)" && stopped == [dir],
-          "reply: toggle while finalising changes nothing and announces nothing")
+    check(h.reply(for: .toggle(mic: nil, dir: nil)) == "error the last recording is still being saved, so nothing new was started. Try again in a moment"
+          && stopped == [dir] && started == [dir] && r.rec.launches.count == 1 && r.rec.sent(SIGINT) == 1 && r.session.phase == .finalising(dir),
+          "B1: toggle while finalising is refused, so the command exits non-zero, and it neither stops nor starts anything")
     _ = h.reply(for: .show)
     check(shown == 1, "reply: show asks the app to show itself")
 }
@@ -2234,7 +2244,8 @@ do {
     check(h.reply(for: .resume) == "ok recording \(dir.path)", "reply: resume")
     check(h.reply(for: .stop) == "ok finalising \(dir.path)" && r.rec.sent(SIGINT) == 1, "reply: ok finalising <dir> from stop")
     check(h.reply(for: .stop) == "ok finalising \(dir.path)" && r.rec.sent(SIGINT) == 1, "reply: stop again while finalising sends nothing")
-    check(h.reply(for: .start(mic: nil, dir: nil)).hasPrefix("error already recording in "), "reply: no start while finalising")
+    check(h.reply(for: .start(mic: nil, dir: nil)) == "error the last recording is still being saved, so nothing new was started. Try again in a moment"
+          && r.rec.launches.count == 1, "B1: no start while finalising, in those words, and nothing launched")
 }
 do {
     let (r, h, _) = handlerRig()
@@ -2434,11 +2445,13 @@ let meetingA = URL(fileURLWithPath: "/Meetings/2026-10-29_1000", isDirectory: tr
 let meetingB = URL(fileURLWithPath: "/Meetings/2026-10-29_1100", isDirectory: true)
 let allOk = Session.Health(mic: .ok, system: .ok, disk: .ok)
 
+/// `ready` is the notice that a meeting's minutes are ready; `notice` gives any other.
 func present(_ phase: Session.Phase = .idle, seconds: Int = 0, health: Session.Health = allOk, processing: URL? = nil,
-             stage: String? = nil, ready: URL? = nil, failure: Failure? = nil, floating: FloatingMode = .whileRecording,
+             stage: String? = nil, ready: URL? = nil, notice: Notice? = nil, failure: Failure? = nil, floating: FloatingMode = .whileRecording,
              preferences: Bool = false) -> StatusPresentation {
-    StatusPresentation(StatusInput(phase: phase, seconds: seconds, health: health, processing: processing, stage: stage,
-                                   ready: ready, failure: failure, floating: floating, preferencesAvailable: preferences))
+    let shown = notice ?? ready.map { Notice(kind: .minutesReady, folder: $0, line: StatusPresentation.minutesReady) }
+    return StatusPresentation(StatusInput(phase: phase, seconds: seconds, health: health, processing: processing, stage: stage,
+                                          notice: shown, failure: failure, floating: floating, preferencesAvailable: preferences))
 }
 /// The menu as text: "-" for a separator, a disabled line in brackets.
 func lines(_ p: StatusPresentation) -> [String] {
@@ -2470,14 +2483,22 @@ do {
     check(action("Resume", in: paused) == .resume, "menu: paused offers Resume")
 
     let fin = present(.finalising(meetingA), seconds: 90)
-    check(fin.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Writing minutes", help: "Writing minutes"), "status: finalising says Writing minutes in the bar, no timer")
-    check(lines(fin) == ["(Writing minutes)", "-", "Show recording folder"] + tail, "menu: finalising (\(lines(fin)))")
+    check(fin.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Saving the recording", help: "Saving the recording"),
+          "B7: status: finalising says Saving the recording in the bar, no timer")
+    check(lines(fin) == ["(Saving the recording)", "-", "(Saving the last recording…)", "Show recording folder"] + tail,
+          "B7, B1: menu: finalising names the stage, and a disabled Saving the last recording… stands where Start would be (\(lines(fin)))")
+    check(fin.menu.first { $0.title == "Saving the last recording…" } == MenuEntry(title: "Saving the last recording…", enabled: false, action: .start),
+          "B1: the saving line is the Start entry, disabled")
 
     let proc = present(processing: meetingA, stage: "transcribing")
-    check(proc.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Writing minutes", help: "Transcribing"), "status: processing says Writing minutes in the bar, the tooltip names the stage")
-    check(lines(proc) == ["(Writing minutes)", "-", "Start recording"] + tail, "menu: processing while idle (\(lines(proc)))")
-    check(present(processing: meetingA).button.help == "Writing minutes" && present(processing: meetingA).button.title == "Writing minutes",
-          "status: processing with no stage yet reads Writing minutes")
+    check(proc.button == StatusButton(symbol: "ellipsis.circle", tint: .plain, title: "Transcribing", help: "Transcribing"), "B7: status: processing names the stage in the bar and the tooltip")
+    check(lines(proc) == ["(Transcribing)", "-", "Start recording"] + tail, "B7: menu: processing while idle names the stage (\(lines(proc)))")
+    check(present(processing: meetingA, stage: "minutes").button.title == "Writing minutes" && lines(present(processing: meetingA, stage: "speakers")).first == "(Finding speakers)",
+          "B7: each stage in the window's words")
+    check(present(processing: meetingA).button.help == "Processing" && present(processing: meetingA).button.title == "Processing"
+          && lines(present(processing: meetingA)).first == "(Processing)", "B7: processing with no stage yet reads Processing, as the window's badge does")
+    check(LibraryBadge.finalising.text == "Saving" && LibraryBadge.processing(stage: "transcribing").text == "Transcribing",
+          "B7: the window's badges agree: Saving, then the stage")
 
     let ready = present(ready: meetingB)
     check(ready.button == StatusButton(symbol: "checkmark.circle", tint: .plain, title: "Minutes ready", help: "Minutes ready"),
@@ -2490,7 +2511,7 @@ do {
     check(lines(ready) == ["Minutes ready", "-", "Start recording"] + tail && action("Minutes ready", in: ready) == .openMinutes(meetingB),
           "menu: Minutes ready is a link to that meeting (\(lines(ready)))")
     check(lines(present(.recording(meetingA), processing: meetingB, ready: meetingB))
-          == ["(Microphone: capturing)", "(System audio: capturing)", "(Writing minutes)", "Minutes ready", "-", "Pause", "Stop", "Show recording folder"] + tail,
+          == ["(Microphone: capturing)", "(System audio: capturing)", "(Processing)", "Minutes ready", "-", "Pause", "Stop", "Show recording folder"] + tail,
           "menu: recording while the last meeting is processed and another is ready")
 
     let failed = present(failure: Failure("start", "No input device matching \"USB\""))
@@ -2499,7 +2520,7 @@ do {
     check(lines(failed) == ["(Could not start: No input device matching \"USB\")", "-", "Start recording"] + tail
           && failed.menu[0].action == .info && !failed.menu[0].enabled, "menu: a failed start is the first line, disabled (\(lines(failed)))")
     let failedBusy = present(.finalising(meetingA), failure: Failure("start", "x"))
-    check(lines(failedBusy).prefix(2) == ["(Could not start: x)", "(Writing minutes)"], "menu: the failed start comes before everything else")
+    check(lines(failedBusy).prefix(2) == ["(Could not start: x)", "(Saving the recording)"], "menu: the failed start comes before everything else")
     // M1: a pause or resume the recorder could not be reached for, shown while the recording goes on.
     let noPause = present(.recording(meetingA), seconds: 7, failure: Failure("pause", ControlHandler.cannotReach.replacingOccurrences(of: "error ", with: "")))
     check(noPause.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "00:07",
@@ -2577,8 +2598,10 @@ do {
 
     let idle = present(floating: .always).panel
     check(idle == PanelPresentation(visible: true, dot: .plain, label: "Ready", controls: [.start], help: nil), "panel: ready with a Record button when idle")
-    check(present(processing: meetingA, floating: .always).panel.label == "Writing minutes"
-          && present(processing: meetingA, floating: .always).panel.controls == [.start], "panel: idle while minutes are written still offers Record")
+    check(present(processing: meetingA, stage: "minutes", floating: .always).panel.label == "Writing minutes"
+          && present(processing: meetingA, stage: "transcribing", floating: .always).panel.label == "Transcribing"
+          && present(processing: meetingA, floating: .always).panel.label == "Processing"
+          && present(processing: meetingA, floating: .always).panel.controls == [.start], "B7: panel: idle while a meeting is processed names the stage, and still offers Record")
     let failed = present(failure: Failure("start", "No microphone"), floating: .always).panel
     check(failed.label == "Could not start" && failed.dot == .amber && failed.controls == [.start] && failed.help == "Could not start: No microphone",
           "panel: a failed start is named, with the reason as its tooltip")
@@ -2594,8 +2617,8 @@ do {
     check(paused == PanelPresentation(visible: true, dot: .plain, label: "00:12", controls: [.resume, .stop, .showFolder(meetingA)], help: nil),
           "panel: paused holds the timer and offers Resume")
     let fin = present(.finalising(meetingA), floating: .always).panel
-    check(fin == PanelPresentation(visible: true, dot: .plain, label: "Writing minutes", controls: [.showFolder(meetingA)], help: nil),
-          "panel: finalising reads Writing minutes and keeps the folder")
+    check(fin == PanelPresentation(visible: true, dot: .plain, label: "Saving the recording", controls: [.showFolder(meetingA)], help: nil),
+          "B7: panel: finalising reads Saving the recording and keeps the folder")
     check(MenuAction.start.title == "Start recording" && MenuAction.pause.title == "Pause" && MenuAction.resume.title == "Resume"
           && MenuAction.stop.title == "Stop" && MenuAction.showFolder(meetingA).title == "Show recording folder",
           "panel: its buttons carry the menu's words")
@@ -2710,6 +2733,17 @@ do {
           "failure: the races (not recording, already stopped) are only logged")
     check(Failure.from(.stop, reply: "error not recording") == nil && Failure.from(.stop, reply: unreachable) == nil, "failure: a stop is never shown")
     check(Failure.from(.start(mic: nil, dir: nil), reply: "ok recording /x") == nil && Failure.from(.pause, reply: "ok paused /x") == nil, "failure: an ok reply is not one")
+    // B6: a start that lost the race to the recording now running is only logged.
+    let lost = "error already recording in \(meetingA.path)"
+    check(Failure.from(.start(mic: nil, dir: nil), reply: lost, phase: .recording(meetingA)) == nil
+          && Failure.from(.start(mic: nil, dir: nil), reply: lost, phase: .paused(meetingA)) == nil,
+          "B6: a start error naming the folder being recorded or paused into is not shown")
+    check(Failure.from(.start(mic: nil, dir: nil), reply: lost, phase: .idle) == Failure("start", "already recording in \(meetingA.path)")
+          && Failure.from(.start(mic: nil, dir: nil), reply: lost, phase: .recording(meetingB)) == Failure("start", "already recording in \(meetingA.path)")
+          && Failure.from(.start(mic: nil, dir: nil), reply: "error No input device", phase: .recording(meetingA)) == Failure("start", "No input device"),
+          "B6: one naming another folder, or none, still is")
+    check(Failure.from(.start(mic: nil, dir: nil), reply: "error " + Session.stillSaving, phase: .finalising(meetingA)) == Failure("start", Session.stillSaving),
+          "B1: a start refused while the last recording is saved is shown")
 }
 
 // One path for every action: perform answers like the socket, without ever waiting on the queue.
@@ -3044,9 +3078,9 @@ do {
     check(badge(libMeeting(name, .done)) == nil, "L2: done has no badge")
     check(badge(libMeeting(name, .recording), .recording(here)) == "Recording", "L2: the session's folder, recording: Recording")
     check(badge(libMeeting(name, .recording), .paused(here)) == "Paused", "L2: the session's folder, paused: Paused")
-    check(badge(libMeeting(name, .finalising), .finalising(here)) == "Finalising", "L2: the session's folder, finalising: Finalising")
+    check(badge(libMeeting(name, .finalising), .finalising(here)) == "Saving", "B7: the session's folder, finalising: Saving")
     check(badge(libMeeting(name, .recording)) == "Recording", "L2: a record that says recording, with no session on it: Recording")
-    check(badge(libMeeting(name, .finalising)) == "Finalising", "L2: a record that says finalising: Finalising")
+    check(badge(libMeeting(name, .finalising)) == "Saving", "B7: a record that says finalising: Saving")
     check(badge(libMeeting(name, .queued)) == "Queued", "L2: queued")
     check(badge(libMeeting(name, .processing)) == "Processing", "L2: processing, no stage known")
     check(badge(libMeeting(name, .processing, stage: "minutes")) == "Writing minutes", "L2: processing, with the stage its record holds")
@@ -3610,7 +3644,7 @@ do {
 // item's own recording entries that apply now, in its order, and nothing else.
 do {
     let phases: [(String, Session.Phase, [MenuAction])] = [("idle", .idle, [.start]), ("recording", .recording(meetingA), [.pause, .stop]),
-                                                          ("paused", .paused(meetingA), [.resume, .stop]), ("finalising", .finalising(meetingA), [])]
+                                                          ("paused", .paused(meetingA), [.resume, .stop]), ("finalising", .finalising(meetingA), [.start])]
     for (name, phase, actions) in phases {
         for p in [present(phase), present(phase, processing: meetingB, ready: meetingB, failure: Failure("start", "No microphone"), preferences: true)] {
             let entries = PreferencesPresentation.recordingEntries(p.menu)
@@ -3619,6 +3653,14 @@ do {
                   "T9 recording entries: \(name) gives the menu bar item's own \(actions.map(\.title)) (\(entries.map(\.title)))")
         }
     }
+    // B1: while the last recording is saved, Start's place holds a disabled line saying so, in every menu and on New meeting.
+    let saving = PreferencesPresentation.recordingEntries(present(.finalising(meetingA)).menu)
+    check(saving == [MenuEntry(title: "Saving the last recording…", enabled: false, action: .start)],
+          "B1: finalising: the recording entries are one disabled Saving the last recording… line")
+    check(PreferencesPresentation.newMeetingTitle(saving) == "Saving the last recording…"
+          && PreferencesPresentation.newMeetingTitle(PreferencesPresentation.recordingEntries(present().menu)) == "New meeting"
+          && PreferencesPresentation.newMeetingTitle(PreferencesPresentation.recordingEntries(present(.recording(meetingA)).menu)) == "New meeting",
+          "B1: New meeting reads Saving the last recording… while finalising, and New meeting otherwise")
 }
 
 // The quit reason, in whichever form the quit event carries it: an enumeration or a type code, as an
@@ -3880,7 +3922,9 @@ MainActor.assumeIsolated {
     m3.stopForQuit { pausedReplied = true }
     check(settle { rec3.sent(SIGINT) == 1 } && !pausedReplied && m3.session.phase == .finalising(folder3),
           "T9 quit: Stop and quit while paused sends Stop and waits while it finalises")
-    check(settle { offers([]) }, "T9 recording entries: finalising: both menus offer nothing, and New meeting is disabled")
+    check(settle { offers(["Saving the last recording…"]) } && menus.dockMenu().items.allSatisfy { !$0.isEnabled }
+          && menus.menu.items.allSatisfy { !$0.isEnabled } && m3.newMeetingTitle == "Saving the last recording…",
+          "B1: finalising: both menus show Saving the last recording…, disabled, and New meeting says so, disabled")
     m3.session.onChange?(.idle)
     _ = settle({ false }, timeout: 0.3)
     check(!pausedReplied, "T9 quit: an idle delivered late, while this recording finalises, does not answer")
@@ -3977,6 +4021,488 @@ do {
           && withLine.last == MenuEntry(title: "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)", enabled: false, action: .info),
           "T10 build: the menu bar item's menu ends with the build line, disabled, after a separator")
     check(StatusPresentation.withBuild(menu, nil) == menu, "T10 build: no build line, the menu as it was")
+}
+
+// MARK: - Final fix round, part 2: the session, status and control
+
+let stillSavingReply = "error the last recording is still being saved, so nothing new was started. Try again in a moment"
+
+// B1: while the last recording is being saved, start and toggle are refused and launch nothing; stop
+// still answers ok finalising; each refusal is announced, for the app's failure sound.
+do {
+    check(Session.stillSaving == String(stillSavingReply.dropFirst("error ".count)), "B1: the refusal's words")
+    let (r, h, _) = handlerRig()
+    var started = 0, stopped = 0, refused = 0
+    h.onStarted = { _ in started += 1 }
+    h.onStopped = { _ in stopped += 1 }
+    h.onRefused = { refused += 1 }
+    _ = h.reply(for: .start(mic: nil, dir: nil))
+    let dir = r.session.phase.folder ?? r.store.root
+    check(h.reply(for: .stop) == "ok finalising \(dir.path)", "B1: stop moves to finalising")
+    let folders = names(r.store.root)
+    let elsewhere = freshRoot()
+    check(h.reply(for: .start(mic: nil, dir: nil)) == stillSavingReply, "B1: start while saving is refused in those words")
+    check(h.reply(for: .start(mic: "USB", dir: elsewhere.path)) == stillSavingReply && names(elsewhere).isEmpty,
+          "B1: and with a folder and a microphone of its own, making nothing there")
+    check(h.reply(for: .toggle(mic: nil, dir: nil)) == stillSavingReply, "B1: toggle while saving is refused in the same words")
+    check(r.rec.launches.count == 1 && names(r.store.root) == folders && r.rec.sent(SIGINT) == 1 && r.session.phase == .finalising(dir),
+          "B1: toggle (or start) while saving neither stops nor starts anything")
+    check(started == 1 && stopped == 1 && refused == 3, "B1: no start or stop sound for them; each refusal is announced (\(refused))")
+    check(h.reply(for: .stop) == "ok finalising \(dir.path)" && stopped == 1 && refused == 3, "B1: stop while saving still answers ok finalising, and is not a refusal")
+    check(h.reply(for: .pause) == "error the recording in \(dir.path) has already stopped" && refused == 3, "B1: pause while saving is not a refusal either")
+    check(errorText { _ = try r.session.start(root: r.store.root, mic: nil) } == Session.stillSaving && r.rec.launches.count == 1,
+          "B1: Session.start while finalising throws the same words and launches nothing")
+    r.rec.exit(r.rec.nextPid, 0, verifies: true)
+    r.at(1)
+    check(r.session.phase == .idle && h.reply(for: .start(mic: nil, dir: nil)).hasPrefix("ok recording ") && r.rec.launches.count == 2 && refused == 3,
+          "B1: once it is saved, a start records again")
+}
+
+// N4: a start over the socket that another client stops inside the grace (a double-pressed hotkey) is
+// answered as stopped, not as a start that failed.
+do {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let q = DispatchQueue(label: "meetingbox.test.n4")
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var started = 0
+    h.onStarted = { _ in started += 1 }
+    let sock = tmp.appendingPathComponent("control.sock")
+    let server = try? ControlServer(socket: sock, handler: h)
+    server?.start()
+    let lock = NSLock()
+    var first: String?
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        let reply = ControlClient.send("toggle", to: sock, timeout: 20)
+        lock.lock(); first = reply; lock.unlock()
+        done.signal()
+    }
+    var dir: URL?
+    for _ in 0..<100 where dir == nil {
+        usleep(20_000)
+        dir = q.sync { r.session.phase.folder }
+    }
+    let second = ControlClient.send("toggle", to: sock, timeout: 20)
+    check(dir != nil && second == "ok finalising \(dir?.path ?? "-")", "N4: a second toggle inside the grace stops the recording (\(second ?? "nil"))")
+    let answered = done.wait(timeout: .now() + 20) == .success
+    lock.lock(); let firstReply = first; lock.unlock()
+    check(answered && firstReply == "ok finalising \(dir?.path ?? "-")" && q.sync { started } == 0,
+          "N4: the first is answered ok finalising, not as a failed start, with no start sound (\(firstReply ?? "nil"))")
+    server?.stop()
+    q.sync {
+        r.rec.exit(r.rec.nextPid, 0, verifies: true)
+        r.session.tick()
+    }
+    q.sync {}
+}
+
+// B2: an end nobody asked for is announced with its reason, and the reason is kept in meeting.json
+// (stopReason) through queued, processing and done.
+func stopReason(_ r: Rig, _ dir: URL) -> String? { r.json(dir)["stopReason"] as? String }
+/// Takes a queued meeting through the queue to done, over the rig's store.
+func processToDone(_ r: Rig, _ dir: URL) -> (processing: String?, done: String?) {
+    let runner = FakeRunner()
+    let q = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil)
+    q.enqueue(dir)
+    let whileProcessing = r.stateOf(dir) == "processing" ? stopReason(r, dir) : "not processing"
+    if !runner.calls.isEmpty { runner.finish(0, 0) }
+    return (whileProcessing, r.stateOf(dir) == "done" ? stopReason(r, dir) : "not done")
+}
+do {
+    let r = Rig()
+    let s = r.make()
+    var ended: [(URL, String)] = []
+    s.onEnded = { ended.append(($0, $1)) }
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(20)
+    check(Session.recorderStopped == "the recorder stopped unexpectedly", "B2: the words for a recorder that stopped")
+    check(ended.count == 1 && ended[0].0 == dir && ended[0].1 == Session.recorderStopped, "B2: a recorder that stops on its own is announced, with why")
+    check(r.stateOf(dir) == "queued" && stopReason(r, dir) == Session.recorderStopped && r.json(dir)["error"] == nil,
+          "B2: its reason is in meeting.json as stopReason, and queued keeps it")
+    let after = processToDone(r, dir)
+    check(after.processing == Session.recorderStopped && after.done == Session.recorderStopped, "B2: processing and done keep it (\(after))")
+}
+do {
+    let r = Rig()
+    let s = r.make()
+    var ended: [(URL, String)] = []
+    s.onEnded = { ended.append(($0, $1)) }
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    r.free = 199 * MB
+    r.at(30)
+    check(ended.count == 1 && ended[0].0 == dir && ended[0].1 == Session.diskStopped && stopReason(r, dir) == Session.diskStopped,
+          "B2: the disk stop is announced with its reason, and the reason is kept")
+    r.rec.exit(r.rec.nextPid, 0, verifies: true)
+    r.at(31)
+    check(ended.count == 1 && r.stateOf(dir) == "queued" && stopReason(r, dir) == Session.diskStopped && r.json(dir)["error"] == nil,
+          "B2: once queued the reason stays (the error goes), and it is announced once")
+    let after = processToDone(r, dir)
+    check(after.processing == Session.diskStopped && after.done == Session.diskStopped, "B2: through processing and done (\(after))")
+}
+do {
+    // an adopted recorder that stops is announced however long ago it started
+    let r = Rig()
+    let dir = r.meeting("2026-10-29_0955") { $0.started = r.clock.base.addingTimeInterval(-300); $0.state = .recording }
+    r.writeState(dir)
+    r.rec.alive.insert(4242)
+    r.rec.running[dir.path] = 4242
+    let s = r.make()
+    var ended: [(URL, String)] = []
+    s.onEnded = { ended.append(($0, $1)) }
+    s.adopt()
+    r.rec.exit(4242, 1, verifies: false)
+    r.rec.exitCodes[4242] = nil
+    r.at(1)
+    check(ended.count == 1 && ended[0].0 == dir && stopReason(r, dir) == Session.recorderStopped, "B2: an adopted recorder that stops is announced")
+}
+do {
+    // nothing is announced for a stop the user asked for, nor for a start whose recorder died at once
+    let r = Rig()
+    let s = r.make()
+    var ended: [(URL, String)] = []
+    s.onEnded = { ended.append(($0, $1)) }
+    let asked = try! s.start(root: r.store.root, mic: nil)
+    r.clock.t = 30
+    _ = s.stop()
+    r.rec.exit(r.rec.nextPid, 0, verifies: true)
+    r.at(31)
+    check(ended.isEmpty && stopReason(r, asked) == nil && r.stateOf(asked) == "queued", "B2: a stop that was asked for is not announced, and has no stopReason")
+    r.clock.t = 100
+    let failedStart = try! s.start(root: r.store.root, mic: nil)
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(101)
+    check(ended.isEmpty && stopReason(r, failedStart) == nil,
+          "B2: a recorder that dies inside the start grace is a failed start, which the start's reply reports, not an end")
+    r.clock.t = 200
+    let late = try! s.start(root: r.store.root, mic: nil)
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(200 + Session.startGrace)
+    check(ended.count == 1 && ended[0].0 == late && ControlHandler.startGrace == Session.startGrace,
+          "B2: one that dies once the grace is over is announced; the grace is the handler's")
+}
+
+// A3: a recovery that finds the folder busy leaves the meeting finalising and the session idle, and the
+// tick alone tries it again, no sooner than 15 s after each busy result, until it settles.
+do {
+    // the stop path
+    let r = Rig()
+    r.rec.recoverBusy = true
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    _ = s.stop()
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(1)
+    check(r.rec.recovered == [dir] && r.stateOf(dir) == "finalising" && s.phase == .idle && r.finished.isEmpty,
+          "A3: stop path, busy: meeting.json still says finalising, and the session is idle")
+    r.at(15)
+    check(r.rec.recovered.count == 1, "A3: not tried again sooner than 15 s after")
+    r.at(16)
+    check(r.rec.recovered.count == 2 && r.stateOf(dir) == "finalising" && r.finished.isEmpty, "A3: tried again at 15 s; still busy, still finalising")
+    r.rec.recoverBusy = false // the other holder lets go
+    r.at(30)
+    check(r.rec.recovered.count == 2, "A3: the next try waits 15 s from the last busy result")
+    r.at(31)
+    check(r.rec.recovered.count == 3 && r.stateOf(dir) == "queued" && r.finished.count == 1 && r.finished[0].0 == dir && r.finished[0].1,
+          "A3: once it is free, ticks alone take it to queued")
+    r.at(60)
+    check(r.rec.recovered.count == 3, "A3: and nothing more once it has settled")
+}
+do {
+    // the orphan path, while a new recording runs
+    let r = Rig()
+    r.rec.recoverBusy = true
+    let orphan = r.meeting("2026-10-28_0900") { $0.state = .finalising }
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered == [orphan] && r.stateOf(orphan) == "finalising" && s.phase == .idle && r.finished.isEmpty,
+          "A3: orphan path, busy: still finalising, idle")
+    let dir = try? s.start(root: r.store.root, mic: nil)
+    check(dir != nil && s.phase == .recording(dir!), "A3: a new recording can start meanwhile")
+    r.rec.recoverBusy = false
+    r.at(14)
+    check(r.rec.recovered.count == 1, "A3: not before 15 s")
+    r.at(15)
+    check(r.rec.recovered.count == 2 && r.stateOf(orphan) == "queued" && r.finished.count == 1 && r.finished[0].0 == orphan
+          && dir.map { s.phase == .recording($0) } == true, "A3: the tick takes the orphan to queued while the new recording goes on")
+}
+do {
+    // a folder that has gone, or that something else has settled, is not tried again
+    let r = Rig()
+    r.rec.recoverBusy = true
+    let gone = r.meeting("2026-10-28_0900") { $0.state = .finalising }
+    let settled = r.meeting("2026-10-28_1000") { $0.state = .finalising }
+    let s = r.make()
+    s.adopt()
+    check(r.rec.recovered.count == 2, "A3: two busy orphans")
+    try! fm.removeItem(at: gone)
+    try! r.store.update(settled) { $0.state = .done }
+    r.rec.recoverBusy = false
+    r.at(15)
+    check(r.rec.recovered.count == 2 && r.finished.isEmpty && !fm.fileExists(atPath: gone.path) && r.stateOf(settled) == "done",
+          "A3: neither is recovered again, and nothing is written")
+}
+do {
+    // the session's own 1 s timer runs the retry, with nothing recording
+    let q = DispatchQueue(label: "meetingbox.test.a3")
+    let r = Rig()
+    r.rec.recoverBusy = true
+    let orphan = r.meeting("2026-10-28_0900") { $0.state = .finalising }
+    q.sync {
+        let s = r.make(tickQueue: q)
+        s.adopt()
+        r.rec.recoverBusy = false
+        r.clock.t = 15
+    }
+    var queuedNow = false
+    for _ in 0..<80 where !queuedNow {
+        usleep(50_000)
+        queuedNow = q.sync { r.stateOf(orphan) == "queued" }
+    }
+    check(queuedNow && q.sync { r.rec.recovered.count } == 2, "A3: the session's timer keeps running for the retry, and takes it to queued")
+    q.sync {}
+}
+
+// B3 with B2: one line about a meeting, the most recent of minutes ready, recording stopped and
+// unfinished. It opens that meeting, and goes when that meeting is opened or the next recording starts.
+do {
+    let tail = ["-", "Open meetingbox", "(Preferences…)", "-", "Quit meetingbox"]
+    let notWritten = "Minutes could not be written: processing failed (exit 1)"
+    let stopped = "Recording stopped: the recorder stopped unexpectedly"
+    check(StatusPresentation.minutesNotWritten("processing failed (exit 1)") == notWritten
+          && StatusPresentation.recordingNotFinished == "The recording could not be finished; its files are kept", "B3: the words")
+
+    // the review's case: A's minutes are ready, then B's job fails
+    var s = StatusInput()
+    s.apply(.minutesReady(meetingA))
+    check(s.notice == Notice(kind: .minutesReady, folder: meetingA, line: "Minutes ready") && s.ready == meetingA, "B3: A's minutes ready")
+    s.apply(.unfinished(meetingB, line: notWritten))
+    check(s.notice == Notice(kind: .unfinished, folder: meetingB, line: notWritten) && s.ready == nil, "B3: then B's job fails: one line, and it is B's")
+    let p = StatusPresentation(s)
+    check(lines(p) == [notWritten, "-", "Start recording"] + tail && action(notWritten, in: p) == .openMinutes(meetingB),
+          "B3: the menu line names the failure and opens B, not A (\(lines(p)))")
+    check(p.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "", help: notWritten), "B3: with the amber icon")
+    s.apply(.minutesOpened(meetingA))
+    check(s.notice?.folder == meetingB, "B3: opening A leaves B's line")
+    s.apply(.minutesOpened(meetingB))
+    check(s.notice == nil && StatusPresentation(s).button.symbol == "record.circle", "B3: opening B clears it")
+
+    // recording stopped, then the most recent wins
+    s.apply(.recordingStopped(meetingA, reason: "the recorder stopped unexpectedly"))
+    check(s.notice == Notice(kind: .recordingStopped, folder: meetingA, line: stopped), "B2: Recording stopped: <reason>")
+    let q = StatusPresentation(s)
+    check(q.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "", help: stopped)
+          && action(stopped, in: q) == .openMinutes(meetingA), "B2: amber, and the line opens that meeting")
+    s.apply(.unfinished(meetingA, line: StatusPresentation.recordingNotFinished))
+    check(s.notice?.line == StatusPresentation.recordingNotFinished, "B3: a recording that could not be finished replaces it")
+    s.apply(.minutesReady(meetingB))
+    check(s.notice == Notice(kind: .minutesReady, folder: meetingB, line: "Minutes ready") && StatusPresentation(s).button.tint == .plain,
+          "B3: minutes ready after it wins, and is not amber")
+
+    // the next recording clears it; a pause taken up, or resumed, does not
+    s.apply(.unfinished(meetingB, line: notWritten))
+    s.apply(.phase(.paused(meetingA)))
+    check(s.notice?.line == notWritten, "B3: a recording taken up as paused does not clear it")
+    s.apply(.phase(.idle))
+    s.apply(.phase(.recording(meetingA)))
+    check(s.notice == nil, "B3: the next recording starting clears it")
+    s.apply(.unfinished(meetingB, line: notWritten))
+    s.apply(.phase(.paused(meetingA)))
+    s.apply(.phase(.recording(meetingA)))
+    check(s.notice?.line == notWritten, "B3: resuming does not")
+
+    // shown while a new recording goes on: the warning, with the timer beside it
+    let live = present(.recording(meetingA), seconds: 7, notice: Notice(kind: .unfinished, folder: meetingB, line: notWritten))
+    check(live.button == StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: "00:07", help: notWritten)
+          && lines(live) == ["(Microphone: capturing)", "(System audio: capturing)", notWritten, "-", "Pause", "Stop", "Show recording folder"] + tail,
+          "B3: during a recording the line is there and the timer stays beside the warning (\(lines(live)))")
+    // a failed start still wins the icon, and both lines are in the menu
+    let both = present(notice: Notice(kind: .unfinished, folder: meetingB, line: notWritten), failure: Failure("start", "x"))
+    check(both.button.help == "Could not start: x" && lines(both) == ["(Could not start: x)", notWritten, "-", "Start recording"] + tail,
+          "B3: a failed start comes first, then the line")
+    // while busy, an amber line wins the icon; minutes ready does not
+    check(present(processing: meetingA, stage: "transcribing", notice: Notice(kind: .recordingStopped, folder: meetingB, line: stopped)).button.symbol == "exclamationmark.triangle"
+          && present(processing: meetingA, stage: "transcribing", ready: meetingB).button.title == "Transcribing",
+          "B3: an amber line wins over busy, minutes ready does not")
+}
+
+// 9(d) with C7 and D2: recovery's last line is the reason a recording could not be finished, and a failed
+// recording that was never finished says how to finish it.
+let tooFull = "the disk is too full to finish the recording; free some space, then run: meetingbox recover /Meetings/x"
+do {
+    let bin = freshRoot()
+    func script(_ name: String, _ body: String) -> URL {
+        let url = bin.appendingPathComponent(name)
+        try! fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! "#!/bin/sh\n\(body)\n".write(to: url, atomically: true, encoding: .utf8)
+        chmod(url.path, 0o755)
+        return url
+    }
+    func newDir() -> URL { try! MeetingFolder.create(in: freshRoot(), at: Date()) }
+    let says = script("says/meetingbox-recorder", "echo 'checking' >&2; echo '\(tooFull)' >&2; echo '' >&2; exit 1")
+    let dir = newDir()
+    try! "No input device matching \"USB\"\n".write(to: dir.appendingPathComponent("capture.log"), atomically: true, encoding: .utf8)
+    check(ChildRecorder(executable: says, legacyExecutable: says).recover(dir: dir) == .failed(tooFull),
+          "9(d): a failed --recover gives the last line it printed")
+    let silent = script("silent/meetingbox-recorder", "exit 1")
+    check(ChildRecorder(executable: silent, legacyExecutable: silent).recover(dir: dir) == .failed(nil),
+          "9(d): one that printed nothing gives no line, never an earlier line of capture.log")
+    let legacySilent = script("legacy/meetingbox", "exit 1")
+    check(ChildRecorder(executable: bin.appendingPathComponent("no-such/meetingbox-recorder"), legacyExecutable: legacySilent).recover(dir: newDir()) == .failed(nil),
+          "9(d): nor the note that the helper is missing")
+}
+do {
+    // the stop path: recovery's line when the recorder gave none of its own
+    let r = Rig()
+    r.rec.recoverResult = false
+    r.rec.recoverSays = tooFull
+    let s = r.make()
+    let dir = try! s.start(root: r.store.root, mic: nil)
+    _ = s.stop()
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(1)
+    check(r.stateOf(dir) == "failed" && r.json(dir)["error"] as? String == tooFull, "9(d): a stop whose recovery is refused for room says to free space")
+    // the recorder's own reason still comes first
+    let dir2 = try! s.start(root: r.store.root, mic: nil)
+    r.log(dir2, "No input device matching \"USB\"")
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(10)
+    check(r.json(dir2)["error"] as? String == "No input device matching \"USB\"", "9(d): the recorder's own reason still wins")
+    // the disk stop keeps its words and adds recovery's
+    r.clock.t = 100
+    let dir3 = try! s.start(root: r.store.root, mic: nil)
+    r.free = 199 * MB
+    r.at(130)
+    r.rec.exit(r.rec.nextPid, 1, verifies: false)
+    r.at(131)
+    check(r.json(dir3)["error"] as? String == "recording stopped because the disk was nearly full; \(tooFull)",
+          "9(d): a disk stop that cannot be finished says both")
+}
+do {
+    // the orphan path
+    let r = Rig()
+    r.rec.recoverResult = false
+    r.rec.recoverSays = tooFull
+    let orphan = r.meeting("2026-10-28_0900") { $0.state = .recording }
+    let s = r.make()
+    s.adopt()
+    check(r.stateOf(orphan) == "failed" && r.json(orphan)["error"] as? String == tooFull, "9(d): an orphan's recovery line is its reason")
+}
+do {
+    // the window: the failure line, then how to finish it; and why a recording stopped early
+    func meeting(_ name: String, _ state: MeetingState, error: String? = nil, stopReason: String? = nil) -> Meeting {
+        let m = libMeeting(name, state, error: error)
+        var rec = m.record!
+        rec.stopReason = stopReason
+        return Meeting(folder: m.folder, record: rec, state: state)
+    }
+    func notes(_ m: Meeting, unfinished: Bool, phase: Session.Phase = .idle) -> [String] {
+        LibraryPresentation.notes(for: m, row: LibraryPresentation.row(m, phase: phase), files: MeetingFiles(audio: nil, runnable: false, unfinished: unfinished))
+    }
+    let cut = meeting("2026-10-28_1508", .failed, error: tooFull)
+    check(notes(cut, unfinished: true) == [tooFull, "To finish it, run: meetingbox recover /Meetings/2026-10-28_1508, then choose Process here."],
+          "9(d): a failed recording that was never finished is followed by how to finish it")
+    check(notes(cut, unfinished: false) == [tooFull], "9(d): one that is finished is not")
+    check(notes(meeting("2026-10-28_1508", .unprocessed), unfinished: true).isEmpty, "9(d): nor one that has not failed")
+    let titled = meeting("2026-10-28 1508 O'Brien review", .failed, error: Session.interrupted)
+    check(notes(titled, unfinished: true).last == "To finish it, run: meetingbox recover '/Meetings/2026-10-28 1508 O'\\''Brien review', then choose Process here.",
+          "9(d): a folder with spaces or quotes is quoted for the shell (\(notes(titled, unfinished: true).last ?? "nil"))")
+    let early = meeting("2026-10-28_1600", .done, stopReason: Session.recorderStopped)
+    check(notes(early, unfinished: false) == ["Recording stopped early: the recorder stopped unexpectedly"], "B2: the window says why a recording stopped early")
+    let both = meeting("2026-10-28_1700", .failed, error: tooFull, stopReason: Session.diskStopped)
+    check(notes(both, unfinished: true) == [tooFull, "To finish it, run: meetingbox recover /Meetings/2026-10-28_1700, then choose Process here.",
+                                            "Recording stopped early: \(Session.diskStopped)"], "B2, 9(d): all three, in that order")
+    // what is on disk
+    let root = freshRoot()
+    let unfinishedFolder = MeetingFolder.parse(make(root, "2026-10-28_1800", files: ["mic.caf": "c"]))!
+    let finishedFolder = MeetingFolder.parse(make(root, "2026-10-28_1810", files: ["audio.m4a": "a", Finaliser.marker: "", "mic.caf": "c"]))!
+    check(MeetingFiles.read(unfinishedFolder).unfinished && !MeetingFiles.read(finishedFolder).unfinished,
+          "9(d): the folder is read as unfinished only with working files and no marker")
+}
+
+// B1, B2 and B3 in the app: each failure is a menu bar line with the amber icon and Basso (only with
+// sounds on); the stop reason stays in meeting.json through queued and done.
+MainActor.assumeIsolated {
+    func json(_ dir: URL) -> [String: Any] {
+        ((try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+    }
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = true
+    prefs.openMinutes = false
+    var played: [String] = []
+    let rec = FakeRecorder()
+    let runner = FakeRunner()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: runner, freeBytes: { _ in 50 * GB },
+                         playSound: { played.append($0) })
+    model.launch()
+
+    // B2: a recording whose recorder stops on its own, after the start grace
+    model.perform(.start)
+    check(settle { model.session.phase.folder != nil }, "app B2: Start records")
+    let first = model.session.phase.folder ?? root
+    _ = settle({ false }, timeout: 2.6)
+    check(played == ["Tink"], "app B2: the start sound once the grace is over (\(played))")
+    rec.exit(rec.nextPid, 1, verifies: false)
+    let stoppedLine = "Recording stopped: the recorder stopped unexpectedly"
+    check(settle { model.status.notice?.kind == .recordingStopped }, "app B2: the end is announced")
+    check(model.status.notice?.line == stoppedLine && isAt(model.status.notice?.folder, first)
+          && model.presentation.button.tint == .amber
+          && model.presentation.menu.contains { $0.title == stoppedLine && $0.action == model.status.notice.map { MenuAction.openMinutes($0.folder) } },
+          "app B2: Recording stopped: <reason>, amber, and the line opens the meeting")
+    check(played == ["Tink", "Basso"], "app B2: with Basso (\(played))")
+    check(settle { runner.calls.count == 1 } && json(first)["stopReason"] as? String == Session.recorderStopped,
+          "app B2: recovered and queued, with its stop reason")
+
+    // B3: its job fails
+    runner.finish(0, 1, "the transcript could not be made")
+    let notWritten = "Minutes could not be written: the transcript could not be made"
+    check(settle { model.status.notice?.kind == .unfinished }, "app B3: a failed job is announced")
+    check(model.status.notice?.line == notWritten && isAt(model.status.notice?.folder, first) && model.presentation.button.tint == .amber
+          && played == ["Tink", "Basso", "Basso"], "app B3: Minutes could not be written: <reason>, about that meeting, amber, Basso (\(played))")
+    check(json(first)["stopReason"] as? String == Session.recorderStopped, "app B2: a failed job keeps the stop reason")
+    model.queue.retry(first)
+    check(settle { runner.calls.count == 2 }, "app B3: tried again")
+    runner.finish(1, 0)
+    check(settle { model.status.notice?.kind == .minutesReady } && played == ["Tink", "Basso", "Basso", "Glass"]
+          && json(first)["state"] as? String == "done" && json(first)["stopReason"] as? String == Session.recorderStopped,
+          "app B2: done keeps the stop reason, and Minutes ready replaces the line (\(played))")
+
+    // B1: a start while the last recording is saved is refused with Basso, and the menus say so
+    model.perform(.start)
+    check(settle { model.session.phase.folder != nil && model.session.phase.folder != first }, "app B1: another recording")
+    let second = model.session.phase.folder ?? root
+    _ = settle({ false }, timeout: 2.6)
+    model.perform(.stop)
+    check(settle { model.session.phase == .finalising(second) && model.recordingEntries.first?.title == "Saving the last recording…" },
+          "app B1: finalising: the recording entries say Saving the last recording…")
+    check(model.recordingEntries == [MenuEntry(title: "Saving the last recording…", enabled: false, action: .start)] && !model.canStartNewMeeting
+          && model.newMeetingTitle == "Saving the last recording…", "app B1: disabled, and New meeting says so, disabled")
+    let launches = rec.launches.count
+    model.perform(.start)
+    check(settle { model.status.failure != nil } && model.status.failure == Failure("start", Session.stillSaving) && rec.launches.count == launches,
+          "app B1: a start is refused in those words and launches nothing")
+    check(settle { played == ["Tink", "Basso", "Basso", "Glass", "Tink", "Pop", "Basso"] }, "app B1: with Basso (\(played))")
+
+    // B3: the recording cannot be finished
+    rec.recoverResult = false
+    rec.exit(rec.nextPid, 1, verifies: false)
+    check(settle { model.status.notice?.kind == .unfinished && model.session.phase == .idle }, "app B3: a recording that could not be finished is announced")
+    check(model.status.notice?.line == StatusPresentation.recordingNotFinished && isAt(model.status.notice?.folder, second)
+          && played == ["Tink", "Basso", "Basso", "Glass", "Tink", "Pop", "Basso", "Basso"] && json(second)["stopReason"] == nil,
+          "app B3: The recording could not be finished; its files are kept, with Basso; a stop that was asked for has no stop reason (\(played))")
+    if let shown = model.status.notice?.folder { model.perform(.openMinutes(shown)) } // as its menu line does
+    check(model.status.notice == nil, "app B3: opening that meeting clears the line")
+
+    // only with sounds on
+    prefs.sounds = false
+    model.play("Basso")
+    check(played.count == 8, "app: no sound at all with sounds off")
+    model.shutDown()
+    try? fm.removeItem(at: state)
 }
 
 try? fm.removeItem(at: scratch)

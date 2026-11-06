@@ -17,7 +17,7 @@ enum MenuAction: Equatable {
     /// The folder of the recording in progress (or just stopped).
     case showFolder(URL)
     case openMeetingbox
-    /// The notes of a meeting whose minutes are ready.
+    /// That meeting in the window: the menu line about it (`Notice`), Minutes ready for one.
     case openMinutes(URL)
     case preferences
     case quit
@@ -82,20 +82,38 @@ struct PanelPresentation: Equatable {
     let help: String?
 }
 
-/// Everything the views depend on, and the state `StatusReducer.swift` keeps. `ready` is the
-/// meeting whose minutes were finished last and not yet opened; `failure` is what the user asked for
-/// last that did not work.
+/// The one line about a meeting that the menu shows until that meeting is opened or the next
+/// recording starts, the most recent of: its minutes are ready, its recording stopped without being
+/// asked to, or it was left unfinished. The line opens that meeting; all but Minutes ready are amber.
+struct Notice: Equatable {
+    enum Kind: Equatable { case minutesReady, recordingStopped, unfinished }
+    let kind: Kind
+    let folder: URL
+    /// The words of the line: "Minutes ready", "Recording stopped: <reason>", "Minutes could not be
+    /// written: <reason>" or "The recording could not be finished; its files are kept".
+    let line: String
+
+    /// Something went wrong with that meeting that nobody asked for.
+    var amber: Bool { kind != .minutesReady }
+}
+
+/// Everything the views depend on, and the state `StatusReducer.swift` keeps. `notice` is the line
+/// about a meeting (`ready` when it is that one's minutes being ready); `failure` is what the user
+/// asked for last that did not work.
 struct StatusInput: Equatable {
     var phase: Session.Phase = .idle
     var seconds = 0
     var health = Session.Health(mic: .ok, system: .ok, disk: .ok)
     var processing: URL? = nil
     var stage: String? = nil
-    var ready: URL? = nil
+    var notice: Notice? = nil
     var failure: Failure? = nil
     var floating: FloatingMode = .whileRecording
     /// The preferences window exists (it does from Task 9).
     var preferencesAvailable = false
+
+    /// The meeting whose minutes were finished last and not yet opened, when that is the line shown.
+    var ready: URL? { notice?.kind == .minutesReady ? notice?.folder : nil }
 }
 
 struct StatusPresentation: Equatable {
@@ -107,13 +125,19 @@ struct StatusPresentation: Equatable {
                        MenuEntry(title: line, enabled: false, action: .info)]
     }
 
-    static let writingMinutes = "Writing minutes"
+    /// The stage while the recording is finalised; then the queue's stages, as the window's badge words them.
+    static let savingRecording = "Saving the recording"
+    /// Where Start would be while the last recording is saved, disabled.
+    static let savingLastRecording = "Saving the last recording…"
     static let minutesReady = "Minutes ready"
     static let microphoneOK = "Microphone: capturing"
     static let microphoneBad = "Microphone: not receiving audio"
     static let systemOK = "System audio: capturing"
     static let systemBad = "System audio: not receiving audio"
     static let diskLow = "Disk space low"
+    static let recordingNotFinished = "The recording could not be finished; its files are kept"
+    static func minutesNotWritten(_ reason: String) -> String { "Minutes could not be written: \(reason)" }
+    static func recordingStopped(_ reason: String) -> String { "Recording stopped: \(reason)" }
 
     let button: StatusButton
     let menu: [MenuEntry]
@@ -128,16 +152,19 @@ struct StatusPresentation: Equatable {
         case .idle: (recording, live, finalising) = (false, false, false)
         }
         let healthy = i.health.mic == .ok && i.health.system == .ok && i.health.disk == .ok
-        let busy = finalising || i.processing != nil
         let failure = i.failure
         let failureLine = failure?.line
+        // What is being done, in the window's words: saving the recording, then the queue's stage.
+        let busyLabel: String? = finalising ? StatusPresentation.savingRecording
+            : i.processing != nil ? LibraryBadge.processing(stage: i.stage).text : nil
+        // The warning: a failure, else a line about a meeting that went wrong.
+        let warning = failureLine ?? (i.notice?.amber == true ? i.notice?.line : nil)
         // A dot is red while recording and plain while paused; either turns amber when capture is wrong.
         let dot: StatusTint = live && !healthy ? .amber : (recording ? .red : .plain)
         let timer = Preferences.timerText(i.seconds)
-        let busyHelp = (!finalising ? i.stage.map(ProcessingQueue.label) : nil) ?? StatusPresentation.writingMinutes
 
-        // The status item. A failure wins; during a recording the timer stays beside the warning.
-        if let line = failureLine {
+        // The status item. A warning wins; during a recording the timer stays beside it.
+        if let line = warning {
             button = StatusButton(symbol: "exclamationmark.triangle", tint: .amber, title: live ? timer : "", help: line)
         } else if recording {
             button = StatusButton(symbol: "circle.fill", tint: dot, title: timer,
@@ -145,8 +172,8 @@ struct StatusPresentation: Equatable {
         } else if live {
             button = StatusButton(symbol: "pause.circle", tint: dot, title: timer,
                                   help: healthy ? "Paused" : "Paused, but some audio is not arriving")
-        } else if busy {
-            button = StatusButton(symbol: "ellipsis.circle", tint: .plain, title: StatusPresentation.writingMinutes, help: busyHelp)
+        } else if let busy = busyLabel {
+            button = StatusButton(symbol: "ellipsis.circle", tint: .plain, title: busy, help: busy)
         } else if i.ready != nil {
             button = StatusButton(symbol: "checkmark.circle", tint: .plain, title: StatusPresentation.minutesReady, help: StatusPresentation.minutesReady)
         } else {
@@ -163,8 +190,8 @@ struct StatusPresentation: Equatable {
             info.append(line(i.health.system == .ok ? StatusPresentation.systemOK : StatusPresentation.systemBad))
             if i.health.disk == .low { info.append(line(StatusPresentation.diskLow)) }
         }
-        if busy { info.append(line(StatusPresentation.writingMinutes)) }
-        if let ready = i.ready { info.append(item(.openMinutes(ready))) }
+        if let busy = busyLabel { info.append(line(busy)) }
+        if let notice = i.notice { info.append(MenuEntry(title: notice.line, enabled: true, action: .openMinutes(notice.folder))) }
 
         var controls: [MenuAction]
         switch i.phase {
@@ -175,10 +202,12 @@ struct StatusPresentation: Equatable {
         }
         var folder: [MenuAction] = []
         if let dir = i.phase.folder { folder = [.showFolder(dir)] }
+        // While the last recording is saved, Start's place says so and cannot be chosen.
+        let saving = finalising ? [MenuEntry(title: StatusPresentation.savingLastRecording, enabled: false, action: .start)] : []
 
         let groups: [[MenuEntry]] = [
             info,
-            (controls + folder).map { item($0) },
+            saving + (controls + folder).map { item($0) },
             [item(.openMeetingbox), item(.preferences, enabled: i.preferencesAvailable)],
             [item(.quit)],
         ]
@@ -200,11 +229,11 @@ struct StatusPresentation: Equatable {
         if live {
             label = timer
         } else if finalising {
-            label = StatusPresentation.writingMinutes
+            label = StatusPresentation.savingRecording
         } else if let failure = failure {
             label = "Could not \(failure.action)"
         } else {
-            label = busy ? StatusPresentation.writingMinutes : "Ready"
+            label = busyLabel ?? "Ready"
         }
         panel = PanelPresentation(visible: visible, dot: failure != nil ? .amber : dot, label: label, controls: controls + folder,
                                   help: failureLine)

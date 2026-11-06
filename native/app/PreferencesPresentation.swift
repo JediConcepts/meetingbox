@@ -106,10 +106,17 @@ enum PreferencesPresentation {
     // MARK: recording entries
 
     /// The recording entries of the menu bar item's menu that apply now (Start recording, or Pause or
-    /// Resume, and Stop), in its order: what the Dock menu and the main menu's Recording menu offer,
-    /// and what New meeting in the window follows. One source, so they never disagree.
+    /// Resume, and Stop, or while the last recording is saved a disabled line in Start's place), in its
+    /// order: what the Dock menu and the main menu's Recording menu offer, and what New meeting in the
+    /// window follows. One source, so they never disagree.
     static func recordingEntries(_ menu: [MenuEntry]) -> [MenuEntry] {
         menu.filter { [MenuAction.start, .pause, .resume, .stop].contains($0.action) }
+    }
+
+    /// New meeting's words: what the menus put in Start's place while it cannot be chosen (Saving the
+    /// last recording…), else New meeting.
+    static func newMeetingTitle(_ entries: [MenuEntry]) -> String {
+        entries.first { $0.action == .start && !$0.enabled }?.title ?? "New meeting"
     }
 
     /// Stop and quit sends Stop and answers later, once the session is idle; Keep recording and quit
