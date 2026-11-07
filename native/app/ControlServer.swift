@@ -50,7 +50,8 @@ enum ControlRequest: Equatable {
 /// Turns requests into the session's answers. Serial: every reply is computed on `queue`, the
 /// session's tick queue, so two requests that arrive together are answered one after the other.
 /// Every recording command, whatever it comes from, goes through here. Sounds and windows are the
-/// app's: it hears about starts, stops, refusals and `show` through the closures, called on `queue`.
+/// app's: it hears about starts, stops, refusals, `show` and the socket's answers through the
+/// closures, called on `queue`.
 ///
 /// A start counts only once its recorder has stayed up for `startGrace`: one that exits at once (a
 /// missing permission, no microphone matching) is reported with its reason, not as recording. While
@@ -63,6 +64,8 @@ final class ControlHandler {
     /// After the grace, how long more to wait for a recorder that died to be settled.
     static let settleLimit: TimeInterval = 10
     static let cannotReach = "error cannot reach the recorder right now, try again"
+    /// The refusal of a start or toggle while the last recording is being saved.
+    static let stillSaving = "error " + Session.stillSaving
 
     let queue: DispatchQueue
     private let session: Session
@@ -76,6 +79,12 @@ final class ControlHandler {
     /// A start or toggle was refused because the last recording is still being saved (for the
     /// failure sound).
     var onRefused: (() -> Void)?
+    /// Every request on the socket, once, with its final reply (the line the client reads, after the
+    /// start wait), as the request it became: a toggle as the start or the stop it was handled as. So
+    /// a start that fails from the hotkey or the command is shown as one from the menus is. Never
+    /// from `perform` or `reply(for:)`: the menus and the floating button hear through `perform`'s
+    /// completion, and nothing is told twice.
+    var onAnswered: ((ControlRequest, String) -> Void)?
     /// The folder of the last recording a stop was asked for (on `queue`), so a start still settling
     /// for it is told apart from one that failed.
     private var stoppedFolder: URL?
@@ -142,19 +151,27 @@ final class ControlHandler {
         return handled
     }
 
+    /// What `request` comes to with the session as it is now: a toggle is a start (with its own mic
+    /// and dir) while idle or while the last recording is being saved, where it is refused as a start
+    /// is, so it neither stops that recording again nor starts another; and a stop while recording or
+    /// paused. Anything else is itself. Call on `queue`, in the same turn as the request is handled.
+    func resolved(_ request: ControlRequest) -> ControlRequest {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard case .toggle(let mic, let dir) = request else { return request }
+        switch session.phase {
+        case .idle, .finalising: return .start(mic: mic, dir: dir)
+        case .recording, .paused: return .stop
+        }
+    }
+
     private func handleRequest(_ request: ControlRequest) -> Handled {
         switch request {
         case .status:
             return .reply(status())
         case .start(let mic, let dir):
             return start(mic: mic, dir: dir)
-        case .toggle(let mic, let dir):
-            // While the last recording is being saved, toggle neither stops it again nor starts
-            // another: it is refused as a start is.
-            switch session.phase {
-            case .idle, .finalising: return start(mic: mic, dir: dir)
-            case .recording, .paused: return .reply(stop())
-            }
+        case .toggle:
+            return handleRequest(resolved(request))
         case .pause:
             return .reply(whileRecording(wanted: { if case .paused = $0 { return true }; return false }) { session.pause() })
         case .resume:
@@ -221,7 +238,7 @@ final class ControlHandler {
     private func start(mic: String?, dir: String?) -> Handled {
         if case .finalising = session.phase {
             onRefused?()
-            return .reply(ControlHandler.oneLine("error \(Session.stillSaving)"))
+            return .reply(ControlHandler.stillSaving)
         }
         let root: URL
         if let dir = dir {
@@ -377,7 +394,12 @@ final class ControlServer {
         guard let line = readLine(c) else { return }
         let reply: String
         if let text = String(data: line, encoding: .utf8), let request = ControlRequest.parse(text) {
-            switch handler.queue.sync(execute: { handler.handle(request) }) {
+            // What a toggle became is decided in the turn that handles it, so the phase cannot change between.
+            let (became, handled) = handler.queue.sync { () -> (ControlRequest, ControlHandler.Handled) in
+                let became = handler.resolved(request)
+                return (became, handler.handle(became))
+            }
+            switch handled {
             case .reply(let text):
                 reply = text
             case .starting(let dir):
@@ -392,6 +414,8 @@ final class ControlServer {
                 }
                 reply = outcome ?? "error not recording"
             }
+            // The app hears the final line before the client reads it.
+            handler.queue.sync { handler.onAnswered?(became, reply) }
         } else {
             reply = "error unknown request"
         }

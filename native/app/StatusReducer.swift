@@ -101,3 +101,23 @@ extension Failure {
         }
     }
 }
+
+/// A failure the app shows, and whether the failure sound plays with it.
+struct ShownFailure: Equatable {
+    let failure: Failure
+    let sound: Bool
+}
+
+extension Failure {
+    /// What the app does with `reply` to `request` (for a toggle, the start or stop it became), with
+    /// the session in `phase`: what `from` shows, the same for the menus and the socket, or nil (an
+    /// error is then only logged). A failed start over the socket (the hotkey or the command) also plays
+    /// the failure sound, since whoever pressed the hotkey is often not looking at the screen. Not the
+    /// refusal while the last recording is saved (`ControlHandler.onRefused` has played it already),
+    /// not a start from the menus or the floating button, and never a pause or resume.
+    static func shown(_ request: ControlRequest, reply: String, phase: Session.Phase, overSocket: Bool) -> ShownFailure? {
+        guard let failure = from(request, reply: reply, phase: phase) else { return nil }
+        guard case .start = request else { return ShownFailure(failure: failure, sound: false) }
+        return ShownFailure(failure: failure, sound: overSocket && reply != ControlHandler.stillSaving)
+    }
+}

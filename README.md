@@ -152,9 +152,14 @@ meetingbox status   # what is going on, and the folder
 The command is a client of the app: it opens the app if it is not running and
 hands over. `meetingbox stop` returns at once, as soon as the recording is
 stopped. The app then finishes the audio, transcribes and writes the minutes,
-showing how far it has got (Saving the recording, Transcribing, Finding speakers,
-Writing minutes) in the menu bar and the meetingbox window, and the minutes open in
-the window when they are ready. The recorded length counts recorded time only.
+showing how far it has got in the menu bar (Saving the recording, Transcribing,
+Finding speakers, Writing minutes) and in the meetingbox window, whose badge reads
+Saving, then the same stages. The minutes open in the window when they are ready.
+The recorded length counts recorded time only.
+
+A start that fails, from the hotkey, the command or the app, shows
+`Could not start: <reason>` in amber in the menu bar item; from the hotkey or the
+command, the failure sound plays too (when sounds are on).
 
 While the last recording is still being saved, a new one does not start: the
 command says so and exits with an error, the app plays its failure sound (when
@@ -178,10 +183,12 @@ recording carries on, and the next time the app opens it picks the recording up
 with the right timer. If the recorder stopped too, the app finishes the recording
 from its working files and queues it; if nothing can be rebuilt, the meeting is
 marked failed and every file is kept. A recording that stops without being asked
-(the recorder stopped, or the disk nearly filled), one that could not be finished,
-and minutes that could not be written are each said in the menu bar item, in amber
-and with the failure sound when sounds are on; click the line to open that
-meeting. While another recording is running the line waits in the menu, and the
+while the app is running (the recorder stopped, or the disk nearly filled), one
+that could not be finished, and minutes that could not be written are each said in
+the menu bar item, in amber and with the failure sound when sounds are on; click
+the line to open that meeting. A recorder that stopped while the app was closed is
+finished at the next launch and queued, or marked failed, without the Recording
+stopped line. While another recording is running the line waits in the menu, and the
 icon keeps showing that recording until it ends. The window says why, and for a
 recording never finished, how to finish it. To finish an interrupted recording by hand:
 

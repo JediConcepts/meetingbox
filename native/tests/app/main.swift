@@ -2766,15 +2766,48 @@ do {
           "B1: a start refused while the last recording is saved is shown")
 }
 
+// Residual: what the app does with an answer, the same for the menus and the socket, and when the
+// failure sound goes with it: only for a failed start over the socket (the hotkey or the command).
+do {
+    let start = ControlRequest.start(mic: nil, dir: nil)
+    let unreachable = String(ControlHandler.cannotReach.dropFirst("error ".count))
+    check(Failure.shown(start, reply: "error No input device", phase: .idle, overSocket: true)
+          == ShownFailure(failure: Failure("start", "No input device"), sound: true),
+          "shown: a failed start over the socket is shown, with one failure sound")
+    check(Failure.shown(start, reply: "error No input device", phase: .idle, overSocket: false)
+          == ShownFailure(failure: Failure("start", "No input device"), sound: false),
+          "shown: a failed start from the menus is shown, silently, as before")
+    check(Failure.shown(start, reply: "error " + Session.stillSaving, phase: .finalising(meetingA), overSocket: true)
+          == ShownFailure(failure: Failure("start", Session.stillSaving), sound: false),
+          "shown: the refusal while saving over the socket is shown, with no second sound (onRefused plays it)")
+    let lost = "error already recording in \(meetingA.path)"
+    check(Failure.shown(start, reply: lost, phase: .recording(meetingA), overSocket: true) == nil
+          && Failure.shown(start, reply: lost, phase: .paused(meetingA), overSocket: true) == nil,
+          "shown: a start over the socket naming the folder now recording gives nothing (B6)")
+    check(Failure.shown(start, reply: "ok recording \(meetingA.path)", phase: .recording(meetingA), overSocket: true) == nil
+          && Failure.shown(.stop, reply: "ok finalising \(meetingA.path)", phase: .finalising(meetingA), overSocket: true) == nil
+          && Failure.shown(.status, reply: "ok idle -", phase: .idle, overSocket: true) == nil,
+          "shown: an ok reply gives nothing")
+    check(Failure.shown(.pause, reply: ControlHandler.cannotReach, phase: .recording(meetingA), overSocket: true)
+          == ShownFailure(failure: Failure("pause", unreachable), sound: false)
+          && Failure.shown(.resume, reply: ControlHandler.cannotReach, phase: .paused(meetingA), overSocket: true)
+          == ShownFailure(failure: Failure("resume", unreachable), sound: false),
+          "shown: a pause or resume over the socket that could not reach the recorder is shown as from the menu, with no sound")
+    check(Failure.shown(.stop, reply: "error not recording", phase: .idle, overSocket: true) == nil
+          && Failure.shown(.pause, reply: "error not recording", phase: .idle, overSocket: true) == nil,
+          "shown: a stop, and the races, over the socket give nothing")
+}
+
 // One path for every action: perform answers like the socket, without ever waiting on the queue.
 do {
     let q = DispatchQueue(label: "meetingbox.test.perform")
     let onQ = DispatchSpecificKey<Bool>()
     q.setSpecific(key: onQ, value: true)
     let (r, h, _) = handlerRig(tickQueue: q)
-    var started = 0, stopped = 0
+    var started = 0, stopped = 0, told = 0
     h.onStarted = { _ in started += 1 }
     h.onStopped = { _ in stopped += 1 }
+    h.onAnswered = { _, _ in told += 1 }
 
     var now: String?
     q.sync { h.perform(.status) { now = $0 } }
@@ -2815,13 +2848,18 @@ do {
     var stop: String?
     q.sync { h.perform(.stop) { stop = $0 } }
     check(q.sync { stop } == "ok finalising \(dir!.path)" && q.sync { stopped } == 1, "perform: stop, and the stop sound is announced")
+    var toggled: String?
+    q.sync { h.perform(.toggle(mic: nil, dir: nil)) { toggled = $0 } }
+    check(q.sync { toggled } == "error " + Session.stillSaving && q.sync { told } == 0,
+          "perform: never tells onAnswered (the menus hear through the completion, and nothing is told twice)")
     q.sync {}
 }
 do {
     let q = DispatchQueue(label: "meetingbox.test.perform.dies")
     let (r, h, _) = handlerRig(tickQueue: q)
-    var started = 0
+    var started = 0, told = 0
     h.onStarted = { _ in started += 1 }
+    h.onAnswered = { _, _ in told += 1 }
     q.sync {
         r.rec.recoverResult = false
         r.rec.dieOnLaunch = (1, "No input device matching \"USB\"")
@@ -2837,6 +2875,7 @@ do {
     let (reply, sounds, phase) = q.sync { (answer, started, r.session.phase) }
     check(reply == "error No input device matching \"USB\"" && sounds == 0 && phase == .idle,
           "perform: error <its reason>, no start sound, and idle (\(reply ?? "nil"))")
+    check(q.sync { told } == 0, "perform: a start that fails after the wait never tells onAnswered either")
     q.sync {}
 }
 
@@ -4122,6 +4161,79 @@ do {
     q.sync {}
 }
 
+// Residual: every request on the socket reaches the app once, on the handler's queue, with the line
+// the client reads, after the start wait; a toggle as the start or the stop it became.
+do {
+    let tmp = shortTemp()
+    defer { try? fm.removeItem(at: tmp) }
+    let q = DispatchQueue(label: "meetingbox.test.answered")
+    let onQ = DispatchSpecificKey<Bool>()
+    q.setSpecific(key: onQ, value: true)
+    let (r, h, _) = handlerRig(tickQueue: q)
+    var told: [(request: ControlRequest, reply: String)] = []
+    var offQueue = 0
+    h.onAnswered = { request, reply in
+        if DispatchQueue.getSpecific(key: onQ) != true { offQueue += 1 }
+        told.append((request, reply))
+    }
+    let sock = tmp.appendingPathComponent("control.sock")
+    let server = try? ControlServer(socket: sock, handler: h)
+    server?.start()
+    func last() -> (count: Int, request: ControlRequest?, reply: String?) { q.sync { (told.count, told.last?.request, told.last?.reply) } }
+
+    // (d) status
+    let idle = ControlClient.send("status", to: sock)
+    let d = last()
+    check(idle == "ok idle -" && d.count == 1 && d.request == .status && d.reply == "ok idle -"
+          && Failure.shown(.status, reply: "ok idle -", phase: .idle, overSocket: true) == nil,
+          "answered: status is told once, with ok idle -, and nothing is shown (\(d))")
+
+    // (a) a toggle while idle whose start throws at once (less than 2 GB free), with its own mic and dir
+    let elsewhere = tmp.appendingPathComponent("Elsewhere").path
+    q.sync { r.free = 1 * GB }
+    let full = ControlClient.send("toggle mic=USB dir=\(elsewhere)", to: sock, timeout: 15)
+    let a = last()
+    check(full == "error not enough free disk space to record (2 GB needed)" && a.count == 2
+          && a.request == .start(mic: "USB", dir: elsewhere) && a.reply == full,
+          "answered: a toggle while idle whose start throws is told once, as the start with its mic and dir, with the line the client read (\(a))")
+    q.sync { r.free = 50 * GB }
+
+    // (c) a toggle whose recorder dies inside the grace: told once, after the wait, with its reason
+    q.sync {
+        r.rec.recoverResult = false
+        r.rec.dieOnLaunch = (1, "No input device matching \"USB\"")
+    }
+    let died = ControlClient.send("toggle", to: sock, timeout: 20)
+    let c = last()
+    check(died == "error No input device matching \"USB\"" && c.count == 3 && c.request == .start(mic: nil, dir: nil) && c.reply == died
+          && q.sync { r.rec.launches.count } == 1,
+          "answered: a toggle whose recorder dies inside the grace is told once, as the start, with the error after the wait (\(c))")
+    q.sync { r.rec.dieOnLaunch = nil }
+
+    // (b) a toggle while recording; reply(for:) tells nothing
+    let before = last().count
+    let recording = q.sync { h.reply(for: .start(mic: nil, dir: nil)) }
+    let dir = q.sync { r.session.phase.folder }
+    check(dir != nil && recording == "ok recording \(dir!.path)" && last().count == before, "answered: reply(for:) never tells onAnswered")
+    let stopped = ControlClient.send("toggle", to: sock, timeout: 15)
+    let b = last()
+    check(dir != nil && stopped == "ok finalising \(dir!.path)" && b.count == 4 && b.request == .stop && b.reply == stopped,
+          "answered: a toggle while recording is told once, as the stop, with ok finalising <dir> (\(b))")
+
+    // a toggle while the last recording is saved is a start, refused
+    let refused = ControlClient.send("toggle mic=USB", to: sock, timeout: 15)
+    let e = last()
+    check(refused == "error " + Session.stillSaving && e.count == 5 && e.request == .start(mic: "USB", dir: nil) && e.reply == refused,
+          "answered: a toggle while saving is told once, as the start it was refused as (\(e))")
+    check(q.sync { offQueue } == 0, "answered: always on the handler's queue")
+    server?.stop()
+    q.sync {
+        r.rec.exit(r.rec.nextPid, 0, verifies: true)
+        r.session.tick()
+    }
+    q.sync {}
+}
+
 // B2: an end nobody asked for is announced with its reason, and the reason is kept in meeting.json
 // (stopReason) through queued, processing and done.
 func stopReason(_ r: Rig, _ dir: URL) -> String? { r.json(dir)["stopReason"] as? String }
@@ -4531,6 +4643,77 @@ MainActor.assumeIsolated {
     prefs.sounds = false
     model.play("Basso")
     check(played.count == 8, "app: no sound at all with sounds off")
+    model.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// Residual in the app: a start that fails from the hotkey or the command shows as one from the menus
+// does, in amber, with Basso once; one from the menus stays silent; the refusal while saving plays
+// Basso once, not twice.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = true
+    prefs.openMinutes = false
+    var played: [String] = []
+    let rec = FakeRecorder()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                         playSound: { played.append($0) })
+    model.launch()
+    let sock = state.appendingPathComponent("control.sock")
+    /// The socket's answers are worked out on the main queue, so the command is sent from another
+    /// thread while this one runs the main run loop.
+    func command(_ line: String) -> String? {
+        let lock = NSLock()
+        var reply: String?? = nil
+        DispatchQueue.global().async {
+            let got = ControlClient.send(line, to: sock, timeout: 20)
+            lock.lock(); reply = .some(got); lock.unlock()
+        }
+        _ = settle({ lock.lock(); defer { lock.unlock() }; return reply != nil }, timeout: 25)
+        lock.lock(); defer { lock.unlock() }
+        return reply ?? nil
+    }
+
+    rec.launchError = FakeError(text: "Failed to start system audio: denied")
+    let denied = command("toggle")
+    let deniedLine = "Could not start: Failed to start system audio: denied"
+    check(denied == "error Failed to start system audio: denied", "app socket: a toggle whose start fails is an error to the command (\(denied ?? "nil"))")
+    check(settle { model.status.failure != nil } && model.status.failure == Failure("start", "Failed to start system audio: denied")
+          && model.presentation.button.tint == .amber && model.presentation.menu.contains { $0.title == deniedLine },
+          "app socket: the app shows Could not start: <reason>, in amber")
+    _ = settle({ false }, timeout: 0.3)
+    check(played == ["Basso"], "app socket: with Basso, once (\(played))")
+
+    rec.launchError = FakeError(text: "No input device")
+    let soundsBefore = played
+    model.perform(.start)
+    check(settle { model.status.failure == Failure("start", "No input device") }, "app menus: a failed start from the menus is shown")
+    _ = settle({ false }, timeout: 0.3)
+    check(played == soundsBefore, "app menus: silently, as before (\(played))")
+
+    rec.launchError = nil
+    let started = command("start")
+    let dir = model.session.phase.folder
+    check(dir != nil && started == "ok recording \(dir!.path)" && model.status.failure == nil,
+          "app socket: a start that records clears the failure (\(started ?? "nil"))")
+    check(dir != nil && command("stop") == "ok finalising \(dir!.path)", "app socket: stop")
+    let refused = command("toggle")
+    check(refused == "error " + Session.stillSaving, "app socket: a toggle while saving is refused (\(refused ?? "nil"))")
+    check(settle { model.status.failure == Failure("start", Session.stillSaving) }, "app socket: and the refusal is shown")
+    _ = settle({ false }, timeout: 0.3)
+    check(played == ["Basso", "Tink", "Pop", "Basso"], "app socket: with Basso once, not twice (\(played))")
+    let shownBefore = model.status
+    let soundsThen = played
+    let saving = command("status")
+    _ = settle({ false }, timeout: 0.3)
+    check(saving == "ok finalising \(dir?.path ?? "-")" && model.status == shownBefore && played == soundsThen,
+          "app socket: an ok reply changes nothing shown, and plays nothing")
+
+    rec.exit(rec.nextPid, 0, verifies: true)
+    check(settle { model.session.phase == .idle }, "app socket: the recording is saved")
     model.shutDown()
     try? fm.removeItem(at: state)
 }

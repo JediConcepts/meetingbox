@@ -123,6 +123,9 @@ final class AppModel: ObservableObject {
         handler.onStopped = { [weak self] _ in Task { @MainActor in self?.play("Pop") } }
         // A start or toggle refused while the last recording is saved, from the menus or the command.
         handler.onRefused = { [weak self] in Task { @MainActor in self?.play("Basso") } }
+        // Every answer the socket gave (the hotkey or the command): a failed start there is shown as
+        // one from the menus is, with the failure sound.
+        handler.onAnswered = { [weak self] request, reply in Task { @MainActor in self?.answered(request, reply, overSocket: true) } }
         // `show` from the socket (a second launch, or the command): the window.
         handler.onShow = { [weak self] in Task { @MainActor in self?.showLibrary() } }
 
@@ -218,18 +221,21 @@ final class AppModel: ObservableObject {
         nonisolated(unsafe) let handler = self.handler
         handler.queue.async { [weak self] in
             handler.perform(request) { reply in
-                Task { @MainActor in self?.answered(request, reply) }
+                Task { @MainActor in self?.answered(request, reply, overSocket: false) }
             }
         }
     }
 
     /// A failed start, and a pause or resume that could not reach the recorder, are shown (the icon
-    /// and the menu's first line). The races, such as a pause that lost to the recorder ending, or a
-    /// start that lost to another start of the recording now running, only go to the log.
-    private func answered(_ request: ControlRequest, _ reply: String) {
+    /// and the menu's first line), from the menus and the socket alike; a failed start over the socket
+    /// plays the failure sound too (`Failure.shown`). The races, such as a pause that lost to the
+    /// recorder ending, or a start that lost to another start of the recording now running, only go
+    /// to the log.
+    private func answered(_ request: ControlRequest, _ reply: String, overSocket: Bool) {
         guard reply.hasPrefix("error ") else { return }
-        if let failure = Failure.from(request, reply: reply, phase: session.phase) {
-            apply(.failed(failure))
+        if let shown = Failure.shown(request, reply: reply, phase: session.phase, overSocket: overSocket) {
+            apply(.failed(shown.failure))
+            if shown.sound { play("Basso") }
         } else {
             NSLog("meetingbox: %@ was refused: %@", String(describing: request), String(reply.dropFirst("error ".count)))
         }
