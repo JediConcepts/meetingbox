@@ -2798,6 +2798,30 @@ do {
           "shown: a stop, and the races, over the socket give nothing")
 }
 
+// Residual round 1: the refusal while saving goes once the save is over; any other failure stays,
+// and the notice is never touched.
+do {
+    let refusal = Failure("start", Session.stillSaving)
+    let note = Notice(kind: .minutesReady, folder: meetingB, line: StatusPresentation.minutesReady)
+    var s = StatusInput()
+    s.apply(.phase(.recording(meetingA)))
+    s.apply(.phase(.finalising(meetingA)))
+    s.apply(.minutesReady(meetingB))
+    s.apply(.failed(refusal))
+    s.apply(.phase(.finalising(meetingA)))
+    check(s.failure == refusal && s.notice == note, "reducer: the refusal while saving stays through a repeated finalising phase, with the notice")
+    s.apply(.phase(.idle))
+    check(s.failure == nil && s.notice == note, "reducer: the refusal while saving goes once the save is over, and the notice stays")
+    var t = StatusInput()
+    t.apply(.phase(.recording(meetingA)))
+    t.apply(.phase(.finalising(meetingA)))
+    t.apply(.minutesReady(meetingB))
+    let full = Failure("start", "not enough free disk space to record (2 GB needed)")
+    t.apply(.failed(full))
+    t.apply(.phase(.idle))
+    check(t.failure == full && t.notice == note, "reducer: any other start failure stays once the save is over, and so does the notice")
+}
+
 // One path for every action: perform answers like the socket, without ever waiting on the queue.
 do {
     let q = DispatchQueue(label: "meetingbox.test.perform")
@@ -4647,9 +4671,23 @@ MainActor.assumeIsolated {
     try? fm.removeItem(at: state)
 }
 
+/// A line over an app's socket. The socket's answers are worked out on the main queue, so the line is
+/// sent from another thread while this one runs the main run loop.
+func socketCommand(_ line: String, to sock: URL) -> String? {
+    let lock = NSLock()
+    var reply: String?? = nil
+    DispatchQueue.global().async {
+        let got = ControlClient.send(line, to: sock, timeout: 20)
+        lock.lock(); reply = .some(got); lock.unlock()
+    }
+    _ = settle({ lock.lock(); defer { lock.unlock() }; return reply != nil }, timeout: 25)
+    lock.lock(); defer { lock.unlock() }
+    return reply ?? nil
+}
+
 // Residual in the app: a start that fails from the hotkey or the command shows as one from the menus
 // does, in amber, with Basso once; one from the menus stays silent; the refusal while saving plays
-// Basso once, not twice.
+// Basso once, not twice, and goes once the save is over.
 MainActor.assumeIsolated {
     let state = shortTemp()
     let root = freshRoot()
@@ -4663,19 +4701,7 @@ MainActor.assumeIsolated {
                          playSound: { played.append($0) })
     model.launch()
     let sock = state.appendingPathComponent("control.sock")
-    /// The socket's answers are worked out on the main queue, so the command is sent from another
-    /// thread while this one runs the main run loop.
-    func command(_ line: String) -> String? {
-        let lock = NSLock()
-        var reply: String?? = nil
-        DispatchQueue.global().async {
-            let got = ControlClient.send(line, to: sock, timeout: 20)
-            lock.lock(); reply = .some(got); lock.unlock()
-        }
-        _ = settle({ lock.lock(); defer { lock.unlock() }; return reply != nil }, timeout: 25)
-        lock.lock(); defer { lock.unlock() }
-        return reply ?? nil
-    }
+    func command(_ line: String) -> String? { socketCommand(line, to: sock) }
 
     rec.launchError = FakeError(text: "Failed to start system audio: denied")
     let denied = command("toggle")
@@ -4714,6 +4740,71 @@ MainActor.assumeIsolated {
 
     rec.exit(rec.nextPid, 0, verifies: true)
     check(settle { model.session.phase == .idle }, "app socket: the recording is saved")
+    check(settle({ model.status.phase == .idle && model.status.failure == nil }, timeout: 3)
+          && model.presentation.button.symbol != "exclamationmark.triangle" && model.presentation.button.tint != .amber,
+          "app socket: once the save is over and idle, the refusal is no longer shown, nor the amber triangle (\(model.presentation.button))")
+    model.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// Residual round 1 in the app: a command over the socket that acts on the recording clears an old
+// failure, as a menu choice does; status leaves it; a retry that fails shows its own failure.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = true
+    prefs.openMinutes = false
+    let rec = FakeRecorder()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                         playSound: { _ in })
+    // An adopted recorder, so pause and resume check its identity (`find`) and can fail to reach it.
+    let live = Session.folderURL(root.appendingPathComponent("2026-11-08_0955").path)
+    try! fm.createDirectory(at: live, withIntermediateDirectories: true)
+    try! model.store.update(live) { $0.started = Date().addingTimeInterval(-300); $0.state = .recording }
+    try! live.path.write(to: state.appendingPathComponent("recording.dir"), atomically: true, encoding: .utf8)
+    rec.alive.insert(4242)
+    rec.running[live.path] = 4242
+    model.launch()
+    check(model.session.phase == .recording(live), "app socket retry: an adopted recording")
+    let sock = state.appendingPathComponent("control.sock")
+    func command(_ line: String) -> String? { socketCommand(line, to: sock) }
+    let reason = String(ControlHandler.cannotReach.dropFirst("error ".count))
+
+    rec.findUnknown = true
+    let unreached = command("pause")
+    check(unreached == ControlHandler.cannotReach && settle { model.status.failure == Failure("pause", reason) },
+          "app socket retry: a pause that cannot reach the recorder is shown (\(unreached ?? "nil"))")
+    rec.findUnknown = false
+    let paused = command("pause")
+    _ = settle({ false }, timeout: 0.3)
+    check(paused == "ok paused \(live.path)" && model.status.failure == nil && model.presentation.button.tint != .amber,
+          "app socket retry: a pause that then works leaves no failure shown (\(model.presentation.button))")
+
+    rec.findUnknown = true
+    check(command("resume") == ControlHandler.cannotReach && settle { model.status.failure == Failure("resume", reason) },
+          "app socket retry: a resume that cannot reach the recorder is shown")
+    let status = command("status")
+    _ = settle({ false }, timeout: 0.3)
+    check(status == "ok paused \(live.path)" && model.status.failure == Failure("resume", reason),
+          "app socket retry: status over the socket leaves the failure shown")
+
+    rec.findUnknown = false
+    check(command("resume") == "ok recording \(live.path)", "app socket retry: resume")
+    rec.findUnknown = true
+    check(command("pause") == ControlHandler.cannotReach && settle { model.status.failure == Failure("pause", reason) },
+          "app socket retry: another pause that cannot reach the recorder is shown")
+    rec.findUnknown = false
+    rec.exit(4242, 0, verifies: true) // the recording ends on its own; the old pause failure stays
+    check(settle { model.status.phase == .idle } && model.status.failure == Failure("pause", reason),
+          "app socket retry: the pause failure outlives the recording")
+    rec.launchError = FakeError(text: "Failed to start system audio: denied")
+    let denied = command("toggle")
+    check(denied == "error Failed to start system audio: denied"
+          && settle { model.status.failure == Failure("start", "Failed to start system audio: denied") }
+          && model.presentation.button.help == "Could not start: Failed to start system audio: denied",
+          "app socket retry: after the old pause failure, a toggle whose start fails shows the new start failure")
     model.shutDown()
     try? fm.removeItem(at: state)
 }

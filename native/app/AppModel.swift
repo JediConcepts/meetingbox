@@ -230,8 +230,15 @@ final class AppModel: ObservableObject {
     /// and the menu's first line), from the menus and the socket alike; a failed start over the socket
     /// plays the failure sound too (`Failure.shown`). The races, such as a pause that lost to the
     /// recorder ending, or a start that lost to another start of the recording now running, only go
-    /// to the log.
+    /// to the log. A command over the socket that acts on the recording first clears an old failure,
+    /// whatever its reply, as a menu choice does in `perform`; status and show do not.
     private func answered(_ request: ControlRequest, _ reply: String, overSocket: Bool) {
+        if overSocket {
+            switch request {
+            case .start, .stop, .pause, .resume: apply(.acted) // a toggle comes as the start or stop it became
+            case .status, .toggle, .show: break
+            }
+        }
         guard reply.hasPrefix("error ") else { return }
         if let shown = Failure.shown(request, reply: reply, phase: session.phase, overSocket: overSocket) {
             apply(.failed(shown.failure))

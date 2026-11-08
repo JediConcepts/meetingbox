@@ -20,7 +20,8 @@ enum StatusEvent {
     case unfinished(URL, line: String)
     /// The user opened that meeting in the window (its menu line, or the window coming forward on it).
     case minutesOpened(URL)
-    /// The user chose something in a menu or on the floating button.
+    /// The user chose something in a menu or on the floating button, or a command over the socket
+    /// acted on the recording (start, stop, pause or resume).
     case acted
     /// What they asked for did not happen.
     case failed(Failure)
@@ -43,9 +44,17 @@ extension StatusInput {
             // A new recording is news enough: the line about the last meeting and any old failure go.
             // A recording taken up as paused, or resumed, is not a new one. A failure is not cleared
             // when a recording ends, because a start that failed arrives after its recorder has died.
+            // The one exception is the refusal while the last recording was being saved: it is about
+            // that save, so it goes as soon as the session is anything but finalising.
             if began, case .recording = new {
                 notice = nil
                 failure = nil
+            }
+            if failure == Failure.stillSaving {
+                switch new {
+                case .finalising: break
+                case .idle, .recording, .paused: failure = nil
+                }
             }
             if !clockRuns { seconds = 0 }
         case .tick(let now, let current):
@@ -109,6 +118,10 @@ struct ShownFailure: Equatable {
 }
 
 extension Failure {
+    /// The refusal of a start while the last recording is being saved, as it is shown: the reason
+    /// `ControlHandler.stillSaving` carries.
+    static let stillSaving = Failure("start", String(ControlHandler.stillSaving.dropFirst("error ".count)))
+
     /// What the app does with `reply` to `request` (for a toggle, the start or stop it became), with
     /// the session in `phase`: what `from` shows, the same for the menus and the socket, or nil (an
     /// error is then only logged). A failed start over the socket (the hotkey or the command) also plays
