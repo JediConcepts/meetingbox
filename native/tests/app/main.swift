@@ -2820,6 +2820,33 @@ do {
     t.apply(.failed(full))
     t.apply(.phase(.idle))
     check(t.failure == full && t.notice == note, "reducer: any other start failure stays once the save is over, and so does the notice")
+
+    // The other order: a refusal that arrives after the save has already ended is not shown.
+    var late = StatusInput()
+    late.apply(.phase(.recording(meetingA)))
+    late.apply(.phase(.finalising(meetingA)))
+    late.apply(.minutesReady(meetingB))
+    late.apply(.phase(.idle))
+    late.apply(.failed(Failure.stillSaving))
+    check(late.failure == nil && late.notice == note, "reducer: a refusal while saving that arrives once the save is over is not shown, and the notice stays")
+    for (label, next) in [("recording", Session.Phase.recording(meetingB)), ("paused", .paused(meetingB))] {
+        var s = StatusInput()
+        s.apply(.phase(.recording(meetingA)))
+        s.apply(.phase(.finalising(meetingA)))
+        s.apply(.phase(.idle))
+        s.apply(.phase(next))
+        s.apply(.failed(Failure.stillSaving))
+        check(s.failure == nil, "reducer: a refusal while saving that arrives once the session is \(label) again is not shown")
+    }
+    var during = StatusInput()
+    during.apply(.phase(.recording(meetingA)))
+    during.apply(.phase(.finalising(meetingA)))
+    during.apply(.failed(Failure.stillSaving))
+    check(during.failure == Failure.stillSaving, "reducer: a refusal while saving that arrives while saving is shown")
+    var idle = StatusInput()
+    idle.apply(.phase(.idle))
+    idle.apply(.failed(full))
+    check(idle.failure == full, "reducer: while idle, any other failure is still shown")
 }
 
 // One path for every action: perform answers like the socket, without ever waiting on the queue.

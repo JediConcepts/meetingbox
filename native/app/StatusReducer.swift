@@ -44,8 +44,10 @@ extension StatusInput {
             // A new recording is news enough: the line about the last meeting and any old failure go.
             // A recording taken up as paused, or resumed, is not a new one. A failure is not cleared
             // when a recording ends, because a start that failed arrives after its recorder has died.
-            // The one exception is the refusal while the last recording was being saved: it is about
-            // that save, so it goes as soon as the session is anything but finalising.
+            // The one exception is the refusal while the last recording was being saved, which is
+            // shown only while saving, whichever of it and the save's end arrives first: here it goes
+            // as soon as the session is anything but finalising, and `.failed` below does not set it
+            // once the session is no longer finalising.
             if began, case .recording = new {
                 notice = nil
                 failure = nil
@@ -76,6 +78,13 @@ extension StatusInput {
         case .acted:
             failure = nil
         case .failed(let what):
+            // The refusal while saving, arriving once the save is over, would be false (see `.phase`).
+            if what == Failure.stillSaving {
+                switch phase {
+                case .finalising: break
+                case .idle, .recording, .paused: return
+                }
+            }
             failure = what
         }
     }
