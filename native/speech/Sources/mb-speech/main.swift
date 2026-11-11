@@ -53,10 +53,14 @@ do {
                               download: sessionDownload())
     case ("check", 2):
         if let reason = checkModels(at: URL(fileURLWithPath: arguments[1])) { fail(reason) }
+    case ("transcribe", 4):
+        try await transcribe(URL(fileURLWithPath: arguments[1]), wav: URL(fileURLWithPath: arguments[2]),
+                             out: URL(fileURLWithPath: arguments[3]))
     case ("warm", 2):
         try await warm(URL(fileURLWithPath: arguments[1]))
     default:
-        fail("usage: mb-speech version | cache-dir | fetch <models> <manifest> | check <models> | warm <models>")
+        fail("usage: mb-speech version | cache-dir | fetch <models> <manifest> | check <models> | warm <models>"
+             + " | transcribe <models> <wav> <out.json>")
     }
 } catch let error as SpeechError {
     fail(error.reason)

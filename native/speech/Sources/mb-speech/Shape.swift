@@ -164,3 +164,58 @@ func writePrivately(_ data: Data, to target: URL) throws {
         throw SpeechError(reason: "\(target.path) cannot be written")
     }
 }
+
+/// One of the transcriber's tokens, with its timing and confidence.
+struct Token {
+    let text: String
+    let start: Double
+    let end: Double
+    let confidence: Double
+}
+
+/// One word of the words JSON.
+struct Word: Equatable {
+    var start: Double
+    var end: Double
+    var text: String
+    var confidence: Double
+}
+
+/// Parakeet's tokens to words. FluidAudio's own word builder has no confidence, so this is ours:
+/// a token starting with a space starts a word (the space dropped), any other token joins the
+/// current word; empty, `<blank>` and `<pad>` tokens are skipped. A token that is only a space ends
+/// the current word, so the next token starts one (Ultra writes digits and `$` that way, and
+/// FluidAudio's own rule splits there too). A word starts with its first token and ends with its
+/// last, and its confidence is the lowest of its tokens'.
+func mergeTokens(_ tokens: [Token]) -> [Word] {
+    var words: [Word] = []
+    var boundary = true
+    for token in tokens {
+        if token.text.isEmpty || token.text == "<blank>" || token.text == "<pad>" { continue }
+        let starts = token.text.hasPrefix(" ") || token.text.hasPrefix("\u{2581}")
+        let text = starts ? String(token.text.dropFirst()) : token.text
+        if text.isEmpty { boundary = true; continue }
+        defer { boundary = false }
+        if starts || boundary {
+            words.append(Word(start: token.start, end: token.end, text: text, confidence: token.confidence))
+        } else {
+            words[words.count - 1].text += text
+            words[words.count - 1].end = token.end
+            words[words.count - 1].confidence = min(words[words.count - 1].confidence, token.confidence)
+        }
+    }
+    return words
+}
+
+/// The words JSON every transcriber's output is read in:
+/// `{"engine": "parakeet-ultra", "words": [{"start": 1.2, "end": 1.48, "text": "Hello,", "confidence": 0.97}]}`.
+func wordsJSON(engine: String, words: [Word]) -> Data {
+    func quoted(_ text: String) -> String {
+        String(data: (try? JSONEncoder().encode(text)) ?? Data("\"\"".utf8), encoding: .utf8) ?? "\"\""
+    }
+    func number(_ value: Double) -> String { String(format: "%.3f", value.isFinite ? value : 0) }
+    let lines = words.map {
+        "{\"start\": \(number($0.start)), \"end\": \(number($0.end)), \"text\": \(quoted($0.text)), \"confidence\": \(number($0.confidence))}"
+    }
+    return Data("{\"engine\": \(quoted(engine)), \"words\": [\(lines.joined(separator: ",\n"))]}\n".utf8)
+}

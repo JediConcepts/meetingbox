@@ -96,6 +96,34 @@ let mode = (try? fm.attributesOfItem(atPath: target.path)[.posixPermissions] as?
 check(mode == 0o600, "write: the file is 0600")
 check(!fm.fileExists(atPath: scratch.appendingPathComponent(".part-out.json").path), "write: no temporary name is left")
 
+// mergeTokens: Parakeet's tokens to words, as FluidAudio's own word builder has no confidence.
+let merged = mergeTokens([
+    Token(text: " Hel", start: 1.2, end: 1.3, confidence: 0.99),
+    Token(text: "lo,", start: 1.3, end: 1.48, confidence: 0.97),
+    Token(text: "<blank>", start: 1.5, end: 1.6, confidence: 0.1),
+    Token(text: "", start: 1.6, end: 1.7, confidence: 0.1),
+    Token(text: "<pad>", start: 1.7, end: 1.8, confidence: 0.1),
+    Token(text: " world", start: 2.0, end: 2.4, confidence: 0.9),
+    Token(text: "'s", start: 2.4, end: 2.5, confidence: 0.95),
+])
+check(merged.map(\.text) == ["Hello,", "world's"], "merge: a token starting with a space starts a word, others join it \(merged.map(\.text))")
+check(merged.first?.start == 1.2 && merged.first?.end == 1.48, "merge: start is the first token's start, end the last token's end")
+check(merged.first?.confidence == 0.97 && merged.last?.confidence == 0.9, "merge: confidence is the lowest of the word's tokens")
+check(mergeTokens([Token(text: "<blank>", start: 0, end: 1, confidence: 1)]).isEmpty, "merge: blank and pad tokens make no word")
+let spaced = mergeTokens([Token(text: " at", start: 0, end: 0.2, confidence: 1), Token(text: " ", start: 0.2, end: 0.3, confidence: 1),
+                          Token(text: "40", start: 0.3, end: 0.6, confidence: 1), Token(text: "\u{2581}", start: 0.6, end: 0.7, confidence: 1),
+                          Token(text: "$5", start: 0.7, end: 0.9, confidence: 1)])
+check(spaced.map(\.text) == ["at", "40", "$5"], "merge: a token that is only a space ends the word, as FluidAudio's own rule \(spaced.map(\.text))")
+let wordsData = wordsJSON(engine: "parakeet-ultra", words: [Word(start: 1.2, end: 1.48, text: "Hello, \"you\"", confidence: 0.97)])
+let parsed = (try? JSONSerialization.jsonObject(with: wordsData)) as? [String: Any]
+let firstWord = (parsed?["words"] as? [[String: Any]])?.first
+check(parsed?["engine"] as? String == "parakeet-ultra" && (parsed?["words"] as? [Any])?.count == 1,
+      "words JSON: engine and words, as the contract says")
+check(firstWord?["start"] as? Double == 1.2 && firstWord?["end"] as? Double == 1.48 && firstWord?["text"] as? String == "Hello, \"you\""
+      && firstWord?["confidence"] as? Double == 0.97, "words JSON: start, end, text and confidence per word \(firstWord ?? [:])")
+let emptyWords = (try? JSONSerialization.jsonObject(with: wordsJSON(engine: "parakeet-ultra", words: []))) as? [String: Any]
+check((emptyWords?["words"] as? [Any])?.isEmpty == true, "words JSON: no words is an empty list")
+
 // No source may ask FluidAudio to download, recover or clear models on its own.
 let banned = ["prepareModels", "AsrModels.download", "downloadAndLoad", "loadFromCache", "loadWithAutoRecovery",
               "ModelHub.clearCache"]

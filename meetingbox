@@ -27,7 +27,9 @@ VERSION="2.0.0"
 
 BASE_DIR="${MB_DIR:-$HOME/Meetings}"
 DIR_ARG="${MB_DIR:-}"                    # sent to the app only when given
-ENGINE="${MB_ENGINE:-auto}"              # auto | native | whisper
+ENGINE="${MB_ENGINE:-auto}"              # auto | parakeet | native | whisper
+WRITER="apple"                           # who writes the minutes: apple
+WORK=""                                  # the run's private work folder, once made
 LOCALE="${MB_LOCALE:-en-GB}"
 MIC="${MB_MIC:-}"                        # substring match, empty = system default
 WHISPER_MODEL="${MB_WHISPER_MODEL:-}"
@@ -1588,17 +1590,52 @@ recover_cmd() {
 
 # ----------------------------------------------------------------- transcribing
 
+# The transcriber a run starts with: a flag, else MB_ENGINE, else the app's choice, else Parakeet.
+# Parakeet only when it is set up and the meeting is in English; otherwise Apple's, and the log
+# says why. Prints parakeet, native or whisper.
 pick_engine() {
-  case "$ENGINE" in
-    native)  have speech-analyzer || die "speech-analyzer not installed. Run: meetingbox setup"; printf 'native' ;;
-    whisper) have whisper-cli     || die "whisper-cli not installed. Run: meetingbox setup";     printf 'whisper' ;;
-    auto)
-      if have speech-analyzer; then printf 'native'
-      elif have whisper-cli;   then printf 'whisper'
-      else die "no transcriber installed. Run: meetingbox setup"; fi ;;
-    *) die "unknown engine: $ENGINE" ;;
+  local choice="$ENGINE"
+  if [ "$choice" = auto ]; then
+    case "$(defaults read com.jediconcepts.meetingbox transcriber 2>/dev/null || true)" in
+      apple) choice=native ;;
+      *)     choice=parakeet ;;
+    esac
+  fi
+  case "$choice" in
+    parakeet)
+      case "$LOCALE" in
+        en|en[-_]*) ;;
+        *) info "Parakeet is used for English meetings only, and this one is set to $LOCALE, so Apple's transcriber is used"
+           choice=native ;;
+      esac ;;
+    native|whisper) ;;
+    *) die "unknown engine: $choice" ;;
+  esac
+  if [ "$choice" = parakeet ] && ! speech_usable; then
+    warn "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup."
+    choice=native
+  fi
+  printf '%s' "$choice"
+}
+
+# The transcribers tried on each side, in order: the chosen one, then Apple's, then whisper.
+engine_chain() {
+  case "$1" in
+    parakeet) echo "parakeet native whisper" ;;
+    native)   echo "native whisper" ;;
+    whisper)  echo "whisper native" ;;
   esac
 }
+engine_name()  { case "$1" in parakeet) echo "Parakeet" ;; native) echo "Apple's transcriber" ;; *) echo "whisper" ;; esac; }
+engine_title() { case "$1" in parakeet) echo "NVIDIA Parakeet" ;; native) echo "Apple SpeechAnalyzer" ;; *) echo "whisper.cpp" ;; esac; }
+
+# The run's private work folder, made inside OUT, for WAVs and the speech helper's own temporary
+# files. drop_work removes it, and so does end_processing whatever happens.
+make_work() {
+  [ -n "$WORK" ] && [ -d "$WORK" ] && return 0
+  WORK="$(mktemp -d "${1:?}/.work.XXXXXX")" || die "could not make a working folder in $1"
+}
+drop_work() { [ -z "$WORK" ] || rm -rf "$WORK"; WORK=""; }
 
 find_whisper_model() {
   [ -n "$WHISPER_MODEL" ] && { printf '%s' "$WHISPER_MODEL"; return; }
@@ -1612,9 +1649,28 @@ find_whisper_model() {
   printf ''
 }
 
+# A v1.2 meeting's one mixed file to plain text: Parakeet's words joined, else Apple's, else whisper.
 transcribe() {
-  audio="$1"; out="$2"
+  local audio="$1" out="$2" engine text model wav
   engine="$(pick_engine)"
+  if [ "$engine" = parakeet ]; then
+    say "transcribing on device (NVIDIA Parakeet)"
+    make_work "$(dirname "$out")"
+    if pk_run "$audio" "$WORK/words.json" \
+       && text="$(jq -r '[.words[].text] | join(" ")' "$WORK/words.json" 2>/dev/null)" && [ -n "$text" ]; then
+      printf '%s\n' "$text" > "$out"
+      drop_work
+      ok "transcript: $(wc -w < "$out" | tr -d ' ') words"
+      return 0
+    fi
+    drop_work
+    warn "Parakeet could not transcribe $(basename "$audio"), trying Apple's transcriber"
+    engine=native
+  fi
+  if [ "$engine" = native ] && ! have speech-analyzer; then
+    have whisper-cli || die "no transcriber installed. Run: meetingbox setup"
+    engine=whisper
+  fi
 
   case "$engine" in
     native)
@@ -1631,12 +1687,13 @@ transcribe() {
       model="$(find_whisper_model)"
       [ -n "$model" ] || die "no whisper model found. Run: meetingbox setup"
       have ffmpeg || die "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"
-      wav="${audio%.*}.16k.wav"
+      make_work "$(dirname "$out")"
+      wav="$WORK/$(basename "${audio%.*}").16k.wav"
       say "transcribing on device (whisper.cpp, $(basename "$model"))"
       ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav"
       whisper-cli -m "$model" -f "$wav" --no-timestamps \
-        --output-txt --output-file "${out%.txt}" >/dev/null || die "whisper-cli failed"
-      rm -f "$wav"
+        --output-txt --output-file "${out%.txt}" >/dev/null || { drop_work; die "whisper-cli failed"; }
+      drop_work
       ;;
   esac
 
@@ -1677,71 +1734,91 @@ sa_run() {
   return 1
 }
 
-# One side of the call to word timed JSON, for mb-transcript. A side that will
-# not transcribe is left empty with a warning, and returns 1: one side is better
-# than none, but both failing is a different problem.
-transcribe_words() {
-  local audio="$1" out="$2" engine model wav
-  engine="$(pick_engine)"
-  case "$engine" in
-    native)
-      sa_run "$out" "$audio" -f json \
-        || { warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"; return 1; }
-      ;;
-    whisper)
-      model="$(find_whisper_model)"
-      [ -n "$model" ] || die "no whisper model found. Run: meetingbox setup"
-      have ffmpeg || die "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"
-      wav="${audio%.*}.16k.wav"
-      if ! { ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
-             && whisper-cli -m "$model" -f "$wav" -oj -ml 1 -sow --output-file "${out%.json}" >/dev/null; }; then
-        warn "could not transcribe $(basename "$audio"), carrying on without it"; : > "$out"
-        rm -f "$wav"; return 1
-      fi
-      rm -f "$wav"
-      ;;
-  esac
+# Parakeet on one side: the audio made a 16 kHz mono WAV in the work folder, then mb-speech writes
+# the words JSON, with its own temporary files in the work folder too. Its one-line reason for a
+# failure goes to the log.
+pk_run() {
+  local audio="$1" out="$2" wav err
+  wav="$WORK/$(basename "${audio%.*}").wav"; err="$WORK/speech.err"
+  if ! afconvert -f WAVE -d LEI16@16000 -c 1 "$audio" "$wav" >/dev/null 2>&1; then
+    rm -f "$wav"; info "Parakeet could not read $(basename "$audio")"; return 1
+  fi
+  if ! TMPDIR="$WORK" "$SPEECH_BIN" transcribe "$SPEECH_MODELS" "$wav" "$out" >/dev/null 2>"$err"; then
+    info "Parakeet: $(head -n 1 "$err")"; rm -f "$wav" "$err"; return 1
+  fi
+  rm -f "$wav" "$err"
 }
 
-# Your side and the other side transcribed on their own, then merged by
-# mb-transcript into lines labelled Me and Them.
+# whisper.cpp on one side, its WAV in the work folder.
+whisper_words() {
+  local audio="$1" out="$2" model wav rc=0
+  model="$(find_whisper_model)"
+  [ -n "$model" ] || { info "no whisper model found. Run: meetingbox setup"; return 1; }
+  have ffmpeg || { info "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"; return 1; }
+  wav="$WORK/$(basename "${audio%.*}").16k.wav"
+  if ! { ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
+         && whisper-cli -m "$model" -f "$wav" -oj -ml 1 -sow --output-file "${out%.json}" >/dev/null; }; then
+    rc=1
+  fi
+  rm -f "$wav"
+  return "$rc"
+}
+
+# One side of the call to word timed JSON in OUT, for mb-transcript: each transcriber in turn. A
+# side every transcriber fails on is written as no words, with a warning, and returns 1: one side
+# is better than none, but both failing is a different problem.
+transcribe_words() {
+  local audio="$1" out="$2" first="$3" e tried=""
+  for e in $(engine_chain "$first"); do
+    case "$e" in
+      native)  have speech-analyzer || continue ;;
+      whisper) have whisper-cli || continue ;;
+    esac
+    [ -z "$tried" ] || warn "$(engine_name "$tried") could not transcribe $(basename "$audio"), trying $(engine_name "$e")"
+    tried="$e"
+    case "$e" in
+      parakeet) pk_run "$audio" "$out" && return 0 ;;
+      native)   sa_run "$out" "$audio" -f json && return 0 ;;
+      whisper)  whisper_words "$audio" "$out" && return 0 ;;
+    esac
+  done
+  warn "could not transcribe $(basename "$audio"), carrying on without it"
+  printf '{"engine": "none", "words": []}\n' > "$out"
+  chmod 600 "$out"
+  return 1
+}
+
+# Your side and the other side transcribed on their own from the audio in SRC, then merged by
+# mb-transcript into lines labelled Me and Them. Every output goes in OUT, with the WAVs in the
+# run's work folder there: nothing in SRC is changed.
+# Usage: transcribe_channels SRC OUT
 transcribe_channels() {
-  local dir="$1" out="$2" engine tmp err msg failed=0
+  local src="$1" dest="$2" engine tmp err msg failed=0
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
   engine="$(pick_engine)"
-  case "$engine" in
-    native)  say "transcribing each side on device (Apple SpeechAnalyzer)" ;;
-    whisper) say "transcribing each side on device (whisper.cpp)" ;;
-  esac
+  say "transcribing each side on device ($(engine_title "$engine"))"
+  make_work "$dest"
   # through ||, so set -e does not end the run on the first side that fails
-  transcribe_words "$dir/mic.m4a" "$dir/mic.words.json" || failed=$((failed + 1))
-  transcribe_words "$dir/call.m4a" "$dir/call.words.json" || failed=$((failed + 1))
-  # Both failing is rarely a silent meeting: usually the engine cannot run at all.
-  if [ "$failed" -eq 2 ] && [ "$engine" = native ] && have whisper-cli; then
-    warn "Apple's transcriber failed on both sides, trying whisper. To use Apple's again, check Speech Recognition is on for speech-analyzer"
-    ENGINE=whisper; engine=whisper; failed=0
-    transcribe_words "$dir/mic.m4a" "$dir/mic.words.json" || failed=$((failed + 1))
-    transcribe_words "$dir/call.m4a" "$dir/call.words.json" || failed=$((failed + 1))
-  fi
+  transcribe_words "$src/mic.m4a" "$dest/mic.words.json" "$engine" || failed=$((failed + 1))
+  transcribe_words "$src/call.m4a" "$dest/call.words.json" "$engine" || failed=$((failed + 1))
+  # Both failing is rarely a silent meeting: usually no transcriber can run at all.
   if [ "$failed" -eq 2 ]; then
-    case "$engine" in
-      native)  die "transcription failed on both sides. Check Speech Recognition in Privacy settings, or run: meetingbox setup" ;;
-      whisper) die "whisper-cli failed on both sides, see its output above" ;;
-    esac
+    drop_work
+    die "transcription failed on both sides. Check Speech Recognition in Privacy settings, or run: meetingbox setup"
   fi
 
   # Written aside and moved, so a failure leaves no half transcript behind.
   progress speakers
-  tmp="$(mktemp)"; err="$(mktemp)"
-  if ! "$TRANSCRIPT_BIN" --mic "$dir/mic.words.json" --call "$dir/call.words.json" > "$tmp" 2> "$err"; then
-    msg="$(cat "$err")"; rm -f "$tmp" "$err"
+  tmp="$WORK/transcript.txt"; err="$WORK/transcript.err"
+  if ! "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" > "$tmp" 2> "$err"; then
+    msg="$(cat "$err")"; drop_work
     die "${msg:-mb-transcript failed}"
   fi
   # a side it could not read is a warning, not a failure
   while IFS= read -r msg; do warn "${msg#mb-transcript: }"; done < "$err"
-  rm -f "$err"
-  mv -f "$tmp" "$out"
-  ok "transcript: $(wc -l < "$out" | tr -d ' ') turns, as Me and Them"
+  mv -f "$tmp" "$dest/transcript.txt"
+  drop_work
+  ok "transcript: $(wc -l < "$dest/transcript.txt" | tr -d ' ') turns, as Me and Them"
 }
 
 # ------------------------------------------------------------------ summarising
@@ -2013,6 +2090,7 @@ release_processing_lock() {
 end_processing() {
   local rc="$1" attempt result tmp_result
   trap - EXIT HUP INT TERM
+  drop_work
   if [ -n "$PROCESSING_LOCK" ]; then
     attempt="$(printf '%s' "${MB_ATTEMPT:-}" | tr -cd 'A-Za-z0-9._-')"
     result="$PROCESSING_DIR/.process-result"
@@ -2061,7 +2139,7 @@ process() {
     *)
       progress transcribing
       if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
-        transcribe_channels "$dir" "$transcript"
+        transcribe_channels "$dir" "$dir"
         spent_audio="$input"; spent_sides=1
       else
         transcribe "$input" "$transcript"
@@ -2289,7 +2367,7 @@ Options
   --mic "USB"            microphone, substring match   (MB_MIC)
   --dir ~/Meetings       where recordings land         (MB_DIR)
   --locale en-GB         transcription locale          (MB_LOCALE)
-  --whisper | --native   pick the transcriber          (MB_ENGINE)
+  --parakeet | --native | --whisper   pick the transcriber   (MB_ENGINE)
   --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
   --no-keep-audio        bin the m4a files once transcribed
 
@@ -2300,28 +2378,41 @@ Output lands in ~/Meetings/<date>_<time>/
 USAGE
 }
 
+# The command line: the command, its file, and the settings. A function above main, so the tests
+# can call it.
+parse_args() {
+  cmd=""
+  argfile=""
+  RESET_TOOLS=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mic|--device) MIC="$2"; shift 2 ;;
+      --dir)     BASE_DIR="$2"; DIR_ARG="$2"; shift 2 ;;
+      --locale)  LOCALE="$2"; shift 2 ;;
+      --model)   WHISPER_MODEL="$2"; ENGINE="whisper"; shift 2 ;;
+      --whisper) ENGINE="whisper"; shift ;;
+      --native)  ENGINE="native"; shift ;;
+      --parakeet) ENGINE="parakeet"; shift ;;
+      --writer)
+        case "${2:-}" in
+          apple) WRITER="apple" ;;
+          *) die "unknown minutes writer: ${2:-none given}" ;;
+        esac
+        shift 2 ;;
+      --keep-audio)    KEEP_AUDIO=1; shift ;;
+      --no-keep-audio) KEEP_AUDIO=0; shift ;;
+      --tools)   RESET_TOOLS=1; shift ;;
+      -v|--version) print_version; exit 0 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)  if [ -z "$cmd" ]; then cmd="$1"; else argfile="$1"; fi; shift ;;
+    esac
+  done
+}
+
 # ------------------------------------------------------------------------ main
 
-cmd=""
-argfile=""
-RESET_TOOLS=0
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --mic|--device) MIC="$2"; shift 2 ;;
-    --dir)     BASE_DIR="$2"; DIR_ARG="$2"; shift 2 ;;
-    --locale)  LOCALE="$2"; shift 2 ;;
-    --model)   WHISPER_MODEL="$2"; ENGINE="whisper"; shift 2 ;;
-    --whisper) ENGINE="whisper"; shift ;;
-    --native)  ENGINE="native"; shift ;;
-    --keep-audio)    KEEP_AUDIO=1; shift ;;
-    --no-keep-audio) KEEP_AUDIO=0; shift ;;
-    --tools)   RESET_TOOLS=1; shift ;;
-    -v|--version) print_version; exit 0 ;;
-    -h|--help) usage; exit 0 ;;
-    -*) die "unknown option: $1" ;;
-    *)  if [ -z "$cmd" ]; then cmd="$1"; else argfile="$1"; fi; shift ;;
-  esac
-done
+parse_args "$@"
 
 case "${cmd:-toggle}" in
   toggle)

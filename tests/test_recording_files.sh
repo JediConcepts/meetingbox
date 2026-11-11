@@ -76,7 +76,7 @@ new_session() {
   rm -rf "$dir"; mkdir -p "$dir"; printf '%s' "$dir" > "$DIR_FILE"; : > "$HOME/calls.log"
 }
 # --- process refuses a recording that was never finished ---
-transcribe_channels() { echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2"; }
+transcribe_channels() { echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2/transcript.txt"; }   # SRC OUT
 transcribe() { echo "transcribe $*" >> "$HOME/calls.log"; printf 'hi\n' > "$2"; }
 summarise() { echo "summarise $*" >> "$HOME/calls.log"; printf '# notes\n' > "$2/notes.md"; }
 chime() { :; }
