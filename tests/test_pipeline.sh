@@ -547,6 +547,7 @@ case "\$1" in
     [ -e "$HOME/pk-fail-\$side" ] && { echo "mb-speech: the model could not run" >&2; exit 1; }
     [ -e "$HOME/pk-silent-\$side" ] && exit 134
     [ -e "$HOME/pk-empty-\$side" ] && { printf '{"engine": "parakeet-ultra", "words": []}\n' > "\$4"; exit 0; }
+    [ -e "$HOME/pk-labelled" ] && { cp "$FIX/labelled-\$side.json" "\$4"; exit 0; }
     cp "$FIX/pk-\$side.json" "\$4" ;;
   speakers)
     [ -e "$HOME/sp-silent-\$side" ] && exit 134
@@ -554,6 +555,8 @@ case "\$1" in
       printf '{"model": "half' > "\$4"; printf '{"mod' > "\$(dirname "\$4")/.part-\$(basename "\$4")"
       echo "mb-speech: the diariser could not run" >&2; exit 1
     fi
+    [ -e "$HOME/sp-garbled-\$side" ] && { printf '{"model": "FluidInference/speaker-diarization-coreml@x", "segm' > "\$4"; exit 0; }
+    [ -e "$HOME/sp-fixture" ] && { cp "$FIX/speakers-\$side.json" "\$4"; exit 0; }
     printf '{"model": "FluidInference/speaker-diarization-coreml@x", "segments": [], "speakers": []}\n' > "\$4" ;;
   *) exit 1 ;;
 esac
@@ -1069,5 +1072,98 @@ if [ "$final_first" = 1 ] \
    && ! printf '%s' "$final" | grep -qF '(a name, Me or Them)'; then
   pass "the final pass gets the label sentence first, and the new owner wording"
 else fail "the final pass gets the label sentence first, and the new owner wording: [$final]"; fi
+
+# === Labels and the voice print: the speakers files, --voice and --learn reach mb-transcript (6.2) ===
+
+# The stand-in helper gives the labelled fixtures: pk-labelled for the words, sp-fixture for the
+# speakers, sp-garbled-<side> for a speakers file that is not JSON. mb-transcript is the real one,
+# behind the wrapper that logs its arguments.
+TRANSCRIPT_BIN="$HOME/mb-transcript-logged"
+mkdir -p "$STATE_DIR"
+lb_reset() { sp_reset; rm -f "$HOME/pk-labelled" "$HOME/sp-fixture" "$HOME"/sp-garbled-* "$VOICE_FILE" "$VOICE_FILE.tmp" "$INSTALLED"; }
+lb_meeting() {   # $1: the folder's name, $2: meeting.json's id, if any
+  d="$(meeting "$1" audio.m4a mic.m4a call.m4a)"
+  [ -z "${2:-}" ] || printf '{"id": "%s", "state": "done"}\n' "$2" > "$d/meeting.json"
+}
+lb_args() { grep '^mb-transcript ' "$HOME/calls.log" | head -n 1; }
+
+# --- the fixtures give Me, Room 1 and Them lines end to end ---
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+lb_meeting lb1 MEETING-ONE
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+t="$d/transcript.txt"
+if [ "$rc" -eq 0 ] && grep -q '^\[00:00:00\] Me: Right, so the plan for today is simple\.' "$t" \
+   && grep -qx '\[00:00:10\] Room 1: what (Them: yeah) about the budget?' "$t" \
+   && grep -q '^\[00:00:16\] Them: That works for me\.' "$t" && [ "$(grep -c . "$t")" = 3 ]; then
+  pass "the speaker fixtures give Me, Room 1 and Them lines end to end"
+else fail "the speaker fixtures give Me, Room 1 and Them lines end to end (rc $rc): $out $(cat "$t" 2>/dev/null)"; fi
+args="$(lb_args)"
+case "$args" in
+  *" --mic-speakers $d/.work."??????"/mic.speakers.json --call-speakers $d/.work."??????"/call.speakers.json --voice $VOICE_FILE"*) args_ok=1 ;;
+  *) args_ok=0 ;;
+esac
+if [ "$args_ok" = 1 ] && [ -z "$(find "$d" -name '*speakers*')" ]; then
+  pass "mb-transcript gets both speakers files from the work folder and the voice print, and no speakers file is left"
+else fail "mb-transcript gets both speakers files from the work folder and the voice print, and no speakers file is left: $args"; fi
+if ! printf '%s' "$args" | grep -q -- '--learn' && [ ! -e "$VOICE_FILE" ] && ! printf '%s' "$out" | grep -q 'Learnt'; then
+  pass "with no voice print on the install record, process passes no --learn and nothing is learnt"
+else fail "with no voice print on the install record, process passes no --learn and nothing is learnt: $args $out"; fi
+
+# --- process passes --learn with the meeting's id when the voice print is on the record ---
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; record_install "$VOICE_FILE"
+lb_meeting lb2 MEETING-TWO
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+args="$(lb_args)"
+if [ "$rc" -eq 0 ] && printf '%s' "$args" | grep -qF -- "--voice $VOICE_FILE --learn MEETING-TWO" \
+   && [ "$(jq -r '.sources | join(",")' "$VOICE_FILE" 2>/dev/null)" = MEETING-TWO ] && [ "$(jq -r .meetings "$VOICE_FILE" 2>/dev/null)" = 1 ] \
+   && [ "$(mode_of "$VOICE_FILE")" = 600 ] && [ ! -e "$VOICE_FILE.tmp" ] \
+   && printf '%s' "$out" | grep -q 'Learnt 9 s of your voice from this call'; then
+  pass "process passes --learn with meeting.json's id, and the call's voice is learnt (0600, through voice.json.tmp)"
+else fail "process passes --learn with meeting.json's id, and the call's voice is learnt (rc $rc): $args $out $(cat "$VOICE_FILE" 2>/dev/null)"; fi
+cp "$VOICE_FILE" "$HOME/voice.before"
+: > "$HOME/calls.log"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && cmp -s "$VOICE_FILE" "$HOME/voice.before" && printf '%s' "$out" | grep -q 'learnt from this meeting before'; then
+  pass "processing the same meeting again learns nothing more"
+else fail "processing the same meeting again learns nothing more (rc $rc): $out"; fi
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; record_install "$VOICE_FILE"
+lb_meeting lb3
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && lb_args | grep -qF -- "--learn lb3" && [ "$(jq -r '.sources[0]' "$VOICE_FILE" 2>/dev/null)" = lb3 ]; then
+  pass "without a meeting.json id, the folder's name is the meeting's id"
+else fail "without a meeting.json id, the folder's name is the meeting's id (rc $rc): $(lb_args) $out"; fi
+
+# --- a redo never learns: transcribe_channels given no meeting id passes no --learn ---
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; record_install "$VOICE_FILE"
+lb_meeting lb4 MEETING-FOUR
+out="$( (transcribe_channels "$d" "$d") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && lb_args | grep -qF -- "--voice $VOICE_FILE" && ! lb_args | grep -q -- '--learn' && [ ! -e "$VOICE_FILE" ]; then
+  pass "transcribing without a meeting id, as a redo will, passes --voice but never --learn"
+else fail "transcribing without a meeting id, as a redo will, passes --voice but never --learn (rc $rc): $(lb_args) $out"; fi
+
+# --- a voice print that is there but not on the install record is never learnt into, and the log says why ---
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+printf '%s\n' '{"model": "x", "seconds": 5, "meetings": 1, "sources": [], "vector": [1], "updated": "x"}' > "$VOICE_FILE"
+cp "$VOICE_FILE" "$HOME/voice.before"
+lb_meeting lb5 MEETING-FIVE
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && ! lb_args | grep -q -- '--learn' && cmp -s "$VOICE_FILE" "$HOME/voice.before" \
+   && printf '%s' "$out" | grep -qF "$VOICE_FILE was not made by meetingbox"; then
+  pass "a voice print not on the install record is not learnt into, and the log says why"
+else fail "a voice print not on the install record is not learnt into, and the log says why (rc $rc): $(lb_args) $out"; fi
+
+# --- an unreadable speakers file warns and leaves Me and Them ---
+lb_reset; touch "$HOME/sp-garbled-mic" "$HOME/sp-garbled-call"
+d="$(meeting lb6 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+t="$d/transcript.txt"
+if [ "$rc" -eq 0 ] && grep -q '] Me: Speaking from this desk' "$t" && grep -q '] Them: Parakeet heard them' "$t" \
+   && printf '%s' "$out" | grep -q 'warn.*mic.speakers.json.*without speaker labels on the microphone side' \
+   && printf '%s' "$out" | grep -q 'warn.*call.speakers.json.*without speaker labels on the call side'; then
+  pass "an unreadable speakers file warns and leaves Me and Them"
+else fail "an unreadable speakers file warns and leaves Me and Them (rc $rc): $out $(cat "$t" 2>/dev/null)"; fi
+lb_reset
+TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
+if [ "$PK_CURL" = 0 ]; then pass "no curl in any labelling run"; else fail "no curl in any labelling run"; fi
 
 finish

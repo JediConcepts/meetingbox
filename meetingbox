@@ -11,7 +11,7 @@
 #                         (+ mic.m4a, call.m4a: each side on its own)
 #   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
 #     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
-#   mb-transcript     ->  transcript.txt     each side transcribed alone, labelled Me and Them
+#   mb-transcript     ->  transcript.txt     each side transcribed alone, labelled by speaker
 #   fm respond        ->  notes.md + brief.json
 #
 # First run: meetingbox setup
@@ -82,7 +82,7 @@ REC_BIN="$REC_APP/Contents/MacOS/meetingbox-recorder"
 # replaces or removes the app goes ahead while a recorder from it is still running.
 OLD_APP_DIR="$SRC_DIR/meetingbox.app"
 OLD_REC_BIN="$OLD_APP_DIR/Contents/MacOS/audio-capture"
-# Merges the mic and call transcripts into one labelled Me and Them. Built from
+# Merges the mic and call transcripts into one, labelled by speaker. Built from
 # native/transcript alongside the app.
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 # Parakeet and speaker labels: the speech helper, built from native/speech with swift build, and
@@ -1338,11 +1338,39 @@ setup() {
   open_app
 }
 
+# The voice print, read from VOICE_FILE with jq: "<whole seconds> <meetings> learnt|sample", or "none"
+# when there is no print or it cannot be read. `engines` prints it as its voice line.
+voice_line() {
+  local line
+  line="$(jq -r -s 'if length == 1 and (.[0] | type) == "object" then .[0] else empty end
+    | select((.seconds | type) == "number" and .seconds >= 0 and (.meetings | type) == "number" and .meetings >= 1)
+    | "\(.seconds | floor) \(.meetings | floor) \(if .sample == true then "sample" else "learnt" end)"' \
+    "$VOICE_FILE" 2>/dev/null)" || line=""
+  printf '%s' "${line:-none}"
+}
+
+# The voice print in Preferences' words (spec 6.2): whole minutes of speech, with singulars.
+voice_words() {
+  local seconds meetings kind minutes calls
+  read -r seconds meetings kind <<< "$(voice_line)"
+  if [ "$seconds" = none ]; then
+    printf '%s' "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+    return
+  fi
+  minutes=$((seconds / 60)); [ "$minutes" = 1 ] && minutes="1 minute" || minutes="$minutes minutes"
+  if [ "$kind" = sample ]; then calls=$((meetings - 1)); else calls="$meetings"; fi
+  [ "$calls" = 1 ] && calls="1 call" || calls="$calls calls"
+  if [ "$kind" = learnt ]; then printf 'Your voice: learnt from %s (%s of speech)' "$calls" "$minutes"
+  elif [ "$meetings" -le 1 ]; then printf 'Your voice: from a recorded sample (%s of speech)' "$minutes"
+  else printf 'Your voice: from a recorded sample and %s (%s of speech)' "$calls" "$minutes"
+  fi
+}
+
 doctor() {
   say "check"
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
-  [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels Me and Them)" || miss "mb-transcript (labels Me and Them)"
+  [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels the speakers)" || miss "mb-transcript (labels the speakers)"
   if speech_ready; then ok "Parakeet (mb-speech)"
   elif speech_usable; then miss "Parakeet is out of date. Run: meetingbox setup"   # still used meanwhile
   elif [ -x "$SPEECH_BIN" ]; then miss "Parakeet is not ready, so Apple's transcriber is used. Run: meetingbox setup"
@@ -1352,7 +1380,13 @@ doctor() {
     c="$(speech_cache)" && ok "model cache $c" \
       || miss "model cache: the helper names no folder meetingbox can record, so none is recorded"
   fi
-  [ -f "$VOICE_FILE" ] && ok "voice print $VOICE_FILE" || info "voice print: not learnt yet"
+  case "$(voice_line)" in
+    none) info "$(voice_words)" ;;
+    *)    ok "$(voice_words)" ;;
+  esac
+  if { [ -e "$VOICE_FILE" ] || [ -L "$VOICE_FILE" ]; } && ! installed_by_us "$VOICE_FILE"; then
+    miss "$VOICE_FILE was not made by meetingbox, so your voice is not learnt into it"
+  fi
   if ! have_signing_identity; then
     miss "signing certificate (permissions will be asked again after updates)"
   elif [ -d "$APP_DIR" ] && ! app_signed_by_us; then
@@ -1885,12 +1919,25 @@ transcribe_words() {
   return 1
 }
 
+# The meeting's id, as the voice print's sources name it: meeting.json's id, or the folder's name.
+meeting_id() {
+  local id=""
+  if [ -f "$1/meeting.json" ]; then
+    id="$(jq -r '.id | select(type == "string" and length > 0 and length <= 200 and (test("[[:cntrl:]]") | not))' \
+            "$1/meeting.json" 2>/dev/null)" || id=""
+  fi
+  printf '%s' "${id:-$(basename "$1")}"
+}
+
 # Your side and the other side transcribed on their own from the audio in SRC, then merged by
-# mb-transcript into lines labelled Me and Them. Every output goes in OUT, with the WAVs in the
-# run's work folder there: nothing in SRC is changed.
-# Usage: transcribe_channels SRC OUT
+# mb-transcript into labelled lines: Me, Room N, Them, Them N or Unknown, from the speakers found on
+# each side and the voice print. Every output goes in OUT, with the WAVs in the run's work folder
+# there: nothing in SRC is changed. With MEETING_ID (first processing only, never a redo), a call may
+# add to the voice print, but only to one on the install record.
+# Usage: transcribe_channels SRC OUT [MEETING_ID]
 transcribe_channels() {
-  local src="$1" dest="$2" engine tmp err msg failed=0 plain=""
+  local src="$1" dest="$2" learn="${3:-}" engine tmp err line held="" status=0 failed=0 plain="" side
+  local labels=()
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
   engine="$(pick_engine)" || exit 1   # pick_engine has said why
   say "transcribing each side on device ($(engine_title "$engine"))"
@@ -1914,18 +1961,44 @@ transcribe_channels() {
     info "Parakeet is not set up, so speakers are not told apart: the transcript says Me and Them"
   fi
 
+  # The speakers files that were made, and with any, the voice print: used to name the speakers, and
+  # learnt into only on a first processing and only when setup recorded it.
+  for side in mic call; do
+    [ ! -f "$WORK/$side.speakers.json" ] || labels+=("--$side-speakers" "$WORK/$side.speakers.json")
+  done
+  if [ "${#labels[@]}" -gt 0 ]; then
+    labels+=(--voice "$VOICE_FILE")
+    if [ -n "$learn" ]; then
+      if installed_by_us "$VOICE_FILE"; then labels+=(--learn "$learn")
+      elif [ -e "$VOICE_FILE" ] || [ -L "$VOICE_FILE" ]; then
+        info "your voice is not learnt from this meeting: $VOICE_FILE was not made by meetingbox, so it is left alone"
+      fi
+    fi
+  fi
+
   # Written aside and moved, so a failure leaves no half transcript behind.
   tmp="$WORK/transcript.txt"; err="$WORK/transcript.err"
   tidy_lines || plain="--plain"
-  if ! "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${plain:+"$plain"} > "$tmp" 2> "$err"; then
-    msg="$(cat "$err")"; drop_work
-    die "${msg:-mb-transcript failed}"
+  "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${labels[@]+"${labels[@]}"} ${plain:+"$plain"} \
+    > "$tmp" 2> "$err" || status=$?
+  # The voice vectors go as soon as mb-transcript is done.
+  rm -f "$WORK/mic.speakers.json" "$WORK/call.speakers.json"
+  # Its "mb-transcript: " lines are warnings (a side it could not read is not a failure), and the last
+  # one is the reason when it failed; its other lines are the meeting's log, about speakers and the voice.
+  while IFS= read -r line; do
+    case "$line" in
+      "mb-transcript: "*) [ -z "$held" ] || warn "$held"; held="${line#mb-transcript: }" ;;
+      *) info "$line" ;;
+    esac
+  done < "$err"
+  if [ "$status" -ne 0 ]; then
+    drop_work
+    die "${held:-mb-transcript failed}"
   fi
-  # a side it could not read is a warning, not a failure
-  while IFS= read -r msg; do warn "${msg#mb-transcript: }"; done < "$err"
+  [ -z "$held" ] || warn "$held"
   mv -f "$tmp" "$dest/transcript.txt"
   drop_work
-  ok "transcript: $(wc -l < "$dest/transcript.txt" | tr -d ' ') turns, as Me and Them"
+  ok "transcript: $(wc -l < "$dest/transcript.txt" | tr -d ' ') lines"
 }
 
 # ------------------------------------------------------------------ summarising
@@ -2246,7 +2319,8 @@ process() {
     *)
       progress transcribing
       if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
-        transcribe_channels "$dir" "$dir"
+        # the first processing of a meeting, so a call may teach meetingbox the user's voice
+        transcribe_channels "$dir" "$dir" "$(meeting_id "$dir")"
         spent_audio="$input"; spent_sides=1
       else
         transcribe "$input" "$transcript"
@@ -2481,7 +2555,7 @@ Options
 
 Output lands in ~/Meetings/<date>_<time>/
   audio.m4a  mic.m4a  call.m4a       the mix, your side, the other side
-  transcript.txt                     who said what, as Me and Them
+  transcript.txt                     who said what, labelled by speaker
   notes.md  notes-raw.md  brief.json
 USAGE
 }

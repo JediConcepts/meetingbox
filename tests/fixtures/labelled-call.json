@@ -1,0 +1,20 @@
+{"engine": "parakeet-ultra", "words": [
+{"start": 11.0, "end": 11.3, "text": "yeah", "confidence": 0.9},
+{"start": 16.0, "end": 16.4, "text": "That", "confidence": 0.95},
+{"start": 17.25, "end": 17.65, "text": "works", "confidence": 0.95},
+{"start": 18.5, "end": 18.9, "text": "for", "confidence": 0.95},
+{"start": 19.75, "end": 20.15, "text": "me.", "confidence": 0.95},
+{"start": 21.0, "end": 21.4, "text": "I", "confidence": 0.95},
+{"start": 22.25, "end": 22.65, "text": "will", "confidence": 0.95},
+{"start": 23.5, "end": 23.9, "text": "send", "confidence": 0.95},
+{"start": 24.75, "end": 25.15, "text": "the", "confidence": 0.95},
+{"start": 26.0, "end": 26.4, "text": "numbers", "confidence": 0.95},
+{"start": 27.25, "end": 27.65, "text": "over", "confidence": 0.95},
+{"start": 28.5, "end": 28.9, "text": "by", "confidence": 0.95},
+{"start": 29.75, "end": 30.15, "text": "Friday", "confidence": 0.95},
+{"start": 31.0, "end": 31.4, "text": "so", "confidence": 0.95},
+{"start": 32.25, "end": 32.65, "text": "we", "confidence": 0.95},
+{"start": 33.5, "end": 33.9, "text": "can", "confidence": 0.95},
+{"start": 34.75, "end": 35.15, "text": "check", "confidence": 0.95},
+{"start": 36.0, "end": 36.4, "text": "them.", "confidence": 0.95}
+]}

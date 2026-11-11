@@ -1,5 +1,5 @@
 // Merges the mic and call transcripts into labelled lines: tidy lines that follow sentences,
-// or with tidying off, a line per turn.
+// or with tidying off, a line per turn. The speakers found on each side become the labels.
 import Foundation
 
 struct Word: Equatable {
@@ -70,6 +70,15 @@ func normalised(_ s: String) -> String {
 /// One word on one side matching two on the other ("chitchat", "chit chat") is echo too.
 func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
                 runWindow: Double = 4.0, bridge: Double = 1.5) -> [Word] {
+    let echo = matchEcho(mic: mic, call: call, window: window, runWindow: runWindow, bridge: bridge).echo
+    return mic.indices.filter { !echo.contains($0) }.map { mic[$0] }
+}
+
+/// removeEcho's matching: the indices of the mic words it drops, and the (mic, call) word pairs it
+/// counted as echo, as indices into `mic` and `call`. A mic word dropped only to bridge a gap has no
+/// pair. Who said the pairs, and which copy came first, is how one voice heard on both sides is told.
+func matchEcho(mic: [Word], call: [Word], window: Double = 0.6, runWindow: Double = 4.0, bridge: Double = 1.5)
+    -> (echo: Set<Int>, pairs: [(micWord: Int, callWord: Int)]) {
     let m = mic.indices.sorted { mic[$0].start != mic[$1].start ? mic[$0].start < mic[$1].start : $0 < $1 }
     let c = call.indices.sorted { call[$0].start != call[$1].start ? call[$0].start < call[$1].start : $0 < $1 }
     let mk = m.map { normalised(mic[$0].text) }
@@ -110,10 +119,11 @@ func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
     while p >= 0 { chain.append(pairs[p]); p = parent[p] }   // comes out earliest first
 
     var echo = [Bool](repeating: false, count: m.count)
+    var matched: [(micWord: Int, callWord: Int)] = []
     for (k, pair) in chain.enumerated() {
         let inRun = (k > 0 && chain[k - 1].i == pair.i - 1) || (k + 1 < chain.count && chain[k + 1].i == pair.i + 1)
         let dt = abs(mic[m[pair.i]].start - call[c[pair.j]].start)
-        if inRun || dt <= window { echo[pair.i] = true }
+        if inRun || dt <= window { echo[pair.i] = true; matched.append((m[pair.i], c[pair.j])) }
     }
 
     // One side hearing one word where the other hears two ("chitchat" and "chit chat",
@@ -130,6 +140,7 @@ func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
         let both = mk[i] + mk[i + 1]
         if let j = callNear(mic[m[i]].start).first(where: { !used.contains($0) && ck[$0] == both }) {
             echo[i] = true; echo[i + 1] = true; used.insert(j)
+            matched.append((m[i], c[j])); matched.append((m[i + 1], c[j]))
         }
     }
     for i in m.indices where !echo[i] && !mk[i].isEmpty {
@@ -137,6 +148,7 @@ func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
         if let j = near.first(where: { $0 + 1 < near.upperBound && !used.contains($0) && !used.contains($0 + 1)
                                         && !ck[$0].isEmpty && !ck[$0 + 1].isEmpty && ck[$0] + ck[$0 + 1] == mk[i] }) {
             echo[i] = true; used.insert(j); used.insert(j + 1)
+            matched.append((m[i], c[j])); matched.append((m[i], c[j + 1]))
         }
     }
 
@@ -156,7 +168,7 @@ func removeEcho(mic: [Word], call: [Word], window: Double = 0.6,
 
     var drop = Set<Int>()
     for (i, e) in echo.enumerated() where e { drop.insert(m[i]) }
-    return mic.indices.filter { !drop.contains($0) }.map { mic[$0] }
+    return (drop, matched)
 }
 
 /// The one place that decides spacing: none before , . ! ? ; : % ) ] } and closing quotes,
@@ -381,4 +393,448 @@ func render(_ turns: [Turn]) -> String {
         let s = Int(t.start.rounded(.down))
         return String(format: "[%02d:%02d:%02d] %@: %@\n", s / 3600, (s / 60) % 60, s % 60, t.label, t.text)
     }.joined()
+}
+
+// ====================================================================== speakers to labels (spec 6.2)
+
+/// The fixed numbers of spec 6.2.
+enum Rule {
+    static let printMatch = 0.60       // a voice is the print's, or two voices are one
+    static let printNear = 0.45        // too like the print to be anyone else
+    static let learnCallLimit = 0.40   // learning needs every call voice further from the user's than this
+    static let dominantShare = 0.80    // of the microphone's kept words: the user, on a call
+    static let smallShare = 0.05       // under this share of a side, without a count, a voice is not numbered
+    static let shortMedian = 2.5       // a median segment under this, without a count, is not numbered either
+    static let meSeconds = 10.0        // talk a print match needs to be Me
+    static let usableSeconds = 60.0    // speech a print needs to be used
+    static let callSeconds = 20.0      // call-side speech that makes a meeting a call
+    static let nearestEdge = 1.0       // how far a word may be from the nearest segment and still take it
+}
+
+/// Whether `x` is at least `limit`, allowing for rounding in the arithmetic that made it.
+func atLeast(_ x: Double, _ limit: Double) -> Bool { x >= limit - 1e-9 }
+
+/// One stretch of one speaker, as the diariser found it. Segments overlap.
+struct Segment: Equatable {
+    let speaker: String
+    let start: Double
+    let end: Double
+}
+
+/// One speaker on a side: talk time and median segment length (measured on the exclusive copy of the
+/// segments), the diariser's voice vector, and `first`, the start of its earliest segment.
+struct SpeakerInfo: Equatable {
+    let id: String
+    let seconds: Double
+    let median: Double
+    let vector: [Double]
+    var first: Double = 0
+}
+
+enum Side { case mic, call }
+
+/// One side's speakers file, as loadSpeakers reads it.
+struct SideSpeakers {
+    let model: String
+    let segments: [Segment]
+    let speakers: [SpeakerInfo]
+}
+
+/// Reads mb-speech's speakers JSON: {"model", "segments": [{speaker, start, end}], "speakers": [{id, seconds,
+/// median, vector}]}. Each speaker's `first` is its earliest segment's start (infinity with none).
+func loadSpeakers(_ data: Data) throws -> (model: String, segments: [Segment], speakers: [SpeakerInfo]) {
+    func number(_ v: Any?) -> Double? {
+        guard let d = (v as? NSNumber)?.doubleValue, d.isFinite else { return nil }
+        return d
+    }
+    guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let model = root["model"] as? String,
+          let segmentList = root["segments"] as? [[String: Any]],
+          let speakerList = root["speakers"] as? [[String: Any]] else {
+        throw TranscriptError(description: "not a speakers file")
+    }
+    var segments: [Segment] = []
+    for item in segmentList {
+        guard let id = item["speaker"] as? String, let start = number(item["start"]), let end = number(item["end"]) else {
+            throw TranscriptError(description: "a segment without a speaker, start and end")
+        }
+        segments.append(Segment(speaker: id, start: start, end: end))
+    }
+    var first: [String: Double] = [:]
+    for s in segments { first[s.speaker] = min(first[s.speaker] ?? s.start, s.start) }
+    var speakers: [SpeakerInfo] = []
+    for item in speakerList {
+        guard let id = item["id"] as? String, let seconds = number(item["seconds"]), let median = number(item["median"]),
+              let list = item["vector"] as? [Any] else {
+            throw TranscriptError(description: "a speaker without an id, seconds, median and vector")
+        }
+        let vector = list.compactMap { number($0) }
+        guard vector.count == list.count else { throw TranscriptError(description: "speaker \(id)'s vector is not all numbers") }
+        speakers.append(SpeakerInfo(id: id, seconds: seconds, median: median, vector: vector, first: first[id] ?? .infinity))
+    }
+    return (model, segments, speakers)
+}
+
+/// A call: the call side holds 20 s or more of speech, measured from its speakers when it has any,
+/// else from its words. A side every transcriber failed on still counts by its speakers.
+func isCall(callWords: [Word], callSpeakers: [SpeakerInfo]?) -> Bool {
+    if let speakers = callSpeakers, !speakers.isEmpty {
+        return atLeast(speakers.reduce(0) { $0 + $1.seconds }, Rule.callSeconds)
+    }
+    return atLeast(callWords.reduce(0) { $0 + max(0, $1.end - $1.start) }, Rule.callSeconds)
+}
+
+/// Each word's candidate speakers: those with a segment that holds the word's midpoint (from the
+/// segment's start, inclusive, to its end, exclusive), in order of that segment's start, the
+/// latest-starting last. With none, the speaker of the segment whose nearer edge is closest to the
+/// midpoint, if that is within 1.0 s.
+func candidates(_ words: [Word], _ segments: [Segment]) -> [[String]] {
+    let ordered = segments.indices.sorted {
+        segments[$0].start != segments[$1].start ? segments[$0].start < segments[$1].start : $0 < $1
+    }.map { segments[$0] }
+    return words.map { word in
+        let mid = (word.start + word.end) / 2
+        var holding: [String: Double] = [:]          // speaker, and the latest start of a segment holding the word
+        var nearest: (gap: Double, speaker: String)?
+        for s in ordered {
+            if s.start > mid + Rule.nearestEdge { break }   // no later segment holds it or is near enough
+            if s.start <= mid && mid < s.end {
+                holding[s.speaker] = max(holding[s.speaker] ?? s.start, s.start)
+            } else {
+                let gap = mid < s.start ? s.start - mid : mid - s.end
+                if nearest.map({ gap < $0.gap }) ?? true { nearest = (gap, s.speaker) }
+            }
+        }
+        if !holding.isEmpty {
+            return holding.sorted { $0.value != $1.value ? $0.value < $1.value : $0.key < $1.key }.map(\.key)
+        }
+        if let n = nearest, atLeast(Rule.nearestEdge, n.gap) { return [n.speaker] }
+        return []
+    }
+}
+
+/// keptWords and firstWord (spec 6.2, "Shares and order"): for each speaker, how many of these words
+/// have it as their one candidate, and when the first of them starts. Words with no candidate, or
+/// several, count for nobody.
+func keptCounts(_ words: [Word], _ candidates: [[String]]) -> (counts: [String: Int], first: [String: Double]) {
+    var counts: [String: Int] = [:]
+    var first: [String: Double] = [:]
+    for (word, c) in zip(words, candidates) where c.count == 1 {
+        counts[c[0], default: 0] += 1
+        first[c[0]] = min(first[c[0]] ?? word.start, word.start)
+    }
+    return (counts, first)
+}
+
+/// A speaker's cosine with the print, or nil when there is no usable print.
+private func likeness(_ speaker: SpeakerInfo, _ print: VoicePrint?) -> Double? {
+    print.map { cosine(speaker.vector, $0.vector) }
+}
+
+/// One voice heard on both sides of a call: a microphone speaker and a call speaker at a cosine of 0.60
+/// or more, neither matching the (usable) print. Their shared words are the echo pairs whose microphone
+/// word has the one and whose call word has the other among its candidates; whichever side's copies
+/// mostly come later is the echo.
+/// - micEcho: the far side leaking into the microphone. Its words are dropped.
+/// - callEcho: the user's voice coming back on the call side, treated as a print match there.
+/// - micUnknown: no shared words, or as many later on each side, so the microphone speaker cannot be
+///   told. A speaker that another pairing shows to be an echo, or the source of the call side's echo,
+///   is not made Unknown by this one.
+func pairVoices(mic: [SpeakerInfo], call: [SpeakerInfo], pairs: [(micWord: Int, callWord: Int)], micWords: [Word], callWords: [Word],
+                micCandidates: [[String]], callCandidates: [[String]], print: VoicePrint?)
+    -> (micEcho: Set<String>, callEcho: Set<String>, micUnknown: Set<String>) {
+    func matchesPrint(_ s: SpeakerInfo) -> Bool { likeness(s, print).map { atLeast($0, Rule.printMatch) } ?? false }
+    var micEcho = Set<String>(), callEcho = Set<String>(), micUnknown = Set<String>(), micSource = Set<String>()
+    for m in mic where !matchesPrint(m) {
+        for c in call where !matchesPrint(c) && atLeast(cosine(m.vector, c.vector), Rule.printMatch) {
+            var micLater = 0, callLater = 0
+            for p in pairs where p.micWord < micCandidates.count && p.callWord < callCandidates.count
+                && micCandidates[p.micWord].contains(m.id) && callCandidates[p.callWord].contains(c.id) {
+                let dt = micWords[p.micWord].start - callWords[p.callWord].start
+                if dt > 0 { micLater += 1 } else if dt < 0 { callLater += 1 }
+            }
+            if micLater > callLater { micEcho.insert(m.id) }
+            else if callLater > micLater { callEcho.insert(c.id); micSource.insert(m.id) }
+            else { micUnknown.insert(m.id) }
+        }
+    }
+    return (micEcho, callEcho, micUnknown.subtracting(micEcho).subtracting(micSource))
+}
+
+/// The speakers that keep at least one word, in order of their first such word (then their first
+/// segment, then their id), and those that keep none, which get no number.
+private func byFirstWord(_ speakers: [SpeakerInfo], _ keptWords: [String: Int], _ firstWord: [String: Double])
+    -> (numbered: [SpeakerInfo], unnumbered: [SpeakerInfo]) {
+    let keeps = speakers.filter { (keptWords[$0.id] ?? 0) > 0 }
+    let numbered = keeps.sorted {
+        let a = firstWord[$0.id] ?? .infinity, b = firstWord[$1.id] ?? .infinity
+        if a != b { return a < b }
+        return $0.first != $1.first ? $0.first < $1.first : $0.id < $1.id
+    }
+    return (numbered, speakers.filter { (keptWords[$0.id] ?? 0) == 0 })
+}
+
+/// A speaker's share of a side: its kept words over all the kept words of the speakers counted.
+private func share(_ s: SpeakerInfo, _ keptWords: [String: Int], of speakers: [SpeakerInfo]) -> Double {
+    let total = speakers.reduce(0) { $0 + (keptWords[$1.id] ?? 0) }
+    return total > 0 ? Double(keptWords[s.id] ?? 0) / Double(total) : 0
+}
+
+/// Names on the call side (spec 6.2). `print` is the usable print, or nil. The first rule that matches:
+/// 1. the user's voice coming back (in `userVoice`, or a print match): Unknown;
+/// 2. without a count: under 5% of the side's kept words, a median segment under 2.5 s, or a cosine of
+///    0.45 or more with the print: plain Them;
+/// 3. the rest: one is Them, several are Them 1, Them 2 in order of their first kept word. One with no
+///    kept word gets no number and is plain Them.
+/// Shares leave out the user's voice.
+func nameCall(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [String: Double], userVoice: Set<String>,
+              print: VoicePrint?, counted: Bool) -> [String: String] {
+    func isUser(_ s: SpeakerInfo) -> Bool {
+        userVoice.contains(s.id) || likeness(s, print).map { atLeast($0, Rule.printMatch) } == true
+    }
+    let others = speakers.filter { !isUser($0) }
+    var names: [String: String] = [:]
+    var rest: [SpeakerInfo] = []
+    for s in speakers {
+        if isUser(s) {
+            names[s.id] = "Unknown"
+        } else if !counted && (!atLeast(share(s, keptWords, of: others), Rule.smallShare) || !atLeast(s.median, Rule.shortMedian)
+                               || likeness(s, print).map({ atLeast($0, Rule.printNear) }) == true) {
+            names[s.id] = "Them"
+        } else {
+            rest.append(s)
+        }
+    }
+    let (numbered, unnumbered) = byFirstWord(rest, keptWords, firstWord)
+    for (k, s) in numbered.enumerated() { names[s.id] = numbered.count == 1 ? "Them" : "Them \(k + 1)" }
+    for s in unnumbered { names[s.id] = "Them" }
+    return names
+}
+
+/// Names on the microphone side (spec 6.2). Echo speakers get no name: their words are dropped.
+/// `print` is the usable print, or nil. The first rule that matches:
+/// 0. paired with a call voice but impossible to tell (in `unknown`): Unknown;
+/// 1. a print match with 10 s or more of talk: Me;
+/// 2. on a call, 80% or more of the kept words, with no print or a cosine of 0.45 or more with it: Me;
+/// 3. a cosine of 0.45 or more with the print: Unknown;
+/// 4. without a count: under 5% of the kept words, or a median segment under 2.5 s: Unknown;
+/// 5. otherwise Room 1, Room 2, numbered by first kept word; one with no kept word is Unknown.
+/// Shares leave out the echo speakers.
+func nameMic(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [String: Double], echo: Set<String>, unknown: Set<String>,
+             print: VoicePrint?, isCall: Bool, counted: Bool) -> [String: String] {
+    let live = speakers.filter { !echo.contains($0.id) }
+    var names: [String: String] = [:]
+    var rest: [SpeakerInfo] = []
+    for s in live {
+        let like = likeness(s, print)
+        let part = share(s, keptWords, of: live)
+        if unknown.contains(s.id) {
+            names[s.id] = "Unknown"
+        } else if let c = like, atLeast(c, Rule.printMatch), atLeast(s.seconds, Rule.meSeconds) {
+            names[s.id] = "Me"
+        } else if isCall, atLeast(part, Rule.dominantShare), like.map({ atLeast($0, Rule.printNear) }) ?? true {
+            names[s.id] = "Me"
+        } else if let c = like, atLeast(c, Rule.printNear) {
+            names[s.id] = "Unknown"
+        } else if !counted, !atLeast(part, Rule.smallShare) || !atLeast(s.median, Rule.shortMedian) {
+            names[s.id] = "Unknown"
+        } else {
+            rest.append(s)
+        }
+    }
+    let (numbered, unnumbered) = byFirstWord(rest, keptWords, firstWord)
+    for (k, s) in numbered.enumerated() { names[s.id] = "Room \(k + 1)" }
+    for s in unnumbered { names[s.id] = "Unknown" }
+    return names
+}
+
+/// The label of a word with no candidate: the side's one label when every named speaker there has
+/// it; Me or Them on a side with no speakers; otherwise Unknown on the microphone side and Them on the call side.
+func fallbackLabel(_ names: [String: String], side: Side) -> String {
+    let labels = Set(names.values)
+    if labels.count == 1, let only = labels.first { return only }
+    if labels.isEmpty { return side == .mic ? "Me" : "Them" }
+    return side == .mic ? "Unknown" : "Them"
+}
+
+/// The words, `words` in time order, as sentences: each runs up to and including a word ending in
+/// `.`, `?` or `!`.
+private func sentences(_ words: [Word]) -> [Range<Int>] {
+    var ranges: [Range<Int>] = []
+    var start = 0
+    for (i, w) in words.enumerated() where w.text.last.map({ ".?!".contains($0) }) == true {
+        ranges.append(start..<(i + 1))
+        start = i + 1
+    }
+    if start < words.count { ranges.append(start..<words.count) }
+    return ranges
+}
+
+/// Each word's label, `words` in time order with their candidates as `candidates` gives them. A word
+/// whose candidates have one label takes it; one with none takes `fallback`. One with two or more
+/// different labels takes the label most words of its sentence with exactly one candidate label hold,
+/// and a tie goes to the label of the latest-starting segment among them.
+func resolve(_ words: [Word], _ candidates: [[String]], names: [String: String], fallback: String) -> [String] {
+    // Each word's candidate labels, each placed where its latest-starting segment is, so the last is the latest.
+    let options: [[String]] = words.indices.map { i in
+        var labels: [String] = []
+        for id in i < candidates.count ? candidates[i] : [] {
+            guard let label = names[id] else { continue }
+            labels.removeAll { $0 == label }
+            labels.append(label)
+        }
+        return labels
+    }
+    var labels = [String](repeating: fallback, count: words.count)
+    for range in sentences(words) {
+        var votes: [String: Int] = [:]
+        for i in range where options[i].count == 1 { votes[options[i][0], default: 0] += 1 }
+        for i in range where !options[i].isEmpty {
+            let best = options[i].map { votes[$0] ?? 0 }.max() ?? 0
+            labels[i] = options[i].last { (votes[$0] ?? 0) == best } ?? fallback
+        }
+    }
+    return labels
+}
+
+/// Smoothing, on labels after naming (so two clusters both named Me are one run). The runs of equal
+/// labels in each sentence are found once; then, in one pass, a run of one or two words with the same
+/// label on both sides takes that label, and a single word at a sentence's start or end takes the label
+/// of its neighbouring run when that run has three or more words.
+func smooth(_ labels: [String], _ words: [Word]) -> [String] {
+    var out = labels
+    for range in sentences(words) where range.upperBound <= labels.count {
+        var runs: [(label: String, start: Int, count: Int)] = []
+        for i in range {
+            if let last = runs.last, last.label == labels[i] { runs[runs.count - 1].count += 1 }
+            else { runs.append((labels[i], i, 1)) }
+        }
+        guard runs.count > 1 else { continue }
+        for (k, run) in runs.enumerated() {
+            var to: String?
+            if k > 0 && k + 1 < runs.count {
+                if run.count <= 2 && runs[k - 1].label == runs[k + 1].label { to = runs[k - 1].label }
+            } else if run.count == 1 {
+                let neighbour = k == 0 ? runs[1] : runs[k - 1]
+                if neighbour.count >= 3 { to = neighbour.label }
+            }
+            if let label = to { for i in run.start..<(run.start + run.count) { out[i] = label } }
+        }
+    }
+    return out
+}
+
+/// Both sides' words with their labels, what the meeting's log says about them, and what learning the
+/// voice needs.
+struct LabelledWords {
+    var mic: [Word] = []
+    var micLabels: [String] = []
+    var call: [Word] = []
+    var callLabels: [String] = []
+    var log: [String] = []
+    var isCall = false
+    var model = ""                          // the speaker model of this run, "" without speakers
+    var micSpeakers: [SpeakerInfo] = []     // the microphone's speakers that are not echo
+    var micKept: [String: Int] = [:]        // their kept words
+    var callSpeakers: [SpeakerInfo] = []
+}
+
+private func inTimeOrder(_ words: [Word]) -> [Word] {
+    words.indices.sorted { words[$0].start != words[$1].start ? words[$0].start < words[$1].start : $0 < $1 }.map { words[$0] }
+}
+
+private func plural(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+
+/// Words to labels (spec 6.2, steps 2 to 7 of mb-transcript): candidates on both sides; the call
+/// side's print matches; echo pairs and one voice heard on both sides; echo removed from the
+/// microphone against the call words that are not the user's voice, and the user's call-side repeats
+/// dropped; both sides named; labels resolved and smoothed. `mic` and `call` have their ends capped.
+/// A side without speakers is Me, or Them, throughout.
+func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeakers?, callSpeakers: SideSpeakers?, print: VoicePrint?,
+                micCounted: Bool = false, callCounted: Bool = false) -> LabelledWords {
+    let mic = inTimeOrder(micIn), call = inTimeOrder(callIn)
+    let micSp = micSpeakers?.speakers ?? [], callSp = callSpeakers?.speakers ?? []
+    var result = LabelledWords()
+    result.model = micSpeakers?.model ?? callSpeakers?.model ?? ""
+    let usable = usablePrint(print, model: result.model)
+
+    // Candidates on both sides.
+    let micCandidates = micSpeakers.map { candidates(mic, $0.segments) } ?? mic.map { _ in [] }
+    let callCandidates = callSpeakers.map { candidates(call, $0.segments) } ?? call.map { _ in [] }
+
+    // The call side's print matches: the user's voice coming back.
+    var userVoice = Set(callSp.filter { likeness($0, usable).map { atLeast($0, Rule.printMatch) } == true }.map(\.id))
+
+    // removeEcho's pairs, then one voice heard on both sides, on a call.
+    result.isCall = isCall(callWords: call, callSpeakers: callSpeakers?.speakers)
+    var voices: (micEcho: Set<String>, callEcho: Set<String>, micUnknown: Set<String>) = ([], [], [])
+    if result.isCall && !micSp.isEmpty && !callSp.isEmpty {
+        voices = pairVoices(mic: micSp, call: callSp, pairs: matchEcho(mic: mic, call: call).pairs, micWords: mic, callWords: call,
+                            micCandidates: micCandidates, callCandidates: callCandidates, print: usable)
+    }
+    userVoice.formUnion(voices.callEcho)
+
+    // Echo: the microphone against the call words that are not the user's voice, so the user's voice
+    // on the call side never cancels the user's own words. Then the words of a microphone echo
+    // speaker, and the user's call-side words that repeat the microphone words kept.
+    let mine = call.indices.filter { !callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains) }
+    let mineSet = Set(mine)
+    let echo = matchEcho(mic: mic, call: call.indices.filter { !mineSet.contains($0) }.map { call[$0] }).echo
+    var leaked = 0
+    let micKept = mic.indices.filter { i in
+        if echo.contains(i) { return false }
+        if !micCandidates[i].isEmpty && micCandidates[i].allSatisfy(voices.micEcho.contains) { leaked += 1; return false }
+        return true
+    }
+    let repeats = matchEcho(mic: mine.map { call[$0] }, call: micKept.map { mic[$0] }).echo   // positions in `mine`
+    let repeated = Set(repeats.map { mine[$0] })
+    let callKept = call.indices.filter { !repeated.contains($0) }
+    if leaked > 0 {
+        result.log.append("Left out \(plural(leaked, "microphone word")) that \(leaked == 1 ? "was" : "were") the call heard through the speakers")
+    }
+    if !mine.isEmpty {
+        let left = mine.count - repeats.count
+        result.log.append("Your voice was heard on the call side: \(plural(repeats.count, "word")) repeating yours "
+                          + "\(repeats.count == 1 ? "was" : "were") left out, and \(left) \(left == 1 ? "is" : "are") marked Unknown")
+    }
+
+    // Names.
+    let micWords = micKept.map { mic[$0] }, micKeptCandidates = micKept.map { micCandidates[$0] }
+    let callWords = callKept.map { call[$0] }, callKeptCandidates = callKept.map { callCandidates[$0] }
+    let micCounts = keptCounts(micWords, micKeptCandidates), callCounts = keptCounts(callWords, callKeptCandidates)
+    let micNames = nameMic(micSp, keptWords: micCounts.counts, firstWord: micCounts.first, echo: voices.micEcho,
+                           unknown: voices.micUnknown, print: usable, isCall: result.isCall, counted: micCounted)
+    let callNames = nameCall(callSp, keptWords: callCounts.counts, firstWord: callCounts.first, userVoice: userVoice,
+                             print: usable, counted: callCounted)
+    let live = micSp.filter { !voices.micEcho.contains($0.id) }
+    if let p = usable, !live.isEmpty, !micNames.values.contains("Me") {
+        let best = live.map { cosine($0.vector, p.vector) }.max() ?? 0
+        result.log.append(String(format: "Your voice was not recognised on the microphone side (best match %.2f)", best))
+    } else if usable == nil, !result.isCall, !live.isEmpty {
+        result.log.append("Your voice is not learnt yet, so nobody in this room recording is labelled Me")
+    }
+
+    // Labels, resolved and smoothed.
+    result.mic = micWords
+    result.micLabels = smooth(resolve(micWords, micKeptCandidates, names: micNames, fallback: fallbackLabel(micNames, side: .mic)), micWords)
+    result.call = callWords
+    result.callLabels = smooth(resolve(callWords, callKeptCandidates, names: callNames, fallback: fallbackLabel(callNames, side: .call)), callWords)
+    result.micSpeakers = live
+    result.micKept = micCounts.counts.filter { id, _ in live.contains { $0.id == id } }
+    result.callSpeakers = callSp
+    return result
+}
+
+/// The transcript's lines from labelled words: joinLines over one stream per label, or with tidying off
+/// (`plain`), mergeTurns over the same streams, so a line starts at every change of label. Labels come
+/// in the order they are first used, the microphone side's first.
+func transcriptLines(_ labelled: LabelledWords, plain: Bool) -> [Turn] {
+    var order: [String] = []
+    var byLabel: [String: [Word]] = [:]
+    for (word, label) in Array(zip(labelled.mic, labelled.micLabels)) + Array(zip(labelled.call, labelled.callLabels)) {
+        if byLabel[label] == nil { order.append(label) }
+        byLabel[label, default: []].append(word)
+    }
+    let streams = order.map { (label: $0, words: byLabel[$0] ?? []) }
+    return plain ? mergeTurns(streams) : joinLines(streams)
 }

@@ -262,9 +262,45 @@ install_speech >/dev/null 2>&1
 need_fm_license() { return 1; }
 out="$(doctor 2>&1)"
 if printf '%s' "$out" | grep -q 'Parakeet' && printf '%s' "$out" | grep -qF "speech models" \
-   && printf '%s' "$out" | grep -qF "model cache $CACHE" && printf '%s' "$out" | grep -qF "voice print"; then
+   && printf '%s' "$out" | grep -qF "model cache $CACHE" \
+   && printf '%s' "$out" | grep -qF "Not learnt yet: meetingbox learns it from your video calls, or record a sample"; then
   pass "doctor reports Parakeet, the models, the cache folder and the voice print"
 else fail "doctor reports Parakeet, the models, the cache folder and the voice print: $out"; fi
+
+# --- doctor's voice line says what Preferences says, from voice.json ---
+voice_said() {   # $1: voice.json's text, or "" for no file; prints doctor's line about the voice
+  rm -f "$VOICE_FILE"
+  [ -z "$1" ] || printf '%s\n' "$1" > "$VOICE_FILE"
+  doctor 2>&1 | grep -i 'voice\|learnt' | sed 's/^ *//; s/^[a-z]* *//'
+}
+voice_ok=1; voice_wrong=""
+voice_case() {   # $1: voice.json's text, $2: the line expected
+  local got
+  got="$(voice_said "$1")"
+  case "$got" in *"$2"*) ;; *) voice_ok=0; voice_wrong="$voice_wrong [$2 / $got]" ;; esac
+}
+voice_case '' "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+voice_case '{"model": "m", "seconds": 75.4, "meetings": 2, "sources": ["a", "b"], "vector": [1], "updated": "x"}' \
+  "Your voice: learnt from 2 calls (1 minute of speech)"
+voice_case '{"model": "m", "seconds": 130, "meetings": 1, "sources": ["a"], "sample": false, "refusals": 0, "vector": [1], "updated": "x"}' \
+  "Your voice: learnt from 1 call (2 minutes of speech)"
+voice_case '{"model": "m", "seconds": 95, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
+  "Your voice: from a recorded sample (1 minute of speech)"
+voice_case '{"model": "m", "seconds": 200, "meetings": 3, "sources": ["a", "b"], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
+  "Your voice: from a recorded sample and 2 calls (3 minutes of speech)"
+voice_case '{"model": "m", "seconds": 61, "meetings": 2, "sources": ["a"], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
+  "Your voice: from a recorded sample and 1 call (1 minute of speech)"
+voice_case '{"model": "m", "seconds": "lots"' "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+if [ "$voice_ok" = 1 ]; then pass "doctor's voice line: learnt from calls, from a sample, from both, or not learnt yet, with singulars"
+else fail "doctor's voice line: learnt from calls, from a sample, from both, or not learnt yet, with singulars:$voice_wrong"; fi
+# a voice print setup did not record is never learnt into, and doctor says so
+grep -vxF "$VOICE_FILE" "$INSTALLED" > "$HOME/installed.tmp"; mv "$HOME/installed.tmp" "$INSTALLED"
+printf '%s\n' '{"model": "m", "seconds": 75, "meetings": 2, "sources": ["a", "b"], "vector": [1], "updated": "x"}' > "$VOICE_FILE"
+out="$(doctor 2>&1)"
+if printf '%s' "$out" | grep -qF "Your voice: learnt from 2 calls" && printf '%s' "$out" | grep -qF "$VOICE_FILE was not made by meetingbox"; then
+  pass "doctor says when the voice print is not on the install record"
+else fail "doctor says when the voice print is not on the install record: $out"; fi
+rm -f "$VOICE_FILE"
 printf '%s\n' "$HOME/Library/Caches" > "$HOME/cache-dir.out"
 out="$(doctor 2>&1)"
 printf '%s' "$out" | grep -qF "model cache: " && pass "doctor says when the cache folder cannot be recorded" \

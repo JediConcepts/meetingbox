@@ -1,0 +1,5 @@
+{"model": "FluidInference/speaker-diarization-coreml@df2625ac79a7ac6b65ad868fee6d80f320da4232",
+"segments": [{"speaker": "S1", "start": 0.0, "end": 9.2},
+{"speaker": "S2", "start": 10.3, "end": 14.8}],
+"speakers": [{"id": "S1", "seconds": 9.2, "median": 9.2, "vector": [0.9, 0.1, 0.0, 0.1]},
+{"id": "S2", "seconds": 4.5, "median": 4.5, "vector": [0.1, 0.9, 0.1, 0.0]}]}

@@ -1,0 +1,1 @@
+{"model": "FluidInference/speaker-diarization-coreml@df2625ac79a7ac6b65ad868fee6d80f320da4232", "seconds": 75.0, "meetings": 2, "sources": ["meeting-a", "meeting-b"], "vector": [1.0, 0.0, 0.0, 0.0], "updated": "2026-11-10T18:00:00Z"}
