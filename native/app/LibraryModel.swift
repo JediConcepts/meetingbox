@@ -53,8 +53,8 @@ final class LibraryModel: ObservableObject {
                 NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
                 return true
             },
-            // With no file named, the Finder opens a window on the folder itself and selects nothing; nothing
-            // in it is opened.
+            // With no file named, AppKit documents that the Finder opens a window on the folder itself and
+            // selects nothing; nothing in it is opened.
             showFolder: { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: $0.path) })
     }
 

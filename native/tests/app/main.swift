@@ -4994,7 +4994,7 @@ MainActor.assumeIsolated {
           "C1: without QuickTime Player it says so, and opens nothing else")
     model.perform(.showInFinder)
     check(shownFolders.count == 1 && isAt(shownFolders.first, a) && opened.count == 2 && model.problem == nil,
-          "C6: Show in Finder opens the meeting's own folder in the Finder (not its parent), opening no file; the message goes")
+          "C6: Show in Finder hands the meeting's own folder to the Finder, opening no file; the message goes")
     found = true
     model.update(StatusInput(phase: .recording(libURL("2026-10-29_0900"))))
     model.perform(.playAudio)
