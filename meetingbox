@@ -654,6 +654,11 @@ speech_cache() {
 }
 
 speech_failed() { warn "Parakeet could not be set up: $1. Carrying on with Apple's transcriber."; }
+# Any failure in the step: a helper that is still usable goes on being used, so it says that.
+speech_step_failed() {
+  if speech_usable; then warn "Parakeet could not be updated: $1. The installed version is still used."
+  else speech_failed "$1"; fi
+}
 
 # Parakeet and speaker labels (on device). Builds mb-speech in a temporary folder that holds every
 # SwiftPM cache, clone and setting, so nothing lands in the user's shared Swift folders, and
@@ -661,60 +666,73 @@ speech_failed() { warn "Parakeet could not be set up: $1. Carrying on with Apple
 # when they fail the helper's check or differ from the source's manifest, and warms them. Any
 # failure says so and returns 1; setup carries on, and a working helper or model is kept.
 install_speech() {
-  local tmp bin cache reason
+  local tmp bin cache reason hash
   say "Parakeet and speaker labels (on device)"
   info "a more accurate transcriber and speaker labels, about 630 MB of models"
-  have swift || { speech_failed "swift build is not installed"; return 1; }
-  fetch_source || { speech_failed "the meetingbox source could not be fetched"; return 1; }
-  [ -f "$SOURCE_DIR/native/speech/Package.swift" ] || { speech_failed "no speech helper source in $SOURCE_DIR"; return 1; }
-  tmp="$(mktemp -d)" || { speech_failed "no temporary folder"; return 1; }
-  cp -R "$SOURCE_DIR/native/speech" "$tmp/speech" \
-    && printf 'let buildVersion = "%s"\nlet speechHash = "%s"\n' "$VERSION" "$(speech_hash)" \
-         > "$tmp/speech/Sources/mb-speech/BuildStamp.swift" \
-    || { rm -rf -- "$tmp"; speech_failed "the source could not be copied"; return 1; }
-  set -- --package-path "$tmp/speech" --scratch-path "$tmp/build" --cache-path "$tmp/cache" \
-    --config-path "$tmp/config" --security-path "$tmp/security" --manifest-cache local \
-    --disable-dependency-cache --force-resolved-versions
-  # Whatever those flags say, swift build still makes folders and URL caches under HOME
-  # (~/.swiftpm, ~/Library/org.swift.swiftpm, ~/Library/Caches) and lock files in TMPDIR, so it
-  # runs with both, and the home Foundation reads, inside the temporary folder as well.
-  mkdir "$tmp/home" "$tmp/tmp" || { rm -rf -- "$tmp"; speech_failed "no temporary folder"; return 1; }
-  info "compiling. The first build fetches FluidAudio and takes a few minutes."
-  if ! HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" swift build -c release "$@" >&2 \
-     || ! bin="$(HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" \
-                 swift build -c release "$@" --show-bin-path)" \
-     || [ ! -x "$bin/mb-speech" ]; then
+  have swift || { speech_step_failed "swift build is not installed"; return 1; }
+  fetch_source || { speech_step_failed "the meetingbox source could not be fetched"; return 1; }
+  [ -f "$SOURCE_DIR/native/speech/Package.swift" ] || { speech_step_failed "no speech helper source in $SOURCE_DIR"; return 1; }
+  hash="$(speech_hash)"
+  # Rebuilt only when its own source changed: a recorded helper stamped with this hash is kept.
+  if installed_by_us "$SPEECH_BIN" && [ -x "$SPEECH_BIN" ] \
+     && [ "$("$SPEECH_BIN" version 2>/dev/null | cut -d' ' -f3)" = "$hash" ]; then
+    ok "speech helper is up to date"
+  else
+    tmp="$(mktemp -d)" || { speech_step_failed "no temporary folder"; return 1; }
+    cp -R "$SOURCE_DIR/native/speech" "$tmp/speech" \
+      && printf 'let buildVersion = "%s"\nlet speechHash = "%s"\n' "$VERSION" "$hash" \
+           > "$tmp/speech/Sources/mb-speech/BuildStamp.swift" \
+      || { rm -rf -- "$tmp"; speech_step_failed "the source could not be copied"; return 1; }
+    set -- --package-path "$tmp/speech" --scratch-path "$tmp/build" --cache-path "$tmp/cache" \
+      --config-path "$tmp/config" --security-path "$tmp/security" --manifest-cache local \
+      --disable-dependency-cache --force-resolved-versions
+    # Whatever those flags say, swift build still makes folders and URL caches under HOME
+    # (~/.swiftpm, ~/Library/org.swift.swiftpm, ~/Library/Caches) and lock files in TMPDIR, so it
+    # runs with both, and the home Foundation reads, inside the temporary folder as well.
+    mkdir "$tmp/home" "$tmp/tmp" || { rm -rf -- "$tmp"; speech_step_failed "no temporary folder"; return 1; }
+    info "compiling. The first build fetches FluidAudio and takes a few minutes."
+    if ! HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" swift build -c release "$@" >&2 \
+       || ! bin="$(HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" \
+                   swift build -c release "$@" --show-bin-path)" \
+       || [ ! -x "$bin/mb-speech" ]; then
+      rm -rf -- "$tmp"
+      speech_step_failed "the speech helper did not build"
+      return 1
+    fi
+    # A recorded helper is replaced by a rename over it, never removed first, so a failed
+    # install leaves the old one working. The first install claims the path.
+    if installed_by_us "$SPEECH_BIN" && { [ -e "$SPEECH_BIN" ] || [ -L "$SPEECH_BIN" ]; }; then
+      install -m 755 "$bin/mb-speech" "$SPEECH_BIN.new" && mv -f "$SPEECH_BIN.new" "$SPEECH_BIN"
+    else
+      mkdir -p "$SRC_DIR" && claim_path "$SPEECH_BIN" && install -m 755 "$bin/mb-speech" "$SPEECH_BIN"
+    fi || {
+      rm -f "$SPEECH_BIN.new"; rm -rf -- "$tmp"
+      speech_step_failed "the speech helper could not be installed"
+      return 1
+    }
     rm -rf -- "$tmp"
-    speech_failed "the speech helper did not build"
-    return 1
+    ok "speech helper -> $SPEECH_BIN"
   fi
-  if ! { mkdir -p "$SRC_DIR" && claim_path "$SPEECH_BIN" && install -m 755 "$bin/mb-speech" "$SPEECH_BIN"; }; then
-    rm -rf -- "$tmp"
-    speech_failed "the speech helper could not be installed"
-    return 1
-  fi
-  rm -rf -- "$tmp"
-  ok "speech helper -> $SPEECH_BIN"
 
   # Recorded only if it is not there yet: a folder of the user's own is never claimed.
   if cache="$(speech_cache)" && [ ! -e "$cache" ] && [ ! -L "$cache" ]; then record_install "$cache"; fi
   if [ ! -e "$VOICE_FILE" ] && [ ! -L "$VOICE_FILE" ]; then record_install "$VOICE_FILE"; fi
 
   if [ -e "$SPEECH_MODELS" ] || [ -L "$SPEECH_MODELS" ]; then
-    installed_by_us "$SPEECH_MODELS" || { claim_path "$SPEECH_MODELS"; speech_failed "the models folder is not meetingbox's"; return 1; }
+    installed_by_us "$SPEECH_MODELS" || { claim_path "$SPEECH_MODELS"; speech_step_failed "the models folder is not meetingbox's"; return 1; }
   else
     { claim_path "$SPEECH_MODELS" && mkdir -m 700 "$SPEECH_MODELS"; } \
-      || { speech_failed "$SPEECH_MODELS could not be made"; return 1; }
+      || { speech_step_failed "$SPEECH_MODELS could not be made"; return 1; }
   fi
   if ! "$SPEECH_BIN" check "$SPEECH_MODELS" >/dev/null 2>&1 \
      || ! cmp -s "$SPEECH_MODELS/models.json" "$SOURCE_DIR/native/speech/models.json"; then
     info "downloading the pinned models, about 630 MB"
     reason="$("$SPEECH_BIN" fetch "$SPEECH_MODELS" "$SOURCE_DIR/native/speech/models.json" 2>&1 >/dev/null)" \
-      || { speech_failed "${reason#mb-speech: }"; return 1; }
+      || { speech_step_failed "${reason#mb-speech: }"; return 1; }
   fi
   ok "speech models -> $SPEECH_MODELS"
   info "preparing the models once, about 30 seconds"
-  reason="$("$SPEECH_BIN" warm "$SPEECH_MODELS" 2>&1 >/dev/null)" || { speech_failed "${reason#mb-speech: }"; return 1; }
+  reason="$("$SPEECH_BIN" warm "$SPEECH_MODELS" 2>&1 >/dev/null)" || { speech_step_failed "${reason#mb-speech: }"; return 1; }
   ok "Parakeet and speaker labels"
 }
 
@@ -1318,6 +1336,7 @@ doctor() {
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
   [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels Me and Them)" || miss "mb-transcript (labels Me and Them)"
   if speech_ready; then ok "Parakeet (mb-speech)"
+  elif speech_usable; then miss "Parakeet is out of date. Run: meetingbox setup"   # still used meanwhile
   elif [ -x "$SPEECH_BIN" ]; then miss "Parakeet is not ready, so Apple's transcriber is used. Run: meetingbox setup"
   else info "Parakeet is not set up, so Apple's transcriber is used"; fi
   if [ -x "$SPEECH_BIN" ]; then

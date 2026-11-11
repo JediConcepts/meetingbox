@@ -387,7 +387,8 @@ better position to be in, but it is not a substitute for telling people.
   which runs Parakeet and the speaker models on device for `mb-speech`
 - Parakeet Ultra by [moondream](https://huggingface.co/moondream/parakeet-ultra), as converted to
   Core ML in [FluidInference/parakeet-ultra-coreml](https://huggingface.co/FluidInference/parakeet-ultra-coreml)
-  (CC-BY-4.0)
+  (CC-BY-4.0). It is a post-trained version of NVIDIA's
+  [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (CC-BY-4.0)
 - Speaker labels: [FluidInference/speaker-diarization-coreml](https://huggingface.co/FluidInference/speaker-diarization-coreml),
   Core ML conversions of [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
   (CC-BY-4.0, as scoped by that repository's NOTICE.md)

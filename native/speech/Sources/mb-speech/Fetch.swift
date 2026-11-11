@@ -1,9 +1,17 @@
 // `mb-speech fetch <models> <manifest>`: the only command that uses the network, and the only
 // one that turns FluidAudio's offline mode off (main.swift). It never asks FluidAudio to
-// download: it fetches each pinned file itself, checks it, then swaps the folder in.
+// download: it fetches each pinned file itself and checks it. Foundation only, so the native
+// tests compile it with a stand-in downloader.
 import Foundation
 
-func fetchModels(into models: URL, manifestAt manifestURL: URL) async throws {
+/// Fetches one file from its address to a local path, or throws.
+typealias Download = (URL, URL) async throws -> Void
+
+/// Every changed model is downloaded and verified into `.part-<folder>` before any folder is
+/// swapped, and `models.json` is written last. So a failed download leaves a working install
+/// exactly as it was. A model whose folder already holds the manifest's revision and verifies
+/// is kept, not downloaded again.
+func fetchModels(into models: URL, manifestAt manifestURL: URL, download: Download) async throws {
     let fm = FileManager.default
     guard let data = try? Data(contentsOf: manifestURL) else {
         throw SpeechError(reason: "\(manifestURL.path) cannot be read")
@@ -18,14 +26,8 @@ func fetchModels(into models: URL, manifestAt manifestURL: URL) async throws {
         try fm.removeItem(at: models.appendingPathComponent(name))
     }
 
-    // Ephemeral: no cookies, no URL cache and nothing else on disk.
-    let configuration = URLSessionConfiguration.ephemeral
-    configuration.timeoutIntervalForRequest = 60
-    configuration.timeoutIntervalForResource = 4 * 60 * 60
-    let session = URLSession(configuration: configuration)
-    defer { session.invalidateAndCancel() }
-
-    for model in manifest.models {
+    var staged: [ManifestModel] = []
+    for model in manifest.models where !modelIsCurrent(model, in: models.appendingPathComponent(model.folder)) {
         let part = models.appendingPathComponent(".part-" + model.folder)
         try fm.createDirectory(at: part, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         for file in model.files {
@@ -35,22 +37,36 @@ func fetchModels(into models: URL, manifestAt manifestURL: URL) async throws {
             let target = part.appendingPathComponent(file.path)
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true,
                                    attributes: [.posixPermissions: 0o700])
-            let (downloaded, response) = try await session.download(from: url)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard status == 200 else {
-                try? fm.removeItem(at: downloaded)
-                throw SpeechError(reason: "\(url.absoluteString) answered \(status)")
-            }
-            try fm.moveItem(at: downloaded, to: target)
+            try await download(url, target)
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
             if let reason = verifyFile(file, in: part) { throw SpeechError(reason: reason) }
         }
         for marker in revisionMarkers {
             try writePrivately(Data((model.revision + "\n").utf8), to: part.appendingPathComponent(marker))
         }
-        try swapIn(part, as: models.appendingPathComponent(model.folder))
+        staged.append(model)
+    }
+    for model in staged {
+        try swapIn(models.appendingPathComponent(".part-" + model.folder), as: models.appendingPathComponent(model.folder))
     }
     try writePrivately(data, to: models.appendingPathComponent(installedManifestName))
+}
+
+/// The real downloader: an ephemeral session, so no cookies, no URL cache and nothing else on disk.
+func sessionDownload() -> Download {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 60
+    configuration.timeoutIntervalForResource = 4 * 60 * 60
+    let session = URLSession(configuration: configuration)
+    return { url, target in
+        let (downloaded, response) = try await session.download(from: url)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            try? FileManager.default.removeItem(at: downloaded)
+            throw SpeechError(reason: "\(url.absoluteString) answered \(status)")
+        }
+        try FileManager.default.moveItem(at: downloaded, to: target)
+    }
 }
 
 /// Renames the old folder aside, renames the new one in, then removes the old.

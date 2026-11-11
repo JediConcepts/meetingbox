@@ -120,6 +120,13 @@ func readMarker(_ url: URL) -> String? {
     return text.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+/// True when `folder` already holds this model: both markers name its revision and every file
+/// has the manifest's size and SHA-256. `fetch` keeps such a folder rather than download it again.
+func modelIsCurrent(_ model: ManifestModel, in folder: URL) -> Bool {
+    revisionMarkers.allSatisfy { readMarker(folder.appendingPathComponent($0)) == model.revision }
+        && model.files.allSatisfy { verifyFile($0, in: folder) == nil }
+}
+
 /// Reads and parses `<models>/models.json`.
 func installedManifest(at models: URL) throws -> Manifest {
     let url = models.appendingPathComponent(installedManifestName)

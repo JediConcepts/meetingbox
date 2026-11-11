@@ -49,7 +49,8 @@ do {
         print(cacheDirectory().path)
     case ("fetch", 3):
         ModelHub.offlineMode = false
-        try await fetchModels(into: URL(fileURLWithPath: arguments[1]), manifestAt: URL(fileURLWithPath: arguments[2]))
+        try await fetchModels(into: URL(fileURLWithPath: arguments[1]), manifestAt: URL(fileURLWithPath: arguments[2]),
+                              download: sessionDownload())
     case ("check", 2):
         if let reason = checkModels(at: URL(fileURLWithPath: arguments[1])) { fail(reason) }
     case ("warm", 2):

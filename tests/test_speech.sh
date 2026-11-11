@@ -62,6 +62,8 @@ if [ "$rc" -eq 0 ] && [ "$(grep -m1 -n '^fetch_source' "$HOME/calls.log" | cut -
 else fail "install_speech fetches the source first, then builds ($rc): $out $(cat "$HOME/calls.log")"; fi
 
 ok_flags=1
+# with no swift call logged, nothing below would be checked: that is a failure too
+[ "$(calls swift)" -ge 1 ] && [ -s "$HOME/swift-env.log" ] || ok_flags=0
 while IFS= read -r line; do
   set -- ${line#swift }
   tmp=""; prev=""; seen=""
@@ -107,9 +109,12 @@ else fail "the cache folder and the voice print, absent before, are recorded: $(
 if printf '%s' "$out" | grep -qF 'Parakeet and speaker labels (on device)'; then pass "the step has its title"
 else fail "the step has its title: $out"; fi
 
-# --- run again: nothing to fetch ---
+# --- run again: nothing to build, nothing to fetch ---
 : > "$HOME/calls.log"
 out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(calls swift)" = 0 ] && [ "$(calls fetch_source)" = 1 ]; then
+  pass "a recorded helper built from this source is not rebuilt"
+else fail "a recorded helper built from this source is not rebuilt: $(cat "$HOME/calls.log")"; fi
 if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech fetch')" = 0 ] && [ "$(calls 'mb-speech warm')" = 1 ]; then
   pass "models that pass check and match the source manifest are not fetched again"
 else fail "models that pass check and match the source manifest are not fetched again: $(cat "$HOME/calls.log")"; fi
@@ -137,15 +142,41 @@ cp "$ROOT/native/speech/Sources/mb-speech/Fetch.swift" "$SOURCE_DIR/native/speec
 speech_ready && pass "speech_ready is true again with the source it was built from" \
   || fail "speech_ready is true again with the source it was built from"
 
-# --- a failing build keeps what works, and setup carries on ---
+# --- an update that fails keeps what works ---
+FETCH_SRC="$SOURCE_DIR/native/speech/Sources/mb-speech/Fetch.swift"
+printf '// changed\n' >> "$FETCH_SRC"   # so the helper is due a rebuild
 cp "$SPEECH_BIN" "$HOME/helper.before"
 cp "$SPEECH_MODELS/models.json" "$HOME/models.before"
+kept() { [ -x "$SPEECH_BIN" ] && cmp -s "$SPEECH_BIN" "$HOME/helper.before" && cmp -s "$SPEECH_MODELS/models.json" "$HOME/models.before"; }
+updated_line() { printf '%s' "$1" | grep -qF "Parakeet could not be updated: " \
+  && printf '%s' "$1" | grep -qF ". The installed version is still used." && ! printf '%s' "$1" | grep -qF "Apple's transcriber"; }
+
+out="$(doctor 2>&1)"
+printf '%s' "$out" | grep -qF "Parakeet is out of date. Run: meetingbox setup" \
+  && pass "doctor says a usable helper built from older source is out of date" \
+  || fail "doctor says a usable helper built from older source is out of date: $out"
+
+out="$(SWIFT_FAILS=1 install_speech 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && updated_line "$out" && kept; then
+  pass "a failing rebuild says Parakeet could not be updated, and keeps the usable helper and models"
+else fail "a failing rebuild says Parakeet could not be updated, and keeps the usable helper and models ($rc): $out"; fi
+
+out="$(install() { echo "install $*" >> "$HOME/calls.log"; return 1; }; install_speech 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && updated_line "$out" && kept; then
+  pass "a failing install of the new helper leaves the old one in place"
+else fail "a failing install of the new helper leaves the old one in place ($rc): $out"; fi
+
+touch "$HOME/check-fails"   # the old helper is not usable now
 out="$(SWIFT_FAILS=1 install_speech 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "Parakeet could not be set up: " \
-   && printf '%s' "$out" | grep -qF ". Carrying on with Apple's transcriber." \
-   && cmp -s "$SPEECH_BIN" "$HOME/helper.before" && cmp -s "$SPEECH_MODELS/models.json" "$HOME/models.before"; then
-  pass "a failing build says Parakeet could not be set up and keeps the old helper and models"
-else fail "a failing build says Parakeet could not be set up and keeps the old helper and models ($rc): $out"; fi
+   && printf '%s' "$out" | grep -qF ". Carrying on with Apple's transcriber." && kept; then
+  pass "a failing build with no usable helper says Parakeet could not be set up"
+else fail "a failing build with no usable helper says Parakeet could not be set up ($rc): $out"; fi
+rm -f "$HOME/check-fails"
+cp "$ROOT/native/speech/Sources/mb-speech/Fetch.swift" "$FETCH_SRC"
+
+out="$(install_speech 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && speech_ready && pass "after the failures, setup installs again" || fail "after the failures, setup installs again: $out"
 
 (
   macos_major() { echo 27; }
@@ -164,6 +195,7 @@ else fail "a failing build says Parakeet could not be set up and keeps the old h
   make_shortcut_hint() { :; }
   open_app() { :; }
   mkdir -p "$BIN_DIR"
+  rm -f "$SPEECH_BIN"   # nothing usable, so the step builds, and fails
   : > "$HOME/calls.log"
   out="$(SWIFT_FAILS=1 setup 2>&1)"; rc=$?
   if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'Parakeet (more accurate transcripts and speaker labels, about 630 MB)' \

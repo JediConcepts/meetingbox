@@ -1,6 +1,6 @@
-// sources: ../../speech/Sources/mb-speech/Shape.swift
-// mb-speech's FluidAudio-free parts: the pinned manifest, file checks and `check`. No network,
-// no models: every file here is made in a temporary folder.
+// sources: ../../speech/Sources/mb-speech/Shape.swift ../../speech/Sources/mb-speech/Fetch.swift
+// mb-speech's FluidAudio-free parts: the pinned manifest, file checks, `check` and `fetch` (with a
+// stand-in downloader). No network, no models: every file here is made in a temporary folder.
 import CryptoKit
 import Foundation
 
@@ -107,6 +107,62 @@ for name in sources where name.hasSuffix(".swift") {
     found += banned.filter { text.contains($0) }.map { "\(name): \($0)" }
 }
 check(found.isEmpty, "sources: none of the banned FluidAudio calls appear \(found)")
+
+// main.swift turns offline mode on, and console mirroring off, before it reads any argument.
+let mainText = (try? String(contentsOf: speech.appendingPathComponent("Sources/mb-speech/main.swift"), encoding: .utf8)) ?? ""
+let firstArgument = mainText.range(of: "CommandLine.arguments")?.lowerBound
+for statement in ["ModelHub.offlineMode = true", "AppLogger.mirrorsToConsole = false"] {
+    let at = mainText.range(of: statement)?.lowerBound
+    check(at != nil && firstArgument != nil && at! < firstArgument!, "main.swift: \(statement) comes before any argument is read")
+}
+
+// fetch: every changed model is downloaded and verified before any is swapped in, so a failed
+// download leaves a working install as it was; a model already at its revision is not fetched again.
+func entry(_ path: String, _ body: Data) -> String { "{\"path\": \"\(path)\", \"size\": \(body.count), \"sha256\": \"\(hex(body))\"}" }
+func twoModels(_ revA: String, _ a: Data, _ revB: String, _ b: Data) -> URL {
+    let url = scratch.appendingPathComponent("manifest-\(UUID().uuidString).json")
+    try! Data("""
+    {"models": [{"name": "a", "repo": "Owner/a-coreml", "revision": "\(revA)", "folder": "a", "files": [\(entry("w/a.bin", a))]},
+                {"name": "b", "repo": "Owner/b-coreml", "revision": "\(revB)", "folder": "b", "files": [\(entry("b.bin", b))]}]}
+    """.utf8).write(to: url)
+    return url
+}
+var requested: [String] = []
+func serving(_ bodies: [String: Data], failing: String? = nil) -> Download {
+    return { url, target in
+        requested.append(url.lastPathComponent)
+        if url.lastPathComponent == failing { throw SpeechError(reason: "\(url.absoluteString) answered 404") }
+        try bodies[url.lastPathComponent]!.write(to: target)
+    }
+}
+let store = scratch.appendingPathComponent("store")
+try! fm.createDirectory(at: store, withIntermediateDirectories: true)
+func fetchReason(_ manifest: URL, _ download: @escaping Download) async -> String? {
+    do { try await fetchModels(into: store, manifestAt: manifest, download: download); return nil }
+    catch let error as SpeechError { return error.reason } catch { return "\(error)" }
+}
+func snapshot() -> [Data?] {
+    ["models.json", "a/w/a.bin", "a/.revision", "a/.fluidaudio-revision", "b/b.bin", "b/.revision", "b/.fluidaudio-revision"]
+        .map { try? Data(contentsOf: store.appendingPathComponent($0)) }
+}
+let rev1 = String(repeating: "1", count: 40), rev2 = String(repeating: "2", count: 40)
+let oldA = Data("old a".utf8), oldB = Data("old b".utf8), newA = Data("new a".utf8), newB = Data("new b".utf8)
+let first = await fetchReason(twoModels(rev1, oldA, rev1, oldB), serving(["a.bin": oldA, "b.bin": oldB]))
+check(first == nil && checkModels(at: store) == nil, "fetch: two models install and pass check \(first ?? "")")
+
+let before = snapshot()
+let failed = await fetchReason(twoModels(rev2, newA, rev2, newB), serving(["a.bin": newA, "b.bin": newB], failing: "b.bin"))
+check(failed?.contains("404") == true, "fetch: a failed download is the reason")
+check(snapshot() == before, "fetch: after a failed download both old folders and models.json are byte-identical")
+check(checkModels(at: store) == nil, "fetch: after a failed download check still passes")
+
+requested = []
+let one = await fetchReason(twoModels(rev1, oldA, rev2, newB), serving(["b.bin": newB]))
+check(one == nil && requested == ["b.bin"], "fetch: a model already at its revision is not downloaded again \(requested)")
+check(checkModels(at: store) == nil && (try? Data(contentsOf: store.appendingPathComponent("b/b.bin"))) == newB,
+      "fetch: the changed model is swapped in and check passes")
+let leftovers = ((try? fm.contentsOfDirectory(atPath: store.path)) ?? []).filter { $0.hasPrefix(".part-") || $0.hasPrefix(".old-") }
+check(leftovers.isEmpty, "fetch: no .part- or .old- folder is left after a good fetch \(leftovers)")
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")
