@@ -45,3 +45,9 @@ openssl()  { echo "openssl $*" >> "$HOME/calls.log"; return 0; }
 # The app's preferences live with the real user, whatever HOME says: never read them. Unset
 # unless a test says otherwise.
 defaults() { echo "defaults $*" >> "$HOME/calls.log"; return 1; }
+# Nothing reaches the network, builds for real or decodes audio unless a suite replaces these.
+curl()      { echo "curl $*" >> "$HOME/calls.log"; return 7; }
+swift()     { echo "swift $*" >> "$HOME/calls.log"; return 1; }
+afconvert() { echo "afconvert $*" >> "$HOME/calls.log"; : > "${!#}"; }
+# Parakeet counts as set up, so a setup() test sees no Parakeet step unless its suite says otherwise.
+speech_ready() { return 0; }

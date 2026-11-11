@@ -58,6 +58,7 @@ meetingbox 4 things to install. I can do all of them from here.
 | Xcode Command Line Tools | compiles the recorder | one Apple installer window |
 | the meetingbox app with its recorder, built from meetingbox's own source (`native/app`, `native/recorder`), plus `mb-transcript` (`native/transcript`) | the app you control recordings from; records you and the far side, and merges the two transcripts | a minute or two to compile |
 | a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, and macOS may ask for your login password once |
+| Parakeet and speaker labels (on device): `mb-speech` (`native/speech`), built with `swift build` over [FluidAudio](https://github.com/FluidInference/FluidAudio) 0.18.3, and its models at fixed revisions, each file's size and SHA-256 checked | more accurate transcripts and speaker labels. Optional: if it cannot be set up, Apple's transcriber is used | a few minutes to build, about 630 MB of models |
 | [speech-analyzer](https://github.com/simonw/speech-analyzer-cli) | Apple's on device transcriber | a few seconds, no model download |
 | or whisper.cpp instead | if you would rather run your own model | 1.6GB download |
 | `sudo fm license` | accepts Apple's model licence, once | your Mac password |
@@ -382,5 +383,16 @@ better position to be in, but it is not a substitute for telling people.
 - [speech-analyzer-cli](https://github.com/simonw/speech-analyzer-cli) by Simon
   Willison, a CLI over Apple's SpeechAnalyzer
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) by Georgi Gerganov
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) by FluidInference (Apache 2.0),
+  which runs Parakeet and the speaker models on device for `mb-speech`
+- Parakeet Ultra by [moondream](https://huggingface.co/moondream/parakeet-ultra), as converted to
+  Core ML in [FluidInference/parakeet-ultra-coreml](https://huggingface.co/FluidInference/parakeet-ultra-coreml)
+  (CC-BY-4.0)
+- Speaker labels: [FluidInference/speaker-diarization-coreml](https://huggingface.co/FluidInference/speaker-diarization-coreml),
+  Core ML conversions of [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
+  (CC-BY-4.0, as scoped by that repository's NOTICE.md)
+
+The models are downloaded by `meetingbox setup` from Hugging Face, at the revisions pinned in
+`native/speech/models.json`. They are not part of this repository.
 
 MIT licensed.

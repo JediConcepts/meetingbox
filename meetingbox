@@ -80,6 +80,11 @@ OLD_REC_BIN="$OLD_APP_DIR/Contents/MacOS/audio-capture"
 # Merges the mic and call transcripts into one labelled Me and Them. Built from
 # native/transcript alongside the app.
 TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
+# Parakeet and speaker labels: the speech helper, built from native/speech with swift build, and
+# the pinned models it checks before every use. The voice print is learnt from video calls.
+SPEECH_BIN="$SRC_DIR/mb-speech"
+SPEECH_MODELS="$SRC_DIR/models"
+VOICE_FILE="$STATE_DIR/voice.json"
 # The app is signed with a certificate setup makes in the login keychain. macOS
 # ties the permissions to that certificate, so they survive a rebuild.
 SIGN_NAME="meetingbox local signing"
@@ -516,6 +521,8 @@ stop_proc() {
 need_xcode_clt()      { ! have swiftc; }
 need_brew()           { ! have brew; }
 need_recorder()       { ! recorder_ready || ! built_from_source; }
+# Checked whenever the recorder is due too, so a release update rebuilds a changed helper.
+need_speech()         { need_recorder || ! speech_ready; }
 # fm rejects an empty prompt ("Missing prompt"), so the probe must send one or it
 # reports the licence missing on every machine.
 need_fm_license()     { have fm && ! printf 'ok' | fm respond -i 'Reply with the single word ok.' >/dev/null 2>&1; }
@@ -603,6 +610,112 @@ install_recorder() {
   rm -rf -- "$build_dir"
   ok "recorder -> $APP_DIR"
   ok "transcript helper -> $TRANSCRIPT_BIN"
+}
+
+# The speech helper's source as one hash: Package.swift, Package.resolved and every
+# Sources/mb-speech/*.swift but BuildStamp.swift (which carries the hash), each by name and
+# contents, with the recipe that builds them (install_speech, declare -f, so comments do not
+# count). Setup stamps the build with it and `mb-speech version` prints it. Empty with no source.
+speech_hash() {
+  local f
+  [ -d "$SOURCE_DIR/native/speech" ] || return 0
+  set -- native/speech/Package.swift native/speech/Package.resolved
+  for f in "$SOURCE_DIR"/native/speech/Sources/mb-speech/*.swift; do
+    case "$f" in */BuildStamp.swift) ;; *) [ -f "$f" ] && set -- "$@" "${f#"$SOURCE_DIR"/}" ;; esac
+  done
+  { { (cd "$SOURCE_DIR" && shasum -a 256 -- "$@")
+      printf '%s  (build recipe)\n' "$(declare -f install_speech | shasum -a 256 | cut -d' ' -f1)"
+    } | LC_ALL=C sort | shasum -a 256 | cut -d' ' -f1; } || true
+}
+
+# Usable: the helper runs and its models pass its own check (every file at its size, each folder's
+# revision markers). Ready: usable, built from the source on disk, and with the source's manifest.
+speech_usable() { [ -x "$SPEECH_BIN" ] && "$SPEECH_BIN" check "$SPEECH_MODELS" >/dev/null 2>&1; }
+speech_ready() {
+  local hash
+  speech_usable || return 1
+  hash="$(speech_hash)"
+  [ -n "$hash" ] && [ "$("$SPEECH_BIN" version 2>/dev/null | cut -d' ' -f3)" = "$hash" ] \
+    && cmp -s "$SPEECH_MODELS/models.json" "$SOURCE_DIR/native/speech/models.json"
+}
+
+# The folder Core ML keeps the helper's prepared models in, as the helper reports it. Printed only
+# when that is one line holding an absolute path that ends in /Library/Caches/mb-speech with no
+# '..' part, so a shared folder is never recorded, and so never removed.
+speech_cache() {
+  local c
+  c="$("$SPEECH_BIN" cache-dir 2>/dev/null)" || return 1
+  case "$c" in
+    *"
+"*|*/../*|*/..) return 1 ;;
+    /*/Library/Caches/mb-speech) printf '%s\n' "$c" ;;
+    *) return 1 ;;
+  esac
+}
+
+speech_failed() { warn "Parakeet could not be set up: $1. Carrying on with Apple's transcriber."; }
+
+# Parakeet and speaker labels (on device). Builds mb-speech in a temporary folder that holds every
+# SwiftPM cache, clone and setting, so nothing lands in the user's shared Swift folders, and
+# replaces the installed helper only once the build has worked. Then fetches the pinned models
+# when they fail the helper's check or differ from the source's manifest, and warms them. Any
+# failure says so and returns 1; setup carries on, and a working helper or model is kept.
+install_speech() {
+  local tmp bin cache reason
+  say "Parakeet and speaker labels (on device)"
+  info "a more accurate transcriber and speaker labels, about 630 MB of models"
+  have swift || { speech_failed "swift build is not installed"; return 1; }
+  fetch_source || { speech_failed "the meetingbox source could not be fetched"; return 1; }
+  [ -f "$SOURCE_DIR/native/speech/Package.swift" ] || { speech_failed "no speech helper source in $SOURCE_DIR"; return 1; }
+  tmp="$(mktemp -d)" || { speech_failed "no temporary folder"; return 1; }
+  cp -R "$SOURCE_DIR/native/speech" "$tmp/speech" \
+    && printf 'let buildVersion = "%s"\nlet speechHash = "%s"\n' "$VERSION" "$(speech_hash)" \
+         > "$tmp/speech/Sources/mb-speech/BuildStamp.swift" \
+    || { rm -rf -- "$tmp"; speech_failed "the source could not be copied"; return 1; }
+  set -- --package-path "$tmp/speech" --scratch-path "$tmp/build" --cache-path "$tmp/cache" \
+    --config-path "$tmp/config" --security-path "$tmp/security" --manifest-cache local \
+    --disable-dependency-cache --force-resolved-versions
+  # Whatever those flags say, swift build still makes folders and URL caches under HOME
+  # (~/.swiftpm, ~/Library/org.swift.swiftpm, ~/Library/Caches) and lock files in TMPDIR, so it
+  # runs with both, and the home Foundation reads, inside the temporary folder as well.
+  mkdir "$tmp/home" "$tmp/tmp" || { rm -rf -- "$tmp"; speech_failed "no temporary folder"; return 1; }
+  info "compiling. The first build fetches FluidAudio and takes a few minutes."
+  if ! HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" swift build -c release "$@" >&2 \
+     || ! bin="$(HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" \
+                 swift build -c release "$@" --show-bin-path)" \
+     || [ ! -x "$bin/mb-speech" ]; then
+    rm -rf -- "$tmp"
+    speech_failed "the speech helper did not build"
+    return 1
+  fi
+  if ! { mkdir -p "$SRC_DIR" && claim_path "$SPEECH_BIN" && install -m 755 "$bin/mb-speech" "$SPEECH_BIN"; }; then
+    rm -rf -- "$tmp"
+    speech_failed "the speech helper could not be installed"
+    return 1
+  fi
+  rm -rf -- "$tmp"
+  ok "speech helper -> $SPEECH_BIN"
+
+  # Recorded only if it is not there yet: a folder of the user's own is never claimed.
+  if cache="$(speech_cache)" && [ ! -e "$cache" ] && [ ! -L "$cache" ]; then record_install "$cache"; fi
+  if [ ! -e "$VOICE_FILE" ] && [ ! -L "$VOICE_FILE" ]; then record_install "$VOICE_FILE"; fi
+
+  if [ -e "$SPEECH_MODELS" ] || [ -L "$SPEECH_MODELS" ]; then
+    installed_by_us "$SPEECH_MODELS" || { claim_path "$SPEECH_MODELS"; speech_failed "the models folder is not meetingbox's"; return 1; }
+  else
+    { claim_path "$SPEECH_MODELS" && mkdir -m 700 "$SPEECH_MODELS"; } \
+      || { speech_failed "$SPEECH_MODELS could not be made"; return 1; }
+  fi
+  if ! "$SPEECH_BIN" check "$SPEECH_MODELS" >/dev/null 2>&1 \
+     || ! cmp -s "$SPEECH_MODELS/models.json" "$SOURCE_DIR/native/speech/models.json"; then
+    info "downloading the pinned models, about 630 MB"
+    reason="$("$SPEECH_BIN" fetch "$SPEECH_MODELS" "$SOURCE_DIR/native/speech/models.json" 2>&1 >/dev/null)" \
+      || { speech_failed "${reason#mb-speech: }"; return 1; }
+  fi
+  ok "speech models -> $SPEECH_MODELS"
+  info "preparing the models once, about 30 seconds"
+  reason="$("$SPEECH_BIN" warm "$SPEECH_MODELS" 2>&1 >/dev/null)" || { speech_failed "${reason#mb-speech: }"; return 1; }
+  ok "Parakeet and speaker labels"
 }
 
 # Build meetingbox.app: the recorder and the app compiled into one executable,
@@ -1119,6 +1232,8 @@ setup() {
   todo=""
   need_xcode_clt      && { miss "Xcode Command Line Tools"; todo="$todo clt"; }     || ok "Xcode Command Line Tools"
   need_recorder       && { miss "the recorder";             todo="$todo capture"; } || ok "the recorder"
+  need_speech         && { miss "Parakeet (more accurate transcripts and speaker labels, about 630 MB)"
+                           todo="$todo parakeet"; } || ok "Parakeet"
   transcriber_present && ok "a transcriber" || { miss "a transcriber"; todo="$todo transcriber"; }
   # whisper alone works, but Apple's is faster and needs no model; offer it beside it
   if transcriber_present && ! have speech-analyzer && [ "${v:-0}" -ge 26 ] 2>/dev/null; then
@@ -1162,6 +1277,8 @@ setup() {
     *" capture "*) install_recorder || return 1 ;;
     *" sign "*)    resign_app || return 1 ;;
   esac
+  # Optional: Apple's transcriber is used without it, so a failure never stops setup.
+  case " $todo " in *" parakeet "*) install_speech || true ;; esac
 
   case " $todo " in
     *" transcriber "*)
@@ -1200,6 +1317,15 @@ doctor() {
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
   recorder_ready      && ok "recorder (meetingbox.app)" || miss "recorder (meetingbox.app)"
   [ -x "$TRANSCRIPT_BIN" ] && ok "mb-transcript (labels Me and Them)" || miss "mb-transcript (labels Me and Them)"
+  if speech_ready; then ok "Parakeet (mb-speech)"
+  elif [ -x "$SPEECH_BIN" ]; then miss "Parakeet is not ready, so Apple's transcriber is used. Run: meetingbox setup"
+  else info "Parakeet is not set up, so Apple's transcriber is used"; fi
+  if [ -x "$SPEECH_BIN" ]; then
+    r="$("$SPEECH_BIN" check "$SPEECH_MODELS" 2>&1)" && ok "speech models in $SPEECH_MODELS" || miss "speech models: ${r#mb-speech: }"
+    c="$(speech_cache)" && ok "model cache $c" \
+      || miss "model cache: the helper names no folder meetingbox can record, so none is recorded"
+  fi
+  [ -f "$VOICE_FILE" ] && ok "voice print $VOICE_FILE" || info "voice print: not learnt yet"
   if ! have_signing_identity; then
     miss "signing certificate (permissions will be asked again after updates)"
   elif [ -d "$APP_DIR" ] && ! app_signed_by_us; then
@@ -2003,7 +2129,8 @@ reset_cmd() {
     [ "$n" -gt 0 ] || info "    nothing, setup has no record of installing anything"
     left=""
     for p in "$APP_DIR" "$TRANSCRIPT_BIN" "$SRC_DIR/meetingbox" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
-             "$SA_APP" "$SA_LINK" "$WHISPER_FILE"; do
+             "$SA_APP" "$SA_LINK" "$WHISPER_FILE" "$SPEECH_BIN" "$SPEECH_MODELS" "$HOME/Library/Caches/mb-speech" \
+             "$VOICE_FILE"; do
       if { [ -e "$p" ] || [ -L "$p" ]; } && ! installed_by_us "$p"; then left="$left$p
 "; fi
     done
@@ -2061,6 +2188,8 @@ reset_cmd() {
     remove_signing_identity || true
     # a half finished download of the model setup was fetching
     if printf '%s\n' "$ours" | grep -qxF -- "$WHISPER_FILE"; then rm -f "$WHISPER_FILE.part"; fi
+    # and the voice print's own temporary name, written beside it
+    if printf '%s\n' "$ours" | grep -qxF -- "$VOICE_FILE"; then rm -f "$VOICE_FILE.tmp"; fi
     rmdir "$SRC_DIR" "$MODEL_DIR" 2>/dev/null || true
     ok "installed tools removed"
     if have brew && brew list whisper-cpp >/dev/null 2>&1; then
