@@ -26,7 +26,7 @@ Mark used below: **(my call)** means Claude decided, and the user has not yet se
   - the choice of where the minutes are written (its 6.3), widened to several sources, including a per-meeting choice when redoing;
   - the core of its player (its 6.5): play, pause, stop and position, in the window's top bar beside the recording controls.
 - **Left for part 2:**
-  - from the 5 November design: the meeting info file, calendar, the people-and-terms list, new instructions tested against the gold lists, quotation checking, the player's speed and volume and jumping from transcript lines and minutes, showing and restoring earlier versions in the window, and the "Keep on this Mac" mark;
+  - from the 5 November design: the meeting info file, calendar, the people-and-terms list, new instructions tested against the gold lists, quotation checking, the player's speed and volume and jumping from transcript lines and minutes, restoring earlier versions from the window, and the "Keep on this Mac" mark;
   - the hotkey setting.
 - **Changed from the 5 November design:**
   - meetingbox now uses Node, for outside models only, so it can use the user's AI Execution Router;
@@ -68,6 +68,7 @@ Mark used below: **(my call)** means Claude decided, and the user has not yet se
    - the recording controls: timer, Pause or Resume, and Stop;
    - a simple player for the selected meeting's audio.
 8. **Your voice:** learnt from video calls, or recorded on purpose in Preferences.
+9. **Transcript versions,** read only: the meeting page can show any transcript in the folder or in `earlier/`. The user approved this on 11 November, after another session started writing `transcript-parakeet.txt` with MLX Parakeet.
 
 ## 3. Non-goals for this part
 
@@ -304,6 +305,14 @@ New:
   - **First processing whose minutes fail:** the transcription files are still swapped in, keeping what they replace. The run then reports failure, so the meeting is Failed with a transcript, as today, and Redo minutes can finish it.
   - Nothing else in the folder is touched.
 - **Restoring an earlier version** is by hand for now: copy back from `earlier/`. The README says so.
+- **Seeing other versions.** The Transcript view gains a picker, read only.
+  - It lists:
+    - "Current" (`transcript.txt`);
+    - every other `transcript*.txt` in the folder, by file name, with `transcript-parakeet.txt` as "Parakeet (MLX)" and `transcript-original.txt` as "Original";
+    - "Earlier, <date> <time>" for each `earlier/*/transcript.txt`, newest first.
+  - Choosing one only shows it.
+  - Search and the minutes still use `transcript.txt` alone.
+  - The picker resets to "Current" when another meeting is selected.
 - **In the window:**
   - **"Redo minutes…"** on a finished meeting, and on a failed one that has a transcript.
     - It opens a small sheet: "Write the minutes with", starting at the meeting's own choice if it has one, else the Preferences choice.

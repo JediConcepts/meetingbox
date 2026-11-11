@@ -918,12 +918,12 @@
   - Expected: as it was, or finished; never a missing file.
 - [ ] **Step 5: Commit** `Every run keeps what it replaces; meetingbox notes and redo`.
 
-### Task 8: Redo minutes and Transcribe again in the window
+### Task 8: Redo minutes, Transcribe again and transcript versions in the window
 
 **Files:**
 - Modify:
   - `native/app/MeetingStore.swift`, `ProcessingQueue.swift`, `LibraryPresentation.swift`, `LibraryModel.swift`;
-  - `LibraryWindow.swift`: the two sheets, with the writer picker added in Task 11;
+  - `LibraryWindow.swift`: the two sheets, with the writer picker added in Task 11, and the transcript version picker;
   - `AppModel.swift`: the redo failure line;
   - `native/tests/app/main.swift`: update the exact action lists, at about lines 3251, 3253, 3263, 3264, 3271, 3275 and 3489.
 
@@ -942,8 +942,19 @@
   - **Sheets:**
     - `struct RedoDraft: Equatable { let folder: URL; let kind: JobKind; var transcriber: Transcriber; var room: Int?; var call: Int?; var tidy: Bool; var writer: MeetingWriter }`;
     - `LibraryModel.redoing: RedoDraft?`, with `beginRedo(_:kind:)`, `commitRedo()` and `cancelRedo()`.
+  - **Transcript versions:**
+    - `struct TranscriptVersion: Equatable { let title: String; let url: URL }`;
+    - `LibraryPresentation.transcriptVersions(in folder: URL, files: [String], earlier: [String]) -> [TranscriptVersion]`;
+    - `LibraryModel.version: URL?`, where nil means Current, and `chooseVersion(_:)`.
+    - Listing and reading run on the existing `reader` queue with a token.
 
 - [ ] **Step 1: Write the failing tests.**
+  - **Transcript versions:**
+    - "Current" comes first, then `transcript-parakeet.txt` as "Parakeet (MLX)", `transcript-original.txt` as "Original", other `transcript*.txt` by file name, then "Earlier, <date> <time>" for each `earlier/*/transcript.txt`, newest first;
+    - choosing one shows that file's text and changes no file;
+    - search still matches only `transcript.txt`;
+    - selecting another meeting resets to Current;
+    - a version deleted in Finder shows "No transcript yet" without a crash.
   - **What is offered:**
     - a done meeting with a transcript and `files.runnable` offers both actions;
     - a done meeting without `runnable` (including a v1.2 `*_meeting.m4a`) offers only Redo minutes;
