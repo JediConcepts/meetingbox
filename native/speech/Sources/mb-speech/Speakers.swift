@@ -16,7 +16,8 @@ func findSpeakers(_ models: URL, wav: URL, out: URL, count: Int?) async throws {
     var segments: [SpeakerSegment] = []
     var vectors: [String: [Float]] = [:]
     do {
-        let result = try await manager.process(wav)
+        // the diariser writes timing lines straight to stderr, where only the reason line may go
+        let result = try await withStderrSilenced { try await manager.process(wav) }
         segments = result.segments.map {
             SpeakerSegment(speaker: $0.speakerId, start: Double($0.startTimeSeconds), end: Double($0.endTimeSeconds))
         }

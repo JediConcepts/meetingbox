@@ -166,6 +166,20 @@ func writePrivately(_ data: Data, to target: URL) throws {
     }
 }
 
+/// Runs `body` with stderr (fd 2) sent to /dev/null, and puts stderr back as it was however `body`
+/// ends. FluidAudio's offline diariser writes "[Profiling]" timing lines straight to stderr, which
+/// would break the one-line rule. Only its `process` runs inside this, so everything else keeps its
+/// stderr, Swift trap text included.
+func withStderrSilenced<T>(_ body: () async throws -> T) async rethrows -> T {
+    let kept = dup(STDERR_FILENO)
+    if kept >= 0 {
+        let null = open("/dev/null", O_WRONLY)
+        if null >= 0 { dup2(null, STDERR_FILENO); close(null) }
+    }
+    defer { if kept >= 0 { dup2(kept, STDERR_FILENO); close(kept) } }
+    return try await body()
+}
+
 /// One of the transcriber's tokens, with its timing and confidence.
 struct Token {
     let text: String

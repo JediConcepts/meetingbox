@@ -1762,21 +1762,40 @@ sa_run() {
   return 1
 }
 
-# Parakeet on one side: the audio made a 16 kHz mono WAV in the work folder, then mb-speech writes
-# the words JSON, with its own temporary files in the work folder too. Its one-line reason for a
-# failure goes to the log.
+# The speech helper on one side, for Parakeet and for speakers alike: AUDIO made the 16 kHz mono WAV
+# mb-speech reads, in the run's work folder WORK, then `mb-speech COMMAND <models> <wav> OUT [ARGS]`
+# run with its own temporary files in WORK too. The WAV and the helper's error file are removed
+# either way. Returns 0 when the helper succeeded, 2 when the audio could not be read, and 1 when the
+# helper failed, with SPEECH_REASON set to its one line without the "mb-speech: " prefix, or, when it
+# gave none, to a fixed line naming its exit status.
+# Usage: speech_run WORK AUDIO COMMAND OUT [ARGS...]
+speech_run() {
+  local work="$1" audio="$2" command="$3" out="$4" wav rc=0
+  shift 4
+  wav="$work/$(basename "${audio%.*}").wav"
+  SPEECH_REASON=""
+  afconvert -f WAVE -d LEI16@16000 -c 1 "$audio" "$wav" >/dev/null 2>&1 || { rm -f "$wav"; return 2; }
+  TMPDIR="$work" "$SPEECH_BIN" "$command" "$SPEECH_MODELS" "$wav" "$out" "$@" >/dev/null 2>"$wav.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    SPEECH_REASON="$(head -n 1 "$wav.err")"; SPEECH_REASON="${SPEECH_REASON#mb-speech: }"
+    SPEECH_REASON="${SPEECH_REASON:-the speech helper stopped without giving a reason (exit $rc)}"
+  fi
+  rm -f "$wav" "$wav.err"
+  [ "$rc" -eq 0 ] || return 1
+}
+
+# Parakeet on one side: speech_run writes the words JSON. Its one-line reason for a failure goes to
+# the log.
 pk_run() {
-  local audio="$1" out="$2" wav err reason
+  local audio="$1" out="$2" rc=0
   [ -n "$WORK" ] && [ -d "$WORK" ] || { info "Parakeet has no work folder for $(basename "$audio")"; return 1; }
-  wav="$WORK/$(basename "${audio%.*}").wav"; err="$WORK/speech.err"
-  if ! afconvert -f WAVE -d LEI16@16000 -c 1 "$audio" "$wav" >/dev/null 2>&1; then
-    rm -f "$wav"; info "Parakeet could not read $(basename "$audio")"; return 1
-  fi
-  if ! TMPDIR="$WORK" "$SPEECH_BIN" transcribe "$SPEECH_MODELS" "$wav" "$out" >/dev/null 2>"$err"; then
-    reason="$(head -n 1 "$err")"
-    info "Parakeet: ${reason:-the speech helper stopped without giving a reason}"; rm -f "$wav" "$err"; return 1
-  fi
-  rm -f "$wav" "$err"
+  speech_run "$WORK" "$audio" transcribe "$out" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) info "Parakeet could not read $(basename "$audio")" ;;
+    *) info "Parakeet: $SPEECH_REASON" ;;
+  esac
+  return 1
 }
 
 # whisper.cpp on one side, its WAV in the work folder.
@@ -1795,39 +1814,49 @@ whisper_words() {
   return "$rc"
 }
 
-# True when a side's transcription worked but heard no words, in any transcriber's shape: Apple's
-# or Parakeet's "words", or whisper's "transcription". A side every transcriber failed on says
-# "engine": "none" and is not this, and nor is a file that cannot be read.
+# True when a side's transcription worked but heard no words: nothing in it that mb-transcript's
+# loadWords keeps, in any transcriber's shape (Apple's or Parakeet's "words", whisper's
+# "transcription"). loadWords keeps an entry with numeric times whose text, trimmed, is neither empty
+# nor in brackets, like [BLANK_AUDIO]; a file of only white space has no words. A side every
+# transcriber failed on says "engine": "none" and is not this, and nor is a file that cannot be read.
 heard_nothing() {
-  jq -e '(.engine // "") != "none" and ((.words // []) + (.transcription // []) | length) == 0' "$1" >/dev/null 2>&1
+  jq -e -s '
+    def num: type == "number";
+    def kept: (.text | type) == "string"
+      and (.text | gsub("\\A\\s+|\\s+\\z"; "") | . != "" and ((startswith("[") and endswith("]") and length > 1) | not));
+    def entries(list): list | if type == "array" then .[] | objects else empty end;
+    if length == 0 then true
+    elif length > 1 or (.[0] | type) != "object" then false
+    else .[0]
+      | (.engine // "") != "none"
+        and ([entries(.words) | select((.start | num) and (.end | num) and kept)]
+             + [entries(.transcription) | select((.offsets | type) == "object" and (.offsets.from | num)
+                                                 and (.offsets.to | num) and kept)]
+             | length) == 0
+    end' "$1" >/dev/null 2>&1
 }
 
-# The speakers on one side (spec 6.2): the side's audio in SRC made a 16 kHz mono WAV in WORK, then
-# mb-speech writes WORK/SIDE.speakers.json, with its own temporary files in WORK too. Nothing is
-# written anywhere else. COUNT is the people on that side: 2 to 6 asks for that many, 1 means no
-# labels there so nothing runs, and anything else works it out. A failure is a warning, with the
-# helper's reason, and leaves no file behind: that side keeps its plain label.
+# The speakers on one side (spec 6.2): speech_run writes WORK/SIDE.speakers.json from the side's
+# audio in SRC, and nothing is written anywhere else. COUNT is the people on that side: 2 to 6 asks
+# for that many, 1 means no labels there so nothing runs, and anything else works it out. A failure
+# is a warning, with the helper's reason, and leaves no file behind: that side keeps its plain label.
 # Usage: find_speakers SRC WORK SIDE COUNT
 find_speakers() {
-  local src="$1" work="$2" side="$3" count="$4" wav out err reason=""
+  local src="$1" work="$2" side="$3" count="$4" out rc=0
   case "$count" in
     1) return 0 ;;
     [2-6]) ;;
     *) count="" ;;
   esac
   [ -n "$work" ] && [ -d "$work" ] || { info "finding speakers has no work folder for the $side side"; return 1; }
-  wav="$work/$side.wav"; out="$work/$side.speakers.json"; err="$work/$side.speakers.err"
-  if ! afconvert -f WAVE -d LEI16@16000 -c 1 "$src/$side.m4a" "$wav" >/dev/null 2>&1; then
-    reason="$side.m4a could not be read"
-  elif ! TMPDIR="$work" "$SPEECH_BIN" speakers "$SPEECH_MODELS" "$wav" "$out" ${count:+--count "$count"} \
-         >/dev/null 2>"$err"; then
-    reason="$(head -n 1 "$err")"; reason="${reason#mb-speech: }"
-    reason="${reason:-the speech helper stopped without giving a reason}"
-  fi
-  rm -f "$wav" "$err"
-  [ -n "$reason" ] || return 0
+  say "finding speakers on the $side side on device (FluidAudio)"
+  out="$work/$side.speakers.json"
+  speech_run "$work" "$src/$side.m4a" speakers "$out" ${count:+--count "$count"} || rc=$?
+  [ "$rc" -ne 0 ] || return 0
   rm -f "$out" "$work/.part-$side.speakers.json"
-  info "finding speakers: $reason"
+  if [ "$rc" -eq 2 ]; then info "finding speakers: $side.m4a could not be read"
+  else info "finding speakers: $SPEECH_REASON"
+  fi
   warn "could not find speakers on the $side side, carrying on without labels there"
   return 1
 }
@@ -1879,7 +1908,6 @@ transcribe_channels() {
   # they stay in the work folder, which goes as soon as mb-transcript is done.
   progress speakers
   if speech_usable; then
-    say "finding speakers on each side on device (FluidAudio)"
     heard_nothing "$dest/mic.words.json" || find_speakers "$src" "$WORK" mic "$ROOM_COUNT" || true
     heard_nothing "$dest/call.words.json" || find_speakers "$src" "$WORK" call "$CALL_COUNT" || true
   else

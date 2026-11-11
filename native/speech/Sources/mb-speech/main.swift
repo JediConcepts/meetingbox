@@ -8,20 +8,9 @@ import Foundation
 ModelHub.offlineMode = true
 AppLogger.mirrorsToConsole = false
 
-// FluidAudio's offline diariser also writes "[Profiling]" timing lines straight to stderr, which
-// would break the one-line rule and could pass for the reason. A copy of stderr is kept for that one
-// line, and everything else written to stderr goes to /dev/null.
-let reasonDescriptor: Int32 = {
-    let kept = dup(STDERR_FILENO)
-    guard kept >= 0 else { return STDERR_FILENO }
-    let null = open("/dev/null", O_WRONLY)
-    if null >= 0 { dup2(null, STDERR_FILENO); close(null) }
-    return kept
-}()
-
 func fail(_ reason: String) -> Never {
     let line = reason.components(separatedBy: .newlines).joined(separator: " ")
-    Data(("mb-speech: " + line + "\n").utf8).withUnsafeBytes { _ = write(reasonDescriptor, $0.baseAddress, $0.count) }
+    FileHandle.standardError.write(Data(("mb-speech: " + line + "\n").utf8))
     exit(1)
 }
 

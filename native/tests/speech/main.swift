@@ -144,13 +144,35 @@ for statement in ["ModelHub.offlineMode = true", "AppLogger.mirrorsToConsole = f
     let at = mainText.range(of: statement)?.lowerBound
     check(at != nil && firstArgument != nil && at! < firstArgument!, "main.swift: \(statement) comes before any argument is read")
 }
-// FluidAudio's offline diariser writes "[Profiling]" lines straight to stderr. The one reason line
-// goes to a kept copy of stderr, and everything else written there goes to /dev/null, from before
-// any argument is read.
-let quieted = mainText.range(of: "dup2(")?.lowerBound
-check(quieted != nil && firstArgument != nil && quieted! < firstArgument!,
-      "main.swift: stderr is sent to /dev/null before any argument is read")
-check(!mainText.contains("FileHandle.standardError"), "main.swift: the reason line is written to the kept stderr, not fd 2")
+// FluidAudio's offline diariser writes "[Profiling]" lines straight to stderr. Only its `process`
+// runs with stderr silenced; every other command, and every reason line, keeps stderr as it is,
+// Swift trap text included.
+check(!mainText.contains("dup2(") && mainText.contains("FileHandle.standardError"),
+      "main.swift: stderr is left alone, and fail writes its line there")
+let speakersText = (try? String(contentsOf: speech.appendingPathComponent("Sources/mb-speech/Speakers.swift"), encoding: .utf8)) ?? ""
+check(speakersText.contains("withStderrSilenced { try await manager.process(wav) }")
+      && speakersText.components(separatedBy: "withStderrSilenced").count == 2,
+      "Speakers.swift: only the diariser's process runs with stderr silenced")
+
+// withStderrSilenced: stderr is dropped inside the block, and back as it was afterwards, even after
+// a throw. The test points fd 2 at a file of its own while it looks.
+let stderrFile = scratch.appendingPathComponent("stderr.txt")
+fm.createFile(atPath: stderrFile.path, contents: nil)
+let testStderr = dup(STDERR_FILENO)
+let stderrTarget = open(stderrFile.path, O_WRONLY)
+dup2(stderrTarget, STDERR_FILENO); close(stderrTarget)
+func writeStderr(_ text: String) { _ = text.withCString { write(STDERR_FILENO, $0, strlen($0)) } }
+writeStderr("before\n")
+await withStderrSilenced { writeStderr("[Profiling] inside\n") }
+_ = try? await withStderrSilenced { () async throws -> Void in
+    writeStderr("[Profiling] inside a throw\n")
+    throw SpeechError(reason: "no speech")
+}
+writeStderr("after\n")
+dup2(testStderr, STDERR_FILENO); close(testStderr)
+let stderrSeen = (try? String(contentsOf: stderrFile, encoding: .utf8)) ?? ""
+check(stderrSeen == "before\nafter\n",
+      "silenced: stderr is dropped only inside the block, and restored after it, even after a throw \(stderrSeen.debugDescription)")
 
 // fetch: every changed model is downloaded and verified before any is swapped in, so a failed
 // download leaves a working install as it was; a model already at its revision is not fetched again.

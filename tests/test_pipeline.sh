@@ -527,9 +527,11 @@ if [ "$got" = "process|native|apple" ]; then pass "parse_args: --native --writer
 else fail "parse_args: --native --writer apple: $got"; fi
 
 # A stand-in mb-speech: check passes unless pk-unusable exists, and transcribe copies a fixture,
-# or fails for a side named in pk-fail-<side>, or finds no words for one named in pk-empty-<side>.
-# It logs the WAV it was given and its TMPDIR. speakers also logs its output file and any further
-# arguments, and fails for a side named in sp-fail-<side>, after leaving a partial file behind.
+# or fails for a side named in pk-fail-<side> with the real helper's "mb-speech: " prefix, or
+# finds no words for one named in pk-empty-<side>. It logs the WAV it was given and its TMPDIR.
+# speakers also logs its output file and any further arguments, and fails for a side named in
+# sp-fail-<side>, after leaving a partial file behind. pk-silent-<side> and sp-silent-<side> stop
+# with 134, as a trap would, and say nothing.
 mkdir -p "$HOME/speech"
 SPEECH_BIN="$HOME/speech/mb-speech"; SPEECH_MODELS="$HOME/speech/models"
 cat > "$SPEECH_BIN" <<EOF
@@ -542,11 +544,12 @@ esac
 case "\$1" in
   check) [ ! -e "$HOME/pk-unusable" ] ;;
   transcribe)
-    [ -e "$HOME/pk-fail-\$side" ] && { echo "the model could not run" >&2; exit 1; }
-    [ -e "$HOME/pk-silent-\$side" ] && exit 1
+    [ -e "$HOME/pk-fail-\$side" ] && { echo "mb-speech: the model could not run" >&2; exit 1; }
+    [ -e "$HOME/pk-silent-\$side" ] && exit 134
     [ -e "$HOME/pk-empty-\$side" ] && { printf '{"engine": "parakeet-ultra", "words": []}\n' > "\$4"; exit 0; }
     cp "$FIX/pk-\$side.json" "\$4" ;;
   speakers)
+    [ -e "$HOME/sp-silent-\$side" ] && exit 134
     if [ -e "$HOME/sp-fail-\$side" ]; then
       printf '{"model": "half' > "\$4"; printf '{"mod' > "\$(dirname "\$4")/.part-\$(basename "\$4")"
       echo "mb-speech: the diariser could not run" >&2; exit 1
@@ -718,10 +721,18 @@ have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
 pk_reset; touch "$HOME/pk-silent-call"
 d="$(meeting pk17 audio.m4a mic.m4a call.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Parakeet: the speech helper stopped without giving a reason' \
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'Parakeet: the speech helper stopped without giving a reason (exit 134)' \
    && ! printf '%s' "$out" | grep -q 'Parakeet: *$'; then
-  pass "a helper failing without a reason logs a fixed one"
-else fail "a helper failing without a reason logs a fixed one (rc $rc): $out"; fi
+  pass "a helper failing without a reason logs a fixed one, with its exit status"
+else fail "a helper failing without a reason logs a fixed one, with its exit status (rc $rc): $out"; fi
+
+# --- the helper's reason is logged once, without its "mb-speech: " prefix ---
+pk_reset; touch "$HOME/pk-fail-call"
+d="$(meeting pk18 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Parakeet: the model could not run' && ! printf '%s' "$out" | grep -q 'mb-speech: '; then
+  pass "Parakeet's log gives the helper's reason without its mb-speech: prefix"
+else fail "Parakeet's log gives the helper's reason without its mb-speech: prefix (rc $rc): $out"; fi
 
 # --- with no work folder, pk_run and whisper_words stop before writing anything ---
 pk_reset
@@ -752,9 +763,14 @@ pk_reset
 
 # === Speakers: mb-speech finds each side's speakers once both sides are transcribed (spec 6.2) ===
 
-sp_reset() { pk_reset; rm -f "$HOME"/sp-fail-*; ROOM_COUNT=""; CALL_COUNT=""; }
+sp_reset() { pk_reset; rm -f "$HOME"/sp-fail-* "$HOME"/sp-silent-*; ROOM_COUNT=""; CALL_COUNT=""; }
 sp_calls() { grep -c "^mb-speech speakers $1" "$HOME/calls.log" | tr -d ' '; }
 sp_line()  { grep "^mb-speech speakers $1 " "$HOME/calls.log" | head -n 1; }
+# The header lines in the log name the sides whose speakers are found: prints them, as "mic call".
+sp_headers() {
+  printf '%s\n' "$out" | sed -n 's/.*finding speakers on the \([a-z]*\) side.*/\1/p' | tr '\n' ' ' | sed 's/ $//'
+  printf '%s\n' "$out" | grep -q 'finding speakers on each side' && printf ' each'
+}
 
 # --- by default: both sides, after both are transcribed, in the work folder, with no count ---
 sp_reset
@@ -766,6 +782,8 @@ if [ "$rc" -eq 0 ] && [ "$(sp_calls mic)" = 1 ] && [ "$(sp_calls call)" = 1 ] &&
    && [ "$first_s" -gt "$last_t" ]; then
   pass "speakers are found on each side once both sides are transcribed"
 else fail "speakers are found on each side once both sides are transcribed (rc $rc): $(cat "$HOME/calls.log") $out"; fi
+if [ "$(sp_headers)" = "mic call" ]; then pass "the log names both sides as their speakers are found"
+else fail "the log names both sides as their speakers are found: [$(sp_headers)] $out"; fi
 paths_ok=1
 for side in mic call; do
   line="$(sp_line "$side")"
@@ -793,6 +811,8 @@ out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
 if [ "$rc" -eq 0 ] && [ "$(sp_calls mic)" = 0 ] && [ "$(sp_calls call)" = 1 ] && sp_line call | grep -q ' more= tmp='; then
   pass "a room count of 1 skips the microphone side, and the call side is worked out"
 else fail "a room count of 1 skips the microphone side, and the call side is worked out (rc $rc): $(grep '^mb-speech speakers' "$HOME/calls.log") $out"; fi
+if [ "$(sp_headers)" = "call" ]; then pass "with a room count of 1, the log names only the call side"
+else fail "with a room count of 1, the log names only the call side: [$(sp_headers)] $out"; fi
 sp_reset; CALL_COUNT=1
 d="$(meeting sp4 audio.m4a mic.m4a call.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
@@ -811,6 +831,31 @@ d="$(meeting sp5 audio.m4a mic.m4a call.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
 if [ "$rc" -eq 0 ] && [ "$(sp_calls mic)" = 1 ] && [ "$(sp_calls call)" = 0 ]; then pass "a side transcribed with no words is skipped"
 else fail "a side transcribed with no words is skipped (rc $rc): $(grep '^mb-speech speakers' "$HOME/calls.log") $out"; fi
+if [ "$(sp_headers)" = "mic" ]; then pass "with no words on the call side, the log names only the microphone side"
+else fail "with no words on the call side, the log names only the microphone side: [$(sp_headers)] $out"; fi
+# whisper's shape: a call side holding only blanks and [BLANK_AUDIO] is no words to mb-transcript,
+# so it is skipped too
+sp_reset; touch "$HOME/pk-fail-call"; SA_FAIL=call
+have() { case "$1" in speech-analyzer|fm|whisper-cli|ffmpeg) return 0 ;; *) return 1 ;; esac; }
+whisper-cli() {
+  echo "whisper-cli $*" >> "$HOME/calls.log"
+  local prev="" a o=""
+  for a in "$@"; do [ "$prev" = --output-file ] && o="$a"; prev="$a"; done
+  printf '%s' '{"transcription":[{"offsets":{"from":0,"to":900},"text":" [BLANK_AUDIO]"},
+    {"offsets":{"from":900,"to":1500},"text":" "}]}' > "$o.json"
+}
+d="$(meeting sp5b audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(pk_calls whisper-cli)" = 1 ] && [ "$(sp_calls mic)" = 1 ] && [ "$(sp_calls call)" = 0 ]; then
+  pass "a whisper side holding only blanks and [BLANK_AUDIO] is skipped"
+else fail "a whisper side holding only blanks and [BLANK_AUDIO] is skipped (rc $rc): $(grep '^mb-speech speakers\|^whisper-cli' "$HOME/calls.log") $out"; fi
+have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+whisper-cli() {
+  echo "whisper-cli $*" >> "$HOME/calls.log"
+  local prev="" a o=""
+  for a in "$@"; do [ "$prev" = --output-file ] && o="$a"; prev="$a"; done
+  cp "$FIX/whisper.json" "$o.json"
+}
 sp_reset; touch "$HOME/pk-fail-call"; SA_FAIL=call
 d="$(meeting sp6 audio.m4a mic.m4a call.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
@@ -824,13 +869,23 @@ printf '{"engine": "parakeet-ultra", "words": []}' > "$HOME/heard/parakeet.json"
 printf '{"transcription": []}' > "$HOME/heard/whisper.json"
 printf '{"engine": "none", "words": []}' > "$HOME/heard/none.json"
 printf '{"words":[{"start":1' > "$HOME/heard/garbled.json"
-heard_ok=1
-for f in apple parakeet whisper; do heard_nothing "$HOME/heard/$f.json" || heard_ok=0; done
-for f in "$HOME/heard/none.json" "$HOME/heard/garbled.json" "$FIX/sa-mic.json" "$FIX/pk-mic.json" "$FIX/whisper.json"; do
-  heard_nothing "$f" && heard_ok=0
+# what loadWords drops: blank or bracketed text, and entries without times
+printf '{"transcription":[{"offsets":{"from":0,"to":900},"text":" [BLANK_AUDIO]"},{"offsets":{"from":900,"to":1500},"text":"  "}]}' \
+  > "$HOME/heard/whisper-blank.json"
+printf '{"words":[{"start":0,"end":1,"text":""},{"start":1,"end":2,"text":" [inaudible] "},{"text":"untimed"}]}' > "$HOME/heard/apple-blank.json"
+printf ' \n' > "$HOME/heard/whitespace.json"
+printf '{"words":[{"start":0,"end":1,"text":"["}]}' > "$HOME/heard/bracket.json"
+heard_ok=1; heard_wrong=""
+for f in apple parakeet whisper whisper-blank apple-blank whitespace; do
+  heard_nothing "$HOME/heard/$f.json" || { heard_ok=0; heard_wrong="$heard_wrong $f"; }
 done
-if [ "$heard_ok" = 1 ]; then pass "heard_nothing: no words from Apple's, Parakeet or whisper, but not engine none, garbled or words"
-else fail "heard_nothing: no words from Apple's, Parakeet or whisper, but not engine none, garbled or words"; fi
+for f in "$HOME/heard/none.json" "$HOME/heard/garbled.json" "$HOME/heard/bracket.json" "$FIX/sa-mic.json" "$FIX/pk-mic.json" \
+         "$FIX/whisper.json"; do
+  heard_nothing "$f" && { heard_ok=0; heard_wrong="$heard_wrong $(basename "$f")"; }
+done
+if [ "$heard_ok" = 1 ]; then
+  pass "heard_nothing: no words, by loadWords' own filter, from Apple's, Parakeet or whisper, but not engine none, garbled or words"
+else fail "heard_nothing: no words, by loadWords' own filter, from Apple's, Parakeet or whisper, but not engine none, garbled or words:$heard_wrong"; fi
 
 # --- Apple's words: the speakers are still found when Parakeet is set up ---
 sp_reset; ENGINE=native
@@ -849,6 +904,20 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'warn.*could not find speaker
    && grep -q 'Them: ' "$d/transcript.txt" && [ -s "$d/notes.md" ] && [ -z "$(find "$d" -name '*speakers*')" ]; then
   pass "speakers failing on one side warns, names it, and the run carries on"
 else fail "speakers failing on one side warns, names it, and the run carries on (rc $rc): $out"; fi
+if ! printf '%s' "$out" | grep -q 'mb-speech: '; then pass "the speakers reason is logged without its mb-speech: prefix"
+else fail "the speakers reason is logged without its mb-speech: prefix: $out"; fi
+sp_reset; touch "$HOME/sp-silent-call"
+d="$(meeting sp8b audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qF 'finding speakers: the speech helper stopped without giving a reason (exit 134)' \
+   && printf '%s' "$out" | grep -q 'could not find speakers on the call side, carrying on without labels there'; then
+  pass "speakers stopping without a reason log its exit status"
+else fail "speakers stopping without a reason log its exit status (rc $rc): $out"; fi
+# one conversion, one run and one reading of the reason, shared by Parakeet and speakers
+if [ "$(grep -c 'afconvert -f WAVE' "$ROOT/meetingbox")" = 1 ] && declare -f pk_run | grep -q 'speech_run ' \
+   && declare -f find_speakers | grep -q 'speech_run '; then
+  pass "pk_run and find_speakers share one conversion and helper run"
+else fail "pk_run and find_speakers share one conversion and helper run"; fi
 src="$(meeting spsrc mic.m4a call.m4a)"
 w="$(mktemp -d "$HOME/spwork.XXXXXX")"
 ( find_speakers "$src" "$w" call "" ) >/dev/null 2>&1; rc=$?
