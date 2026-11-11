@@ -1162,6 +1162,50 @@ if [ "$rc" -eq 0 ] && grep -q '] Me: Speaking from this desk' "$t" && grep -q ']
    && printf '%s' "$out" | grep -q 'warn.*call.speakers.json.*without speaker labels on the call side'; then
   pass "an unreadable speakers file warns and leaves Me and Them"
 else fail "an unreadable speakers file warns and leaves Me and Them (rc $rc): $out $(cat "$t" 2>/dev/null)"; fi
+
+# --- an unreadable voice print is left byte for byte as it was under --learn, with a warning ---
+LB_MODEL="FluidInference/speaker-diarization-coreml@df2625ac79a7ac6b65ad868fee6d80f320da4232"
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; record_install "$VOICE_FILE"
+printf '{"model": "%s", "seconds": "lots", "meetings": 1' "$LB_MODEL" > "$VOICE_FILE"
+cp "$VOICE_FILE" "$HOME/voice.before"
+lb_meeting lb7 MEETING-SEVEN
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && lb_args | grep -qF -- "--learn MEETING-SEVEN" && cmp -s "$VOICE_FILE" "$HOME/voice.before" \
+   && [ ! -e "$VOICE_FILE.tmp" ] && printf '%s' "$out" | grep -q 'warn.*cannot read your voice print' \
+   && grep -q '] Room 1: ' "$d/transcript.txt"; then
+  pass "an unreadable voice print is left byte for byte as it was under --learn, and the transcript is still labelled"
+else fail "an unreadable voice print is left byte for byte as it was under --learn, and the transcript is still labelled (rc $rc): $out"; fi
+
+# --- the discard path end to end: a second refused call in a row discards a print that is not usable ---
+lb_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; record_install "$VOICE_FILE"
+printf '{"model": "%s", "seconds": 20, "meetings": 1, "sources": ["MEETING-ZERO"], "sample": false, "refusals": 1, "refused": ["MEETING-ONE-B"], "vector": [0, 0, 0, 1], "updated": "x"}\n' \
+  "$LB_MODEL" > "$VOICE_FILE"
+lb_meeting lb8 MEETING-EIGHT
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$VOICE_FILE" ] && [ ! -e "$VOICE_FILE.tmp" ] \
+   && printf '%s' "$out" | grep -q "This call's microphone voice did not match the voice learnt so far, so it was not learnt" \
+   && printf '%s' "$out" | grep -q 'That is two calls in a row, so the voice learnt so far is discarded'; then
+  pass "a second refused call in a row discards the print, and the log says so"
+else fail "a second refused call in a row discards the print, and the log says so (rc $rc): $out"; fi
+
+# --- a count of 1 leaves that side unlabelled, and nothing is learnt from a microphone count of 1 ---
+mkdir -p "$HOME/counts"
+cp "$FIX/speakers-mic.json" "$HOME/counts/mic.speakers.json"
+printf '%s\n' "{\"model\": \"$LB_MODEL\", \"segments\": [{\"speaker\": \"T1\", \"start\": 10.9, \"end\": 11.4},
+  {\"speaker\": \"T1\", \"start\": 15.8, \"end\": 26.0}, {\"speaker\": \"T2\", \"start\": 26.0, \"end\": 36.6}],
+  \"speakers\": [{\"id\": \"T1\", \"seconds\": 10.7, \"median\": 10.2, \"vector\": [0.0, 0.1, 0.9, 0.2]},
+  {\"id\": \"T2\", \"seconds\": 10.6, \"median\": 10.6, \"vector\": [0.1, 0.0, 0.2, 0.9]}]}" > "$HOME/counts/call.speakers.json"
+labels_of() {   # the labels mb-transcript gives the fixtures with these extra arguments, sorted and joined
+  "$REAL_TRANSCRIPT_BIN" --mic "$FIX/labelled-mic.json" --call "$FIX/labelled-call.json" --mic-speakers "$HOME/counts/mic.speakers.json" \
+    --call-speakers "$HOME/counts/call.speakers.json" "$@" 2>/dev/null | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u | tr '\n' ',' | sed 's/,$//'
+}
+base="$(labels_of)"
+mic1="$(labels_of --mic-count 1 --voice "$HOME/counts/voice.json" --learn COUNTED)"
+call1="$(labels_of --call-count 1)"
+if [ "$base" = "Me,Room 1,Them 1,Them 2" ] && [ "$mic1" = "Me,Them 1,Them 2" ] && [ ! -e "$HOME/counts/voice.json" ] \
+   && printf '%s' "$call1" | grep -q 'Them' && ! printf '%s' "$call1" | grep -q 'Them [0-9]'; then
+  pass "a count of 1 leaves that side unlabelled (all Me, or all Them), and a microphone count of 1 learns nothing"
+else fail "a count of 1 leaves that side unlabelled (all Me, or all Them), and a microphone count of 1 learns nothing: [$base] [$mic1] [$call1]"; fi
 lb_reset
 TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
 if [ "$PK_CURL" = 0 ]; then pass "no curl in any labelling run"; else fail "no curl in any labelling run"; fi

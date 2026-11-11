@@ -2,9 +2,10 @@
 // calls, and saving it only if nobody changed it while the meeting was processed. Foundation only.
 import Foundation
 
-/// voice.json: `{"model", "seconds", "meetings", "sources", "sample", "refusals", "vector", "updated"}`.
+/// voice.json: `{"model", "seconds", "meetings", "sources", "sample", "refusals", "refused", "vector", "updated"}`.
 /// `sample` is true when the print began from a recorded sample; `refusals` counts calls refused in a row
-/// by the print-match test while the print is not usable.
+/// by the print-match test while the print is not usable, and `refused` names those calls (their meeting
+/// ids), so the same call processed again is not counted twice.
 struct VoicePrint: Codable, Equatable {
     var model: String
     var seconds: Double
@@ -12,12 +13,13 @@ struct VoicePrint: Codable, Equatable {
     var sources: [String]
     var sample: Bool = false
     var refusals: Int = 0
+    var refused: [String] = []
     var vector: [Double]
     var updated: String
 }
 
 extension VoicePrint {
-    /// A file from before `sample` and `refusals` reads them as false and 0.
+    /// A file from before `sample`, `refusals` or `refused` reads them as false, 0 and none.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         model = try c.decode(String.self, forKey: .model)
@@ -26,6 +28,7 @@ extension VoicePrint {
         sources = try c.decodeIfPresent([String].self, forKey: .sources) ?? []
         sample = try c.decodeIfPresent(Bool.self, forKey: .sample) ?? false
         refusals = try c.decodeIfPresent(Int.self, forKey: .refusals) ?? 0
+        refused = try c.decodeIfPresent([String].self, forKey: .refused) ?? []
         vector = try c.decode([Double].self, forKey: .vector)
         updated = try c.decodeIfPresent(String.self, forKey: .updated) ?? ""
         guard seconds.isFinite, seconds >= 0, meetings >= 0, refusals >= 0, vector.allSatisfy({ $0.isFinite }) else {
@@ -95,9 +98,11 @@ enum LearnReason: Equatable {
 /// side's speakers. A call adds only if: it is a call with at least one call speaker; its dominant
 /// microphone speaker holds 80% or more of the kept words; that speaker's cosine with every call speaker
 /// is under 0.40; when the print (of this model) holds any speech, its cosine with the print is 0.60 or
-/// more; and this meeting has not added to it before. A learnt call is `write` with `refusals` 0. A call
-/// refused by the print-match test while the print is not usable is `write` with `refusals` plus 1, or
-/// `discard` when that makes 2. Every other case is `unchanged`. Another model's print is replaced.
+/// more; and this meeting has not added to it before. A learnt call is `write` with `refusals` 0 and no
+/// `refused` meetings, since refusals count only in a row. A call refused by the print-match test while
+/// the print is not usable is `write` with `refusals` plus 1 and the meeting added to `refused`, or
+/// `discard` when that makes 2; a meeting already in `refused` (the same call processed again) is not
+/// counted again. Every other case is `unchanged`. Another model's print is replaced.
 func learn(_ print: VoicePrint?, mic: [SpeakerInfo], keptWords: [String: Int], call: [SpeakerInfo], isCall: Bool,
            model: String, source: String, now: Date) -> LearnOutcome {
     learnWithReason(print, mic: mic, keptWords: keptWords, call: call, isCall: isCall, model: model, source: source, now: now).outcome
@@ -119,10 +124,11 @@ func learnWithReason(_ print: VoicePrint?, mic: [SpeakerInfo], keptWords: [Strin
     let own = print.flatMap { $0.model == model ? $0 : nil }
     if let p = own, p.sources.contains(source) { return (.unchanged, .alreadyLearnt) }
     if let p = own, p.seconds > 0, !atLeast(cosine(top.vector, p.vector), Rule.printMatch) {
-        if usablePrint(p, model: model) != nil { return (.unchanged, .refused) }
+        if usablePrint(p, model: model) != nil || p.refused.contains(source) { return (.unchanged, .refused) }
         if p.refusals + 1 >= 2 { return (.discard, .discarded) }
         var counted = p
         counted.refusals += 1
+        counted.refused.append(source)
         counted.updated = stamp(now)
         return (.write(counted), .refused)
     }

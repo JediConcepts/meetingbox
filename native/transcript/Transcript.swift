@@ -582,8 +582,9 @@ private func share(_ s: SpeakerInfo, _ keptWords: [String: Int], of speakers: [S
 
 /// Names on the call side (spec 6.2). `print` is the usable print, or nil. The first rule that matches:
 /// 1. the user's voice coming back (in `userVoice`, or a print match): Unknown;
-/// 2. without a count: under 5% of the side's kept words, a median segment under 2.5 s, or a cosine of
-///    0.45 or more with the print: plain Them;
+/// 2. a cosine of 0.45 or more with the print, or, without a count, under 5% of the side's kept words or
+///    a median segment under 2.5 s: plain Them. A count turns off the share and segment-length tests;
+///    the voice print tests still apply ("People counts");
 /// 3. the rest: one is Them, several are Them 1, Them 2 in order of their first kept word. One with no
 ///    kept word gets no number and is plain Them.
 /// Shares leave out the user's voice.
@@ -598,8 +599,8 @@ func nameCall(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [S
     for s in speakers {
         if isUser(s) {
             names[s.id] = "Unknown"
-        } else if !counted && (!atLeast(share(s, keptWords, of: others), Rule.smallShare) || !atLeast(s.median, Rule.shortMedian)
-                               || likeness(s, print).map({ atLeast($0, Rule.printNear) }) == true) {
+        } else if likeness(s, print).map({ atLeast($0, Rule.printNear) }) == true
+                    || (!counted && (!atLeast(share(s, keptWords, of: others), Rule.smallShare) || !atLeast(s.median, Rule.shortMedian))) {
             names[s.id] = "Them"
         } else {
             rest.append(s)
@@ -777,7 +778,23 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     // Echo: the microphone against the call words that are not the user's voice, so the user's voice
     // on the call side never cancels the user's own words. Then the words of a microphone echo
     // speaker, and the user's call-side words that repeat the microphone words kept.
-    let mine = call.indices.filter { !callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains) }
+    // A call word whose candidates are all the user's voice is the user's. One whose candidates mix the
+    // user's voice with a far-side speaker (overlapping segments) is decided by which copy comes later,
+    // as pairVoices decides a speaker: when it repeats a microphone word later, it is the user's voice
+    // coming back; otherwise it stays in echo removal, where a far-side word that leaked into the
+    // microphone (the microphone copy later) is still dropped.
+    let mixed = call.indices.filter {
+        callCandidates[$0].contains(where: userVoice.contains) && !callCandidates[$0].allSatisfy(userVoice.contains)
+    }
+    var cameBack = Set<Int>()
+    if !mixed.isEmpty {
+        for p in matchEcho(mic: mic, call: mixed.map { call[$0] }).pairs where call[mixed[p.callWord]].start > mic[p.micWord].start {
+            cameBack.insert(mixed[p.callWord])
+        }
+    }
+    let mine = call.indices.filter {
+        cameBack.contains($0) || (!callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains))
+    }
     let mineSet = Set(mine)
     let echo = matchEcho(mic: mic, call: call.indices.filter { !mineSet.contains($0) }.map { call[$0] }).echo
     var leaked = 0

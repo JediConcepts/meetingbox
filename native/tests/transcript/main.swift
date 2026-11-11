@@ -333,6 +333,10 @@ check(nameCall([sp("P", seconds: 300, median: 4, vector: at(0.5)), t1, t3], kept
                firstWord: ["P": 0, "T1": 9, "T3": 5], userVoice: [], print: usable, counted: false)
       == ["P": "Them", "T1": "Them 2", "T3": "Them 1"],
       "nameCall: a cosine of 0.45 or more with the print is plain Them; the rest are numbered by first word")
+check(nameCall([sp("P", seconds: 300, median: 4, vector: at(0.5)), t1, t3], keptWords: ["P": 30, "T1": 40, "T3": 30],
+               firstWord: ["P": 0, "T1": 9, "T3": 5], userVoice: [], print: usable, counted: true)
+      == ["P": "Them", "T1": "Them 2", "T3": "Them 1"],
+      "nameCall: with a call count, the 0.45 print test still applies (review finding 3)")
 
 // --- naming the microphone side ---
 let roomR = sp("R", seconds: 100, median: 4, vector: e3)
@@ -388,6 +392,7 @@ check(usablePrint(vp(seconds: 75, meetings: 1, sources: [], sample: true), model
 let oldPrint = try? decodePrint(fixtureData("voice-old.json"))
 check(oldPrint?.sample == false && oldPrint?.refusals == 0 && oldPrint?.meetings == 2 && oldPrint?.seconds == 75,
       "decodePrint: a voice.json without sample or refusals reads them as false and 0")
+check(oldPrint?.refused == [], "decodePrint: a voice.json without refused reads it as no refused meetings")
 check((try? decodePrint(fixtureData("voice-sample.json")))?.sample == true, "decodePrint: sample is read")
 if let encoded = try? encodePrint(usable), let back = try? decodePrint(encoded) {
     check(back == usable, "encodePrint: a print reads back as it was written")
@@ -430,6 +435,23 @@ check(nothing(pairVoices(mic: [below], call: [callC], pairs: [], micWords: [], c
 check(nothing(pairVoices(mic: [sp("E", vector: e1)], call: [sp("C", vector: e1)], pairs: [], micWords: [], callWords: [], micCandidates: [],
                          callCandidates: [], print: usable)),
       "pairVoices: a pair that matches the print is not one voice heard twice")
+// A tie: as many shared words later on each side, so the microphone speaker cannot be told.
+let tieMic = [shared[0], shared[1], sharedLater[2], sharedLater[3]], tieCall = [sharedLater[0], sharedLater[1], shared[2], shared[3]]
+let tie = pairVoices(mic: [micE], call: [callC], pairs: (0..<4).map { (micWord: $0, callWord: $0) }, micWords: tieMic, callWords: tieCall,
+                     micCandidates: Array(repeating: ["E"], count: 4), callCandidates: Array(repeating: ["C"], count: 4), print: nil)
+check(tie.micUnknown == ["E"] && tie.micEcho.isEmpty && tie.callEcho.isEmpty,
+      "pairVoices: as many shared words later on each side makes the microphone speaker Unknown")
+// A weaker pairing never makes Unknown a speaker another pairing shows to be echo, or the source of the
+// call side's echo: C2 is like E and U too, but shares no words with either.
+let callC2 = sp("C2", vector: [0, 0, 0.8, 0.6])
+let echoAndNone = pairVoices(mic: [sp("E", vector: e3)], call: [callC, callC2], pairs: fivePairs, micWords: sharedLater, callWords: shared,
+                             micCandidates: micE5, callCandidates: callC5, print: nil)
+check(echoAndNone.micEcho == ["E"] && echoAndNone.micUnknown.isEmpty,
+      "pairVoices: a speaker shown to be echo is not made Unknown by a pairing with no shared words")
+let sourceAndNone = pairVoices(mic: [sp("E", vector: e3)], call: [callC, callC2], pairs: fivePairs, micWords: shared, callWords: sharedLater,
+                               micCandidates: micE5, callCandidates: callC5, print: nil)
+check(sourceAndNone.callEcho == ["C"] && sourceAndNone.micUnknown.isEmpty && sourceAndNone.micEcho.isEmpty,
+      "pairVoices: the source of the call side's echo is not made Unknown by a pairing with no shared words")
 
 // --- words to labels, end to end on synthetic speakers ---
 /// The words of `text`, `step` apart from `from`, each 0.3 s long.
@@ -487,6 +509,33 @@ check(!printLines.contains { $0.label == "Unknown" } && printLines.map(\.label) 
       "labelWords: a print match of 0.75 with 8 s whose words repeat the user's 0.3 s later adds no line (\(printLines))")
 check(removeEcho(mic: mineToShip, call: Array(repeated.prefix(8))).count == 5,
       "removeEcho: against every call word, the call-side repeat would have cancelled the user's own words")
+// The same, with the far side's segment overlapping the user's voice coming back (review finding 1): a
+// call word with both candidates that repeats a microphone word later is the user's voice, so no word
+// of the user's is cancelled, and none moves to the call side as Them or Unknown.
+for farStart in [12.0, 10.0] {
+    let overlap = labelWords(mic: mineToShip, call: Array(repeated.prefix(8)) + farReply,
+                             micSpeakers: side([Segment(speaker: "U", start: 9.8, end: 13.5), Segment(speaker: "U", start: 39.8, end: 42)],
+                                               [sp("U", seconds: 45, vector: at(0.9))]),
+                             callSpeakers: side([Segment(speaker: "P", start: 10.1, end: 13.8), Segment(speaker: "T", start: farStart, end: 22)],
+                                                [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                             print: usable)
+    check(overlap.mic.count == 13 && overlap.micLabels.allSatisfy { $0 == "Me" } && overlap.call.map(\.text) == farReply.map(\.text)
+          && overlap.callLabels.allSatisfy { $0 == "Them" } && overlap.log.contains { $0.hasPrefix("Your voice was heard on the call side") },
+          "labelWords: with a far-side segment from \(farStart) s overlapping the user's voice coming back, all 13 Me words stay Me "
+          + "and nothing moves to Them or Unknown (\(overlap.mic.count) \(overlap.call.map(\.text)) \(overlap.callLabels) \(overlap.log))")
+}
+// Real echo is still dropped where the segments overlap: the far side's words leak into the microphone
+// (the microphone copy is later) while the user's voice coming back overlaps them on the call side.
+let farTalk = said("we should look at the numbers again before friday.", from: 20)
+let leakedIntoMic = farTalk.map { w($0.start + 0.3, $0.end + 0.3, $0.text) }
+let overlapLeak = labelWords(mic: mineFirst + leakedIntoMic + mineLast, call: farTalk,
+                             micSpeakers: side([Segment(speaker: "U", start: 0, end: 32.5)], [sp("U", seconds: 30, vector: at(0.9))]),
+                             callSpeakers: side([Segment(speaker: "P", start: 19.5, end: 24), Segment(speaker: "T", start: 19.8, end: 24)],
+                                                [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                             print: usable)
+check(overlapLeak.mic.count == 10 && overlapLeak.micLabels.allSatisfy { $0 == "Me" } && overlapLeak.call.count == 9,
+      "labelWords: where the user's voice and the far side overlap on the call side, far-side words heard later on the microphone "
+      + "are still dropped as echo (\(overlapLeak.mic.count) \(overlapLeak.call.count))")
 
 // A usable print that matches nobody on the microphone side.
 let notMe = labelWords(mic: said("shall we start then.", from: 0) + said("yes let us begin now.", from: 5), call: [],
@@ -576,7 +625,11 @@ if case .write(let once) = firstRefusal {
           "learn: while unusable, one refused call writes refusals 1 and a second discards the print")
     if case .write(let reset) = learnFrom(once, source: "m-2") {
         check(reset.refusals == 0 && reset.meetings == 2, "learn: a learnt call in between resets refusals to 0")
+        check(reset.refused == [], "learn: a learnt call in between clears the refused meetings, which count only in a row")
     } else { check(false, "learn: a learnt call in between resets refusals to 0") }
+    // Review finding 2: the same refused call processed again (Try again, a Finder duplicate) is not a second refusal.
+    check(once.refused == ["m-1"] && learnFrom(once, voiceB, kept: keptB, source: "m-1") == .unchanged,
+          "learn: the same refused call processed twice counts once: refusals stays 1, not a discard")
 } else { check(false, "learn: while unusable, one refused call writes refusals 1 and a second discards the print") }
 if case .write(let startB) = learnFrom(nil, voiceB, kept: keptB, source: "m-3") {
     check(startB.vector == e3 && startB.meetings == 1, "learn: after a discard, voice B's next qualifying call starts a new print")
