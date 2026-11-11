@@ -1592,7 +1592,8 @@ recover_cmd() {
 
 # The transcriber a run starts with: a flag, else MB_ENGINE, else the app's choice, else Parakeet.
 # Parakeet only when it is set up and the meeting is in English; otherwise Apple's, and the log
-# says why. Prints parakeet, native or whisper.
+# says why. A chosen transcriber that is not installed gives way to the other, also said; with
+# none installed, the run stops. Prints parakeet, native or whisper.
 pick_engine() {
   local choice="$ENGINE"
   if [ "$choice" = auto ]; then
@@ -1613,6 +1614,15 @@ pick_engine() {
   esac
   if [ "$choice" = parakeet ] && ! speech_usable; then
     warn "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup."
+    choice=native
+  fi
+  if [ "$choice" = native ] && ! have speech-analyzer; then
+    have whisper-cli || die "no transcriber installed. Run: meetingbox setup"
+    warn "Apple's transcriber is not installed, so whisper is used. Run meetingbox setup."
+    choice=whisper
+  elif [ "$choice" = whisper ] && ! have whisper-cli; then
+    have speech-analyzer || die "no transcriber installed. Run: meetingbox setup"
+    warn "whisper is not installed, so Apple's transcriber is used. Run meetingbox setup."
     choice=native
   fi
   printf '%s' "$choice"
@@ -1652,7 +1662,7 @@ find_whisper_model() {
 # A v1.2 meeting's one mixed file to plain text: Parakeet's words joined, else Apple's, else whisper.
 transcribe() {
   local audio="$1" out="$2" engine text model wav
-  engine="$(pick_engine)"
+  engine="$(pick_engine)" || exit 1   # pick_engine has said why
   if [ "$engine" = parakeet ]; then
     say "transcribing on device (NVIDIA Parakeet)"
     make_work "$(dirname "$out")"
@@ -1664,12 +1674,11 @@ transcribe() {
       return 0
     fi
     drop_work
-    warn "Parakeet could not transcribe $(basename "$audio"), trying Apple's transcriber"
-    engine=native
-  fi
-  if [ "$engine" = native ] && ! have speech-analyzer; then
-    have whisper-cli || die "no transcriber installed. Run: meetingbox setup"
-    engine=whisper
+    if have speech-analyzer; then engine=native
+    elif have whisper-cli; then engine=whisper
+    else die "Parakeet could not transcribe $(basename "$audio"), and no other transcriber is installed. Run: meetingbox setup"
+    fi
+    warn "Parakeet could not transcribe $(basename "$audio"), trying $(engine_name "$engine")"
   fi
 
   case "$engine" in
@@ -1738,13 +1747,15 @@ sa_run() {
 # the words JSON, with its own temporary files in the work folder too. Its one-line reason for a
 # failure goes to the log.
 pk_run() {
-  local audio="$1" out="$2" wav err
+  local audio="$1" out="$2" wav err reason
+  [ -n "$WORK" ] && [ -d "$WORK" ] || { info "Parakeet has no work folder for $(basename "$audio")"; return 1; }
   wav="$WORK/$(basename "${audio%.*}").wav"; err="$WORK/speech.err"
   if ! afconvert -f WAVE -d LEI16@16000 -c 1 "$audio" "$wav" >/dev/null 2>&1; then
     rm -f "$wav"; info "Parakeet could not read $(basename "$audio")"; return 1
   fi
   if ! TMPDIR="$WORK" "$SPEECH_BIN" transcribe "$SPEECH_MODELS" "$wav" "$out" >/dev/null 2>"$err"; then
-    info "Parakeet: $(head -n 1 "$err")"; rm -f "$wav" "$err"; return 1
+    reason="$(head -n 1 "$err")"
+    info "Parakeet: ${reason:-the speech helper stopped without giving a reason}"; rm -f "$wav" "$err"; return 1
   fi
   rm -f "$wav" "$err"
 }
@@ -1755,6 +1766,7 @@ whisper_words() {
   model="$(find_whisper_model)"
   [ -n "$model" ] || { info "no whisper model found. Run: meetingbox setup"; return 1; }
   have ffmpeg || { info "whisper.cpp needs ffmpeg for the 16kHz conversion. brew install ffmpeg"; return 1; }
+  [ -n "$WORK" ] && [ -d "$WORK" ] || { info "whisper has no work folder for $(basename "$audio")"; return 1; }
   wav="$WORK/$(basename "${audio%.*}").16k.wav"
   if ! { ffmpeg -hide_banner -loglevel error -y -i "$audio" -ar 16000 -ac 1 -c:a pcm_s16le "$wav" \
          && whisper-cli -m "$model" -f "$wav" -oj -ml 1 -sow --output-file "${out%.json}" >/dev/null; }; then
@@ -1795,7 +1807,7 @@ transcribe_words() {
 transcribe_channels() {
   local src="$1" dest="$2" engine tmp err msg failed=0
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
-  engine="$(pick_engine)"
+  engine="$(pick_engine)" || exit 1   # pick_engine has said why
   say "transcribing each side on device ($(engine_title "$engine"))"
   make_work "$dest"
   # through ||, so set -e does not end the run on the first side that fails

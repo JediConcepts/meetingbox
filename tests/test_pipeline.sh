@@ -522,6 +522,9 @@ if [ "$got" = "process|X|parakeet|apple|" ]; then pass "parse_args: --parakeet -
 else fail "parse_args: --parakeet --writer apple: $got"; fi
 got="$( (ENGINE=auto; WHISPER_MODEL=""; parse_args process X --model /x; printf '%s|%s' "$ENGINE" "$WHISPER_MODEL") 2>&1 )"
 if [ "$got" = "whisper|/x" ]; then pass "parse_args: --model still means whisper"; else fail "parse_args: --model still means whisper: $got"; fi
+got="$( (ENGINE=auto; WRITER=""; parse_args process X --native --writer apple; printf '%s|%s|%s' "$cmd" "$ENGINE" "$WRITER") 2>&1 )"
+if [ "$got" = "process|native|apple" ]; then pass "parse_args: --native --writer apple"
+else fail "parse_args: --native --writer apple: $got"; fi
 
 # A stand-in mb-speech: check passes unless pk-unusable exists, and transcribe copies a fixture,
 # or fails for a side named in pk-fail-<side>. It logs the WAV it was given and its TMPDIR.
@@ -535,6 +538,7 @@ case "\$1" in
   transcribe)
     case "\$(basename "\$3")" in call*) side=call ;; *) side=mic ;; esac
     [ -e "$HOME/pk-fail-\$side" ] && { echo "the model could not run" >&2; exit 1; }
+    [ -e "$HOME/pk-silent-\$side" ] && exit 1
     cp "$FIX/pk-\$side.json" "\$4" ;;
   *) exit 1 ;;
 esac
@@ -550,7 +554,9 @@ speech-analyzer() {
     *) return 1 ;;
   esac
 }
-pk_reset() { : > "$HOME/calls.log"; rm -f "$HOME"/pk-*; ENGINE=auto; LOCALE=en-GB; SA_FAIL=""; }
+# Every run in this section is checked for curl, though each case starts a fresh log.
+PK_CURL=0; : > "$HOME/calls.log"
+pk_reset() { grep -q '^curl' "$HOME/calls.log" && PK_CURL=1; : > "$HOME/calls.log"; rm -f "$HOME"/pk-*; ENGINE=auto; LOCALE=en-GB; SA_FAIL=""; }
 pk_calls() { grep -c "^$1" "$HOME/calls.log" | tr -d ' '; }
 
 # --- by default, Parakeet on both sides ---
@@ -587,9 +593,11 @@ if [ "$rc" -eq 0 ] && [ "$(pk_calls speech-analyzer)" = 2 ] && [ "$(pk_calls 'mb
 defaults() { echo "defaults $*" >> "$HOME/calls.log"; return 1; }
 
 # --- a meeting that is not in English uses Apple's, and says why ---
-pk_reset; LOCALE=fr-FR
+# MB_LOCALE, read by the engine's own settings line, as a run from the app or Terminal reads it
+pk_reset; export MB_LOCALE=fr-FR
 d="$(meeting pk4 audio.m4a mic.m4a call.m4a)"
-out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+out="$( (eval "$(grep '^LOCALE=' "$ROOT/meetingbox")"; process "$d/audio.m4a") 2>&1 )"; rc=$?
+unset MB_LOCALE
 if [ "$rc" -eq 0 ] && [ "$(pk_calls speech-analyzer)" = 2 ] && [ "$(pk_calls 'mb-speech transcribe')" = 0 ] \
    && printf '%s' "$out" | grep -q 'fr-FR.*Apple'; then
   pass "a meeting in fr-FR uses Apple's, and says why"; else fail "a meeting in fr-FR uses Apple's, and says why (rc $rc): $out"; fi
@@ -650,6 +658,71 @@ if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk.
   pass "a single-file meeting gets Parakeet's plain text"
 else fail "a single-file meeting gets Parakeet's plain text (rc $rc): $out"; fi
 
+# --- a flag beats the app's preference ---
+pk_reset; ENGINE=parakeet
+defaults() { echo "defaults $*" >> "$HOME/calls.log"; [ "$*" = "read com.jediconcepts.meetingbox transcriber" ] && echo apple; }
+d="$(meeting pk12 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(pk_calls 'mb-speech transcribe')" = 2 ] && [ "$(pk_calls speech-analyzer)" = 0 ]; then
+  pass "--parakeet beats the app's preference for Apple"; else fail "--parakeet beats the app's preference for Apple (rc $rc): $out"; fi
+defaults() { echo "defaults $*" >> "$HOME/calls.log"; return 1; }
+
+# --- a chosen transcriber that is not installed: said so, and the header names the one used ---
+pk_reset; ENGINE=native
+have() { case "$1" in fm|whisper-cli|ffmpeg) return 0 ;; *) return 1 ;; esac; }
+d="$(meeting pk13 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "Apple's transcriber is not installed, so whisper is used" \
+   && printf '%s' "$out" | grep -q 'each side on device (whisper.cpp)' && [ "$(pk_calls whisper-cli)" = 2 ]; then
+  pass "--native without speech-analyzer says whisper is used instead"
+else fail "--native without speech-analyzer says whisper is used instead (rc $rc): $out"; fi
+pk_reset; ENGINE=whisper
+have() { case "$1" in fm|speech-analyzer) return 0 ;; *) return 1 ;; esac; }
+d="$(meeting pk14 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "whisper is not installed, so Apple's transcriber is used" \
+   && printf '%s' "$out" | grep -q 'each side on device (Apple SpeechAnalyzer)' && [ "$(pk_calls speech-analyzer)" = 2 ]; then
+  pass "--whisper without whisper-cli says Apple's is used instead"
+else fail "--whisper without whisper-cli says Apple's is used instead (rc $rc): $out"; fi
+pk_reset; touch "$HOME/pk-unusable"
+have() { case "$1" in fm) return 0 ;; *) return 1 ;; esac; }
+d="$(meeting pk15 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'no transcriber installed. Run: meetingbox setup' \
+   && ! printf '%s' "$out" | grep -q 'Speech Recognition'; then
+  pass "with no transcriber installed, the run says so"
+else fail "with no transcriber installed, the run says so (rc $rc): $out"; fi
+pk_reset; touch "$HOME/pk-fail-mic"
+have() { case "$1" in fm|whisper-cli|ffmpeg) return 0 ;; *) return 1 ;; esac; }
+d="$(meeting pk16 audio.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"
+if printf '%s' "$out" | grep -q 'Parakeet could not transcribe audio.m4a, trying whisper' \
+   && ! printf '%s' "$out" | grep -q "trying Apple's"; then
+  pass "a single file: Parakeet failing with no Apple's transcriber says whisper is tried"
+else fail "a single file: Parakeet failing with no Apple's transcriber says whisper is tried: $out"; fi
+have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+
+# --- the helper failing without a reason: the log still gives one ---
+pk_reset; touch "$HOME/pk-silent-call"
+d="$(meeting pk17 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Parakeet: the speech helper stopped without giving a reason' \
+   && ! printf '%s' "$out" | grep -q 'Parakeet: *$'; then
+  pass "a helper failing without a reason logs a fixed one"
+else fail "a helper failing without a reason logs a fixed one (rc $rc): $out"; fi
+
+# --- with no work folder, pk_run and whisper_words stop before writing anything ---
+pk_reset
+ffmpeg() { echo "ffmpeg $*" >> "$HOME/calls.log"; for a in "$@"; do :; done; printf 'wav' > "$a"; }
+have() { case "$1" in speech-analyzer|fm|whisper-cli|ffmpeg) return 0 ;; *) return 1 ;; esac; }
+( WORK=""; pk_run "$HOME/pk1/mic.m4a" "$HOME/pk-none.json" ) >/dev/null 2>&1; rc1=$?
+( WORK=""; whisper_words "$HOME/pk1/mic.m4a" "$HOME/pk-none.json" ) >/dev/null 2>&1; rc2=$?
+if [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ] && [ "$(pk_calls afconvert)" = 0 ] && [ "$(pk_calls ffmpeg)" = 0 ] \
+   && [ "$(pk_calls 'mb-speech')" = 0 ] && [ "$(pk_calls whisper-cli)" = 0 ]; then
+  pass "pk_run and whisper_words refuse an empty work folder"
+else fail "pk_run and whisper_words refuse an empty work folder ($rc1 $rc2): $(cat "$HOME/calls.log")"; fi
+have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+
 # --- with SRC and OUT apart, SRC is left byte for byte as it was ---
 pk_reset
 src="$(meeting pk11 audio.m4a mic.m4a call.m4a)"; dst="$HOME/pk11-out"; mkdir -p "$dst"
@@ -660,7 +733,8 @@ if [ "$rc" -eq 0 ] && [ "$before" = "$after" ] && [ -s "$dst/transcript.txt" ] &
    && [ -s "$dst/call.words.json" ] && ! ls -a "$dst" | grep -q '^\.work'; then
   pass "transcribe_channels reads SRC and writes only in OUT"
 else fail "transcribe_channels reads SRC and writes only in OUT (rc $rc): $out"; fi
-if [ "$(pk_calls curl)" = 0 ]; then pass "no curl in any Parakeet run"; else fail "no curl in any Parakeet run"; fi
+pk_reset
+if [ "$PK_CURL" = 0 ]; then pass "no curl in any Parakeet run"; else fail "no curl in any Parakeet run"; fi
 pk_reset
 
 finish
