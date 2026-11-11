@@ -1,4 +1,5 @@
-// Merges the mic and call transcripts into Me and Them turns.
+// Merges the mic and call transcripts into labelled lines: tidy lines that follow sentences,
+// or with tidying off, a line per turn.
 import Foundation
 
 struct Word: Equatable {
@@ -186,6 +187,157 @@ func mergeTurns(_ streams: [(label: String, words: [Word])], gap: Double = 1.5) 
         previous = (item.label, item.word)
     }
     return turns
+}
+
+/// Each word's end, capped at its start plus `cap` seconds. A transcriber can stretch the word
+/// before a pause across the whole pause, which would hold a turn open. Applies with tidying on or off.
+func capEnds(_ words: [Word], cap: Double = 1.2) -> [Word] {
+    words.map { $0.end > $0.start + cap ? Word(start: $0.start, end: $0.start + cap, text: $0.text) : $0 }
+}
+
+/// Lower-case letters and apostrophes only: how fillers and short replies are matched.
+func bareWord(_ s: String) -> String {
+    String(s.lowercased().unicodeScalars.filter { CharacterSet.letters.contains($0) || $0 == "'" || $0 == "\u{2019}" })
+}
+
+/// Acknowledgements that can be a short reply. "No" is not one: it is an answer.
+let shortReplyWords: Set<String> = ["yeah", "yes", "yep", "right", "okay", "ok", "mm", "mhm", "hmm", "sure", "exactly",
+                                    "cool", "wow", "oh", "ah", "true", "absolutely", "alright", "totally", "nice", "good", "great"]
+let fillerWords: Set<String> = ["um", "uh", "erm", "er", "umm", "uhm"]
+
+/// One speaker's words for tidy lines, in time order: ends capped, and `#` tokens and fillers
+/// dropped. A filler takes its own punctuation with it, and any commas or stops written as
+/// tokens of their own straight after it, so no comma is left orphaned. A full stop, question
+/// mark or exclamation mark it carried moves to the word before, so no sentence loses its end
+/// ("um..." trails off, and ends nothing).
+func tidyWords(_ words: [Word]) -> [Word] {
+    let ordered = words.indices.sorted { words[$0].start != words[$1].start ? words[$0].start < words[$1].start : $0 < $1 }
+    var kept: [Word] = []
+    var afterFiller = false
+    for w in capEnds(ordered.map { words[$0] }) {
+        if w.text.hasPrefix("#") { continue }
+        let punctuationOnly = w.text.allSatisfy { ",.;:?!".contains($0) }
+        guard fillerWords.contains(bareWord(w.text)) || (afterFiller && punctuationOnly) else {
+            kept.append(w)
+            afterFiller = false
+            continue
+        }
+        afterFiller = true
+        if let stop = w.text.last, ".?!".contains(stop), !w.text.hasSuffix(".."), let last = kept.last,
+           let end = last.text.last, !".?!".contains(end) {
+            var text = last.text
+            while let c = text.last, ",;:".contains(c) { text.removeLast() }
+            kept[kept.count - 1] = Word(start: last.start, end: last.end, text: text + String(stop))
+        }
+    }
+    return kept
+}
+
+/// Lines that follow sentences (spec 6.3), from one word stream per label. Words with the same
+/// label are one speaker's, whichever stream they came from. The words are tidied first.
+///
+/// - A short reply is a stretch of one speaker's speech (words no more than 1.5 s apart) of three
+///   words or fewer, all acknowledgements. Its host is the latest-starting other speaker's stretch,
+///   not itself a reply, that contains the reply's start or ended within 0.5 s before it. A reply
+///   with a host is written inline, "(Label: words)", after the host's last word that started by
+///   then, and without a closing comma or full stop. A reply with no host stays a line of its own.
+/// - Utterances are the rest of each speaker's words, split where a gap exceeds 1.5 s, at a
+///   sentence end once the utterance has run over 45 s, and at a pause in which another speaker
+///   said a whole stretch that is not a short reply. Speaking over someone who is still going
+///   does not split their utterance: cutting both speakers at every overlapping word left most
+///   lines of a real call three words or fewer. Overlapping utterances are ordered by their start.
+/// - A line takes in the same speaker's next utterance when nobody spoke in between, it starts
+///   within 4 s of the line's end, and the line so far spans under 60 s. A short reply is not
+///   somebody in between.
+func joinLines(_ streams: [(label: String, words: [Word])]) -> [Turn] {
+    // Every kept word in time order; ties keep the stream order.
+    var all: [(label: String, word: Word)] = []
+    for s in streams { for w in tidyWords(s.words) { all.append((s.label, w)) } }
+    let order = all.indices.sorted { all[$0].word.start != all[$1].word.start ? all[$0].word.start < all[$1].word.start : $0 < $1 }
+    all = order.map { all[$0] }
+
+    // Each speaker's stretches of speech, in order of their first word. These find the short
+    // replies and their hosts, and who spoke in a pause.
+    var spans: [(label: String, words: [Int], start: Double, end: Double)] = []
+    var latest: [String: Int] = [:]
+    for (i, item) in all.enumerated() {
+        if let k = latest[item.label], item.word.start - spans[k].end <= 1.5 {
+            spans[k].words.append(i)
+            spans[k].end = max(spans[k].end, item.word.end)
+        } else {
+            latest[item.label] = spans.count
+            spans.append((item.label, [i], item.word.start, item.word.end))
+        }
+    }
+    // In time order, so a host is settled before its replies: a stretch that became a reply
+    // hosts none, and one that stayed a line can, even a short one.
+    var aside = [Bool](repeating: false, count: spans.count)
+    var asidesAfter: [Int: [String]] = [:]   // a host word's index, and the replies written after it
+    var inAside = [Bool](repeating: false, count: all.count)
+    for (r, reply) in spans.enumerated()
+    where reply.words.count <= 3 && reply.words.allSatisfy({ shortReplyWords.contains(bareWord(all[$0].word.text)) }) {
+        guard let h = (0..<r).last(where: { !aside[$0] && spans[$0].label != reply.label && reply.start - spans[$0].end <= 0.5 }),
+              let at = spans[h].words.last(where: { all[$0].word.start <= reply.start }) else { continue }
+        var words = reply.words.reduce("") { joinWords($0, all[$1].word.text) }
+        while let c = words.last, ",.".contains(c) { words.removeLast() }
+        asidesAfter[at, default: []].append("(\(reply.label): \(words))")
+        aside[r] = true
+        for i in reply.words { inAside[i] = true }
+    }
+
+    // Whether another speaker said a whole stretch, not a short reply, between `from` and `to`.
+    func spokeBetween(_ label: String, _ from: Double, _ to: Double) -> Bool {
+        var a = 0, b = spans.count
+        while a < b { let m = (a + b) / 2; if spans[m].start < from { a = m + 1 } else { b = m } }
+        while a < spans.count && spans[a].start <= to {
+            if !aside[a] && spans[a].label != label && spans[a].end <= to { return true }
+            a += 1
+        }
+        return false
+    }
+
+    // The utterances, from the words that are not short replies. They come out in order of
+    // their first word, because the words are walked in time order.
+    var utterances: [(label: String, words: [Int], start: Double, end: Double)] = []
+    var open: [String: Int] = [:]   // each speaker's utterance still taking words
+    for (i, item) in all.enumerated() where !inAside[i] {
+        let w = item.word
+        if let k = open[item.label] {
+            let u = utterances[k]
+            if w.start - u.end <= 1.5 && !spokeBetween(item.label, u.end, w.start) {
+                utterances[k].words.append(i)
+                utterances[k].end = max(u.end, w.end)
+            } else {
+                open[item.label] = nil
+            }
+        }
+        if open[item.label] == nil {
+            open[item.label] = utterances.count
+            utterances.append((item.label, [i], w.start, w.end))
+        }
+        let u = utterances[open[item.label]!]
+        if let c = w.text.last, ".?!".contains(c), u.end - u.start > 45 { open[item.label] = nil }
+    }
+
+    // Lines: the same speaker's next utterance joins the line when nobody spoke in between,
+    // it starts within 4 s of the line's end, and the line so far spans under 60 s.
+    var lines: [(label: String, words: [Int], start: Double, end: Double)] = []
+    for u in utterances {
+        if let l = lines.last, l.label == u.label, u.start - l.end <= 4, l.end - l.start < 60 {
+            lines[lines.count - 1].words += u.words
+            lines[lines.count - 1].end = max(l.end, u.end)
+        } else {
+            lines.append(u)
+        }
+    }
+    return lines.map { l in
+        var text = ""
+        for i in l.words {
+            text = joinWords(text, all[i].word.text)
+            for aside in asidesAfter[i] ?? [] { text = joinWords(text, aside) }
+        }
+        return Turn(label: l.label, start: l.start, text: text)
+    }
 }
 
 /// One line per turn: [HH:MM:SS] Label: text

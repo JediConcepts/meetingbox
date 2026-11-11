@@ -54,7 +54,7 @@ d="$(meeting m1 audio.m4a mic.m4a call.m4a)"
 : > "$HOME/fm-input.txt"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
 t="$d/transcript.txt"
-if [ "$rc" -eq 0 ] && [ -s "$t" ] && ! grep -qvE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] (Me|Them): ' "$t" \
+if [ "$rc" -eq 0 ] && [ -s "$t" ] && ! grep -qvE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] [A-Za-z][A-Za-z0-9 ]*: ' "$t" \
    && grep -q '] Me: ' "$t" && grep -q '] Them: ' "$t"; then
   pass "three files give [HH:MM:SS] Me/Them lines"
 else fail "three files give [HH:MM:SS] Me/Them lines (rc $rc): $out $(cat "$t" 2>/dev/null)"; fi
@@ -722,6 +722,7 @@ if [ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ] && [ "$(pk_calls afconvert)" = 0 ] && [ 
   pass "pk_run and whisper_words refuse an empty work folder"
 else fail "pk_run and whisper_words refuse an empty work folder ($rc1 $rc2): $(cat "$HOME/calls.log")"; fi
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
+ffmpeg() { for a in "$@"; do :; done; printf 'wav' > "$a"; }   # the whisper test's stub again, without the log
 
 # --- with SRC and OUT apart, SRC is left byte for byte as it was ---
 pk_reset
@@ -736,5 +737,125 @@ else fail "transcribe_channels reads SRC and writes only in OUT (rc $rc): $out";
 pk_reset
 if [ "$PK_CURL" = 0 ]; then pass "no curl in any Parakeet run"; else fail "no curl in any Parakeet run"; fi
 pk_reset
+
+# === Tidy lines: on unless --no-tidy or the app's preference says no (spec 6.3) ===
+
+# --- parse_args: the app's process arguments with --tidy and --no-tidy ---
+got="$( (ENGINE=auto; TIDY=auto; WRITER=""; parse_args process X --parakeet --tidy --writer apple
+         printf '%s|%s|%s|%s|%s' "$cmd" "$argfile" "$ENGINE" "$TIDY" "$WRITER") 2>&1 )"
+if [ "$got" = "process|X|parakeet|1|apple" ]; then pass "parse_args: --parakeet --tidy --writer apple"
+else fail "parse_args: --parakeet --tidy --writer apple: $got"; fi
+got="$( (ENGINE=auto; TIDY=auto; WRITER=""; parse_args process X --native --no-tidy --writer apple
+         printf '%s|%s|%s|%s|%s' "$cmd" "$argfile" "$ENGINE" "$TIDY" "$WRITER") 2>&1 )"
+if [ "$got" = "process|X|native|0|apple" ]; then pass "parse_args: --native --no-tidy --writer apple"
+else fail "parse_args: --native --no-tidy --writer apple: $got"; fi
+
+# --- mb-transcript itself: tidy lines by default; with --plain, every word and a line per turn ---
+mkdir -p "$HOME/tidy"
+printf '%s' '{"engine": "parakeet-ultra", "words": [
+  {"start": 0.0, "end": 0.3, "text": "So", "confidence": 0.9}, {"start": 0.4, "end": 0.6, "text": "um", "confidence": 0.9},
+  {"start": 0.7, "end": 0.9, "text": "we", "confidence": 0.9}, {"start": 1.0, "end": 1.3, "text": "should", "confidence": 0.9},
+  {"start": 1.5, "end": 1.8, "text": "go", "confidence": 0.9}, {"start": 1.9, "end": 2.0, "text": "to", "confidence": 0.9},
+  {"start": 2.1, "end": 2.2, "text": "the", "confidence": 0.9}, {"start": 2.3, "end": 2.6, "text": "park.", "confidence": 0.9}]}' \
+  > "$HOME/tidy/mic.words.json"
+printf '%s' '{"engine": "parakeet-ultra", "words": [{"start": 1.35, "end": 1.45, "text": "yeah", "confidence": 0.9}]}' \
+  > "$HOME/tidy/call.words.json"
+tidied="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" 2>&1)"
+plain="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" --plain 2>&1)"
+if [ "$tidied" = "[00:00:00] Me: So we should (Them: yeah) go to the park." ]; then
+  pass "mb-transcript tidies by default: 'um' dropped, the short reply inline"
+else fail "mb-transcript tidies by default: 'um' dropped, the short reply inline: $tidied"; fi
+if [ "$plain" = "$(printf '[00:00:00] Me: So um we should\n[00:00:01] Them: yeah\n[00:00:01] Me: go to the park.')" ]; then
+  pass "mb-transcript --plain keeps 'um' and starts a line at every change of speaker"
+else fail "mb-transcript --plain keeps 'um' and starts a line at every change of speaker: $plain"; fi
+# a word stretched to 15 s: capped at 1.2 s either way, so the next word 10 s on is a new line
+printf '%s' '{"engine": "parakeet-ultra", "words": [{"start": 0.0, "end": 15.0, "text": "Hello.", "confidence": 0.9},
+  {"start": 10.0, "end": 10.5, "text": "Again.", "confidence": 0.9}]}' > "$HOME/tidy/long.words.json"
+printf '%s' '{"engine": "none", "words": []}' > "$HOME/tidy/none.words.json"
+n_plain="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/long.words.json" --call "$HOME/tidy/none.words.json" --plain 2>/dev/null | grep -c .)"
+n_tidy="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/long.words.json" --call "$HOME/tidy/none.words.json" 2>/dev/null | grep -c .)"
+if [ "$n_plain" = 2 ] && [ "$n_tidy" = 2 ]; then pass "mb-transcript caps word ends at 1.2 s with --plain and without"
+else fail "mb-transcript caps word ends at 1.2 s with --plain and without (plain $n_plain lines, tidy $n_tidy)"; fi
+
+# --- the engine passes --plain only when tidying is off: a flag, else the app's preference ---
+# A stand-in mb-transcript that logs its arguments, then runs the real one.
+REAL_TRANSCRIPT_BIN="$TRANSCRIPT_BIN"
+cat > "$HOME/mb-transcript-logged" <<EOF
+#!/bin/bash
+echo "mb-transcript \$*" >> "$HOME/calls.log"
+exec "$REAL_TRANSCRIPT_BIN" "\$@"
+EOF
+chmod 755 "$HOME/mb-transcript-logged"
+TRANSCRIPT_BIN="$HOME/mb-transcript-logged"
+# process on a new meeting, with the options after its name, as the command line gives them
+tidy_process() {
+  local name="$1"; shift
+  pk_reset
+  d="$(meeting "$name" audio.m4a mic.m4a call.m4a)"
+  out="$( (parse_args process "$d/audio.m4a" "$@"; process "$argfile") 2>&1 )"; rc=$?
+}
+mbt_calls() { grep -c "^mb-transcript ${1:-}" "$HOME/calls.log" | tr -d ' '; }
+asked_tidy() { grep -q '^defaults read com.jediconcepts.meetingbox tidyLines$' "$HOME/calls.log"; }
+
+tidy_process td1 --no-tidy
+if [ "$rc" -eq 0 ] && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.* --plain$')" = 1 ]; then pass "--no-tidy passes --plain"
+else fail "--no-tidy passes --plain (rc $rc): $(grep '^mb-transcript' "$HOME/calls.log") $out"; fi
+
+defaults() {
+  echo "defaults $*" >> "$HOME/calls.log"
+  [ "$*" = "read com.jediconcepts.meetingbox tidyLines" ] && { echo 0; return 0; }
+  return 1
+}
+tidy_process td2
+if [ "$rc" -eq 0 ] && asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.* --plain$')" = 1 ]; then
+  pass "the app's tidyLines preference of 0 passes --plain"
+else fail "the app's tidyLines preference of 0 passes --plain (rc $rc): $(grep '^mb-transcript\|^defaults' "$HOME/calls.log") $out"; fi
+tidy_process td3 --tidy
+if [ "$rc" -eq 0 ] && ! asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.*--plain')" = 0 ]; then
+  pass "--tidy beats the app's preference"
+else fail "--tidy beats the app's preference (rc $rc): $(grep '^mb-transcript\|^defaults' "$HOME/calls.log") $out"; fi
+defaults() { echo "defaults $*" >> "$HOME/calls.log"; return 1; }
+
+tidy_process td4
+if [ "$rc" -eq 0 ] && asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.*--plain')" = 0 ] && [ -s "$d/transcript.txt" ]; then
+  pass "with no flag and no preference, lines are tidied"
+else fail "with no flag and no preference, lines are tidied (rc $rc): $(grep '^mb-transcript\|^defaults' "$HOME/calls.log") $out"; fi
+TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
+pk_reset
+
+# --- the minutes writers are told what the labels mean, and the final pass how to name an owner ---
+LABELS='Speaker labels: "Me" is the person who recorded the meeting. "Room 1", "Room 2" and so on are people in the same room, numbered in the order they first spoke; if no line is labelled "Me", the person who recorded was not recognised and may be one of them. "Them", or "Them 1", "Them 2", are people on the other end of a call; a plain "Them" next to numbered ones is someone on the call who could not be told apart. "Unknown" means the speaker could not be told. Text in brackets such as "(Them: yeah)" is a short reply made during or just after someone else'\''s turn; it may be that person'\''s answer to a question. Keep these labels exactly as written and never guess a real name for a label.'
+mkdir -p "$HOME/labels"
+printf '[00:00:01] Room 1: we start now (Them 2: yeah)\n[00:00:05] Them: fine\n' > "$HOME/labels/transcript.txt"
+: > "$HOME/fm-instructions.txt"
+(
+  # over the window, so the transcript is sliced and the notes folded before the final pass
+  fm() {
+    case "$1" in
+      count-tokens) cat >/dev/null; echo 5000 ;;
+      respond) printf '%s\n' "$3" >> "$HOME/fm-instructions.txt"; cat >/dev/null; echo "the minutes" ;;
+      *) return 1 ;;
+    esac
+  }
+  summarise "$HOME/labels/transcript.txt" "$HOME/labels"
+) >/dev/null 2>&1
+map="$(grep '^You are taking minutes' "$HOME/fm-instructions.txt" | head -n 1)"
+reduce="$(grep '^These are notes from consecutive slices' "$HOME/fm-instructions.txt" | head -n 1)"
+final="$(grep 'Write the final minutes' "$HOME/fm-instructions.txt" | head -n 1)"
+old='"Them" is everyone on the other end of the call'
+labels_ok=1
+for instr in "$map" "$reduce"; do
+  case "$instr" in *"$LABELS"*) ;; *) labels_ok=0 ;; esac
+  case "$instr" in *"$old"*) labels_ok=0 ;; esac
+done
+if [ -n "$map" ] && [ -n "$reduce" ] && [ "$labels_ok" = 1 ]; then
+  pass "the slice and folding passes get the label sentence in place of the Me and Them one"
+else fail "the slice and folding passes get the label sentence in place of the Me and Them one: [$map] [$reduce]"; fi
+case "$final" in "$LABELS Write the final minutes"*) final_first=1 ;; *) final_first=0 ;; esac
+if [ "$final_first" = 1 ] \
+   && printf '%s' "$final" | grep -qF '(a name, or a speaker label exactly as written, such as Me, Room 1 or Them 2)' \
+   && ! printf '%s' "$final" | grep -qF '(a name, Me or Them)'; then
+  pass "the final pass gets the label sentence first, and the new owner wording"
+else fail "the final pass gets the label sentence first, and the new owner wording: [$final]"; fi
 
 finish

@@ -28,6 +28,7 @@ VERSION="2.0.0"
 BASE_DIR="${MB_DIR:-$HOME/Meetings}"
 DIR_ARG="${MB_DIR:-}"                    # sent to the app only when given
 ENGINE="${MB_ENGINE:-auto}"              # auto | parakeet | native | whisper
+TIDY="auto"                              # auto | 1 | 0: tidy transcript lines; auto is the app's choice, else 1
 WRITER="apple"                           # who writes the minutes: apple
 WORK=""                                  # the run's private work folder, once made
 LOCALE="${MB_LOCALE:-en-GB}"
@@ -103,11 +104,14 @@ WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggm
 CHUNK_WORDS="${MB_CHUNK_WORDS:-1500}"    # ~2000 tokens, leaves room for the answer
 TOKEN_CEILING="${MB_TOKEN_CEILING:-2600}"
 
-MAP_INSTRUCTIONS='You are taking minutes. This is one slice of a longer meeting transcript, so write no introduction and no conclusion. Extract only what is actually in this text, under these headings, omitting any heading with nothing under it: DECISIONS (only what was agreed), ACTIONS (only something someone said they would do; name the owner if one was named), NUMBERS AND DATES, OPEN QUESTIONS, NOTABLE QUOTES. Be terse. Invent nothing. If a point is ambiguous, say so rather than resolving it. Lines may start with the speaker: "Me" is the person who recorded the meeting, "Them" is everyone on the other end of the call. Keep those labels when naming who said or owns something.'
+# What the speaker labels in a transcript mean, told to every minutes writer.
+LABEL_INSTRUCTIONS='Speaker labels: "Me" is the person who recorded the meeting. "Room 1", "Room 2" and so on are people in the same room, numbered in the order they first spoke; if no line is labelled "Me", the person who recorded was not recognised and may be one of them. "Them", or "Them 1", "Them 2", are people on the other end of a call; a plain "Them" next to numbered ones is someone on the call who could not be told apart. "Unknown" means the speaker could not be told. Text in brackets such as "(Them: yeah)" is a short reply made during or just after someone else'\''s turn; it may be that person'\''s answer to a question. Keep these labels exactly as written and never guess a real name for a label.'
 
-REDUCE_INSTRUCTIONS='These are notes from consecutive slices of one meeting. Merge them into a single set of minutes. Drop duplicates, keep every distinct decision and action, keep the owner against each action, and preserve all numbers, dates and names exactly as written. Add nothing that is not in the notes. Same headings: DECISIONS, ACTIONS, NUMBERS AND DATES, OPEN QUESTIONS. Lines may start with the speaker: "Me" is the person who recorded the meeting, "Them" is everyone on the other end of the call. Keep those labels when naming who said or owns something.'
+MAP_INSTRUCTIONS='You are taking minutes. This is one slice of a longer meeting transcript, so write no introduction and no conclusion. Extract only what is actually in this text, under these headings, omitting any heading with nothing under it: DECISIONS (only what was agreed), ACTIONS (only something someone said they would do; name the owner if one was named), NUMBERS AND DATES, OPEN QUESTIONS, NOTABLE QUOTES. Be terse. Invent nothing. If a point is ambiguous, say so rather than resolving it. '"$LABEL_INSTRUCTIONS"' Keep those labels when naming who said or owns something.'
 
-FINAL_INSTRUCTIONS='Write the final minutes of this meeting from the notes below, in Markdown, under exactly these four headings in this order. SUMMARY: three lines on what the meeting was about and what came of it. DECISIONS: only things the people in this meeting agreed, during it, about what happens next. ACTIONS: only things someone said they will do after the meeting. A story about the past is neither: something agreed or done before the meeting is not a decision or an action. Put an owner first only when the notes name one (a name, Me or Them). End every decision and action with the words from the notes that show it, in quotes; if you cannot quote the words, it did not happen, so leave it out. OPEN QUESTIONS: only questions still unanswered at the end; a question that was answered is not open. Under a heading with nothing that fits, write None. Many calls, interviews and chats decide nothing, and that is fine. No preamble and no sign off. Add nothing that is not in the notes.'
+REDUCE_INSTRUCTIONS='These are notes from consecutive slices of one meeting. Merge them into a single set of minutes. Drop duplicates, keep every distinct decision and action, keep the owner against each action, and preserve all numbers, dates and names exactly as written. Add nothing that is not in the notes. Same headings: DECISIONS, ACTIONS, NUMBERS AND DATES, OPEN QUESTIONS. '"$LABEL_INSTRUCTIONS"' Keep those labels when naming who said or owns something.'
+
+FINAL_INSTRUCTIONS="$LABEL_INSTRUCTIONS"' Write the final minutes of this meeting from the notes below, in Markdown, under exactly these four headings in this order. SUMMARY: three lines on what the meeting was about and what came of it. DECISIONS: only things the people in this meeting agreed, during it, about what happens next. ACTIONS: only things someone said they will do after the meeting. A story about the past is neither: something agreed or done before the meeting is not a decision or an action. Put an owner first only when the notes name one (a name, or a speaker label exactly as written, such as Me, Room 1 or Them 2). End every decision and action with the words from the notes that show it, in quotes; if you cannot quote the words, it did not happen, so leave it out. OPEN QUESTIONS: only questions still unanswered at the end; a question that was answered is not open. Under a heading with nothing that fits, write None. Many calls, interviews and chats decide nothing, and that is fine. No preamble and no sign off. Add nothing that is not in the notes.'
 
 BRIEF_INSTRUCTIONS='Extract the structured record of this meeting from the notes below. Every item must come from the notes. Leave an array empty rather than guessing.'
 
@@ -1628,6 +1632,19 @@ pick_engine() {
   printf '%s' "$choice"
 }
 
+# Whether transcript lines are tidied (spec 6.3): a flag, else the app's choice, else yes. Off,
+# mb-transcript gets --plain: a line per turn, every word kept.
+tidy_lines() {
+  case "$TIDY" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  case "$(defaults read com.jediconcepts.meetingbox tidyLines 2>/dev/null || true)" in
+    0|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # The transcribers tried on each side, in order: the chosen one, then Apple's, then whisper.
 engine_chain() {
   case "$1" in
@@ -1805,7 +1822,7 @@ transcribe_words() {
 # run's work folder there: nothing in SRC is changed.
 # Usage: transcribe_channels SRC OUT
 transcribe_channels() {
-  local src="$1" dest="$2" engine tmp err msg failed=0
+  local src="$1" dest="$2" engine tmp err msg failed=0 plain=""
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
   engine="$(pick_engine)" || exit 1   # pick_engine has said why
   say "transcribing each side on device ($(engine_title "$engine"))"
@@ -1822,7 +1839,8 @@ transcribe_channels() {
   # Written aside and moved, so a failure leaves no half transcript behind.
   progress speakers
   tmp="$WORK/transcript.txt"; err="$WORK/transcript.err"
-  if ! "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" > "$tmp" 2> "$err"; then
+  tidy_lines || plain="--plain"
+  if ! "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${plain:+"$plain"} > "$tmp" 2> "$err"; then
     msg="$(cat "$err")"; drop_work
     die "${msg:-mb-transcript failed}"
   fi
@@ -2380,6 +2398,7 @@ Options
   --dir ~/Meetings       where recordings land         (MB_DIR)
   --locale en-GB         transcription locale          (MB_LOCALE)
   --parakeet | --native | --whisper   pick the transcriber   (MB_ENGINE)
+  --tidy | --no-tidy     tidy transcript lines, or a line per turn with every word
   --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
   --no-keep-audio        bin the m4a files once transcribed
 
@@ -2405,6 +2424,8 @@ parse_args() {
       --whisper) ENGINE="whisper"; shift ;;
       --native)  ENGINE="native"; shift ;;
       --parakeet) ENGINE="parakeet"; shift ;;
+      --tidy)    TIDY=1; shift ;;
+      --no-tidy) TIDY=0; shift ;;
       --writer)
         case "${2:-}" in
           apple) WRITER="apple" ;;

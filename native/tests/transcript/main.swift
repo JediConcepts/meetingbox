@@ -1,5 +1,6 @@
 // sources: ../../transcript/Transcript.swift
-// The merge turns two word lists into Me and Them turns. Pure functions, no audio.
+// The merge turns two word lists into Me and Them turns, and joinLines into lines that follow
+// sentences, with short replies inline. Pure functions, no audio.
 import Foundation
 
 var failures = 0
@@ -102,6 +103,98 @@ check(render([]) == "", "render: no turns, empty string")
 // mic only
 let solo = mergeTurns([("Me", removeEcho(mic: mic, call: [])), ("Them", [])])
 check(!solo.isEmpty && solo.allSatisfy { $0.label == "Me" }, "mic only: every turn is Me")
+
+// capEnds: the 1.2 s cap on word ends, which applies with tidying on or off
+check(capEnds([w(0, 15, "Hello."), w(2, 2.5, "x")]) == [w(0, 1.2, "Hello."), w(2, 2.5, "x")],
+      "capEnds: a word ends at most 1.2 s after its start")
+check(mergeTurns([("Me", capEnds([w(0, 15, "Hello."), w(10, 10.5, "Again.")]))]).count == 2,
+      "capEnds: with tidying off too, a stretched word does not join the next turn")
+
+// joinLines: lines follow sentences, short replies go inline, fillers go (spec 6.3).
+// The words of `text`, end to end, spread evenly from `from` to `to`.
+func spread(_ text: String, _ from: Double, _ to: Double) -> [Word] {
+    let parts = text.split(separator: " ").map(String.init)
+    let d = (to - from) / Double(parts.count)
+    return parts.enumerated().map { k, t in w(from + Double(k) * d, from + Double(k + 1) * d, t) }
+}
+func labels(_ turns: [Turn]) -> [String] { turns.map(\.label) }
+
+// asides and utterances: Me's sentence has a pause from 1.6 s to 2.0 s
+let park = spread("I think we should", 0, 1.6) + spread("go to the park today.", 2.0, 4.0)
+let yeah = joinLines([("Me", park), ("Them", [w(1.7, 1.9, "yeah")])])
+check(yeah == [Turn(label: "Me", start: 0, text: "I think we should (Them: yeah) go to the park today.")],
+      "joinLines: Them's 'yeah' inside a Me sentence is one Me line, the reply at its time (\(yeah))")
+let rather = joinLines([("Me", spread("so here is the plan for the quarter", 0, 5) + spread("then we can talk about it.", 6.4, 9)),
+                        ("Them", spread("I would rather not", 5.2, 6.0))])
+check(labels(rather) == ["Me", "Them", "Me"] && rather.map(\.start) == [0, 5.2, 6.4],
+      "joinLines: Me 0 to 5 s, Them 'I would rather not', Me from 6.4 s are three lines in order (\(rather))")
+let no = joinLines([("Me", park), ("Them", [w(1.7, 1.9, "No.")])])
+check(labels(no) == ["Me", "Them", "Me"] && !no.contains { $0.text.contains("(") },
+      "joinLines: Them's 'no' is never an aside, and said in Me's pause it splits the line (\(no))")
+let over = joinLines([("Me", spread("I was saying that we should all go", 0, 4)), ("Them", spread("but what about the budget", 3.0, 5.0))])
+check(over == [Turn(label: "Me", start: 0, text: "I was saying that we should all go"),
+               Turn(label: "Them", start: 3.0, text: "but what about the budget")],
+      "joinLines: talking over Me while Me is still speaking does not cut Me's line into pieces (\(over))")
+let carriesOver = joinLines([("Me", park), ("Them", spread("but what about the budget", 1.7, 3.5))])
+check(labels(carriesOver) == ["Me", "Them"] && carriesOver[0].text == "I think we should go to the park today.",
+      "joinLines: nor does starting in Me's pause and still talking when Me carries on (\(carriesOver))")
+let three = joinLines([("Me", park), ("Them", spread("Oh, okay, sure.", 1.4, 1.75))])
+check(three.count == 1 && three[0].text == "I think we should (Them: Oh, okay, sure) go to the park today.",
+      "joinLines: three words from the list are a short reply, without its closing full stop (\(three))")
+let four = joinLines([("Me", park), ("Them", spread("yes yes yes yes", 1.62, 1.98))])
+check(labels(four) == ["Me", "Them", "Me"], "joinLines: four words are not a short reply (\(four))")
+let twoAsides = joinLines([("Me", park), ("Them", [w(0.5, 0.7, "mm")]), ("Them 2", [w(3.2, 3.4, "right")])])
+check(twoAsides.map(\.text) == ["I think (Them: mm) we should go to the park (Them 2: right) today."],
+      "joinLines: two short replies sit in time order (\(twoAsides))")
+let unhosted = joinLines([("Them", [w(10, 10.4, "Okay.")]), ("Me", [w(10.6, 10.9, "Yeah.")])])
+check(unhosted == [Turn(label: "Them", start: 10, text: "Okay. (Me: Yeah)")],
+      "joinLines: a short reply with no host stays a line, and can host the next one (\(unhosted))")
+
+// continuing and splitting lines
+let hello = spread("Hello there.", 0, 2)
+let pause3 = joinLines([("Me", hello + spread("Again.", 5, 6))])
+check(pause3 == [Turn(label: "Me", start: 0, text: "Hello there. Again.")],
+      "joinLines: Me after a 3 s pause with nobody between carries on the line (\(pause3))")
+let pause5 = joinLines([("Me", hello + spread("Again.", 7, 8))])
+check(pause5.map(\.start) == [0, 7], "joinLines: after a 5 s pause Me starts a new line (\(pause5))")
+let asideBetween = joinLines([("Me", hello + spread("Again.", 5, 6)), ("Them", [w(2.3, 2.6, "Yeah.")])])
+check(asideBetween == [Turn(label: "Me", start: 0, text: "Hello there. (Them: Yeah) Again.")],
+      "joinLines: a short reply between is not somebody between (\(asideBetween))")
+let tenWords = "one two three four five six seven eight nine ten."
+let minute = joinLines([("Me", (0..<7).flatMap { k in spread(tenWords, Double(12 * k), Double(12 * k + 10)) })])
+check(minute.map(\.start) == [0, 72], "joinLines: a line takes in no further utterance once it spans 60 s (\(minute.map(\.start)))")
+let sentences = joinLines([("Me", (0..<13).flatMap { k in spread("a b c d e f g h i end.", Double(10 * k), Double(10 * k + 10)) })])
+check(sentences.map(\.start) == [0, 100],
+      "joinLines: an utterance over 45 s splits at the next sentence end (\(sentences.map(\.start)))")
+
+// cleaning
+let ums = joinLines([("Me", spread("Uh so we um, should go.", 0, 3))])
+check(ums.map(\.text) == ["so we should go."], "joinLines: 'um,' and 'Uh' vanish (\(ums.map(\.text)))")
+let commas = joinLines([("Me", spread("Well um , I think, um. Then we go.", 0, 4))])
+check(commas.map(\.text) == ["Well I think. Then we go."],
+      "joinLines: no double spaces or orphaned commas, and a filler's full stop stays (\(commas.map(\.text)))")
+let stretched = joinLines([("Me", [w(0, 15, "Hello."), w(10, 10.5, "Again.")])])
+check(stretched.count == 2, "joinLines: a word ending 15 s after its start does not hold a line open (\(stretched))")
+let stretchedHost = joinLines([("Me", [w(0, 15, "Hello.")]), ("Them", [w(8, 8.3, "yeah")])])
+check(labels(stretchedHost) == ["Me", "Them"], "joinLines: nor does it make a reply 8 s later an aside (\(stretchedHost))")
+let hashes = joinLines([("Me", spread("hello # there #noise", 0, 2))])
+check(hashes.map(\.text) == ["hello there"], "joinLines: tokens starting with # are dropped (\(hashes.map(\.text)))")
+
+// labels and edge cases
+let named = joinLines([("Room 1", spread("we start now.", 0, 2)), ("Them 2", [w(1.0, 1.2, "yeah")]),
+                       ("Unknown", spread("who said that?", 4, 5)), ("Sam", spread("I did.", 6, 7))])
+check(named == [Turn(label: "Room 1", start: 0, text: "we start (Them 2: yeah) now."),
+                Turn(label: "Unknown", start: 4, text: "who said that?"),
+                Turn(label: "Sam", start: 6, text: "I did.")],
+      "joinLines: Room 1, Them 2, Unknown and a first name work like any label (\(named))")
+check(render(named).hasSuffix("[00:00:06] Sam: I did.\n"), "render: any label is written as it is")
+check(joinLines([]).isEmpty && joinLines([("Me", []), ("Them", [])]).isEmpty, "joinLines: no streams or no words, no lines")
+check(joinLines([("Me", spread("Um, uh. erm er umm uhm", 0, 3))]).isEmpty, "joinLines: a stream of only fillers gives no line")
+
+// tidying off: mergeTurns, as mb-transcript --plain uses it
+let plainUm = mergeTurns([("Me", spread("I think um we should go.", 0, 3)), ("Them", [w(1.4, 1.45, "yeah")])])
+check(labels(plainUm) == ["Me", "Them", "Me"] && plainUm[0].text == "I think um",
+      "mergeTurns (--plain): 'um' stays, and a change of label always starts a line (\(plainUm))")
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")
