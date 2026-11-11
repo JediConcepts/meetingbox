@@ -4969,15 +4969,15 @@ do {
 }
 
 // C1, C5, C6 and C2 in the window: Play opens the recording in QuickTime Player and nothing else; Show in
-// Finder selects the folder; nothing plays during a recording; a meeting outside the folder can be shown.
+// Finder opens the meeting's own folder; nothing plays during a recording; a meeting outside the folder can be shown.
 MainActor.assumeIsolated {
     let r = Rig()
     let session = r.make()
     let queue = ProcessingQueue(store: r.store, runner: FakeRunner(), tickQueue: nil)
     var opened: [(file: URL, app: String)] = []
-    var revealed: [URL] = []
+    var shownFolders: [URL] = []
     var found = true
-    let opener = LibraryModel.Opener(open: { file, app in opened.append((file, app)); return found }, reveal: { revealed.append($0) })
+    let opener = LibraryModel.Opener(open: { file, app in opened.append((file, app)); return found }, showFolder: { shownFolders.append($0) })
     let model = LibraryModel(store: r.store, session: session, queue: queue, opener: opener)
     let a = make(r.store.root, "2026-10-28_1508", files: ["audio.m4a": "a", "notes.md": "the minutes"])
     try! r.store.update(a) { $0.state = .done }
@@ -4986,15 +4986,15 @@ MainActor.assumeIsolated {
     check(settle { model.shownContent?.files.audio != nil }, "C1: the audio is found")
     model.perform(.playAudio)
     check(opened.count == 1 && isAt(opened.first?.file, a.appendingPathComponent("audio.m4a")) && opened.first?.app == "com.apple.QuickTimePlayerX"
-          && revealed.isEmpty && model.problem == nil,
+          && shownFolders.isEmpty && model.problem == nil,
           "C1: Play audio opens the recording in QuickTime Player, by its bundle id, and nothing else is opened (\(opened.map(\.app)))")
     found = false
     model.perform(.playAudio)
-    check(opened.count == 2 && model.problem == "QuickTime Player is needed to play recordings" && revealed.isEmpty,
+    check(opened.count == 2 && model.problem == "QuickTime Player is needed to play recordings" && shownFolders.isEmpty,
           "C1: without QuickTime Player it says so, and opens nothing else")
     model.perform(.showInFinder)
-    check(revealed.count == 1 && isAt(revealed.first, a) && opened.count == 2 && model.problem == nil,
-          "C6: Show in Finder selects the folder in the Finder, opening nothing; the message goes")
+    check(shownFolders.count == 1 && isAt(shownFolders.first, a) && opened.count == 2 && model.problem == nil,
+          "C6: Show in Finder opens the meeting's own folder in the Finder (not its parent), opening no file; the message goes")
     found = true
     model.update(StatusInput(phase: .recording(libURL("2026-10-29_0900"))))
     model.perform(.playAudio)

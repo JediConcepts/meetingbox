@@ -44,8 +44,8 @@ final class LibraryModel: ObservableObject {
         /// Opens the file in the application with this bundle identifier; false when there is no such
         /// application, and then nothing is opened.
         var open: (URL, String) -> Bool
-        /// Shows the item selected in a Finder window, without opening it.
-        var reveal: (URL) -> Void
+        /// Opens a Finder window on the folder itself, showing its files, without opening any of them.
+        var showFolder: (URL) -> Void
 
         static let system = Opener(
             open: { file, bundleID in
@@ -53,7 +53,9 @@ final class LibraryModel: ObservableObject {
                 NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
                 return true
             },
-            reveal: { NSWorkspace.shared.activateFileViewerSelecting([$0]) })
+            // With no file named, the Finder opens a window on the folder itself and selects nothing; nothing
+            // in it is opened.
+            showFolder: { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: $0.path) })
     }
 
     /// The first scan has come back, so an empty list means no meetings rather than not yet read.
@@ -287,8 +289,8 @@ final class LibraryModel: ObservableObject {
         case .stop: control?(.stop)
         case .rename: beginRename()
         case .showInFinder:
-            // Selected in a Finder window, never opened: a folder can look like a package to the Finder.
-            opener.reveal(meeting.folder.url)
+            // The meeting's own folder, with its files, not the folder of meetings around it.
+            opener.showFolder(meeting.folder.url)
         case .playAudio:
             // Only while it is offered (never during a recording or a pause), and only in QuickTime Player.
             guard actions(for: meeting).contains(.playAudio), let audio = shownContent?.files.audio else { return }
