@@ -29,6 +29,8 @@ BASE_DIR="${MB_DIR:-$HOME/Meetings}"
 DIR_ARG="${MB_DIR:-}"                    # sent to the app only when given
 ENGINE="${MB_ENGINE:-auto}"              # auto | parakeet | native | whisper
 TIDY="auto"                              # auto | 1 | 0: tidy transcript lines; auto is the app's choice, else 1
+ROOM_COUNT=""                            # people in the room, 1 to 6; empty works it out
+CALL_COUNT=""                            # people on the other end of the call, 1 to 6; empty works it out
 WRITER="apple"                           # who writes the minutes: apple
 WORK=""                                  # the run's private work folder, once made
 LOCALE="${MB_LOCALE:-en-GB}"
@@ -1793,6 +1795,43 @@ whisper_words() {
   return "$rc"
 }
 
+# True when a side's transcription worked but heard no words, in any transcriber's shape: Apple's
+# or Parakeet's "words", or whisper's "transcription". A side every transcriber failed on says
+# "engine": "none" and is not this, and nor is a file that cannot be read.
+heard_nothing() {
+  jq -e '(.engine // "") != "none" and ((.words // []) + (.transcription // []) | length) == 0' "$1" >/dev/null 2>&1
+}
+
+# The speakers on one side (spec 6.2): the side's audio in SRC made a 16 kHz mono WAV in WORK, then
+# mb-speech writes WORK/SIDE.speakers.json, with its own temporary files in WORK too. Nothing is
+# written anywhere else. COUNT is the people on that side: 2 to 6 asks for that many, 1 means no
+# labels there so nothing runs, and anything else works it out. A failure is a warning, with the
+# helper's reason, and leaves no file behind: that side keeps its plain label.
+# Usage: find_speakers SRC WORK SIDE COUNT
+find_speakers() {
+  local src="$1" work="$2" side="$3" count="$4" wav out err reason=""
+  case "$count" in
+    1) return 0 ;;
+    [2-6]) ;;
+    *) count="" ;;
+  esac
+  [ -n "$work" ] && [ -d "$work" ] || { info "finding speakers has no work folder for the $side side"; return 1; }
+  wav="$work/$side.wav"; out="$work/$side.speakers.json"; err="$work/$side.speakers.err"
+  if ! afconvert -f WAVE -d LEI16@16000 -c 1 "$src/$side.m4a" "$wav" >/dev/null 2>&1; then
+    reason="$side.m4a could not be read"
+  elif ! TMPDIR="$work" "$SPEECH_BIN" speakers "$SPEECH_MODELS" "$wav" "$out" ${count:+--count "$count"} \
+         >/dev/null 2>"$err"; then
+    reason="$(head -n 1 "$err")"; reason="${reason#mb-speech: }"
+    reason="${reason:-the speech helper stopped without giving a reason}"
+  fi
+  rm -f "$wav" "$err"
+  [ -n "$reason" ] || return 0
+  rm -f "$out" "$work/.part-$side.speakers.json"
+  info "finding speakers: $reason"
+  warn "could not find speakers on the $side side, carrying on without labels there"
+  return 1
+}
+
 # One side of the call to word timed JSON in OUT, for mb-transcript: each transcriber in turn. A
 # side every transcriber fails on is written as no words, with a warning, and returns 1: one side
 # is better than none, but both failing is a different problem.
@@ -1836,8 +1875,18 @@ transcribe_channels() {
     die "transcription failed on both sides. Check Speech Recognition in Privacy settings, or run: meetingbox setup"
   fi
 
-  # Written aside and moved, so a failure leaves no half transcript behind.
+  # The speakers on each side, with either transcriber's words. Their files hold voice vectors, so
+  # they stay in the work folder, which goes as soon as mb-transcript is done.
   progress speakers
+  if speech_usable; then
+    say "finding speakers on each side on device (FluidAudio)"
+    heard_nothing "$dest/mic.words.json" || find_speakers "$src" "$WORK" mic "$ROOM_COUNT" || true
+    heard_nothing "$dest/call.words.json" || find_speakers "$src" "$WORK" call "$CALL_COUNT" || true
+  else
+    info "Parakeet is not set up, so speakers are not told apart: the transcript says Me and Them"
+  fi
+
+  # Written aside and moved, so a failure leaves no half transcript behind.
   tmp="$WORK/transcript.txt"; err="$WORK/transcript.err"
   tidy_lines || plain="--plain"
   if ! "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${plain:+"$plain"} > "$tmp" 2> "$err"; then

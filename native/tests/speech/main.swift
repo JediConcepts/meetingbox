@@ -1,6 +1,7 @@
 // sources: ../../speech/Sources/mb-speech/Shape.swift ../../speech/Sources/mb-speech/Fetch.swift
 // mb-speech's FluidAudio-free parts: the pinned manifest, file checks, `check` and `fetch` (with a
-// stand-in downloader). No network, no models: every file here is made in a temporary folder.
+// stand-in downloader), and the speakers JSON with its exclusive copy. No network, no models: every
+// file here is made in a temporary folder.
 import CryptoKit
 import Foundation
 
@@ -143,6 +144,13 @@ for statement in ["ModelHub.offlineMode = true", "AppLogger.mirrorsToConsole = f
     let at = mainText.range(of: statement)?.lowerBound
     check(at != nil && firstArgument != nil && at! < firstArgument!, "main.swift: \(statement) comes before any argument is read")
 }
+// FluidAudio's offline diariser writes "[Profiling]" lines straight to stderr. The one reason line
+// goes to a kept copy of stderr, and everything else written there goes to /dev/null, from before
+// any argument is read.
+let quieted = mainText.range(of: "dup2(")?.lowerBound
+check(quieted != nil && firstArgument != nil && quieted! < firstArgument!,
+      "main.swift: stderr is sent to /dev/null before any argument is read")
+check(!mainText.contains("FileHandle.standardError"), "main.swift: the reason line is written to the kept stderr, not fd 2")
 
 // fetch: every changed model is downloaded and verified before any is swapped in, so a failed
 // download leaves a working install as it was; a model already at its revision is not fetched again.
@@ -191,6 +199,59 @@ check(checkModels(at: store) == nil && (try? Data(contentsOf: store.appendingPat
       "fetch: the changed model is swapped in and check passes")
 let leftovers = ((try? fm.contentsOfDirectory(atPath: store.path)) ?? []).filter { $0.hasPrefix(".part-") || $0.hasPrefix(".old-") }
 check(leftovers.isEmpty, "fetch: no .part- or .old- folder is left after a good fetch \(leftovers)")
+
+// The exclusive copy, by FluidAudio's own rule: sorted by start, a segment starting before the last
+// kept one ends starts at that end instead, and is dropped if under 1.0 s is left.
+func seg(_ speaker: String, _ start: Double, _ end: Double) -> SpeakerSegment {
+    SpeakerSegment(speaker: speaker, start: start, end: end)
+}
+let overlapping = [seg("S2", 3.0, 9.0), seg("S1", 0.0, 5.0)]
+check(exclusiveCopy(overlapping) == [seg("S1", 0.0, 5.0), seg("S2", 5.0, 9.0)],
+      "exclusive: the later of two overlapping segments starts where the earlier ends \(exclusiveCopy(overlapping))")
+let pairTalk = speakerTalk(overlapping)
+check(pairTalk["S1"] == SpeakerTalk(seconds: 5.0, median: 5.0) && pairTalk["S2"] == SpeakerTalk(seconds: 4.0, median: 4.0),
+      "exclusive: two overlapping segments give S1 5 s (median 5 s) and S2 4 s (median 4 s) \(pairTalk)")
+check(exclusiveCopy([seg("S1", 0.0, 5.0), seg("S2", 4.0, 5.8)]) == [seg("S1", 0.0, 5.0)],
+      "exclusive: a segment with under 1.0 s left is dropped")
+check(exclusiveCopy([seg("S1", 0.0, 5.0), seg("S2", 4.0, 6.0)]) == [seg("S1", 0.0, 5.0), seg("S2", 5.0, 6.0)],
+      "exclusive: a segment with exactly 1.0 s left is kept")
+check(exclusiveCopy([seg("S1", 0.0, 10.0), seg("S2", 2.0, 4.0), seg("S3", 5.0, 12.0)])
+      == [seg("S1", 0.0, 10.0), seg("S3", 10.0, 12.0)],
+      "exclusive: a segment inside the last kept one is dropped, the next starts at the kept one's end")
+check(exclusiveCopy([seg("S1", 1.0, 5.0), seg("S2", 1.0, 3.0)]) == [seg("S2", 1.0, 3.0), seg("S1", 3.0, 5.0)],
+      "exclusive: equal starts go by end, as FluidAudio sorts them")
+check(exclusiveCopy([seg("S2", 1.0, 3.0), seg("S1", 1.0, 3.0)]) == [seg("S1", 1.0, 3.0)],
+      "exclusive: equal starts and ends go by speaker, as FluidAudio sorts them")
+let several = speakerTalk([seg("S1", 0, 2), seg("S1", 10, 14), seg("S1", 20, 23), seg("S2", 30, 32), seg("S2", 40, 45),
+                           seg("S3", 31, 32)])
+check(several["S1"] == SpeakerTalk(seconds: 9, median: 3) && several["S2"] == SpeakerTalk(seconds: 7, median: 3.5),
+      "talk: total seconds, and the median segment (the middle two averaged when even) \(several)")
+check(several["S3"] == SpeakerTalk(seconds: 0, median: 0), "talk: a speaker with nothing left in the exclusive copy has 0 and 0")
+
+// The speakers JSON: the overlapping segments as found, and each speaker's talk from the exclusive copy.
+let vectors: [String: [Float]] = ["S1": (0..<256).map { Float($0) / 256 }, "S2": Array(repeating: -0.5, count: 256)]
+let speakersData = try? speakersJSON(model: "FluidInference/speaker-diarization-coreml@df2625ac79a7ac6b65ad868fee6d80f320da4232",
+                                     segments: overlapping, vectors: vectors)
+let speakersRoot = speakersData.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+let speakerSegments = speakersRoot?["segments"] as? [[String: Any]] ?? []
+let speakerList = speakersRoot?["speakers"] as? [[String: Any]] ?? []
+check(speakersRoot?["model"] as? String == "FluidInference/speaker-diarization-coreml@df2625ac79a7ac6b65ad868fee6d80f320da4232",
+      "speakers JSON: the model is repo@revision")
+check(speakerSegments.map { "\($0["speaker"] ?? "")" } == ["S1", "S2"] && speakerSegments.last?["start"] as? Double == 3.0
+      && speakerSegments.last?["end"] as? Double == 9.0,
+      "speakers JSON: segments overlap, as found, in start order \(speakerSegments)")
+check(speakerList.map { "\($0["id"] ?? "")" } == ["S1", "S2"] && speakerList.first?["seconds"] as? Double == 5.0
+      && speakerList.last?["seconds"] as? Double == 4.0 && speakerList.last?["median"] as? Double == 4.0,
+      "speakers JSON: each speaker's seconds and median come from the exclusive copy \(speakerList.map { [$0["id"], $0["seconds"], $0["median"]] })")
+let firstVector = (speakerList.first?["vector"] as? [Double]) ?? []
+check(firstVector.count == 256 && firstVector[128] == 0.5 && (speakerList.last?["vector"] as? [Double])?.allSatisfy { $0 == -0.5 } == true,
+      "speakers JSON: each speaker's vector is its raw 256 values")
+check(reason { _ = try speakersJSON(model: "m@r", segments: overlapping, vectors: ["S1": [1]]) } != nil,
+      "speakers JSON: a speaker without a vector is refused")
+let noSpeech = (try? speakersJSON(model: "m@r", segments: [], vectors: [:])).flatMap { try? JSONSerialization.jsonObject(with: $0) }
+    as? [String: Any]
+check((noSpeech?["segments"] as? [Any])?.isEmpty == true && (noSpeech?["speakers"] as? [Any])?.isEmpty == true
+      && noSpeech?["model"] as? String == "m@r", "speakers JSON: no speech gives empty segments and speakers")
 
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

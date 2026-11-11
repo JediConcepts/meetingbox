@@ -8,9 +8,20 @@ import Foundation
 ModelHub.offlineMode = true
 AppLogger.mirrorsToConsole = false
 
+// FluidAudio's offline diariser also writes "[Profiling]" timing lines straight to stderr, which
+// would break the one-line rule and could pass for the reason. A copy of stderr is kept for that one
+// line, and everything else written to stderr goes to /dev/null.
+let reasonDescriptor: Int32 = {
+    let kept = dup(STDERR_FILENO)
+    guard kept >= 0 else { return STDERR_FILENO }
+    let null = open("/dev/null", O_WRONLY)
+    if null >= 0 { dup2(null, STDERR_FILENO); close(null) }
+    return kept
+}()
+
 func fail(_ reason: String) -> Never {
     let line = reason.components(separatedBy: .newlines).joined(separator: " ")
-    FileHandle.standardError.write(Data(("mb-speech: " + line + "\n").utf8))
+    Data(("mb-speech: " + line + "\n").utf8).withUnsafeBytes { _ = write(reasonDescriptor, $0.baseAddress, $0.count) }
     exit(1)
 }
 
@@ -58,9 +69,19 @@ do {
                              out: URL(fileURLWithPath: arguments[3]))
     case ("warm", 2):
         try await warm(URL(fileURLWithPath: arguments[1]))
+    case ("speakers", 4), ("speakers", 6):
+        var count: Int?
+        if arguments.count == 6 {
+            guard arguments[4] == "--count", let n = Int(arguments[5]), (2...6).contains(n) else {
+                fail("speakers: --count must be 2 to 6")
+            }
+            count = n
+        }
+        try await findSpeakers(URL(fileURLWithPath: arguments[1]), wav: URL(fileURLWithPath: arguments[2]),
+                               out: URL(fileURLWithPath: arguments[3]), count: count)
     default:
         fail("usage: mb-speech version | cache-dir | fetch <models> <manifest> | check <models> | warm <models>"
-             + " | transcribe <models> <wav> <out.json>")
+             + " | transcribe <models> <wav> <out.json> | speakers <models> <wav> <out.json> [--count N]")
     }
 } catch let error as SpeechError {
     fail(error.reason)

@@ -1,5 +1,6 @@
-// FluidAudio-free parts of mb-speech: the model manifest, file checks and private writes.
-// native/tests/speech compiles this file on its own, so it must never import FluidAudio.
+// FluidAudio-free parts of mb-speech: the model manifest, file checks, private writes, the words JSON
+// and the speakers JSON. native/tests/speech compiles this file on its own, so it must never import
+// FluidAudio.
 import CryptoKit
 import Foundation
 
@@ -207,15 +208,96 @@ func mergeTokens(_ tokens: [Token]) -> [Word] {
     return words
 }
 
+/// A JSON string, quoted and escaped.
+private func quoted(_ text: String) -> String {
+    String(data: (try? JSONEncoder().encode(text)) ?? Data("\"\"".utf8), encoding: .utf8) ?? "\"\""
+}
+
+/// A JSON number to the millisecond; anything not finite is 0.
+private func number(_ value: Double) -> String { String(format: "%.3f", value.isFinite ? value : 0) }
+
 /// The words JSON every transcriber's output is read in:
 /// `{"engine": "parakeet-ultra", "words": [{"start": 1.2, "end": 1.48, "text": "Hello,", "confidence": 0.97}]}`.
 func wordsJSON(engine: String, words: [Word]) -> Data {
-    func quoted(_ text: String) -> String {
-        String(data: (try? JSONEncoder().encode(text)) ?? Data("\"\"".utf8), encoding: .utf8) ?? "\"\""
-    }
-    func number(_ value: Double) -> String { String(format: "%.3f", value.isFinite ? value : 0) }
     let lines = words.map {
         "{\"start\": \(number($0.start)), \"end\": \(number($0.end)), \"text\": \(quoted($0.text)), \"confidence\": \(number($0.confidence))}"
     }
     return Data("{\"engine\": \(quoted(engine)), \"words\": [\(lines.joined(separator: ",\n"))]}\n".utf8)
+}
+
+/// The shortest segment the diariser keeps, and the shortest the exclusive copy keeps after trimming.
+let minimumSegmentSeconds = 1.0
+
+/// One speaker's turn, as the diariser found it.
+struct SpeakerSegment: Equatable {
+    let speaker: String
+    let start: Double
+    let end: Double
+}
+
+/// FluidAudio's start order: by start, then end, then speaker.
+private func startsBefore(_ a: SpeakerSegment, _ b: SpeakerSegment) -> Bool {
+    (a.start, a.end, a.speaker) < (b.start, b.end, b.speaker)
+}
+
+/// The exclusive copy, by the rule FluidAudio's own exclusive output follows: in start order, a
+/// segment starting before the last kept one ends starts at that end instead, and is dropped if
+/// less than `minimum` seconds is left.
+func exclusiveCopy(_ segments: [SpeakerSegment], minimum: Double = minimumSegmentSeconds) -> [SpeakerSegment] {
+    var kept: [SpeakerSegment] = []
+    for segment in segments.sorted(by: startsBefore) {
+        let start = max(segment.start, kept.last?.end ?? segment.start)
+        if segment.end > start && segment.end - start >= minimum {
+            kept.append(SpeakerSegment(speaker: segment.speaker, start: start, end: segment.end))
+        }
+    }
+    return kept
+}
+
+/// A speaker's talk time and median segment length, in seconds.
+struct SpeakerTalk: Equatable {
+    let seconds: Double
+    let median: Double
+}
+
+/// Each speaker's talk, measured on the exclusive copy of the segments, as the naming thresholds
+/// were. A speaker with nothing left in it has 0 and 0. The median of an even count is the mean of
+/// the middle two.
+func speakerTalk(_ segments: [SpeakerSegment]) -> [String: SpeakerTalk] {
+    var lengths: [String: [Double]] = Dictionary(uniqueKeysWithValues: Set(segments.map(\.speaker)).map { ($0, []) })
+    for segment in exclusiveCopy(segments) { lengths[segment.speaker, default: []].append(segment.end - segment.start) }
+    return lengths.mapValues { list in
+        let sorted = list.sorted(), middle = sorted.count / 2
+        let median: Double
+        if sorted.isEmpty { median = 0 }
+        else if sorted.count % 2 == 1 { median = sorted[middle] }
+        else { median = (sorted[middle - 1] + sorted[middle]) / 2 }
+        return SpeakerTalk(seconds: sorted.reduce(0, +), median: median)
+    }
+}
+
+/// The speakers JSON, kept only in the run's work folder:
+/// `{"model": "<repo>@<revision>", "segments": [{"speaker": "S1", "start": 0.0, "end": 4.2}],
+///   "speakers": [{"id": "S1", "seconds": 391.0, "median": 3.9, "vector": [256 numbers]}]}`.
+/// The segments overlap, as found, in start order. Each speaker's seconds and median come from the
+/// exclusive copy, and its vector is the diariser's own. A speaker without a vector is refused.
+func speakersJSON(model: String, segments: [SpeakerSegment], vectors: [String: [Float]]) throws -> Data {
+    let talks = speakerTalk(segments)
+    let ids = talks.keys.sorted { $0.compare($1, options: .numeric) == .orderedAscending }
+    let segmentLines = segments.sorted(by: startsBefore).map {
+        "{\"speaker\": \(quoted($0.speaker)), \"start\": \(number($0.start)), \"end\": \(number($0.end))}"
+    }
+    let speakerLines = try ids.map { id -> String in
+        guard let vector = vectors[id], let talk = talks[id] else {
+            throw SpeechError(reason: "the diariser gave no voice vector for speaker \(id)")
+        }
+        let values = vector.map { $0.isFinite ? "\($0)" : "0" }.joined(separator: ", ")
+        return "{\"id\": \(quoted(id)), \"seconds\": \(number(talk.seconds)), \"median\": \(number(talk.median)), \"vector\": [\(values)]}"
+    }
+    return Data("""
+    {"model": \(quoted(model)),
+    "segments": [\(segmentLines.joined(separator: ",\n"))],
+    "speakers": [\(speakerLines.joined(separator: ",\n"))]}
+
+    """.utf8)
 }
