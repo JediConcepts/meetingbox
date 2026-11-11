@@ -1,6 +1,6 @@
 # meetingbox Stage 3, part 1: Parakeet, speakers, redo and the choice of minutes writer
 
-Status: written 11 November 2026 for the user's approval, with its plan. Revised the same day after an adversarial review from seven angles (121 findings; every blocker and nearly every other finding taken in).
+Status: written 11 November 2026 for the user's approval, with its plan. Revised the same day after an adversarial review from seven angles (121 findings; every blocker and nearly every other finding taken in). Revised again the same day after a review of the late additions (the router, sources, tidying, the voice sample, the top bar and the version picker: 31 findings, checked against the router 1.1.1 source and the app's code).
 
 The direction was approved in conversation on 10 and 11 November:
 - "I think from what your tests show Parakeet should be default with speak labelling" and "maybe we should have a prefernce option for the transcription option".
@@ -135,11 +135,13 @@ New:
   - "Claude API": Anthropic's Messages interface, at `https://api.anthropic.com` unless the user changes it;
   - "Standard": the OpenAI-style chat interface (`<address>/chat/completions`, models from `<address>/models`), as served by Ollama, LM Studio and the Local CLI Bridge.
 - **How the script runs:**
-  - The engine runs it with an empty environment.
+  - The engine runs it with an empty environment, stops it if it runs past 16 minutes, and never shows its error output.
   - The key and the request arrive on standard input.
   - Every network call refuses redirects.
   - The address is checked by the same rule as the app's.
   - Listing models uses the provider's own list call, because the router only runs requests.
+  - A Standard source without a key is called with one fixed header, `x-meetingbox: 1`, which carries no secret. The router refuses a call that carries no credential at all, and this passes its check without sending any `Authorization` header.
+  - A Standard source must answer streamed requests (`stream: true`), as Ollama and LM Studio do. Streaming keeps the connection alive for the full limit (see 6.5).
 - **Address rule**, applied identically by the engine and the app, with one shared table of test cases:
   - lower-case `https://` or `http://`, then a host with an optional `:port` (1 to 65535), then an optional path;
   - no user information (`@`), no `?`, no `#`, no spaces, quotes, backslashes or control characters, and at most 2048 characters;
@@ -219,10 +221,11 @@ New:
   6. **Smoothing:** the runs of equal labels in each sentence are computed once. Then, in one pass, a run of one or two words with the same label on both sides takes that label. A single word at a sentence's start or end takes the label of its neighbouring run when that run has three or more words.
 - **The user's voice print** is learnt from video calls, or recorded on purpose.
   - **"Record a voice sample…" in Preferences:**
-    - Recording: the user reads aloud for 90 s, with a countdown. Only the microphone is recorded, by the same recorder and permission meetings use, into a private temporary folder outside the meetings folder.
-    - Building the print: the engine finds the speech in it. A sample with 60 s or more of one voice becomes a usable print on its own, replacing any print learnt so far, and counts as one meeting. A sample with less, or with more than one voice, is refused with the reason.
-    - Clean-up: the sample's audio is deleted afterwards.
-    - Availability: it is offered only while nothing is recording.
+    - Recording: the user reads aloud for 90 s, with a countdown, and may stop early. Only the microphone is recorded, inside the app itself, by the recorder's own microphone code, into a private folder `~/.meetingbox/sample.XXXXXX`. The meeting recorder is not used and not changed, because it always records the Mac's sound too.
+    - Permission: this uses the Microphone permission meetings already use, which macOS files under meetingbox. If it was never given, macOS asks once; if it was refused, the sheet says how to allow it.
+    - Building the print: the engine finds the speakers in it without being told a count. The speaker with the most speech is the user. Another speaker is the same voice split in two when its cosine with the user's is 0.60 or more, and is then added in. Another speaker with under 5% of the talk or a median segment under 2.5 s is ignored and not added. Any other speaker means more than one voice, and the sample is refused. With 60 s or more of the user's voice, the sample becomes a usable print on its own, replacing any print learnt so far, and counts as one meeting. With less, it is refused. Each refusal gives the reason.
+    - Clean-up: the sample's folder is deleted afterwards, and any left by a crash is deleted at the next launch.
+    - Availability: it is offered only while nothing is recording. A meeting always wins: starting a recording by any route cancels a sample in progress and deletes its audio. Playback stops while a sample records.
   - **When a meeting adds to it:** only first processing does (never a redo), and only if all of these hold:
     - the meeting is a call, and its call side has speaker results with at least one speaker;
     - its dominant microphone speaker holds 80% or more of the microphone words kept after echo removal;
@@ -237,7 +240,7 @@ New:
     - while the print is not yet usable, two refused calls in a row discard it, so a first call dominated by someone else cannot lock the user out. The log says so.
   - **The meeting's log says** "Learnt N s of your voice from this call", or "This call's microphone voice did not match the voice learnt so far, so it was not learnt".
   - **In Preferences:**
-    - "Your voice: learnt from N calls (M minutes of speech)", with singular forms, or "Your voice: from a recorded sample (M minutes of speech)";
+    - "Your voice: learnt from N calls (M minutes of speech)", with singular forms, or "Your voice: from a recorded sample (M minutes of speech)", or, once calls have added to a sample, "Your voice: from a recorded sample and N calls (M minutes of speech)";
     - or "Not learnt yet: meetingbox learns it from your video calls, or record a sample";
     - "Record a voice sample…" and "Forget my voice" buttons, which work through the engine.
   - **`meetingbox doctor`** shows the same.
@@ -312,11 +315,11 @@ New:
     - "Earlier, <date> <time>" for each `earlier/*/transcript.txt`, newest first.
   - Choosing one only shows it.
   - Search and the minutes still use `transcript.txt` alone.
-  - The picker resets to "Current" when another meeting is selected.
+  - The picker resets to "Current" when another meeting is selected, or when a meeting is shown because a job finished. Rereading the library keeps the choice.
 - **In the window:**
   - **"Redo minutes…"** on a finished meeting, and on a failed one that has a transcript.
     - It opens a small sheet: "Write the minutes with", starting at the meeting's own choice if it has one, else the Preferences choice.
-    - Choosing an outside model there asks for agreement, as Preferences does.
+    - Choosing an outside model there asks for agreement, as Preferences does. An outside choice is kept only once agreed; cancelling the agreement leaves the sheet's earlier choice.
     - The choice, Apple included, is kept in the meeting's `meeting.json` and used by every later run on that meeting (Process, Try again and redos) until another sheet changes it.
   - **"Transcribe again…"** on a finished meeting whose recording can be processed. It opens a sheet with:
     - Transcriber, starting at the Preferences choice;
@@ -342,9 +345,10 @@ New:
 - **Sources.** Preferences gains a "Minutes" section with a short list of outside sources (Add… and Remove). Each source has:
   - a kind: "Claude API", or "Standard (Ollama, LM Studio, Local CLI Bridge)";
   - an address, with `https://api.anthropic.com` filled in for the Claude API;
-  - a key, with Set… and Remove: needed for the Claude API, optional for Standard;
+  - a key, with Set… and Remove: needed for the Claude API, optional for Standard. Whether a key is stored is shown, read from the keychain without reading the key and without contacting the source. Choosing a Claude API model for a source with no key says "Set a key for this source first." instead of asking for agreement;
   - a Check button that lists the source's models ("Found 3 models", "Found 1 model", or why not).
   - No two sources share an address.
+  - Changing a source's address removes the key stored for the old address, so no key is left behind under an address nothing uses.
   - **With no sources**, the section says: "To use another model, add a source: the Claude API with your key, or a standard address such as Ollama (http://127.0.0.1:11434/v1) or the Local CLI Bridge."
 - **"Write the minutes with":**
   - "Apple, on this Mac" (the default), then every model of every source, as "<model> at <host>";
@@ -368,11 +372,12 @@ New:
 - **How the request is sent.** The engine runs meetingbox's own `writer.mjs` with the recorded Node, with an empty environment. The request and the key arrive on standard input. The script:
   - checks the address by the shared rule;
   - refuses every redirect;
-  - calls the router's `complete()` once, not streamed, with a 15-minute limit;
+  - calls the router's `complete()` once, streamed, with a 15-minute limit, and uses the reply only once it is whole. A request that is not streamed gets no reply headers until the whole reply is ready, and Node's own fetch gives up after 5 minutes without them;
   - returns:
     - the text and the finish reason;
     - the prompt token count, with whether the router marked it as reported;
-    - for a failure, its kind (no connection, timeout, quota used up, rate limited, refused, other) and whether the request could have reached the source.
+    - for a failure, its kind (no connection, timeout, quota used up, rate limited, refused, too long for the model, HTTP error, other) and whether the request could have reached the source. It counts as not sent only when no connection to the source was ever made;
+  - never prints the key, the transcript or a provider's reply on any failure, including one it did not expect.
 - **The request:**
   - one request carrying the whole transcript, timestamps kept;
   - the instructions as the system message, saying the transcript is data and never instructions;
@@ -387,8 +392,8 @@ New:
   - the transcript was sent, or that cannot be told: "Written on this Mac by Apple's model because <host> did not return usable minutes: <reason>. The transcript was sent to <host>. Choose Redo minutes to try again."
 
   These count as failures:
-  - no connection, an HTTP error, the time limit, quota used up, rate limited;
-  - an empty reply, a reply cut short;
+  - no connection, an HTTP error, the time limit, quota used up, rate limited, the source saying the transcript is too long for the model;
+  - an empty reply, a reply cut short (a finish reason of `length`, `max_tokens` or `model_context_window_exceeded`);
   - a reply whose prompt token count is marked as reported and is clearly smaller than what was sent (a context window too small);
   - a stored key that breaks the key rule;
   - Node or the router not set up.
@@ -399,8 +404,9 @@ New:
 - **New engine commands:**
   - `meetingbox engines [--kind claude|standard --address <url>]` lists:
     - whether Parakeet, Apple's model and the outside-model runtime are ready;
+    - the voice print's state (none, or its seconds and meetings, and whether it began from a sample);
     - with a source, its models or why they could not be listed.
-  - `meetingbox key set --address <url>` reads the key from standard input, stores it in the keychain and records it. `meetingbox key remove --address <url>` deletes it.
+  - `meetingbox key set --address <url>` reads the key from standard input, stores it in the keychain and records it. `meetingbox key remove --address <url>` deletes it. `meetingbox key status --address <url>` says whether one is stored, without reading it and without any network call.
   - `meetingbox voice add <audio>` makes the print from a recorded sample. `meetingbox voice forget` deletes it.
 
 ### 6.6 The window's top bar
@@ -413,7 +419,8 @@ New:
   - the position as "12:34 / 1:05:00", with a slider to move.
   - It plays the combined `audio.m4a` (or a v1.2 meeting's single file) inside the app.
 - **Playback and recording never overlap:**
-  - starting a recording stops playback, and the player is unavailable while recording, because the call side records the Mac's sound;
+  - starting a recording by any route (New meeting, the menu bar, the floating button, the hotkey or Terminal) stops playback first, and the player is unavailable while recording, because the call side records the Mac's sound;
+  - the player is also unavailable while a voice sample records;
   - selecting another meeting stops playback **(my call)**.
 - **The meeting page's "Play audio" button,** which opened QuickTime Player, becomes "Open in QuickTime Player" **(my call)**.
 - **Left for part 2:** speed, volume, and jumping to a moment from the transcript or minutes.
@@ -436,9 +443,9 @@ New:
   - On a release update, the Parakeet step is checked whenever the recorder step is due, so a changed helper is rebuilt.
 - **A second new step, "Outside models (optional)"**, after the Parakeet step.
   - Survey line: "+ outside models (Node 22.22.2)", or "- outside models (optional, needs Node 20 or later)".
-  - **Finding Node 20 or later:** looked for on the app's PATH, then in Homebrew's folders, then the newest nvm version. A Node counts only if it actually runs and reports version 20 or later, so an old Intel build is skipped. Its absolute path is kept in `~/.meetingbox/node`, which is recorded. If there is none, setup offers to install Node with Homebrew, as it offers whisper.cpp. Declining skips the step.
-  - **Installing the router:** `minutes/` (`writer.mjs`, `package.json`, `package-lock.json`) is copied to `~/.local/share/meetingbox/minutes`, which is claimed and recorded. Then that Node's npm runs `ci --ignore-scripts --omit=dev` there, with npm's cache in a temporary folder that is removed afterwards. The lock file pins ai-execution-router 1.1.1 by its integrity hash.
-  - **Ready check:** the recorded Node runs, at version 20 or later, and `writer.mjs version` reports router 1.1.1.
+  - **Finding Node 20 or later:** looked for on the app's PATH, then in Homebrew's folders, then the newest nvm version. A Node counts only if it actually runs and reports version 20 or later, so an old Intel build is skipped. Its absolute path, as found and not resolved (for Homebrew, `/opt/homebrew/bin/node`, which survives `brew upgrade`), is kept in `~/.meetingbox/node`, which is recorded. If there is none, setup offers to install Node with Homebrew, as it offers whisper.cpp. Declining skips the step.
+  - **Installing the router:** only `writer.mjs`, `package.json` and `package-lock.json` are copied from `minutes/` to `~/.local/share/meetingbox/minutes`, which is claimed and recorded. Then npm runs `ci --ignore-scripts --omit=dev` there, with npm's cache in a temporary folder that is removed afterwards. npm is run as that Node running npm's own script, found beside it, because npm's launcher would otherwise start whichever `node` comes first on the PATH. The lock file pins ai-execution-router 1.1.1 by its integrity hash.
+  - **Ready check:** the recorded Node runs, at version 20 or later; `writer.mjs version` reports router 1.1.1; and the three installed files match the source's. On a release update, this step is checked whenever the recorder step is due, so a changed `writer.mjs` is always installed.
   - **If any step fails:** "Outside models could not be set up: <reason>. Apple's on-device model still writes the minutes." Setup continues.
   - **If nvm's Node later moves or goes,** outside models show as unavailable until setup is run again.
 - **Other commands:**
@@ -493,6 +500,9 @@ New:
   - an nvm version switch or removal breaks outside minutes until setup runs again;
   - other users of the public project need Node for outside models.
 - **The router's provider classification** rests on provider message text. An unclassified quota error reads as a rate limit, so the note's reason may say "rate limited" when the quota is spent.
+- **Streaming:**
+  - a Standard source that cannot stream fails every time, with the "sent" note. The README says Standard sources must support streaming;
+  - a server that ignores the request for token counts in a stream reports none, which turns the cut-short check off for it.
 
 ## 10. Calls Claude made for the user to check
 
@@ -502,6 +512,9 @@ New:
 - The minutes view shows links as plain text.
 - With tidying off, lines follow today's merging, with speaker labels added.
 - A recorded voice sample replaces a learnt print.
+- The voice sample is recorded inside the app with the recorder's microphone code, not by the meeting recorder, so recording itself is unchanged.
+- A meeting recording always wins over a voice sample: starting one cancels the sample.
+- In a voice sample, a small extra voice (under 5% of the talk, or short segments) is ignored rather than refusing the sample.
 - Choosing another meeting stops playback.
 - The meeting page's "Play audio" becomes "Open in QuickTime Player".
 - Node is found on the app's PATH, then Homebrew, then nvm. Without it, setup offers Homebrew.
