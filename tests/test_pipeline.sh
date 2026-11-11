@@ -801,15 +801,19 @@ tidy_process td1 --no-tidy
 if [ "$rc" -eq 0 ] && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.* --plain$')" = 1 ]; then pass "--no-tidy passes --plain"
 else fail "--no-tidy passes --plain (rc $rc): $(grep '^mb-transcript' "$HOME/calls.log") $out"; fi
 
+# the app's preference answers TIDY_PREF; a Bool reads back as 0, a hand-set string as no or false
 defaults() {
   echo "defaults $*" >> "$HOME/calls.log"
-  [ "$*" = "read com.jediconcepts.meetingbox tidyLines" ] && { echo 0; return 0; }
+  [ "$*" = "read com.jediconcepts.meetingbox tidyLines" ] && { echo "$TIDY_PREF"; return 0; }
   return 1
 }
-tidy_process td2
-if [ "$rc" -eq 0 ] && asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.* --plain$')" = 1 ]; then
-  pass "the app's tidyLines preference of 0 passes --plain"
-else fail "the app's tidyLines preference of 0 passes --plain (rc $rc): $(grep '^mb-transcript\|^defaults' "$HOME/calls.log") $out"; fi
+for TIDY_PREF in 0 no false; do
+  tidy_process "td2$TIDY_PREF"
+  if [ "$rc" -eq 0 ] && asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.* --plain$')" = 1 ]; then
+    pass "the app's tidyLines preference of $TIDY_PREF passes --plain"
+  else fail "the app's tidyLines preference of $TIDY_PREF passes --plain (rc $rc): $(grep '^mb-transcript\|^defaults' "$HOME/calls.log") $out"; fi
+done
+TIDY_PREF=0
 tidy_process td3 --tidy
 if [ "$rc" -eq 0 ] && ! asked_tidy && [ "$(mbt_calls)" = 1 ] && [ "$(mbt_calls '.*--plain')" = 0 ]; then
   pass "--tidy beats the app's preference"

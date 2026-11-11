@@ -146,9 +146,23 @@ check(labels(four) == ["Me", "Them", "Me"], "joinLines: four words are not a sho
 let twoAsides = joinLines([("Me", park), ("Them", [w(0.5, 0.7, "mm")]), ("Them 2", [w(3.2, 3.4, "right")])])
 check(twoAsides.map(\.text) == ["I think (Them: mm) we should go to the park (Them 2: right) today."],
       "joinLines: two short replies sit in time order (\(twoAsides))")
+// The host is an utterance: Me's sentences split at 50 s by the 45 s rule, Room 1 talking over
+// them from 20 s to 56 s, and Them's "yeah" at 52.5 s, inside both.
+let sixty = (0..<6).flatMap { k in spread("a b c d e f g h i end.", Double(10 * k), Double(10 * k + 10)) }
+let talker = spread(Array(repeating: "talk", count: 36).joined(separator: " "), 20, 56)
+let hosted = joinLines([("Me", sixty), ("Room 1", talker), ("Them", [w(52.5, 52.8, "yeah")])])
+let holders = hosted.filter { $0.text.contains("(Them: yeah)") }
+check(holders.count == 1 && holders[0].label == "Me" && holders[0].start == 50,
+      "joinLines: a reply's host is the latest-starting utterance, Me's from 50 s, not Room 1's (\(hosted.map { ($0.label, $0.start) }))")
+// A reply with no host is never somebody in between: Them's "yeah" 0.7 s after Me stopped goes
+// inline in the Me line around it.
+let gapReply = joinLines([("Me", spread("I think we should", 0, 1.6) + spread("go to the park today.", 4.0, 6.0)),
+                          ("Them", [w(2.3, 2.6, "yeah")])])
+check(gapReply == [Turn(label: "Me", start: 0, text: "I think we should (Them: yeah) go to the park today.")],
+      "joinLines: a reply with no host does not split a line, and goes inline in the line around it (\(gapReply))")
 let unhosted = joinLines([("Them", [w(10, 10.4, "Okay.")]), ("Me", [w(10.6, 10.9, "Yeah.")])])
-check(unhosted == [Turn(label: "Them", start: 10, text: "Okay. (Me: Yeah)")],
-      "joinLines: a short reply with no host stays a line, and can host the next one (\(unhosted))")
+check(unhosted == [Turn(label: "Them", start: 10, text: "Okay."), Turn(label: "Me", start: 10.6, text: "Yeah.")],
+      "joinLines: a reply with no host and no line around it is a line of its own, and hosts nothing (\(unhosted))")
 
 // continuing and splitting lines
 let hello = spread("Hello there.", 0, 2)
@@ -179,6 +193,16 @@ let stretchedHost = joinLines([("Me", [w(0, 15, "Hello.")]), ("Them", [w(8, 8.3,
 check(labels(stretchedHost) == ["Me", "Them"], "joinLines: nor does it make a reply 8 s later an aside (\(stretchedHost))")
 let hashes = joinLines([("Me", spread("hello # there #noise", 0, 2))])
 check(hashes.map(\.text) == ["hello there"], "joinLines: tokens starting with # are dropped (\(hashes.map(\.text)))")
+// Punctuation written as a token of its own joins the speaker's word before it, and is never a word.
+let dotted = joinLines([("Me", park), ("Them", [w(1.7, 1.8, "yeah"), w(1.8, 1.85, ".")])])
+check(dotted.map(\.text) == ["I think we should (Them: yeah) go to the park today."],
+      "joinLines: 'yeah' then '.' on its own is still a short reply (\(dotted.map(\.text)))")
+let lone = joinLines([("Me", park), ("Them", [w(1.7, 1.75, "?")])])
+let joinedOn = joinLines([("Them", [w(0, 0.4, "Really"), w(2.5, 2.55, "?")])])
+check(lone.map(\.text) == ["I think we should go to the park today."] && joinedOn.map(\.text) == ["Really?"],
+      "joinLines: a lone '?' in Me's pause splits nothing; with no word before it, it is dropped (\(lone.map(\.text)) \(joinedOn.map(\.text)))")
+let leading = joinLines([("Me", spread("# , so we go.", 0, 2))])
+check(leading.map(\.text) == ["so we go."], "joinLines: a ',' with no word before it leaves no orphan (\(leading.map(\.text)))")
 
 // labels and edge cases
 let named = joinLines([("Room 1", spread("we start now.", 0, 2)), ("Them 2", [w(1.0, 1.2, "yeah")]),
