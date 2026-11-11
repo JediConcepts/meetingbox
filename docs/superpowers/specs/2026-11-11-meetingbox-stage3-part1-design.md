@@ -8,21 +8,29 @@ The direction was approved in conversation on 10 and 11 November:
 - On the minutes: "as an option in preferences to choose between available models".
 - "yes to The plan for Parakeet as the default transcriber. It covers the setting to switch back to Apple, speaker labels, and your redo-summary button."
 
-Marks used below:
-- **(my call):** Claude decided, and the user has not yet seen the choice.
-- **(your decision):** the user must answer at approval. The text describes the recommended answer, which the plan assumes; section 10 lists these questions.
+The user's answers to the design questions, 11 November:
+- **Per meeting:** pick the writer per redo, with the Preferences choice as the default.
+- **Models:** Apple, plus Ollama's local models, Claude through the Local CLI Bridge, "also via the claude API - in fact this is what our AI router is for". Then: "Use the router (adds Node). we now have a use case to add node".
+- **Sources:** several sources listed together.
+- **Your voice:** learnt from calls, and also a record button.
+- **Lines:** "option to clean up. Option to repreocess with different options". Tidying is on by default.
+- **Window:** "Option to have the meeting controls (play, pause, stop) in the meetingbox gui where the new meeting button is", meaning recording controls and an audio player.
+
+Mark used below: **(my call)** means Claude decided, and the user has not yet seen the choice.
 
 ## Relation to the earlier designs
 
 - **2026-10-28 (meetingbox 2.0):** this part delivers that design's stage 3, "Speakerphone": speaker labels on both channels and a voice print that picks out "Me". FluidAudio replaces sherpa-onnx, after the hands-on test the 5 November design asked for.
 - **2026-11-05 (Stage 3, approved):** this part delivers two of its pieces now:
   - Redo (its 6.4), with every replaced file kept;
-  - the choice of where the minutes are written (its 6.3), through the standard endpoint it specified, including a per-meeting choice when redoing.
+  - the choice of where the minutes are written (its 6.3), widened to several sources, including a per-meeting choice when redoing;
+  - the core of its player (its 6.5): play, pause, stop and position, in the window's top bar beside the recording controls.
 - **Left for part 2:**
-  - from the 5 November design: the meeting info file, calendar, the people-and-terms list, new instructions tested against the gold lists, quotation checking, the player, showing and restoring earlier versions in the window, and the "Keep on this Mac" mark;
+  - from the 5 November design: the meeting info file, calendar, the people-and-terms list, new instructions tested against the gold lists, quotation checking, the player's speed and volume and jumping from transcript lines and minutes, showing and restoring earlier versions in the window, and the "Keep on this Mac" mark;
   - the hotkey setting.
-
-  The user's order (6 November, restated since) is speakers first, then the hotkey setting and the player.
+- **Changed from the 5 November design:**
+  - meetingbox now uses Node, for outside models only, so it can use the user's AI Execution Router;
+  - the Claude API is reached directly with the user's key, as well as through a bridge.
 
 ## 1. Why
 
@@ -50,13 +58,16 @@ Marks used below:
    - "Room 1", "Room 2" for other people in the room;
    - "Them", or "Them 1" and "Them 2", for the far side of a call;
    - "Unknown" when it cannot tell.
-3. Transcript lines that read as sentences, with short replies from others kept inline **(my call; the user did not ask for this)**.
-4. **Redo minutes** and **Transcribe again** on any finished meeting, from the window and from Terminal.
+3. **Tidy lines,** an option that is on by default: transcript lines read as sentences, with fillers dropped and short replies kept inline.
+4. **Redo minutes** and **Transcribe again** on any finished meeting, from the window and from Terminal. Transcribe again takes its own options: transcriber, people counts, tidying and minutes writer.
 5. Nothing meetingbox does ever overwrites a transcript or minutes without keeping the earlier copy.
-6. A Preferences choice of minutes writer:
+6. **A Preferences choice of minutes writer,** with the same choice for one meeting when redoing it:
    - Apple on this Mac (the default);
-   - any model offered by an outside endpoint the user sets up;
-   - and the same choice for one meeting when redoing its minutes.
+   - or any model from the outside sources the user adds: the Claude API with the user's key, Ollama or LM Studio, or the Local CLI Bridge, all listed together.
+7. **The window's top bar** carries:
+   - the recording controls: timer, Pause or Resume, and Stop;
+   - a simple player for the selected meeting's audio.
+8. **Your voice:** learnt from video calls, or recorded on purpose in Preferences.
 
 ## 3. Non-goals for this part
 
@@ -65,8 +76,9 @@ Marks used below:
 - Remembering anyone's voice except the user's. Speaker vectors are used during processing and never kept in meeting folders.
 - Names-and-terms boosting in the transcriber. Tested on 11 November: two false insertions for every fix.
 - Speaker labels for v1.2 meetings that have only one mixed file. They get Parakeet text without labels.
-- A recorded voice sample in Preferences. The voice is learnt from video calls **(your decision)**.
-- Built-in Claude, through the user's Claude Code login, as a minutes writer **(your decision)**. Claude is reached through the user's Local CLI Bridge at a standard address.
+- Running Claude through the user's Claude Code login from inside meetingbox. That stays the Local CLI Bridge's job.
+- Gemini, Vertex and Bedrock sources. The router supports them, so they are a small later step.
+- Node anywhere but the outside minutes writer.
 - Any change to recording, crash safety or finalising.
 
 ## 4. Anti-goals: failure even if it works
@@ -114,8 +126,19 @@ New:
   - A missing or wrong model means "use Apple".
 - **The helper reads a 16 kHz mono WAV** that the engine makes with macOS's own `afconvert` in the run's private staging folder, and its temporary files go there too. So no decoded audio is ever left outside the meeting folder.
 - **English only for Parakeet.** A meeting with a non-English `MB_LOCALE` uses Apple's transcriber.
-- **The outside endpoint is the standard chat completions interface:** `POST <address>/chat/completions`, and `GET <address>/models` to list models, which is what the 5 November design specified.
-  - The user's Local CLI Bridge serves it, and so does Ollama, which is installed on this Mac.
+- **Outside models go through Node and the user's AI Execution Router,** and through nothing else:
+  - the router (MIT, no dependencies) is pinned at exactly version 1.1.1 and installed with its install scripts disabled;
+  - a small script in the repository, `minutes/writer.mjs`, calls it;
+  - Node 20 or later is needed for outside models only. Transcription, speakers and Apple's minutes never need Node.
+- **Two kinds of source:**
+  - "Claude API": Anthropic's Messages interface, at `https://api.anthropic.com` unless the user changes it;
+  - "Standard": the OpenAI-style chat interface (`<address>/chat/completions`, models from `<address>/models`), as served by Ollama, LM Studio and the Local CLI Bridge.
+- **How the script runs:**
+  - The engine runs it with an empty environment.
+  - The key and the request arrive on standard input.
+  - Every network call refuses redirects.
+  - The address is checked by the same rule as the app's.
+  - Listing models uses the provider's own list call, because the router only runs requests.
 - **Address rule**, applied identically by the engine and the app, with one shared table of test cases:
   - lower-case `https://` or `http://`, then a host with an optional `:port` (1 to 65535), then an optional path;
   - no user information (`@`), no `?`, no `#`, no spaces, quotes, backslashes or control characters, and at most 2048 characters;
@@ -123,16 +146,16 @@ New:
   - `https` for a DNS name or a bracketed IPv6 literal.
 
   Every host shown to the user is the host parsed by this rule **(my call)**.
-- **A key for the endpoint, if needed:**
+- **A key for a source, if needed** (the Claude API always needs one):
   - it is 1 to 4096 characters from `A-Za-z0-9._~+/=-`;
-  - it is kept in the login keychain only, stored and read by the engine through `security`, and is never in a command line, a file, a log or the environment;
+  - it is kept in the login keychain only, stored and read by the engine through `security`, and handed to the script on standard input;
+  - it is never in a command line, a file, a log or the environment;
   - a key read back that breaks the rule is not used.
-- **Every request to an outside endpoint:**
-  - ignores the user's curl configuration;
+- **Every request to an outside source:**
   - follows no redirects;
   - is limited to the address's own protocol;
-  - for a local `http` address, never uses a proxy.
-- **The README's promise:** "Recordings never leave the Mac. Transcripts and minutes stay on it too unless you choose an outside model for the minutes. Then each meeting's transcript, with its date, time and length, is sent to the address you set, and on to wherever that service sends it."
+  - for a local `http` address, uses no proxy.
+- **The README's promise:** "Recordings never leave the Mac. Transcripts and minutes stay on it too unless you choose an outside model for the minutes. Then each meeting's transcript, with its date, time and length, is sent to the source you chose, and on to wherever that service sends it."
 
 ## 6. What is decided
 
@@ -193,7 +216,12 @@ New:
   4. **A word with no candidate** takes the side's label when every speaker on that side has the same label. Otherwise it is "Unknown" on the microphone side and "Them" on the call side.
   5. **A word with two or more different candidate labels** takes the label held by most words of its sentence that have exactly one candidate label. A tie goes to the label of the latest-starting segment. A sentence runs up to and including a word ending in `.`, `?` or `!`.
   6. **Smoothing:** the runs of equal labels in each sentence are computed once. Then, in one pass, a run of one or two words with the same label on both sides takes that label. A single word at a sentence's start or end takes the label of its neighbouring run when that run has three or more words.
-- **The user's voice print is learnt from video calls** **(your decision)**.
+- **The user's voice print** is learnt from video calls, or recorded on purpose.
+  - **"Record a voice sample…" in Preferences:**
+    - Recording: the user reads aloud for 90 s, with a countdown. Only the microphone is recorded, by the same recorder and permission meetings use, into a private temporary folder outside the meetings folder.
+    - Building the print: the engine finds the speech in it. A sample with 60 s or more of one voice becomes a usable print on its own, replacing any print learnt so far, and counts as one meeting. A sample with less, or with more than one voice, is refused with the reason.
+    - Clean-up: the sample's audio is deleted afterwards.
+    - Availability: it is offered only while nothing is recording.
   - **When a meeting adds to it:** only first processing does (never a redo), and only if all of these hold:
     - the meeting is a call, and its call side has speaker results with at least one speaker;
     - its dominant microphone speaker holds 80% or more of the microphone words kept after echo removal;
@@ -208,9 +236,9 @@ New:
     - while the print is not yet usable, two refused calls in a row discard it, so a first call dominated by someone else cannot lock the user out. The log says so.
   - **The meeting's log says** "Learnt N s of your voice from this call", or "This call's microphone voice did not match the voice learnt so far, so it was not learnt".
   - **In Preferences:**
-    - "Your voice: learnt from N calls (M minutes of speech)", with singular forms;
-    - or "Not learnt yet: meetingbox learns it from your video calls";
-    - and a "Forget my voice" button, which deletes the file through the engine.
+    - "Your voice: learnt from N calls (M minutes of speech)", with singular forms, or "Your voice: from a recorded sample (M minutes of speech)";
+    - or "Not learnt yet: meetingbox learns it from your video calls, or record a sample";
+    - "Record a voice sample…" and "Forget my voice" buttons, which work through the engine.
   - **`meetingbox doctor`** shows the same.
 - **People counts for one meeting.** "Transcribe again" asks:
   - "People in the room, including you": Work it out, 1 (just you), 2 to 6;
@@ -219,9 +247,12 @@ New:
   - **A count of 2 or more** asks for that many speakers and turns off the share and segment-length tests on that side. The voice print tests still apply.
   - Counts are saved in the meeting's `meeting.json` and used by later redos of that meeting from the window. From Terminal, `--room` and `--call` give them; without them it works them out.
 
-### 6.3 Lines (my call)
+### 6.3 Tidy lines (an option, on by default)
 
-The joiner replaces today's turn merging. The 10 November prototype took lines of three words or fewer from 65% to 7%.
+- **Where it is set:** Preferences gains "Tidy transcript lines (drop 'um' and 'uh', keep short replies inline)", on by default. Transcribe again has the same switch for one meeting, starting at the Preferences choice.
+- **When it is on:** the joiner below replaces today's turn merging. The 10 November prototype took lines of three words or fewer from 65% to 7%.
+- **When it is off:** today's merging is kept, with speaker labels. A new line starts at every change of speaker, and every filler stays.
+- **The 1.2 s cap** on word ends applies either way, because the speaker rules need it.
 
 - **Word timings and noise:**
   - a word's end is capped at its start plus 1.2 s;
@@ -275,12 +306,13 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
 - **Restoring an earlier version** is by hand for now: copy back from `earlier/`. The README says so.
 - **In the window:**
   - **"Redo minutes…"** on a finished meeting, and on a failed one that has a transcript.
-    - It opens a small sheet: "Write the minutes with", starting at the meeting's own choice if it has one, else the Preferences choice **(your decision)**.
+    - It opens a small sheet: "Write the minutes with", starting at the meeting's own choice if it has one, else the Preferences choice.
     - Choosing an outside model there asks for agreement, as Preferences does.
     - The choice, Apple included, is kept in the meeting's `meeting.json` and used by every later run on that meeting (Process, Try again and redos) until another sheet changes it.
   - **"Transcribe again…"** on a finished meeting whose recording can be processed. It opens a sheet with:
     - Transcriber, starting at the Preferences choice;
     - the two people counts, starting at the meeting's saved counts;
+    - "Tidy transcript lines", starting at the Preferences choice;
     - "Write the minutes with";
     - Cancel and Transcribe again.
   - **Busy meetings:** neither action is offered, or accepted at the click, for a meeting being recorded, saved, queued or processed, including by a `meetingbox` run in Terminal.
@@ -298,36 +330,44 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
 
 ### 6.5 The minutes writer
 
-- **In Preferences, a "Minutes" section.**
-  - **"Write the minutes with":**
-    - "Apple, on this Mac" (the default), then each model the outside endpoint lists, as "<model> at <host>";
-    - a model whose name ends in `-cloud` or `:cloud` is shown as "<model> at <host> (runs online)";
-    - a saved choice no longer listed stays as "(not available)";
-    - if the endpoint lists no models, or cannot list them, a "Model name" field appears.
-  - **"Outside model" rows:**
-    - Address;
-    - Key, with Set… and Remove;
-    - a Check button that lists the models ("Found 3 models", "Found 1 model", or why not).
-  - **With no address set**, the picker shows only Apple, and the Address row says: "To use another model, run one at a standard address, such as Ollama (http://127.0.0.1:11434/v1) or the Local CLI Bridge, and enter it here."
-  - **When the list is fetched:** the endpoint is contacted only when the user presses Check, opens the picker, or saves a new address. Never at launch, and never just because Preferences opened.
-  - **The line under the picker:**
-    - "Transcripts stay on this Mac.";
-    - or, in amber, "Transcripts are sent to <host> to write the minutes. Recordings stay on this Mac. This applies to every meeting processed, including new recordings."
-- **Agreement.** Choosing an outside model, in Preferences or in a redo sheet, at an address not yet agreed opens a confirmation:
+- **Sources.** Preferences gains a "Minutes" section with a short list of outside sources (Add… and Remove). Each source has:
+  - a kind: "Claude API", or "Standard (Ollama, LM Studio, Local CLI Bridge)";
+  - an address, with `https://api.anthropic.com` filled in for the Claude API;
+  - a key, with Set… and Remove: needed for the Claude API, optional for Standard;
+  - a Check button that lists the source's models ("Found 3 models", "Found 1 model", or why not).
+  - No two sources share an address.
+  - **With no sources**, the section says: "To use another model, add a source: the Claude API with your key, or a standard address such as Ollama (http://127.0.0.1:11434/v1) or the Local CLI Bridge."
+- **"Write the minutes with":**
+  - "Apple, on this Mac" (the default), then every model of every source, as "<model> at <host>";
+  - a model whose name ends in `-cloud` or `:cloud` is shown with "(runs online)";
+  - a saved choice no longer listed stays, as "(not available)";
+  - a source that lists no models, or cannot list them, gets a "Model name" field.
+- **When sources are contacted:** only when the user presses Check, opens the picker, or saves a source. Never at launch, and never just because Preferences opened.
+- **The line under the picker:**
+  - "Transcripts stay on this Mac.";
+  - or, in amber, "Transcripts are sent to <host> to write the minutes. Recordings stay on this Mac. This applies to every meeting processed, including new recordings."
+- **Agreement.** Choosing an outside model, in Preferences or in a redo sheet, from a source not yet agreed opens a confirmation:
   - Title: "Send transcripts to <host>?"
-  - Text: "To write the minutes, meetingbox will send each meeting's full transcript, with its date, time and length, to <address>. A program at this address may pass it on: the Local CLI Bridge sends it to Claude or Codex under your account, and an Ollama model whose name ends in 'cloud' runs on Ollama's servers. The transcript includes what other people said, so make sure they are happy with that. Recordings stay on this Mac. You can switch back to Apple at any time."
+  - Text: "To write the minutes, meetingbox will send each meeting's full transcript, with its date, time and length, to <address>. If that is a program on this Mac, it may pass it on: the Local CLI Bridge sends it to Claude or Codex under your account, and an Ollama model whose name ends in 'cloud' runs on Ollama's servers. The transcript includes what other people said, so make sure they are happy with that. Recordings stay on this Mac. You can switch back to Apple at any time."
   - Buttons: Cancel, and "Send transcripts to <host>".
-  - Agreement is kept for the current address only. Changing or clearing the address withdraws it.
-  - **At launch,** an outside writer is used only if its address is still agreed and is still the address in Preferences. Otherwise the run uses Apple and the log says why.
-  - meetingbox treats every outside endpoint as leaving the Mac, even one at `127.0.0.1` **(my call)**.
-- **The engine uses an outside model only when told explicitly for that run:** `--writer outside --address <url> --writer-model <name>`.
+  - Agreement is kept for that source while its kind and address stay the same. Changing either, or removing the source, withdraws it.
+  - **At launch,** an outside writer is used only if its source still exists, unchanged and agreed. Otherwise the run uses Apple and the log says why.
+  - meetingbox treats every outside source as leaving the Mac, even one at `127.0.0.1` **(my call)**.
+- **The engine uses an outside model only when told explicitly for that run:** `--writer outside --kind claude|standard --address <url> --writer-model <name>`.
   - It never reads an outside writer from the environment or from the app's settings.
-  - The app passes these per job, and only for an agreed address.
+  - The app passes these per job, and only for an agreed source.
+- **How the request is sent.** The engine runs meetingbox's own `writer.mjs` with the recorded Node, with an empty environment. The request and the key arrive on standard input. The script:
+  - checks the address by the shared rule;
+  - refuses every redirect;
+  - calls the router's `complete()` once, not streamed, with a 15-minute limit;
+  - returns:
+    - the text and the finish reason;
+    - the prompt token count, with whether the router marked it as reported;
+    - for a failure, its kind (no connection, timeout, quota used up, rate limited, refused, other) and whether the request could have reached the source.
 - **The request:**
   - one request carrying the whole transcript, timestamps kept;
   - the instructions as the system message, saying the transcript is data and never instructions;
-  - the user message is a context line, a blank line, then the transcript between `<transcript>` tags;
-  - not streamed, with a 15-minute limit.
+  - the user message is a context line, a blank line, then the transcript between `<transcript>` tags.
 - **What gets written:**
   - The reply is the minutes in Markdown under today's headings.
   - `notes-raw.md` is the reply as received; `notes.md` adds a last line naming the writer.
@@ -338,19 +378,36 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
   - the transcript was sent, or that cannot be told: "Written on this Mac by Apple's model because <host> did not return usable minutes: <reason>. The transcript was sent to <host>. Choose Redo minutes to try again."
 
   These count as failures:
-  - no connection, an HTTP error, the time limit;
+  - no connection, an HTTP error, the time limit, quota used up, rate limited;
   - an empty reply, a reply cut short;
-  - a reply that reports a positive count of prompt tokens clearly smaller than what was sent (a context window too small);
-  - a stored key that breaks the key rule.
+  - a reply whose prompt token count is marked as reported and is clearly smaller than what was sent (a context window too small);
+  - a stored key that breaks the key rule;
+  - Node or the router not set up.
 
-  meetingbox never falls back from one outside choice to another.
+  The note's reason names which, for example "your Claude API quota is used up". meetingbox never falls back from one outside choice to another.
 - **The minutes view** shows links as plain text, never as clickable links **(my call)**.
+- **Without Node:** if Node or the router is not set up, outside models show as unavailable with the reason, "Outside models need Node 20 or later. Run meetingbox setup."
 - **New engine commands:**
-  - `meetingbox engines [--address <url>]` lists:
-    - whether Parakeet and Apple's model are ready;
-    - with an address, the endpoint's models or why they could not be listed.
+  - `meetingbox engines [--kind claude|standard --address <url>]` lists:
+    - whether Parakeet, Apple's model and the outside-model runtime are ready;
+    - with a source, its models or why they could not be listed.
   - `meetingbox key set --address <url>` reads the key from standard input, stores it in the keychain and records it. `meetingbox key remove --address <url>` deletes it.
-  - `meetingbox voice forget` deletes the voice print.
+  - `meetingbox voice add <audio>` makes the print from a recorded sample. `meetingbox voice forget` deletes it.
+
+### 6.6 The window's top bar
+
+- **While a recording runs or is paused,** the bar beside New meeting shows the timer, Pause (Resume when paused) and Stop.
+  - They control that recording whichever meeting is selected.
+  - They go through the same single owner as the menu bar.
+- **When nothing is recording,** the bar holds a player for the selected meeting's audio:
+  - Play or Pause, and Stop (back to the start);
+  - the position as "12:34 / 1:05:00", with a slider to move.
+  - It plays the combined `audio.m4a` (or a v1.2 meeting's single file) inside the app.
+- **Playback and recording never overlap:**
+  - starting a recording stops playback, and the player is unavailable while recording, because the call side records the Mac's sound;
+  - selecting another meeting stops playback **(my call)**.
+- **The meeting page's "Play audio" button,** which opened QuickTime Player, becomes "Open in QuickTime Player" **(my call)**.
+- **Left for part 2:** speed, volume, and jumping to a moment from the transcript or minutes.
 
 ## 7. Install and setup
 
@@ -368,9 +425,19 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
   - the installed manifest matches the source's;
   - every model file is present at its size.
   - On a release update, the Parakeet step is checked whenever the recorder step is due, so a changed helper is rebuilt.
+- **A second new step, "Outside models (optional)"**, after the Parakeet step.
+  - Survey line: "+ outside models (Node 22.22.2)", or "- outside models (optional, needs Node 20 or later)".
+  - **Finding Node 20 or later:** looked for on the app's PATH, then in Homebrew's folders, then the newest nvm version. Its absolute path is kept in `~/.meetingbox/node`, which is recorded. If there is none, setup offers to install Node with Homebrew, as it offers whisper.cpp. Declining skips the step.
+  - **Installing the router:** `minutes/` (`writer.mjs`, `package.json`, `package-lock.json`) is copied to `~/.local/share/meetingbox/minutes`, which is claimed and recorded. Then that Node's npm runs `ci --ignore-scripts --omit=dev` there, with npm's cache in a temporary folder that is removed afterwards. The lock file pins ai-execution-router 1.1.1 by its integrity hash.
+  - **Ready check:** the recorded Node runs, at version 20 or later, and `writer.mjs version` reports router 1.1.1.
+  - **If any step fails:** "Outside models could not be set up: <reason>. Apple's on-device model still writes the minutes." Setup continues.
+  - **If nvm's Node later moves or goes,** outside models show as unavailable until setup is run again.
 - **Other commands:**
-  - `meetingbox doctor` reports the helper, the models, the cache folder, the voice print, and any staging folder left behind.
-  - `reset --tools` and `uninstall` remove all of these, plus stored keys, through the install record.
+  - `meetingbox doctor` reports:
+    - the helper, the models, the cache folder and the voice print;
+    - Node and the router;
+    - any staging folder left behind.
+  - `reset --tools` and `uninstall` remove all of these, plus stored keys, through the install record. Node itself is left alone; a Homebrew Node is listed as installed by Homebrew, as whisper.cpp is today.
 
 ## 8. How we will know it worked
 
@@ -389,11 +456,15 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
   - `earlier/` holds the replaced files byte for byte;
   - a hand-edited `notes.md` is kept as `notes-edited-<stamp>.md`.
 - **Minutes writer:**
-  - with Apple chosen, processing makes no network request (a test fails if `curl` is called);
-  - with an outside writer at a dead address, the minutes come from Apple with the "not sent" note.
+  - with Apple chosen, processing makes no network request (a test fails if Node or `curl` is called);
+  - with an outside writer at a dead address, the minutes come from Apple with the "not sent" note;
+  - against a local test source, the script refuses a redirect and reports the reason;
+  - a Standard source (Ollama) and a Claude API source with the user's key each write minutes for a synthetic transcript.
+- **Your voice:** a recorded 90 s sample makes "Me" appear in a room recording without any call.
 - **The user, without help, on the final build:**
   - records a video call and an in-person conversation and reads labelled transcripts;
-  - transcribes a spare meeting again with "2" people in the room;
+  - pauses, resumes and stops from the window's top bar, then plays a meeting there;
+  - transcribes a spare meeting again with "2" people in the room and tidying off;
   - redoes a spare meeting's minutes with an outside model;
   - switches the transcriber to Apple and back.
 
@@ -409,21 +480,19 @@ The joiner replaces today's turn merging. The 10 November prototype took lines o
 - **On another Mac:**
   - Swift Package Manager may fail there. Apple's transcriber is the fallback.
   - If macOS clears Core ML's cache, the next run spends about 30 s preparing the model again.
+- **Node:**
+  - an nvm version switch or removal breaks outside minutes until setup runs again;
+  - other users of the public project need Node for outside models.
+- **The router's provider classification** rests on provider message text. An unclassified quota error reads as a rate limit, so the note's reason may say "rate limited" when the quota is spent.
 
-## 10. Decisions for the user at approval
+## 10. Calls Claude made for the user to check
 
-1. **Sending one meeting to an outside model.** The recommended answer, which the plan assumes:
-   - Preferences sets the default for new meetings;
-   - "Redo minutes…" and "Transcribe again…" let you pick the writer for that one meeting;
-   - "Keep this meeting on this Mac" waits for part 2, and until then, while an outside model is the default, every new meeting is sent to it.
-
-   The alternatives: add "Keep on this Mac" now, or no per-meeting choice at all.
-2. **Which models appear.** The recommended answer, as approved on 5 November: Apple, plus whatever your endpoint lists. Today that means Ollama's local models, such as Gemma 4 26B, and Claude through your Local CLI Bridge.
-
-   The alternative: meetingbox also runs Claude directly through your Claude Code login, with strict privacy settings, so no bridge is needed.
-3. **Your voice.** The recommended answer: learnt automatically from your video calls (two calls before it is used), with "Forget my voice" in Preferences.
-
-   The alternative: also a "Record a voice sample (90 s)" button, for people who seldom make video calls.
-4. **Tidier lines.** The recommended answer: drop "um" and "uh" and keep short replies inline, as in 6.3.
-
-   The alternative: keep today's line breaks and only add speaker labels.
+- Every outside source counts as leaving the Mac, even one at `127.0.0.1`.
+- Hosts shown to the user are the ones parsed by the address rule.
+- A failed Parakeet build keeps the working helper and models it had.
+- The minutes view shows links as plain text.
+- With tidying off, lines follow today's merging, with speaker labels added.
+- A recorded voice sample replaces a learnt print.
+- Choosing another meeting stops playback.
+- The meeting page's "Play audio" becomes "Open in QuickTime Player".
+- Node is found on the app's PATH, then Homebrew, then nvm. Without it, setup offers Homebrew.
