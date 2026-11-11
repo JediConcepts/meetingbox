@@ -436,7 +436,7 @@ New:
   - On a release update, the Parakeet step is checked whenever the recorder step is due, so a changed helper is rebuilt.
 - **A second new step, "Outside models (optional)"**, after the Parakeet step.
   - Survey line: "+ outside models (Node 22.22.2)", or "- outside models (optional, needs Node 20 or later)".
-  - **Finding Node 20 or later:** looked for on the app's PATH, then in Homebrew's folders, then the newest nvm version. Its absolute path is kept in `~/.meetingbox/node`, which is recorded. If there is none, setup offers to install Node with Homebrew, as it offers whisper.cpp. Declining skips the step.
+  - **Finding Node 20 or later:** looked for on the app's PATH, then in Homebrew's folders, then the newest nvm version. A Node counts only if it actually runs and reports version 20 or later, so an old Intel build is skipped. Its absolute path is kept in `~/.meetingbox/node`, which is recorded. If there is none, setup offers to install Node with Homebrew, as it offers whisper.cpp. Declining skips the step.
   - **Installing the router:** `minutes/` (`writer.mjs`, `package.json`, `package-lock.json`) is copied to `~/.local/share/meetingbox/minutes`, which is claimed and recorded. Then that Node's npm runs `ci --ignore-scripts --omit=dev` there, with npm's cache in a temporary folder that is removed afterwards. The lock file pins ai-execution-router 1.1.1 by its integrity hash.
   - **Ready check:** the recorded Node runs, at version 20 or later, and `writer.mjs version` reports router 1.1.1.
   - **If any step fails:** "Outside models could not be set up: <reason>. Apple's on-device model still writes the minutes." Setup continues.

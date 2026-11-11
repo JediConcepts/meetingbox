@@ -1090,6 +1090,7 @@
     - `key remove` deletes the item and forgets the line; `uninstall` removes recorded items.
   - **`install_minutes`:**
     - it picks the first Node of version 20 or later on the app's PATH, then in `/opt/homebrew/bin`, then `/usr/local/bin`, then the newest under `~/.nvm/versions/node/*/bin`;
+    - a candidate counts only if running `<node> --version` succeeds within 5 s and prints v20 or later. One that fails to start (this Mac's `/usr/local/bin/node` is an Intel build) or is too old is skipped, and the log names it. Stubs for this: a failing node, a v18 node, and a good one third in the order;
     - it records `NODE_FILE` and `MINUTES_DIR`, and runs that Node's npm `ci --ignore-scripts --omit=dev --cache <tmp>`, with the temporary folder gone afterwards;
     - with no Node, it offers `brew install node` and skips on no;
     - a failure prints the "could not be set up" line and setup carries on.
