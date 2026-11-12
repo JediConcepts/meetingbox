@@ -537,9 +537,10 @@ check(overlapLeak.mic.count == 10 && overlapLeak.micLabels.allSatisfy { $0 == "M
       "labelWords: where the user's voice and the far side overlap on the call side, far-side words heard later on the microphone "
       + "are still dropped as echo (\(overlapLeak.mic.count) \(overlapLeak.call.count))")
 
-// Fix round 2: "later" means later by a real round trip (Rule.returnLag), decided over runs. A leak through
-// the speakers lags its call copy by tens of milliseconds, inside a transcriber's timing jitter; a voice
-// coming back lags by 150 ms or more.
+// Fix rounds 2 and 3: "later" means later by a real round trip (Rule.returnLag), judged word by word on
+// each call word's own pair in the alignment of both whole sides. A leak through the speakers lags its
+// call copy by tens of milliseconds, inside a transcriber's timing jitter; a voice coming back lags by
+// 150 ms or more.
 func heardLine(_ l: LabelledWords) -> Bool { l.log.contains { $0.hasPrefix("Your voice was heard on the call side") } }
 let overlapCall = side([Segment(speaker: "P", start: 19.5, end: 24), Segment(speaker: "T", start: 19.8, end: 24)],
                        [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)])
@@ -570,33 +571,59 @@ let yesYes = labelWords(mic: micYes, call: callYes, micSpeakers: side([Segment(s
 check(yesYes.mic.count == micYes.count - 2 && !yesYes.mic.contains { $0.text == "yes" } && yesYes.micLabels.allSatisfy { $0 == "Me" }
       && yesYes.call.map(\.text) == ["yes", "yes"] && yesYes.callLabels == ["Them", "Them"],
       "labelWords (case B): the far side's leaked 'yes yes' is dropped, and both its 'yes' words stay Them (\(yesYes.call.map(\.text)) \(yesYes.callLabels))")
-// The user's voice coming back 0.15 s and 0.3 s later, with single words jittered by 0.05 s and two words
-// stamped early: every user word stays Me, and the copies are dropped as repeats.
-for returning in [0.15, 0.3] {
-    let lags = [returning, returning, returning + 0.05, returning, -0.05, -0.05, returning, returning - 0.05]
+// The user's voice coming back about 0.15 s and 0.3 s later inside a P and T overlap, each copy jittered
+// on its own but none stamped under Rule.returnLag: every user word stays Me, and the copies are dropped
+// as repeats. (Fix round 3: these checks used to stamp two copies 0.05 s early, which only a median over
+// runs could carry; a copy stamped under the margin is now the documented boundary below.)
+let jitterLags = [0.15, 0.13, 0.20, 0.12, 0.17, 0.14, 0.15, 0.12]
+func returningOverlap(_ lags: [Double], pEnd: Double) -> LabelledWords {
     let back = said("I think we can ship it on monday.", from: 10).enumerated().map { k, x in w(x.start + lags[k], x.end + lags[k], x.text) }
-    let jittered = labelWords(mic: mineToShip, call: back + farReply,
-                              micSpeakers: side([Segment(speaker: "U", start: 9.8, end: 13.5), Segment(speaker: "U", start: 39.8, end: 42)],
-                                                [sp("U", seconds: 45, vector: at(0.9))]),
-                              callSpeakers: side([Segment(speaker: "P", start: 9.9, end: 13.8 + returning), Segment(speaker: "T", start: 9.5, end: 22)],
-                                                 [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
-                              print: usable)
+    return labelWords(mic: mineToShip, call: back + farReply,
+                      micSpeakers: side([Segment(speaker: "U", start: 9.8, end: 13.5), Segment(speaker: "U", start: 39.8, end: 42)],
+                                        [sp("U", seconds: 45, vector: at(0.9))]),
+                      callSpeakers: side([Segment(speaker: "P", start: 9.9, end: pEnd), Segment(speaker: "T", start: 9.5, end: 22)],
+                                         [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                      print: usable)
+}
+for (returning, lags) in [(0.15, jitterLags), (0.3, jitterLags.map { $0 + 0.15 })] {
+    let jittered = returningOverlap(lags, pEnd: 13.8 + returning)
     check(jittered.mic.count == 13 && jittered.micLabels.allSatisfy { $0 == "Me" } && jittered.call.map(\.text) == farReply.map(\.text)
           && jittered.callLabels.allSatisfy { $0 == "Them" },
-          "labelWords: a voice coming back \(returning) s later, single words jittered by 0.05 s and two stamped early, leaves every "
-          + "user word Me (\(jittered.mic.count) \(jittered.call.map(\.text)))")
+          "labelWords: a voice coming back about \(returning) s later, every copy jittered but none under the margin, leaves every "
+          + "user word Me and the far reply Them (\(jittered.mic.count) \(jittered.call.map(\.text)))")
 }
+// The margin is judged per word (fix round 3). In the same layout, with every other copy 0.3 s later, a
+// copy stamped exactly Rule.returnLag later is the user's voice; one stamped 0.10 s later stays in echo
+// removal and cancels its microphone word, which is the documented boundary (a returning voice stamped
+// under the margin counts as leakage). That word's call copy stays on the call side, and no other word
+// moves.
+let atMargin = returningOverlap([0.3, 0.3, 0.3, 0.3, Rule.returnLag, 0.3, 0.3, 0.3], pEnd: 14.1)
+check(atMargin.mic.count == 13 && atMargin.micLabels.allSatisfy { $0 == "Me" } && atMargin.call.map(\.text) == farReply.map(\.text)
+      && atMargin.callLabels.allSatisfy { $0 == "Them" },
+      "labelWords: a returning copy stamped exactly Rule.returnLag after its microphone word is the user's voice, so all 13 stay Me "
+      + "(\(atMargin.mic.count) \(atMargin.call.map(\.text)))")
+let underMargin = returningOverlap([0.3, 0.3, 0.3, 0.3, 0.10, 0.3, 0.3, 0.3], pEnd: 14.1)
+check(underMargin.mic.count == 12 && !underMargin.mic.contains { $0.text == "ship" } && underMargin.micLabels.allSatisfy { $0 == "Me" }
+      && underMargin.call.map(\.text) == ["ship"] + farReply.map(\.text),
+      "labelWords (documented boundary): a returning copy stamped 0.10 s after its microphone word stays in echo removal and cancels "
+      + "only that word, while its neighbours, judged by their own pairs, stay Me (\(underMargin.mic.map(\.text)) \(underMargin.call.map(\.text)))")
 // Both say "okay" at once: the user's at 10.0, the far side's at 10.3 on the call side (in the overlap with
-// the user's voice coming back), leaking into the microphone at 10.32.
+// the user's voice coming back), leaking into the microphone at 10.32. A documented boundary (fix round 3):
+// the alignment of both whole sides pairs the far side's "okay" with the user's, 0.3 s earlier, so it is
+// taken for the user's voice coming back and dropped as a repeat, and its leak at 10.32 stays on the
+// microphone as Me. No word of the user's is lost and the far reply stays Them; the log counts that
+// "okay" as 1 word repeating the user's, although none came back.
 let okays = labelWords(mic: said("okay.", from: 10.0) + said("okay.", from: 10.32) + mineLast, call: said("okay.", from: 10.3) + farReply,
                        micSpeakers: side([Segment(speaker: "U", start: 9.8, end: 11.0), Segment(speaker: "U", start: 29.8, end: 32.5)],
                                          [sp("U", seconds: 45, vector: at(0.9))]),
                        callSpeakers: side([Segment(speaker: "P", start: 10.1, end: 10.9), Segment(speaker: "T", start: 10.2, end: 22)],
                                           [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
                        print: usable)
-check(okays.call.first.map { $0.text == "okay." && $0.start == 10.3 } == true && okays.callLabels.first == "Them"
-      && okays.mic.filter { $0.text == "okay." }.count == 1 && okays.micLabels.allSatisfy { $0 == "Me" },
-      "labelWords: when both say 'okay' at once, the far side's 'okay' stays Them and one 'okay' is Me (\(okays.call.map(\.text)) \(okays.callLabels))")
+check(okays.call.map(\.text) == farReply.map(\.text) && okays.callLabels.allSatisfy { $0 == "Them" }
+      && okays.mic.filter { $0.text == "okay." }.map(\.start) == [10.0, 10.32] && okays.micLabels.allSatisfy { $0 == "Me" },
+      "labelWords (documented boundary): when both say 'okay' at once, the far side's 'okay' 0.3 s after the user's is taken for the "
+      + "user's voice and dropped, both microphone 'okay' words stay Me, and the far reply stays Them (\(okays.call.map(\.text)) "
+      + "\(okays.mic.map(\.text)) \(okays.log))")
 // pairVoices with a systematic +0.03 s offset between the sides (the microphone stamped early), on a far-side
 // leak cluster and no print: still echo, not the user's voice; the user stays Me and the far side Them.
 let farLong = said("we should look at the numbers again before friday.", from: 20) + said("and the budget for next quarter too.", from: 26)
@@ -616,6 +643,128 @@ let offsetVote = pairVoices(mic: [micE], call: [callC], pairs: offsetPairs, micW
                            micCandidates: micE5, callCandidates: callC5, print: nil)
 check(offsetVote.micEcho == ["E"] && offsetVote.callEcho.isEmpty,
       "pairVoices: shared words with the call copy only 0.03 s later count as later on the microphone side (echo)")
+
+// Changes of turn with both the user's voice coming back (P, or C found by pairVoices) and the far side
+// leaking into the microphone (fix round 3, from the round 3 benchmark's spec cases). The user's returning
+// copies lag by 0.3 s and the leak by 0 to 0.03 s, and P's and T's segments overlap where the turn
+// changes, so both voices' words are mixed there. Each is judged by its own pair: the user's 13 words stay
+// Me, no leaked word is kept on the microphone, and the far side's words stay Them on the call side.
+func shifted(_ words: [Word], _ d: Double) -> [Word] { words.map { w($0.start + d, $0.end + d, $0.text) } }
+func wordKey(_ x: Word) -> String { "\(x.start.bitPattern)|\(x.text)" }
+/// How many of `words` (same start, same text) `out` kept, counting only those whose label is `label` or
+/// starts with `prefix` when given.
+func keptCount(_ words: [Word], in out: [Word], _ labels: [String], label: String? = nil, prefix: String? = nil) -> Int {
+    let want = Set(words.map(wordKey))
+    return zip(out, labels).filter { x, l in
+        want.contains(wordKey(x)) && (label.map { l == $0 } ?? true) && (prefix.map { l.hasPrefix($0) } ?? true)
+    }.count
+}
+/// N in the log's "Your voice was heard on the call side: N words repeating yours ..." line.
+func repeatCount(_ l: LabelledWords) -> Int? {
+    guard let line = l.log.first(where: { $0.hasPrefix("Your voice was heard on the call side") }),
+          let colon = line.range(of: ": ") else { return nil }
+    return Int(line[colon.upperBound...].prefix { $0.isNumber })
+}
+let userTurn = "I think we can ship it on monday."
+let laterTurn = said("and then we test it.", from: 40)
+let shortReply = "sounds good to me.", longReply = "sounds good to me but we should check the numbers with finance first."
+// T1, T2 and T5: the user's sentence, then the far side's reply `gap` after its last word, leaking `leak`
+// later on the microphone; P runs `pAfter` past the last returning copy and T starts `tBefore` before the reply.
+func turnChange(_ name: String, reply: String, gap: Double, leak: Double, pAfter: Double, tBefore: Double, noPrint: Bool = false,
+                repeats: Int?) {
+    let u = said(userTurn, from: 10)
+    let replyStart = u.last!.start + gap
+    let rw = said(reply, from: replyStart)
+    let leaked = shifted(rw, leak)
+    let micSp = side([Segment(speaker: "U", start: 9.8, end: rw.last!.start + 2), Segment(speaker: "U", start: 39.8, end: 42)],
+                     [sp("U", seconds: 45, vector: noPrint ? e1 : at(0.9))])
+    let callSp = side([Segment(speaker: noPrint ? "C" : "P", start: 10.2, end: u.last!.start + 0.3 + pAfter),
+                       Segment(speaker: "T", start: replyStart - tBefore, end: rw.last!.start + 2)],
+                      [noPrint ? sp("C", seconds: 8, vector: [0.8, 0.6, 0, 0]) : sp("P", seconds: 8, vector: at(0.75)),
+                       sp("T", seconds: 30, vector: e3)])
+    let r = labelWords(mic: u + leaked + laterTurn, call: shifted(u, 0.3) + rw, micSpeakers: micSp, callSpeakers: callSp,
+                       print: noPrint ? nil : usable)
+    check(keptCount(u + laterTurn, in: r.mic, r.micLabels, label: "Me") == 13 && keptCount(leaked, in: r.mic, r.micLabels) == 0
+          && keptCount(rw, in: r.call, r.callLabels, prefix: "Them") == rw.count && (repeats == nil || repeatCount(r) == repeats),
+          "labelWords (\(name)): at a change of turn the user's 13 words stay Me, no leaked word is kept, the far reply's \(rw.count) "
+          + "words stay Them\(repeats.map { ", and the log counts \($0) repeats" } ?? "") (\(r.mic.map(\.text)) \(r.call.map(\.text)) "
+          + "\(r.callLabels) \(r.log))")
+}
+for leak in [0.0, 0.03] {
+    turnChange("T1, leak +\(leak) s", reply: shortReply, gap: 0.8, leak: leak, pAfter: 1.4, tBefore: 0.1, repeats: 8)
+}
+turnChange("T2, a long reply 0.4 s after", reply: longReply, gap: 0.4, leak: 0, pAfter: 0.4, tBefore: 0.3, repeats: nil)
+turnChange("T5, no print, the returning voice found by pairVoices", reply: shortReply, gap: 0.8, leak: 0, pAfter: 1.4, tBefore: 0.1,
+           noPrint: true, repeats: 8)
+// T3: a long user sentence with the far side's "yeah sure." inside P's tail, leaking.
+do {
+    let u = said("I think we can ship it on monday if the tests pass tonight.", from: 10)
+    let reply = said("yeah sure.", from: 15.3)
+    let r = labelWords(mic: u + reply + laterTurn, call: shifted(u, 0.3) + reply,
+                       micSpeakers: side([Segment(speaker: "U", start: 9.8, end: 17), Segment(speaker: "U", start: 39.8, end: 42)],
+                                         [sp("U", seconds: 45, vector: at(0.9))]),
+                       callSpeakers: side([Segment(speaker: "P", start: 10.2, end: 16.0), Segment(speaker: "T", start: 15.2, end: 17)],
+                                          [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    check(keptCount(u + laterTurn, in: r.mic, r.micLabels, label: "Me") == 18 && keptCount(reply, in: r.mic, r.micLabels) == 0
+          && keptCount(reply, in: r.call, r.callLabels, prefix: "Them") == 2 && repeatCount(r) == 13,
+          "labelWords (T3): the far side's 'yeah sure.' inside P's tail, leaking, stays Them and is dropped from the microphone, "
+          + "the user's 18 words stay Me, and the log counts 13 repeats (\(r.mic.map(\.text)) \(r.call.map(\.text)) \(r.log))")
+}
+// T4: the user's "yes that works." between two far-side stretches that leak, with T spanning the whole stretch.
+for leak in [0.0, 0.03] {
+    let far1 = said("we should look at the numbers again before friday", from: 20)
+    let user = said("yes that works.", from: 23.8)
+    let far2 = said("and then send them to the finance team next week.", from: 25.2)
+    let hello = said("hello everyone thanks for joining.", from: 0)
+    let leaked = shifted(far1, leak) + shifted(far2, leak)
+    let r = labelWords(mic: hello + leaked + user, call: far1 + shifted(user, 0.3) + far2,
+                       micSpeakers: side([Segment(speaker: "U", start: 0, end: 30)], [sp("U", seconds: 45, vector: at(0.9))]),
+                       callSpeakers: side([Segment(speaker: "T", start: 19.8, end: 29.5), Segment(speaker: "P", start: 24.0, end: 25.2)],
+                                          [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    check(keptCount(hello + user, in: r.mic, r.micLabels, label: "Me") == 8 && keptCount(leaked, in: r.mic, r.micLabels) == 0
+          && keptCount(far1 + far2, in: r.call, r.callLabels, prefix: "Them") == 19 && repeatCount(r) == 3,
+          "labelWords (T4, leak +\(leak) s): the user's short reply inside a far-side stretch stays Me, the far side's 19 words stay "
+          + "Them, no leaked word is kept, and the log counts 3 repeats (\(r.mic.map(\.text)) \(r.call.map(\.text)) \(r.log))")
+}
+// Round 2's boundary layouts: forward (the user, then the far side's reply) and reverse (the far side, then
+// the user), with the user's voice coming back 0.3 s later.
+let reverseFar = "sounds good to me but we should check the numbers again first."
+for (leak, gap) in [(0.0, 0.8), (0.03, 0.5)] {
+    let user = said(userTurn, from: 10)
+    let back = shifted(user, 0.3)
+    let replyStart = user.last!.start + gap
+    let reply = said(shortReply, from: replyStart)
+    let leaked = shifted(reply, leak)
+    let r = labelWords(mic: user + leaked, call: back + reply,
+                       micSpeakers: side([Segment(speaker: "U", start: 9.8, end: replyStart + 6)], [sp("U", seconds: 45, vector: at(0.9))]),
+                       callSpeakers: side([Segment(speaker: "P", start: 10.1, end: back.last!.end + 0.6),
+                                           Segment(speaker: "T", start: replyStart - 0.1, end: replyStart + 6)],
+                                          [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    check(keptCount(user, in: r.mic, r.micLabels, label: "Me") == 8 && keptCount(leaked, in: r.mic, r.micLabels) == 0
+          && keptCount(reply, in: r.call, r.callLabels, prefix: "Them") == reply.count,
+          "labelWords (forward, leak +\(leak) s, reply \(gap) s after): the user's 8 words stay Me, no leaked word is kept, and the "
+          + "far reply stays Them (\(r.mic.map(\.text)) \(r.call.map(\.text)) \(r.callLabels))")
+}
+for leak in [0.0, 0.03] {
+    let far = said(reverseFar, from: 5)
+    let leaked = shifted(far, leak)
+    let userStart = far.last!.start + 0.8
+    let user = said(userTurn, from: userStart)
+    let back = shifted(user, 0.3)
+    let r = labelWords(mic: leaked + user, call: far + back,
+                       micSpeakers: side([Segment(speaker: "U", start: 4.5, end: userStart + 5)], [sp("U", seconds: 45, vector: at(0.9))]),
+                       callSpeakers: side([Segment(speaker: "T", start: 4.8, end: back.first!.start + 0.9),
+                                           Segment(speaker: "P", start: back.first!.start - 0.2, end: back.last!.end + 0.3)],
+                                          [sp("P", seconds: 8, vector: at(0.75)), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    check(keptCount(user, in: r.mic, r.micLabels, label: "Me") == 8 && keptCount(leaked, in: r.mic, r.micLabels) == 0
+          && keptCount(far, in: r.call, r.callLabels, prefix: "Them") == far.count,
+          "labelWords (reverse, a long far turn, leak +\(leak) s): the user's 8 words stay Me, no leaked word is kept, and the far "
+          + "side's \(far.count) words stay Them (\(r.mic.map(\.text)) \(r.call.map(\.text)) \(r.callLabels))")
+}
 
 // A usable print that matches nobody on the microphone side.
 let notMe = labelWords(mic: said("shall we start then.", from: 0) + said("yes let us begin now.", from: 5), call: [],

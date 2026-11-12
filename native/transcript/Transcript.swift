@@ -536,45 +536,6 @@ private func likeness(_ speaker: SpeakerInfo, _ print: VoicePrint?) -> Double? {
     print.map { cosine(speaker.vector, $0.vector) }
 }
 
-/// Each echo pair's lag (call start minus microphone start), decided over the run it belongs to rather
-/// than word by word, since each side's stamps jitter by tens of milliseconds. A run is a sequence of
-/// pairs whose microphone words follow one another (the same word, or the next one starting within 1.5 s
-/// of it), and it takes the median lag of its pairs. A pair on its own takes the lag to the nearest
-/// microphone word with the same text within 4 s, since the alignment's choice among equal words is
-/// arbitrary. `mic` and `call` are in time order; the result maps each paired call word to its lag.
-func echoLags(mic: [Word], call: [Word], pairs: [(micWord: Int, callWord: Int)], bridge: Double = 1.5,
-              runWindow: Double = 4.0) -> [Int: Double] {
-    let ordered = pairs.sorted { $0.micWord != $1.micWord ? $0.micWord < $1.micWord : $0.callWord < $1.callWord }
-    var runs: [[(micWord: Int, callWord: Int)]] = []
-    for p in ordered {
-        if let last = runs.last?.last, p.micWord == last.micWord
-            || (p.micWord == last.micWord + 1 && mic[p.micWord].start - mic[last.micWord].start <= bridge) {
-            runs[runs.count - 1].append(p)
-        } else {
-            runs.append([p])
-        }
-    }
-    var lags: [Int: Double] = [:]
-    for run in runs {
-        var lag: Double
-        if run.count == 1 {
-            let p = run[0], t = call[p.callWord].start, key = normalised(call[p.callWord].text)
-            lag = t - mic[p.micWord].start
-            var a = 0, b = mic.count
-            while a < b { let m = (a + b) / 2; if mic[m].start < t - runWindow { a = m + 1 } else { b = m } }
-            while a < mic.count && mic[a].start <= t + runWindow {
-                if abs(t - mic[a].start) < abs(lag) && normalised(mic[a].text) == key { lag = t - mic[a].start }
-                a += 1
-            }
-        } else {
-            let sorted = run.map { call[$0.callWord].start - mic[$0.micWord].start }.sorted()
-            lag = sorted.count % 2 == 1 ? sorted[sorted.count / 2] : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
-        }
-        for p in run { lags[p.callWord] = lag }
-    }
-    return lags
-}
-
 /// One voice heard on both sides of a call: a microphone speaker and a call speaker at a cosine of 0.60
 /// or more, neither matching the (usable) print. Their shared words are the echo pairs whose microphone
 /// word has the one and whose call word has the other among its candidates; whichever side's copies
@@ -833,15 +794,16 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     // speaker, and the user's call-side words that repeat the microphone words kept.
     // A call word whose candidates are all the user's voice is the user's. One whose candidates mix the
     // user's voice with a far-side speaker (overlapping segments) is the user's voice coming back only
-    // when, in the alignment of both whole sides, its run (or, alone, its nearest same word) lags the
-    // microphone by a real round trip (`Rule.returnLag`). Otherwise it stays in echo removal, where a
-    // far-side word that leaked into the microphone is still dropped.
+    // when, in the alignment of both whole sides, it lags its own microphone word by a real round trip
+    // (`Rule.returnLag`). Otherwise it stays in echo removal, where a far-side word that leaked into the
+    // microphone is still dropped.
     let allUser = Set(call.indices.filter { !callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains) })
-    let mixed = call.indices.filter { !allUser.contains($0) && callCandidates[$0].contains(where: userVoice.contains) }
+    let mixed = Set(call.indices.filter { !allUser.contains($0) && callCandidates[$0].contains(where: userVoice.contains) })
     var cameBack = Set<Int>()
     if !mixed.isEmpty {
-        let lags = echoLags(mic: mic, call: call, pairs: aligned())
-        for j in mixed where lags[j].map({ atLeast($0, Rule.returnLag) }) == true { cameBack.insert(j) }
+        for p in aligned() where mixed.contains(p.callWord) && atLeast(call[p.callWord].start - mic[p.micWord].start, Rule.returnLag) {
+            cameBack.insert(p.callWord)
+        }
     }
     let mine = call.indices.filter { allUser.contains($0) || cameBack.contains($0) }
     let mineSet = Set(mine)
