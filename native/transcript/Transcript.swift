@@ -409,6 +409,11 @@ enum Rule {
     static let usableSeconds = 60.0    // speech a print needs to be used
     static let callSeconds = 20.0      // call-side speech that makes a meeting a call
     static let nearestEdge = 1.0       // how far a word may be from the nearest segment and still take it
+    // How much later a call copy must be for the user's voice to have come back: a real round trip. A
+    // leak through the speakers lags its call copy by tens of milliseconds, within the transcribers'
+    // timing jitter (Parakeet's frames are 80 ms); a voice coming back lags by 150 ms or more. Set on
+    // that physical argument: not yet measured on a recording with speaker leakage.
+    static let returnLag = 0.12
 }
 
 /// Whether `x` is at least `limit`, allowing for rounding in the arithmetic that made it.
@@ -531,10 +536,51 @@ private func likeness(_ speaker: SpeakerInfo, _ print: VoicePrint?) -> Double? {
     print.map { cosine(speaker.vector, $0.vector) }
 }
 
+/// Each echo pair's lag (call start minus microphone start), decided over the run it belongs to rather
+/// than word by word, since each side's stamps jitter by tens of milliseconds. A run is a sequence of
+/// pairs whose microphone words follow one another (the same word, or the next one starting within 1.5 s
+/// of it), and it takes the median lag of its pairs. A pair on its own takes the lag to the nearest
+/// microphone word with the same text within 4 s, since the alignment's choice among equal words is
+/// arbitrary. `mic` and `call` are in time order; the result maps each paired call word to its lag.
+func echoLags(mic: [Word], call: [Word], pairs: [(micWord: Int, callWord: Int)], bridge: Double = 1.5,
+              runWindow: Double = 4.0) -> [Int: Double] {
+    let ordered = pairs.sorted { $0.micWord != $1.micWord ? $0.micWord < $1.micWord : $0.callWord < $1.callWord }
+    var runs: [[(micWord: Int, callWord: Int)]] = []
+    for p in ordered {
+        if let last = runs.last?.last, p.micWord == last.micWord
+            || (p.micWord == last.micWord + 1 && mic[p.micWord].start - mic[last.micWord].start <= bridge) {
+            runs[runs.count - 1].append(p)
+        } else {
+            runs.append([p])
+        }
+    }
+    var lags: [Int: Double] = [:]
+    for run in runs {
+        var lag: Double
+        if run.count == 1 {
+            let p = run[0], t = call[p.callWord].start, key = normalised(call[p.callWord].text)
+            lag = t - mic[p.micWord].start
+            var a = 0, b = mic.count
+            while a < b { let m = (a + b) / 2; if mic[m].start < t - runWindow { a = m + 1 } else { b = m } }
+            while a < mic.count && mic[a].start <= t + runWindow {
+                if abs(t - mic[a].start) < abs(lag) && normalised(mic[a].text) == key { lag = t - mic[a].start }
+                a += 1
+            }
+        } else {
+            let sorted = run.map { call[$0.callWord].start - mic[$0.micWord].start }.sorted()
+            lag = sorted.count % 2 == 1 ? sorted[sorted.count / 2] : (sorted[sorted.count / 2 - 1] + sorted[sorted.count / 2]) / 2
+        }
+        for p in run { lags[p.callWord] = lag }
+    }
+    return lags
+}
+
 /// One voice heard on both sides of a call: a microphone speaker and a call speaker at a cosine of 0.60
 /// or more, neither matching the (usable) print. Their shared words are the echo pairs whose microphone
 /// word has the one and whose call word has the other among its candidates; whichever side's copies
-/// mostly come later is the echo.
+/// mostly come later is the echo. A shared word counts as later on the call side only when its call copy
+/// is later by a real round trip (`Rule.returnLag`); otherwise the microphone copy counts as the later,
+/// since a leak through the speakers lags by less than the transcribers' timing jitter.
 /// - micEcho: the far side leaking into the microphone. Its words are dropped.
 /// - callEcho: the user's voice coming back on the call side, treated as a print match there.
 /// - micUnknown: no shared words, or as many later on each side, so the microphone speaker cannot be
@@ -550,8 +596,7 @@ func pairVoices(mic: [SpeakerInfo], call: [SpeakerInfo], pairs: [(micWord: Int, 
             var micLater = 0, callLater = 0
             for p in pairs where p.micWord < micCandidates.count && p.callWord < callCandidates.count
                 && micCandidates[p.micWord].contains(m.id) && callCandidates[p.callWord].contains(c.id) {
-                let dt = micWords[p.micWord].start - callWords[p.callWord].start
-                if dt > 0 { micLater += 1 } else if dt < 0 { callLater += 1 }
+                if atLeast(callWords[p.callWord].start - micWords[p.micWord].start, Rule.returnLag) { callLater += 1 } else { micLater += 1 }
             }
             if micLater > callLater { micEcho.insert(m.id) }
             else if callLater > micLater { callEcho.insert(c.id); micSource.insert(m.id) }
@@ -766,11 +811,19 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     // The call side's print matches: the user's voice coming back.
     var userVoice = Set(callSp.filter { likeness($0, usable).map { atLeast($0, Rule.printMatch) } == true }.map(\.id))
 
-    // removeEcho's pairs, then one voice heard on both sides, on a call.
+    // removeEcho's pairs over both whole sides (made once, when needed), then one voice heard on both
+    // sides, on a call.
+    var alignment: [(micWord: Int, callWord: Int)]?
+    func aligned() -> [(micWord: Int, callWord: Int)] {
+        if let a = alignment { return a }
+        let a = matchEcho(mic: mic, call: call).pairs
+        alignment = a
+        return a
+    }
     result.isCall = isCall(callWords: call, callSpeakers: callSpeakers?.speakers)
     var voices: (micEcho: Set<String>, callEcho: Set<String>, micUnknown: Set<String>) = ([], [], [])
     if result.isCall && !micSp.isEmpty && !callSp.isEmpty {
-        voices = pairVoices(mic: micSp, call: callSp, pairs: matchEcho(mic: mic, call: call).pairs, micWords: mic, callWords: call,
+        voices = pairVoices(mic: micSp, call: callSp, pairs: aligned(), micWords: mic, callWords: call,
                             micCandidates: micCandidates, callCandidates: callCandidates, print: usable)
     }
     userVoice.formUnion(voices.callEcho)
@@ -779,22 +832,18 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     // on the call side never cancels the user's own words. Then the words of a microphone echo
     // speaker, and the user's call-side words that repeat the microphone words kept.
     // A call word whose candidates are all the user's voice is the user's. One whose candidates mix the
-    // user's voice with a far-side speaker (overlapping segments) is decided by which copy comes later,
-    // as pairVoices decides a speaker: when it repeats a microphone word later, it is the user's voice
-    // coming back; otherwise it stays in echo removal, where a far-side word that leaked into the
-    // microphone (the microphone copy later) is still dropped.
-    let mixed = call.indices.filter {
-        callCandidates[$0].contains(where: userVoice.contains) && !callCandidates[$0].allSatisfy(userVoice.contains)
-    }
+    // user's voice with a far-side speaker (overlapping segments) is the user's voice coming back only
+    // when, in the alignment of both whole sides, its run (or, alone, its nearest same word) lags the
+    // microphone by a real round trip (`Rule.returnLag`). Otherwise it stays in echo removal, where a
+    // far-side word that leaked into the microphone is still dropped.
+    let allUser = Set(call.indices.filter { !callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains) })
+    let mixed = call.indices.filter { !allUser.contains($0) && callCandidates[$0].contains(where: userVoice.contains) }
     var cameBack = Set<Int>()
     if !mixed.isEmpty {
-        for p in matchEcho(mic: mic, call: mixed.map { call[$0] }).pairs where call[mixed[p.callWord]].start > mic[p.micWord].start {
-            cameBack.insert(mixed[p.callWord])
-        }
+        let lags = echoLags(mic: mic, call: call, pairs: aligned())
+        for j in mixed where lags[j].map({ atLeast($0, Rule.returnLag) }) == true { cameBack.insert(j) }
     }
-    let mine = call.indices.filter {
-        cameBack.contains($0) || (!callCandidates[$0].isEmpty && callCandidates[$0].allSatisfy(userVoice.contains))
-    }
+    let mine = call.indices.filter { allUser.contains($0) || cameBack.contains($0) }
     let mineSet = Set(mine)
     let echo = matchEcho(mic: mic, call: call.indices.filter { !mineSet.contains($0) }.map { call[$0] }).echo
     var leaked = 0
@@ -809,8 +858,10 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     if leaked > 0 {
         result.log.append("Left out \(plural(leaked, "microphone word")) that \(leaked == 1 ? "was" : "were") the call heard through the speakers")
     }
-    if !mine.isEmpty {
-        let left = mine.count - repeats.count
+    // Marked Unknown: the user's voice left on the call side, which is only a word whose candidates are all
+    // the user's voice (a mixed word left over is resolved by its sentence, and may be Them).
+    let left = mine.filter { allUser.contains($0) && !repeated.contains($0) }.count
+    if repeats.count + left > 0 {
         result.log.append("Your voice was heard on the call side: \(plural(repeats.count, "word")) repeating yours "
                           + "\(repeats.count == 1 ? "was" : "were") left out, and \(left) \(left == 1 ? "is" : "are") marked Unknown")
     }
