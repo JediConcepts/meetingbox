@@ -116,7 +116,7 @@ New:
 - **The speech helper is the one Swift package.**
   - FluidAudio is about 97,000 lines of Swift with a C++ part, too big to vendor and compile with `swiftc`.
   - The helper, `mb-speech`, is a small package in the repository built by setup with `swift build`. Swift Package Manager has worked on this Mac since 28 October.
-  - Every SwiftPM cache, clone and configuration lives in setup's temporary folder, so nothing lands in the user's shared Swift folders.
+  - Every SwiftPM cache, clone and configuration lives in setup's temporary folder, so nothing lands in the user's shared Swift folders. The one exception is the fetched dependency source (FluidAudio), kept in meetingbox's own build cache, `~/.local/share/meetingbox/swiftpm-cache`, so a rebuild with the same pinned version does not fetch it again. (User decision, 12 November.)
   - If the build fails on any Mac, setup says so and carries on with Apple's transcriber, keeping any working helper it had **(my call)**.
 - **Pinned versions:**
   - FluidAudio exactly v0.18.3 (Apache 2.0), with only the features ASR and offline speaker labelling need (no text-to-speech, no downloaded text normaliser), and its resolved commit checked in;
@@ -431,7 +431,8 @@ New:
 - **A new setup step, "Parakeet and speaker labels (on device)"**, after the recorder step.
   - Survey line: "+ Parakeet", or "- Parakeet (more accurate transcripts and speaker labels, about 630 MB)".
   - **Source:** it fetches the meetingbox source first.
-  - **Build:** `mb-speech` is built from `native/speech` in a temporary folder that holds every SwiftPM cache and clone. Only then does it replace the installed helper at `~/.local/share/meetingbox/mb-speech`, which is claimed and recorded the first time.
+  - **Build:** `mb-speech` is built from `native/speech` in a temporary folder that holds the build, the checkouts, SwiftPM's configuration and a home and temporary folder for the build. Only then does it replace the installed helper at `~/.local/share/meetingbox/mb-speech`, which is claimed and recorded the first time.
+    - **Build cache:** SwiftPM's dependency cache is `~/.local/share/meetingbox/swiftpm-cache`, claimed and recorded the first time, so `reset --tools` and `uninstall` remove it. The pinned versions in `Package.resolved` are forced, so the cache never changes what is built. A folder there that is not meetingbox's is never used: the build then caches in the temporary folder, as before. If a build with the cache fails, the cache is removed and the build is tried once more without it.
   - **Models:** the models folder is claimed and recorded when first created. The models are downloaded only when the folder's check fails or its manifest differs from the source's, into a part folder, verified, then swapped in.
   - **Cache:** the folder Core ML uses for the helper's prepared models is recorded if it did not exist before. It is recorded only if the path the helper reports ends in `/Library/Caches/mb-speech`, so a shared folder is never recorded.
   - **Voice print:** the voice print's path is recorded if the file does not exist yet.
