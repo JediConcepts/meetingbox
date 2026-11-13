@@ -405,7 +405,7 @@ enum Rule {
     static let dominantShare = 0.80    // of the microphone's kept words: the user, on a call
     static let smallShare = 0.05       // under this share of a side, without a count, a voice is not numbered
     static let shortMedian = 2.5       // on the call side, a median segment under this, without a count, is not numbered either
-    static let leakShare = 0.5         // of a paired microphone voice's own words, the copies that make it the far side leaking
+    static let leakShare = 0.5         // of a paired microphone voice's sole-candidate words, the copies that make it the far side leaking
     static let meSeconds = 10.0        // talk a print match needs to be Me
     static let usableSeconds = 60.0    // speech a print needs to be used
     static let callSeconds = 20.0      // call-side speech that makes a meeting a call
@@ -546,7 +546,8 @@ private func likeness(_ speaker: SpeakerInfo, _ print: VoicePrint?) -> Double? {
 /// - micEcho: the far side leaking into the microphone, when the microphone copies mostly come later and
 ///   at least half (`Rule.leakShare`) of the words whose one candidate is the microphone speaker are
 ///   copies: the microphone word of a pair, with any call word of any call speaker, whose microphone copy
-///   counts as the later. Its words are dropped. Short of that share it is a person in the room whose
+///   counts as the later. A speaker with no word whose one candidate it is passes this share test, so the
+///   vote alone decides. Its words are dropped. Short of that share it is a person in the room whose
 ///   voice is like one on the far side: this pairing puts it in no set, so it is named as usual and only
 ///   its words that echo removal matches are dropped.
 /// - callEcho: the user's voice coming back on the call side, treated as a print match there.
@@ -842,13 +843,6 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     if leaked > 0 {
         result.log.append("Left out \(plural(leaked, "microphone word")) that \(leaked == 1 ? "was" : "were") the call heard through the speakers")
     }
-    // Marked Unknown: the user's voice left on the call side, which is only a word whose candidates are all
-    // the user's voice (a mixed word left over is resolved by its sentence, and may be Them).
-    let left = mine.filter { allUser.contains($0) && !repeated.contains($0) }.count
-    if repeats.count + left > 0 {
-        result.log.append("Your voice was heard on the call side: \(plural(repeats.count, "word")) repeating yours "
-                          + "\(repeats.count == 1 ? "was" : "were") left out, and \(left) \(left == 1 ? "is" : "are") marked Unknown")
-    }
 
     // Names.
     let micWords = micKept.map { mic[$0] }, micKeptCandidates = micKept.map { micCandidates[$0] }
@@ -859,18 +853,26 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     let callNames = nameCall(callSp, keptWords: callCounts.counts, firstWord: callCounts.first, userVoice: userVoice,
                              print: usable, counted: callCounted)
     let live = micSp.filter { !voices.micEcho.contains($0.id) }
-    if let p = usable, !live.isEmpty, !micNames.values.contains("Me") {
-        let best = live.map { cosine($0.vector, p.vector) }.max() ?? 0
-        result.log.append(String(format: "Your voice was not recognised on the microphone side (best match %.2f)", best))
-    } else if usable == nil, !result.isCall, !live.isEmpty {
-        result.log.append("Your voice is not learnt yet, so nobody in this room recording is labelled Me")
-    }
 
     // Labels, resolved and smoothed.
     result.mic = micWords
     result.micLabels = smooth(resolve(micWords, micKeptCandidates, names: micNames, fallback: fallbackLabel(micNames, side: .mic)), micWords)
     result.call = callWords
     result.callLabels = smooth(resolve(callWords, callKeptCandidates, names: callNames, fallback: fallbackLabel(callNames, side: .call)), callWords)
+
+    // Marked Unknown: the call-side words labelled Unknown. On the call side only the user's voice is named
+    // Unknown, so these are the user's voice left there, by their own candidates or by their sentence's label.
+    let marked = result.callLabels.filter { $0 == "Unknown" }.count
+    if repeats.count + marked > 0 {
+        result.log.append("Your voice was heard on the call side: \(plural(repeats.count, "word")) repeating yours "
+                          + "\(repeats.count == 1 ? "was" : "were") left out, and \(marked) \(marked == 1 ? "is" : "are") marked Unknown")
+    }
+    if let p = usable, !live.isEmpty, !micNames.values.contains("Me") {
+        let best = live.map { cosine($0.vector, p.vector) }.max() ?? 0
+        result.log.append(String(format: "Your voice was not recognised on the microphone side (best match %.2f)", best))
+    } else if usable == nil, !result.isCall, !live.isEmpty {
+        result.log.append("Your voice is not learnt yet, so nobody in this room recording is labelled Me")
+    }
     result.micSpeakers = live
     result.micKept = micCounts.counts.filter { id, _ in live.contains { $0.id == id } }
     result.callSpeakers = callSp

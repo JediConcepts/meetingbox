@@ -478,6 +478,25 @@ let sourceAndNone = pairVoices(mic: [sp("E", vector: e3)], call: [callC, callC2]
                                micCandidates: micE5, callCandidates: callC5, print: nil)
 check(sourceAndNone.callEcho == ["C"] && sourceAndNone.micUnknown.isEmpty && sourceAndNone.micEcho.isEmpty,
       "pairVoices: the source of the call side's echo is not made Unknown by a pairing with no shared words")
+// The share test's clauses (Gate A, 13 November): a copy is a microphone word whose copy counts as the
+// later, the share is over the words whose sole candidate is the speaker, and a speaker with no such
+// words passes. E and C are one voice (e3); microphone word k is "m<k>" at k s, paired with call word k.
+let shareE = sp("E", vector: e3), shareC = sp("C", vector: e3), shareU = sp("U", vector: e1)
+func shareVote(_ micCandidates: [[String]], callShift: [Double]) -> Set<String> {
+    let micWords = micCandidates.indices.map { w(Double($0), Double($0) + 0.3, "m\($0)") }
+    let callWords = callShift.enumerated().map { k, d in w(Double(k) + d, Double(k) + d + 0.3, "m\(k)") }
+    return pairVoices(mic: [shareU, shareE], call: [shareC], pairs: callShift.indices.map { (micWord: $0, callWord: $0) },
+                      micWords: micWords, callWords: callWords, micCandidates: micCandidates,
+                      callCandidates: Array(repeating: ["C"], count: callShift.count), print: nil).micEcho
+}
+check(shareVote(Array(repeating: ["E"], count: 10), callShift: [-0.3, -0.3, -0.3, -0.3, 0.3, 0.3]).isEmpty,
+      "pairVoices: a shared word whose call copy is later by a round trip is no copy: with a vote of 4 to 2, only 4 of E's 10 "
+      + "words are copies, so E is no leak")
+check(shareVote(Array(repeating: ["E"], count: 10) + Array(repeating: ["U", "E"], count: 4), callShift: Array(repeating: -0.3, count: 5)) == ["E"],
+      "pairVoices: the share is over the words whose sole candidate is E: 5 copies of its 10, not of 14 with the 4 it shares "
+      + "with U, so E is the leak")
+check(shareVote(Array(repeating: ["U", "E"], count: 5), callShift: Array(repeating: -0.3, count: 5)) == ["E"],
+      "pairVoices: a speaker with no word whose sole candidate it is passes the share test, so the vote alone makes E the leak")
 
 // --- words to labels, end to end on synthetic speakers ---
 /// The words of `text`, `step` apart from `from`, each 0.3 s long.
@@ -880,7 +899,8 @@ do {
 }
 
 // Words with no candidate (more than 1.0 s from every segment) take their sentence's label when its
-// single-label words hold one. Each run of them is four words, so smoothing cannot give the label.
+// single-label words hold one. The runs of them after single-label words are four words long, so smoothing
+// cannot give the label; "okay then." is a sentence of its own, which smoothing leaves as it is.
 do {
     let s1Me = said("so we will look at", from: 0), s1Gap = said("the numbers again tomorrow.", from: 3.5)
     let s2Me = said("we can", from: 10), s2Room = said("do that", from: 11.2), s2Gap = said("later on this week.", from: 13.5)
@@ -908,6 +928,21 @@ do {
                        print: nil)
     check(keptCount(far1, in: r.call, r.callLabels, label: "Them 1") == 9 && keptCount(far2 + far2Gap, in: r.call, r.callLabels, label: "Them 2") == 8,
           "labelWords: on the call side, words with no candidate in a sentence held by Them 2 are Them 2 (\(r.callLabels))")
+}
+// The log's "marked Unknown" count is the call-side words labelled Unknown: here the user's voice (P, a
+// print match) says 4 words, and the 4 with no candidate in the same sentence take its label too.
+do {
+    let r = labelWords(mic: said("hello everyone thanks for joining.", from: 0),
+                       call: said("can you hear me", from: 10) + said("now okay then fine.", from: 13)
+                           + said("we should look at the numbers again before friday.", from: 20),
+                       micSpeakers: side([Segment(speaker: "U", start: 0, end: 2.5)], [sp("U", seconds: 45, vector: at(0.9))]),
+                       callSpeakers: side([Segment(speaker: "P", start: 9.8, end: 11.5), Segment(speaker: "T", start: 19.8, end: 23.6)],
+                                          [sp("P", seconds: 10, vector: at(0.9)), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    check(r.callLabels.filter { $0 == "Unknown" }.count == 8
+          && r.log.contains("Your voice was heard on the call side: 0 words repeating yours were left out, and 8 are marked Unknown"),
+          "labelWords: the log's 'marked Unknown' count is every call-side word labelled Unknown, those its sentence gave the "
+          + "user's voice included (\(r.callLabels) \(r.log))")
 }
 
 // A usable print that matches nobody on the microphone side.
