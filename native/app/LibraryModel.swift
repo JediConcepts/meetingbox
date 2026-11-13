@@ -97,6 +97,8 @@ final class LibraryModel: ObservableObject {
     /// from the picker. Read only: choosing one changes no file. Back to Current when another meeting is
     /// selected and when `show` is asked for one; a rescan keeps it.
     @Published private(set) var version: URL?
+    /// The listed entry `version` was chosen from, so the picker can still name it once it has gone.
+    private var chosen: TranscriptVersion?
     /// Why the last action did nothing (Play audio without QuickTime Player), until the next action or
     /// another meeting is chosen.
     @Published private(set) var problem: String?
@@ -224,9 +226,10 @@ final class LibraryModel: ObservableObject {
         reader.async { [weak self] in
             let dir = folder.url
             func read(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+            // A chosen version is read only while it is a plain file, never through a link.
+            let transcript = version.map { LibraryModel.isPlain($0, S_IFREG) ? read($0) : nil } ?? read(dir.appendingPathComponent("transcript.txt"))
             let loaded = Content(key: key, minutes: read(dir.appendingPathComponent("notes.md")).map(LibraryPresentation.minutes),
-                                 transcript: read(version ?? dir.appendingPathComponent("transcript.txt")), files: MeetingFiles.read(folder),
-                                 versions: LibraryModel.versions(in: dir))
+                                 transcript: transcript, files: MeetingFiles.read(folder), versions: LibraryModel.versions(in: dir))
             Task { @MainActor in self?.loaded(loaded, token, version) }
         }
     }
@@ -238,25 +241,38 @@ final class LibraryModel: ObservableObject {
     }
 
     /// The transcripts a meeting's folder holds: its own `transcript*.txt` files, and the `transcript.txt`
-    /// in each folder in its `earlier/`. Call it off the main queue.
+    /// in each folder in its `earlier/`. No link is followed, as the engine follows none there: `earlier`
+    /// and each folder in it must be real folders, and every transcript a plain file. Call it off the main
+    /// queue.
     nonisolated private static func versions(in dir: URL) -> [TranscriptVersion] {
         let fm = FileManager.default
-        let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isRegularFileKey])) ?? [])
-            .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
-            .map(\.lastPathComponent)
+        let files = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter {
+            isPlain(dir.appendingPathComponent($0), S_IFREG)
+        }
         let earlier = dir.appendingPathComponent("earlier", isDirectory: true)
-        let kept = ((try? fm.contentsOfDirectory(atPath: earlier.path)) ?? []).filter {
-            !$0.hasPrefix(".") && fm.fileExists(atPath: earlier.appendingPathComponent($0).appendingPathComponent("transcript.txt").path)
+        let listed = isPlain(earlier, S_IFDIR) ? (try? fm.contentsOfDirectory(atPath: earlier.path)) ?? [] : []
+        let kept = listed.filter {
+            let folder = earlier.appendingPathComponent($0, isDirectory: true)
+            return !$0.hasPrefix(".") && isPlain(folder, S_IFDIR) && isPlain(folder.appendingPathComponent("transcript.txt"), S_IFREG)
         }
         return LibraryPresentation.transcriptVersions(in: dir, files: files, earlier: kept)
+    }
+
+    /// The path is a file of this type (`S_IFREG`, `S_IFDIR`) itself, not a link to one.
+    nonisolated private static func isPlain(_ url: URL, _ type: mode_t) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0 && (st.st_mode & S_IFMT) == type
     }
 
     /// What the transcript picker offers: the selected meeting's versions when there is more than Current,
     /// or while another is chosen (even one deleted since, which reads as no transcript), so there is
     /// always a way back to Current. Empty when there is nothing to choose.
+    /// A chosen version no longer listed (deleted in Finder) stays in the list, titled as it was, so the
+    /// picker never shows a blank choice; it reads as no transcript.
     var versionChoices: [TranscriptVersion] {
         guard let versions = shownContent?.versions, versions.count > 1 || version != nil else { return [] }
-        return versions
+        guard let gone = chosen, gone.url == version, !versions.contains(where: { $0.url == gone.url }) else { return versions }
+        return versions + [gone]
     }
 
     /// Shows another of the selected meeting's transcripts, one the picker lists, read only: nothing is
@@ -267,6 +283,7 @@ final class LibraryModel: ObservableObject {
         if let url = url {
             guard let index = versions.firstIndex(where: { $0.url == url }) else { return }
             next = index == 0 ? nil : url
+            chosen = index == 0 ? nil : versions[index]
         } else {
             next = nil
         }

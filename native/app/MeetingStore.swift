@@ -35,13 +35,27 @@ struct MeetingRecord {
 
     /// A redo's kind and choices, written before it runs and cleared on every final outcome: `job`
     /// (absent for a process), and for Transcribe again `jobTranscriber` and `jobTidy`.
-    var job: JobKind?
-    var jobTranscriber: Transcriber?
-    var jobTidy: Bool?
+    var job: JobKind? { didSet { setFields.insert(.job) } }
+    var jobTranscriber: Transcriber? { didSet { setFields.insert(.jobTranscriber) } }
+    var jobTidy: Bool? { didSet { setFields.insert(.jobTidy) } }
     /// Kept settings, never cleared by the queue: the writer last chosen and agreed in a sheet for this
     /// meeting, and the counts last chosen in Transcribe again.
-    var writer: MeetingWriter?
+    var writer: MeetingWriter? { didSet { setFields.insert(.writer) } }
     var people = People()
+
+    /// The redo fields set since this record was read: `apply` writes only these, and a count only when it
+    /// differs from the one read. So a value this version cannot read (a later version's writer or job, a
+    /// count out of range), or a key it does not know inside one, stays as it is until the field is set.
+    private enum Field { case job, jobTranscriber, jobTidy, writer }
+    private var setFields: Set<Field> = []
+    /// The counts as they were read.
+    private var readPeople = People()
+    /// A `job` was there that this version cannot read.
+    private var unreadableJob = false
+
+    /// The record names a job this version does not know (a later version's kind, a mistyped word, not a
+    /// word at all). It must never run, as a process or as anything else. Setting `job` ends it.
+    var jobUnknown: Bool { unreadableJob && !setFields.contains(.job) }
 
     init(id: String = UUID().uuidString, title: String? = nil, started: Date = Date(), seconds: Int = 0,
          state: MeetingState) {
@@ -78,13 +92,16 @@ struct MeetingRecord {
         self.attempts = (json["attempts"] as? NSNumber)?.intValue
         self.attempt = json["attempt"] as? String
         self.stopReason = json["stopReason"] as? String
-        // A redo's own: only values in their words are taken; anything else reads as absent.
+        // A redo's own: only values in their words are taken; anything else reads as absent, and is kept
+        // as it is in the file (see `apply`).
         self.job = (json["job"] as? String).flatMap(JobKind.init(rawValue:))
+        self.unreadableJob = json["job"] != nil && !(json["job"] is NSNull) && job == nil
         self.jobTranscriber = (json["jobTranscriber"] as? String).flatMap(Transcriber.init(rawValue:))
         self.jobTidy = MeetingRecord.flag(json["jobTidy"])
         self.writer = MeetingRecord.writer(json["writer"])
         let people = json["people"] as? [String: Any]
         self.people = People(room: MeetingRecord.count(people?["room"]), call: MeetingRecord.count(people?["call"]))
+        self.readPeople = self.people
     }
 
     /// true or false, as JSON writes them; nil for anything else (a number or a string included).
@@ -109,8 +126,9 @@ struct MeetingRecord {
         return .outside(OutsideWriter(kind: kind, address: address, model: model))
     }
 
-    /// Writes every known field into `json`, removing keys whose value is nil. Other keys are untouched,
-    /// and so are keys inside `people` other than `room` and `call`.
+    /// Writes every known field into `json`, removing keys whose value is nil; a redo's fields only when
+    /// they were set (`setFields`), and a count only when it changed. Other keys are untouched, and so are
+    /// keys inside `people` other than `room` and `call`.
     func apply(to json: inout [String: Any]) {
         let iso = ISO8601DateFormatter()
         func put(_ key: String, _ value: Any?) {
@@ -128,19 +146,24 @@ struct MeetingRecord {
         put("attempts", attempts)
         put("attempt", attempt)
         put("stopReason", stopReason)
-        put("job", job == .process ? nil : job?.rawValue)
-        put("jobTranscriber", jobTranscriber?.rawValue)
-        put("jobTidy", jobTidy)
-        switch writer {
-        case .apple?: json["writer"] = "apple"
-        case .outside(let w)?: json["writer"] = ["kind": w.kind.rawValue, "address": w.address, "model": w.model]
-        case nil: json.removeValue(forKey: "writer")
+        if setFields.contains(.job) { put("job", job == .process ? nil : job?.rawValue) }
+        if setFields.contains(.jobTranscriber) { put("jobTranscriber", jobTranscriber?.rawValue) }
+        if setFields.contains(.jobTidy) { put("jobTidy", jobTidy) }
+        if setFields.contains(.writer) {
+            switch writer {
+            case .apple?: json["writer"] = "apple"
+            case .outside(let w)?: json["writer"] = ["kind": w.kind.rawValue, "address": w.address, "model": w.model]
+            case nil: json.removeValue(forKey: "writer")
+            }
         }
-        var counts = json["people"] as? [String: Any] ?? [:]
-        for (key, value) in [("room", people.room), ("call", people.call)] {
-            if let value = value { counts[key] = value } else { counts.removeValue(forKey: key) }
+        let changed = [("room", people.room, readPeople.room), ("call", people.call, readPeople.call)].filter { $0.1 != $0.2 }
+        if !changed.isEmpty {
+            var counts = json["people"] as? [String: Any] ?? [:] // people that was not an object is replaced
+            for (key, value, _) in changed {
+                if let value = value { counts[key] = value } else { counts.removeValue(forKey: key) }
+            }
+            put("people", counts.isEmpty ? nil : counts)
         }
-        put("people", counts.isEmpty ? nil : counts)
     }
 }
 

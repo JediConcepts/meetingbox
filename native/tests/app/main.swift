@@ -1721,8 +1721,8 @@ final class QRig {
     let runner = FakeRunner()
     var queue: ProcessingQueue!
     var finished: [(String, Bool)] = []
-    /// The kind of each job `finished` reports, in the same order.
-    var kinds: [JobKind] = []
+    /// The kind of each job `finished` reports, in the same order (nil: a kind this version cannot read).
+    var kinds: [JobKind?] = []
     var changes = 0
 
     init() {
@@ -6355,7 +6355,8 @@ MainActor.assumeIsolated {
     check(settle { model.meetings.count == 2 }, "T8 versions: the meetings are read")
     model.select(keyA)
     check(changed == 1, "T8 selection: select calls onSelectionChange when the selection changes")
-    check(settle { model.shownContent?.versions.count == 5 }, "T8 versions: the versions are listed off the main queue")
+    check(model.shownContent == nil, "R1 versions: nothing of the meeting is read before select returns")
+    check(settle { model.shownContent?.versions.count == 5 }, "T8 versions: the versions arrive with the meeting's text")
     let versions = model.shownContent?.versions ?? []
     check(versions.map(\.title) == ["Current", "Parakeet (MLX)", "Original", "Earlier, 12 Nov 2026 14:05 (2)", "Earlier, 12 Nov 2026 14:05"]
           && model.version == nil && model.shownContent?.transcript == "[00:00:01] Me: the current words",
@@ -6391,7 +6392,9 @@ MainActor.assumeIsolated {
     // A read already under way may list the folder after the file went: wait for the read that follows.
     check(settle { model.shownContent?.versions.count == 4 && model.shownContent?.transcript == nil } && model.version == zebra,
           "T8 versions: a version deleted in Finder shows No transcript yet (nil), without a crash (\(model.shownContent?.versions.map(\.title) ?? []), \(model.shownContent?.transcript ?? "nil"), \(model.version?.path ?? "nil"))")
-    check(model.versionChoices.count == 4, "T8 versions: the picker stays while a deleted version is chosen, so Current can be chosen again")
+    check(model.versionChoices.count == 5 && model.versionChoices.last?.url == zebra
+          && model.versionChoices.last?.title == "Earlier, 12 Nov 2026 14:05 (2)" && Array(model.versionChoices.prefix(4)) == model.shownContent?.versions,
+          "R1 versions: the picker keeps the deleted choice, titled as it was, so it never shows a blank choice and Current can be chosen again (\(model.versionChoices.map(\.title)))")
     model.select(keyB)
     check(changed == 2 && model.version == nil, "T8 versions: selecting another meeting goes back to Current")
     check(settle { model.shownContent?.key == keyB } && model.versionChoices.isEmpty, "T8 versions: a meeting with only Current offers no picker")
@@ -6556,6 +6559,296 @@ MainActor.assumeIsolated {
           && MeetingStore.record(in: dir)?.error == nil, "T8 app: the next success clears the error line, and Minutes ready replaces the amber line")
     model.shutDown()
     try? fm.removeItem(at: state)
+}
+
+// MARK: - Redo in the window, round 1
+
+/// A JSON value as bytes, keys sorted, to compare values byte for byte.
+func jsonBytes(_ value: Any?) -> Data? {
+    value.flatMap { try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys, .fragmentsAllowed]) }
+}
+let unknownJobReason = "The redo did not finish: this version of meetingbox does not know that kind of job. Nothing was changed."
+
+// A value of a key meetingbox knows but cannot read is kept, byte for byte, until that field is set (ADV-4, F3, T8Q-6).
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    let dir = make(root, "2026-11-13_0900")
+    let base: [String: Any] = ["id": "x", "started": "2026-11-13T09:00:00Z", "state": "done"]
+    var odd = base
+    odd["writer"] = ["kind": "gemini", "address": "https://g.example", "model": "g1"]
+    odd["people"] = ["room": 9, "call": 2]
+    odd["job"] = "speakers"
+    odd["jobTranscriber"] = "whisper"
+    odd["jobTidy"] = "yes"
+    writeRecord(dir, odd)
+    try! store.update(dir) { $0.title = "Renamed" }
+    let after = recordJSON(dir)
+    let kept = ["writer", "people", "job", "jobTranscriber", "jobTidy"].filter { after[$0] != nil && jsonBytes(after[$0]) == jsonBytes(odd[$0]) }
+    check(kept.count == 5 && after["title"] as? String == "Renamed",
+          "R1 record: a rename keeps a writer of kind gemini, people {room: 9, call: 2}, an unknown job, transcriber and tidying, byte for byte (kept \(kept))")
+    var extra = base
+    let writer: [String: Any] = ["kind": "standard", "address": t8Local.address, "model": "llama", "agreedAt": "2026-11-01"]
+    extra["writer"] = writer
+    extra["people"] = [2, 3]
+    writeRecord(dir, extra)
+    check(MeetingStore.record(in: dir)?.writer == .outside(t8Local), "R1 record: a writer with a key it does not know is still read")
+    try! store.update(dir) { $0.state = .queued; $0.stage = "transcribing" }
+    let queued = recordJSON(dir)
+    check(jsonBytes(queued["writer"]) == jsonBytes(writer) && jsonBytes(queued["people"]) == jsonBytes([2, 3]),
+          "R1 record: the queue's own writes keep that key, and people that is not an object (\(queued))")
+    try! store.update(dir) {
+        $0.writer = .apple
+        $0.people.room = 3
+    }
+    let set = recordJSON(dir)
+    check(set["writer"] as? String == "apple" && jsonBytes(set["people"]) == jsonBytes(["room": 3]),
+          "R1 record: a field that is set is written: the writer, and the counts (replacing people that was not an object) (\(set))")
+    writeRecord(dir, odd)
+    try! store.update(dir) {
+        $0.job = nil
+        $0.jobTranscriber = nil
+        $0.jobTidy = nil
+        $0.people.call = nil
+    }
+    let cleared = recordJSON(dir)
+    check(cleared["job"] == nil && cleared["jobTranscriber"] == nil && cleared["jobTidy"] == nil
+          && jsonBytes(cleared["people"]) == jsonBytes(["room": 9]) && jsonBytes(cleared["writer"]) == jsonBytes(odd["writer"]),
+          "R1 record: clearing a field removes what it held, even unreadable; a count set keeps the other, unreadable one (\(cleared))")
+    writeRecord(dir, base)
+    try! store.update(dir) { $0.title = "Plain" }
+    let plain = recordJSON(dir)
+    check(plain["writer"] == nil && plain["people"] == nil && plain["job"] == nil, "R1 record: and a record without them gains no key")
+}
+
+// A job word this version does not know never runs, as a process or as anything else: it ends as a redo that
+// could not run, Done with its minutes, else Failed, and the job is cleared (ADV-1).
+for (label, word) in [("Minutes", "Minutes" as Any), ("minutes with a trailing space", "minutes "), ("1", 1), ("[minutes]", ["minutes"]),
+                      ("speakers", "speakers")] {
+    let r = QRig()
+    let dir = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    var queued = recordJSON(dir)
+    queued["state"] = "queued"
+    queued["job"] = word
+    writeRecord(dir, queued)
+    let q = r.make()
+    q.resume()
+    check(r.runner.calls.isEmpty && r.state(dir) == "done" && r.error(dir) == unknownJobReason && r.json(dir)["job"] == nil
+          && r.json(dir)["writer"] as? String == "apple" && r.finished.last.map { $0 == (dir.lastPathComponent, false) } == true
+          && r.kinds.count == 1 && r.kinds.last! == nil && q.current == nil,
+          "R1 job: queued with job \(label): nothing runs; Done with the reason, the job cleared, the writer kept (\(r.runner.calls.map(\.arguments)), \(r.error(dir) ?? "-"))")
+    let s = QRig()
+    let held = t8Done(s, "2026-11-13_0900") { $0.writer = .apple }
+    var processing = recordJSON(held)
+    processing["state"] = "processing"
+    processing["attempts"] = 1
+    processing["attempt"] = "att-1"
+    processing["job"] = word
+    writeRecord(held, processing)
+    // as if a run had worked: both files fresh, so a process's rule would call it done
+    try! "new transcript\n".write(to: held.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
+    try! "new minutes\n".write(to: held.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    s.result(held, attempt: "att-1", status: 0, started: Date().addingTimeInterval(-30))
+    s.lock(held, owner: "\(deadPid) Thu Jan  1 00:00:00 2026")
+    s.make().resume()
+    check(s.runner.calls.isEmpty && s.state(held) == "done" && s.error(held) == unknownJobReason && s.json(held)["job"] == nil,
+          "R1 job: settled with job \(label): nothing runs again; Done with the reason, the job cleared (\(s.runner.calls.map(\.arguments)))")
+}
+do {
+    let r = QRig()
+    let dir = t8Done(r, "2026-11-13_0900", notes: false)
+    var queued = recordJSON(dir)
+    queued["state"] = "queued"
+    queued["job"] = "speakers"
+    writeRecord(dir, queued)
+    r.make().resume()
+    check(r.runner.calls.isEmpty && r.state(dir) == "failed" && r.error(dir) == unknownJobReason, "R1 job: without minutes it is Failed")
+    check(ProcessingQueue.unknownJob == "this version of meetingbox does not know that kind of job", "R1 job: the reason, in these words")
+}
+
+// One outcome rule for a run that ended and one settled after a relaunch (T8Q-5, F1, T8Q-3).
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900")
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    r.runner.finish(0, 0, writeOutputs: false)
+    check(r.runner.calls.count == 1 && r.state(a) == "done" && r.error(a) == "The redo did not finish: meetingbox finished but wrote nothing new. Nothing was changed.",
+          "R1 outcome: a redo that exits 0 with nothing fresh is not run again, and says so (\(r.error(a) ?? "-"))")
+    var dir = URL(fileURLWithPath: "/")
+    let stale = resumedRedo(.minutes, attempts: 1) { r, d in
+        dir = d
+        r.result(d, attempt: "attempt-x", status: 0, started: Date().addingTimeInterval(-30))
+    }
+    check(stale.runner.calls.isEmpty && stale.state(dir) == "done"
+          && stale.error(dir) == "The redo did not finish: meetingbox finished but wrote nothing new. Nothing was changed." && stale.json(dir)["job"] == nil,
+          "R1 outcome: the same when it is settled after a relaunch: not run again, the same words (\(stale.error(dir) ?? "-"))")
+    let minutes = resumedRedo(.minutes, attempts: 1) { r, d in
+        dir = d
+        try! "new minutes\n".write(to: d.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        r.result(d, attempt: "attempt-x", status: 0, started: Date().addingTimeInterval(-30))
+    }
+    check(minutes.runner.calls.isEmpty && minutes.state(dir) == "done" && minutes.error(dir) == nil && minutes.json(dir)["job"] == nil
+          && minutes.finished.last.map { $0.1 } == true, "R1 outcome (F1): a Redo minutes settled with only notes.md fresh is Done, not run again, the job cleared")
+    let p = r.meeting("2026-11-13_1000", files: ["audio.m4a": "a", "notes.md": "older minutes"], queued)
+    age(p)
+    q.enqueue(p)
+    r.runner.finish(1, 1, "the transcript could not be made", writeOutputs: false)
+    check(r.state(p) == "failed" && r.error(p) == "the transcript could not be made",
+          "R1 outcome (T8Q-3): a process that fails stays Failed though an older notes.md is there")
+}
+
+// A meeting moved in Finder while its redo runs, waits or is queued is found by its id and finished there,
+// without a relaunch, as its kind, running nothing twice (ADV-3, Review Focus 8).
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    let movedA = r.store.root.appendingPathComponent("2026-11-13 0900 Weekly", isDirectory: true)
+    _ = Darwin.rename(a.path, movedA.path)
+    try! "new minutes\n".write(to: movedA.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    r.runner.calls.first?.done(0, "")
+    check(r.runner.calls.count == 1 && r.state(movedA) == "done" && r.error(movedA) == nil && r.json(movedA)["job"] == nil
+          && r.finished.last.map { $0 == (movedA.lastPathComponent, true) } == true && r.kinds.last! == .minutes && q.current == nil,
+          "R1 moved: a redo that worked while its folder was moved ends Done at its new path, nothing run again (\(r.finished))")
+    let b = t8Done(r, "2026-11-13_1000") { $0.writer = .apple }
+    _ = q.redo(b, kind: .transcribe, options: JobOptions(transcriber: .apple, tidy: false, writer: .apple))
+    let movedB = r.store.root.appendingPathComponent("2026-11-13 1000 Standup", isDirectory: true)
+    _ = Darwin.rename(b.path, movedB.path)
+    if r.runner.calls.count == 2 { r.runner.calls[1].done(1, "the meeting folder was moved, nothing was changed") }
+    check(r.runner.calls.count == 2 && r.state(movedB) == "done" && r.json(movedB)["job"] == nil
+          && r.error(movedB) == "The redo did not finish: the meeting folder was moved, nothing was changed. Nothing was changed."
+          && r.finished.last.map { $0 == (movedB.lastPathComponent, false) } == true && r.kinds.last! == .transcribe && q.current == nil,
+          "R1 moved: one the engine refused because its folder moved ends Done with the reason at its new path (\(r.error(movedB) ?? "-"))")
+    // queued behind another job, then moved
+    let busy = r.meeting("2026-11-13_0800", files: ["audio.m4a": "a"], queued)
+    q.enqueue(busy)
+    let c = t8Done(r, "2026-11-13_1100") { $0.writer = .apple }
+    _ = q.redo(c, kind: .minutes, options: JobOptions(writer: .apple))
+    let movedC = r.store.root.appendingPathComponent("2026-11-13 1100 Review", isDirectory: true)
+    _ = Darwin.rename(c.path, movedC.path)
+    r.runner.finish(2, 0)
+    let run = r.runner.calls.last
+    check(r.runner.calls.count == 4 && run?.job.kind == .minutes && argsAre(run?.arguments, "notes", movedC, ["--writer", "apple"]),
+          "R1 moved: a redo queued when its folder was moved still runs, as its kind, at its new path (\(run?.arguments ?? []))")
+    r.runner.finishNotes(3, 0)
+    check(r.state(movedC) == "done" && r.error(movedC) == nil && q.current == nil, "R1 moved: and ends Done there")
+    // waiting on another meetingbox, then moved with its lock
+    let d = t8Done(r, "2026-11-13_1200") { $0.writer = .apple }
+    _ = q.redo(d, kind: .minutes, options: JobOptions(writer: .apple))
+    r.lock(d, owner: "\(me) \(lstartOf(me))")
+    r.runner.finish(4, 75, "this meeting is already being processed")
+    let movedD = r.store.root.appendingPathComponent("2026-11-13 1200 Later", isDirectory: true)
+    _ = Darwin.rename(d.path, movedD.path)
+    q.tick()
+    check(r.runner.calls.count == 5 && q.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(movedD),
+          "R1 moved: a redo waiting on another meetingbox follows its folder, and goes on waiting while the lock there is held")
+    r.unlock(movedD)
+    q.tick()
+    let again = r.runner.calls.last
+    check(r.runner.calls.count == 6 && again?.job.kind == .minutes && argsAre(again?.arguments, "notes", movedD, ["--writer", "apple"]),
+          "R1 moved: once that lock goes it runs there as its kind (\(again?.arguments ?? []))")
+    r.runner.finishNotes(5, 0)
+    check(r.state(movedD) == "done" && q.current == nil, "R1 moved: and ends Done")
+}
+
+// Earlier versions: the engine's -N (2 or more, no leading zero) is told apart; any other name is shown as it
+// is, control characters as spaces (ADV-5).
+do {
+    let dir = URL(fileURLWithPath: "/Meetings/2026-11-13_0900", isDirectory: true)
+    let titles = LibraryPresentation.transcriptVersions(in: dir, files: ["transcript-a\nb.txt"],
+                                                        earlier: ["2026-11-12 1405", "2026-11-12 1405-1", "2026-11-12 1405-0",
+                                                                  "2026-11-12 1405-01", "2026-11-12 1405-2", "x\ny", "2026-11-12 1405\n"]).map(\.title)
+    check(titles == ["Current", "transcript-a b.txt", "Earlier, 12 Nov 2026 14:05 (2)", "Earlier, 12 Nov 2026 14:05", "Earlier, 2026-11-12 1405 ",
+                     "Earlier, 2026-11-12 1405-0",
+                     "Earlier, 2026-11-12 1405-01", "Earlier, 2026-11-12 1405-1", "Earlier, x y"],
+          "R1 versions: only the engine's -N is told apart; other names are shown as they are, control characters as spaces (\(titles))")
+}
+
+// The versions listing follows no link: a linked earlier/, earlier/<x> or transcript.txt is neither listed nor read
+// (ADV-2, T8Q-7).
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let model = LibraryModel(store: r.store, session: session, queue: ProcessingQueue(store: r.store, runner: FakeRunner(), tickQueue: nil))
+    let outside = freshRoot()
+    func put(_ path: String, _ text: String) {
+        let u = outside.appendingPathComponent(path)
+        try! fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try! text.write(to: u, atomically: true, encoding: .utf8)
+    }
+    put("secret.txt", "OUTSIDE SECRET")
+    put("earlier-elsewhere/2026-01-01 0900/transcript.txt", "OUTSIDE EARLIER")
+    put("one/transcript.txt", "OUTSIDE ONE")
+    let root = r.store.root
+    let a = make(root, "2026-11-13_0900", files: ["transcript.txt": "a words", "notes.md": "m"])
+    try! fm.createSymbolicLink(at: a.appendingPathComponent("earlier"), withDestinationURL: outside.appendingPathComponent("earlier-elsewhere"))
+    let b = make(root, "2026-11-13_1000", files: ["transcript.txt": "b words", "notes.md": "m"])
+    try! fm.createDirectory(at: b.appendingPathComponent("earlier"), withIntermediateDirectories: true)
+    try! fm.createSymbolicLink(at: b.appendingPathComponent("earlier/2026-11-12 1406"), withDestinationURL: outside.appendingPathComponent("one"))
+    let c = make(root, "2026-11-13_1100", files: ["transcript.txt": "c words", "notes.md": "m"])
+    let linkedIn = c.appendingPathComponent("earlier/2026-11-12 1405", isDirectory: true)
+    try! fm.createDirectory(at: linkedIn, withIntermediateDirectories: true)
+    try! fm.createSymbolicLink(at: linkedIn.appendingPathComponent("transcript.txt"), withDestinationURL: outside.appendingPathComponent("secret.txt"))
+    let real = c.appendingPathComponent("earlier/2026-11-12 1300", isDirectory: true)
+    try! fm.createDirectory(at: real, withIntermediateDirectories: true)
+    try! "c kept words".write(to: real.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
+    model.reload()
+    check(settle { model.meetings.count == 3 }, "R1 links: the meetings are read")
+    let cases: [(URL, String, [String], URL)] = [
+        (a, "a linked earlier/", ["Current"], a.appendingPathComponent("earlier/2026-01-01 0900/transcript.txt")),
+        (b, "a linked earlier/<x>", ["Current"], b.appendingPathComponent("earlier/2026-11-12 1406/transcript.txt")),
+        (c, "a linked transcript.txt", ["Current", "Earlier, 12 Nov 2026 13:00"], linkedIn.appendingPathComponent("transcript.txt")),
+    ]
+    for (dir, label, titles, planted) in cases {
+        let key = LibraryPresentation.key(dir)
+        model.select(key)
+        check(settle { model.shownContent?.key == key } && model.shownContent?.versions.map(\.title) == titles,
+              "R1 links: \(label) is not listed (\(model.shownContent?.versions.map(\.title) ?? []))")
+        // the entry for it as the listing spells it, if it were listed
+        model.chooseVersion(model.shownContent?.versions.first { LibraryPresentation.key($0.url) == LibraryPresentation.key(planted) }?.url ?? planted)
+        _ = settle({ false }, timeout: 0.2)
+        check(model.version == nil && !(model.shownContent?.transcript ?? "").contains("OUTSIDE"), "R1 links: \(label) cannot be chosen or read")
+    }
+    model.chooseVersion(model.shownContent?.versions.last?.url)
+    check(settle { model.shownContent?.transcript == "c kept words" }, "R1 links: a real earlier version beside them still shows")
+    try! fm.removeItem(at: real.appendingPathComponent("transcript.txt"))
+    try! fm.createSymbolicLink(at: real.appendingPathComponent("transcript.txt"), withDestinationURL: outside.appendingPathComponent("secret.txt"))
+    model.reload()
+    check(settle { model.shownContent?.versions.count == 1 } && model.version != nil && !(model.shownContent?.transcript ?? "").contains("OUTSIDE"),
+          "R1 links: a chosen version replaced by a link afterwards is not read through it (\(model.shownContent?.transcript ?? "nil"))")
+}
+
+// commitRedo: Cancel while the check is under way queues nothing (T8Q-1); a lock ps cannot tell about is busy
+// (T8Q-2, F2).
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let runner = FakeRunner()
+    let queue = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil)
+    let model = LibraryModel(store: r.store, session: session, queue: queue)
+    let root = r.store.root
+    let a = make(root, "2026-11-13_0900", files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello", "notes.md": "minutes"])
+    try! r.store.update(a) { $0.state = .done }
+    model.reload()
+    check(settle { model.meetings.count == 1 }, "R1 commit: the meeting is read")
+    model.select(LibraryPresentation.key(a))
+    check(settle { model.shownContent?.files.transcript == true }, "R1 commit: and its folder")
+    model.perform(.redoMinutes)
+    let bytes = r.raw(a)
+    model.commitRedo()
+    model.cancelRedo()
+    _ = settle({ false }, timeout: 0.5)
+    check(runner.calls.isEmpty && r.raw(a) == bytes && model.redoing == nil && model.problem == nil,
+          "R1 commit: Cancel before the check comes back queues nothing and leaves meeting.json byte-identical")
+    model.perform(.redoMinutes)
+    chmod(a.path, 0o600) // its lock cannot be looked at: ProcessingLock.owner says unknown
+    model.commitRedo()
+    check(settle { model.redoing == nil }, "R1 commit: the check comes back")
+    chmod(a.path, 0o700)
+    check(model.problem == "That meeting is busy" && runner.calls.isEmpty && r.stateOf(a) == "done",
+          "R1 commit: a lock ps cannot tell about is busy: That meeting is busy, nothing queued")
 }
 
 try? fm.removeItem(at: scratch)

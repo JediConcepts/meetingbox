@@ -325,7 +325,8 @@ enum LibraryPresentation {
     /// `transcript-original.txt` as "Original"; then every other `transcript*.txt` by file name; then
     /// "Earlier, <date> <time>" for each earlier version, newest first, a second one kept in the same
     /// minute (`-2`, `-3`) told apart as "(2)", "(3)" and listed before the first. A folder in `earlier/`
-    /// not named by meetingbox is listed last, by its name.
+    /// not named as meetingbox names them is listed last, as "Earlier, <its name>". Control characters
+    /// in a name (a newline, say) are shown as spaces.
     static func transcriptVersions(in folder: URL, files: [String], earlier: [String]) -> [TranscriptVersion] {
         var list = [TranscriptVersion(title: currentVersion, url: folder.appendingPathComponent("transcript.txt"))]
         let others = Set(files.filter { $0.hasPrefix("transcript") && $0.hasSuffix(".txt") && $0 != "transcript.txt" })
@@ -333,13 +334,13 @@ enum LibraryPresentation {
             list.append(TranscriptVersion(title: title, url: folder.appendingPathComponent(name)))
         }
         for name in others.subtracting(namedVersions.map(\.0)).sorted() {
-            list.append(TranscriptVersion(title: name, url: folder.appendingPathComponent(name)))
+            list.append(TranscriptVersion(title: shown(name), url: folder.appendingPathComponent(name)))
         }
         let kept = earlier.map { (name: $0, stamp: EarlierStamp($0)) }
         let dated = kept.compactMap { k in k.stamp.map { (name: k.name, stamp: $0) } }
             .sorted { $0.stamp.minute != $1.stamp.minute ? $0.stamp.minute > $1.stamp.minute : $0.stamp.copy > $1.stamp.copy }
         let titled = dated.map { ($0.name, "Earlier, \($0.stamp.text)" + ($0.stamp.copy > 1 ? " (\($0.stamp.copy))" : "")) }
-            + kept.filter { $0.stamp == nil }.map(\.name).sorted().map { ($0, "Earlier, \($0)") }
+            + kept.filter { $0.stamp == nil }.map(\.name).sorted().map { ($0, "Earlier, \(shown($0))") }
         for (name, title) in titled {
             let url = folder.appendingPathComponent("earlier", isDirectory: true).appendingPathComponent(name, isDirectory: true)
                 .appendingPathComponent("transcript.txt")
@@ -348,15 +349,21 @@ enum LibraryPresentation {
         return list
     }
 
-    /// An `earlier/` folder's name as the engine makes it, `YYYY-MM-DD HHMM` with `-N` for a later copy
-    /// kept in the same minute: the minute (which sorts as text), which copy, and the words for it. The
-    /// stamp is local time and is only reworded, never converted.
+    /// A name as one line of the picker: each control character (a newline, a tab) a space.
+    private static func shown(_ name: String) -> String {
+        String(String.UnicodeScalarView(name.unicodeScalars.map { CharacterSet.controlCharacters.contains($0) ? " " : $0 }))
+    }
+
+    /// An `earlier/` folder's name as the engine makes it, `YYYY-MM-DD HHMM`, with `-N` (2 or more, no
+    /// leading zero) for a later copy kept in the same minute: the minute (which sorts as text), which
+    /// copy, and the words for it. Any other name is not the engine's. The stamp is local time and is only
+    /// reworded, never converted.
     private struct EarlierStamp: Equatable {
         let minute: String
         let copy: Int
         let text: String
 
-        private static let pattern = try! NSRegularExpression(pattern: "^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4})(?:-([0-9]{1,4}))?$")
+        private static let pattern = try! NSRegularExpression(pattern: "^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4})(?:-([2-9]|[1-9][0-9]{1,3}))?\\z")
         private static func formatter(_ format: String, _ locale: String) -> DateFormatter {
             let f = DateFormatter()
             f.locale = Locale(identifier: locale)

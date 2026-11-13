@@ -475,6 +475,8 @@ final class ProcessingQueue {
     static let busyExit: Int32 = 75
     /// The reason a redo gives when it was stopped by a signal, or kept stopping, with nothing better said.
     static let redoStopped = "meetingbox was stopped before it finished"
+    /// Why a job this version cannot read is not run (`MeetingRecord.jobUnknown`).
+    static let unknownJob = "this version of meetingbox does not know that kind of job"
     /// The reason a redo gives when the engine said it was done but its files are not new.
     static let redoWroteNothing = "meetingbox finished but wrote nothing new"
 
@@ -518,9 +520,10 @@ final class ProcessingQueue {
     /// The last stage in its progress file.
     private(set) var stage: String?
     var onChange: (() -> Void)?
-    /// The folder, whether the job worked (true) or not (false), and its kind. A redo that did not work
+    /// The folder (where it is now), whether the job worked (true) or not (false), and its kind: nil for a
+    /// job this version could not read, which ends as a redo that could not run. A redo that did not work
     /// can leave its meeting Done, with the reason in its record's `error`.
-    var onFinished: ((URL, Bool, JobKind) -> Void)?
+    var onFinished: ((URL, Bool, JobKind?) -> Void)?
 
     private let store: MeetingStore
     private let runner: PipelineRunner
@@ -532,6 +535,9 @@ final class ProcessingQueue {
     private var timer: DispatchSourceTimer?
 
     private var pending: [URL] = []
+    /// The id in `meeting.json` of each meeting this queue holds, by its folder's path, so a folder moved
+    /// or renamed in Finder is found again (`locate`).
+    private var ids: [String: String] = [:]
     private enum Job {
         /// Our run of this kind, started at `started`. `token` ignores a late `done` from an earlier run.
         case running(started: Date, token: Int, kind: JobKind)
@@ -565,7 +571,8 @@ final class ProcessingQueue {
     func enqueue(_ folder: URL) {
         onTickQueue()
         let dir = ProcessingQueue.normal(folder)
-        guard !known(dir), let state = ProcessingQueue.read(dir)?.state, state == .queued || state == .processing else { return }
+        guard !known(dir), let record = ProcessingQueue.read(dir), record.state == .queued || record.state == .processing else { return }
+        ids[dir.path] = record.id
         pending.append(dir)
         onChange?()
         advance()
@@ -677,9 +684,12 @@ final class ProcessingQueue {
     func resume() {
         onTickQueue()
         for meeting in store.scanEveryRoot().reversed() {
-            guard let state = meeting.record?.state, state == .queued || state == .processing else { continue }
+            guard let record = meeting.record, record.state == .queued || record.state == .processing else { continue }
             let dir = ProcessingQueue.normal(meeting.folder.url)
-            if !known(dir) { pending.append(dir) }
+            if !known(dir) {
+                ids[dir.path] = record.id
+                pending.append(dir)
+            }
         }
         onChange?()
         advance()
@@ -687,21 +697,31 @@ final class ProcessingQueue {
 
     // MARK: running
 
-    /// Follows the progress file, and settles a job whose lock another process held once it goes.
+    /// Follows the progress file, and settles a job whose lock another process held once it goes. A
+    /// folder moved meanwhile is followed, with the other process's lock in it.
     func tick() {
         guard let dir = current, let job = job else { return }
         switch job {
         case .running:
             pollProgress(dir)
         case .waiting:
-            if ProcessingLock.owner(dir, ps: ps, now: now()) == .gone {
-                settle(dir)
+            guard let here = locate(dir) else {
+                // Nowhere to be found: not ours to settle any more.
+                forget(dir)
+                self.job = nil
+                advance()
+                return
+            }
+            current = here
+            if ProcessingLock.owner(here, ps: ps, now: now()) == .gone {
+                settle(here)
                 advance()
             }
         }
     }
 
-    /// Starts jobs until one is running or waiting, or none is left.
+    /// Starts jobs until one is running or waiting, or none is left. A meeting whose folder was moved
+    /// while it waited its turn is run where it is now.
     private func advance() {
         while job == nil {
             guard !pending.isEmpty else {
@@ -713,10 +733,14 @@ final class ProcessingQueue {
                 updateTimer()
                 return
             }
-            let dir = pending.removeFirst()
-            current = dir
+            let queuedAt = pending.removeFirst()
             stage = nil
-            guard let record = ProcessingQueue.read(dir) else { current = nil; continue }
+            guard let dir = locate(queuedAt), let record = ProcessingQueue.read(dir) else {
+                forget(queuedAt)
+                current = nil
+                continue
+            }
+            current = dir
             switch record.state {
             case .queued:
                 launch(dir, attempts: 1)
@@ -728,7 +752,7 @@ final class ProcessingQueue {
                     wait(dir)
                 }
             default:
-                break // changed since it was queued: not ours to run
+                forget(dir) // changed since it was queued: not ours to run
             }
             if job == nil { current = nil }
             onChange?()
@@ -736,24 +760,79 @@ final class ProcessingQueue {
         updateTimer()
     }
 
-    /// A `processing` meeting nobody holds, settled by the kind its record names: done when its result is
-    /// our attempt's success with what that kind writes fresh; failed when that run failed on its own;
-    /// otherwise it stopped part way (a signal, a swap left to finish, or no result) and runs again.
+    /// Where a meeting this queue holds is now: its folder, while that still holds the meeting with the
+    /// id it had when it was queued; else, after it was moved or renamed in Finder, the folder in the roots
+    /// whose record has that id, found by one scan. Nil when it is nowhere to be found.
+    private func locate(_ dir: URL) -> URL? {
+        guard let id = ids[dir.path] else { return dir }
+        if ProcessingQueue.read(dir)?.id == id { return dir }
+        guard let found = store.scanEveryRoot().first(where: { $0.record?.id == id }) else { return nil }
+        let moved = ProcessingQueue.normal(found.folder.url)
+        ids[dir.path] = nil
+        ids[moved.path] = id
+        return moved
+    }
+
+    private func forget(_ dir: URL) {
+        ids[dir.path] = nil
+    }
+
+    /// A `processing` meeting nobody holds, settled by the kind its record names, by the rule a run that
+    /// ended goes by (`outcome`), from its `.process-result` when that is our attempt's. With no result of
+    /// ours it stopped part way, and runs again. A job this version cannot read is never run.
     private func settle(_ dir: URL) {
         job = nil
         guard let record = ProcessingQueue.read(dir), record.state == .processing else { return }
-        let kind = record.job ?? .process
-        if let result = ProcessResult.read(dir), let attempt = record.attempt, result.attempt == attempt {
-            if result.status == 0, let started = result.started, ProcessingQueue.fresh(dir, since: started, kind: kind) {
-                succeed(dir, kind)
-                return
-            }
-            if result.status != 0 && result.status < 128 && result.status != Int(ProcessingQueue.swapExit) {
-                fail(dir, kind, ProcessingQueue.failure(kind, status: Int32(clamping: result.status), line: ""))
-                return
-            }
+        if record.jobUnknown {
+            fail(dir, nil, ProcessingQueue.redoNothingChanged(ProcessingQueue.unknownJob))
+            return
         }
-        runAgain(dir, kind, reason: ProcessingQueue.redoStopped)
+        let kind = record.job ?? .process
+        guard let result = ProcessResult.read(dir), let attempt = record.attempt, result.attempt == attempt else {
+            runAgain(dir, kind, reason: ProcessingQueue.redoStopped)
+            return
+        }
+        let fresh = result.started.map { ProcessingQueue.fresh(dir, since: $0, kind: kind) } ?? false
+        finish(dir, kind, ProcessingQueue.outcome(kind, status: Int32(clamping: result.status), fresh: fresh, line: "", settled: true))
+    }
+
+    /// What a run of ours came to, by its kind, its exit status, whether what that kind writes is fresh
+    /// and the engine's last line: one rule for a run that ended (`ended`) and one settled after a relaunch
+    /// (`settle`, which has no last line).
+    /// - Exit 0: done when fresh. Otherwise a redo did not finish, having written nothing new. A process
+    ///   that ended wrote no minutes; one settled runs again, as it always has.
+    /// - Exit 3: a swap was left to finish, so the same kind runs again.
+    /// - A signal runs a redo again, and a process when it is settled; a process that ended fails, as it
+    ///   always has.
+    /// - Anything else fails, in the engine's words.
+    private enum Outcome {
+        case done
+        case failed(String)
+        case runAgain(String)
+    }
+
+    private static func outcome(_ kind: JobKind, status: Int32, fresh: Bool, line: String, settled: Bool) -> Outcome {
+        switch status {
+        case 0:
+            if fresh { return .done }
+            if kind != .process { return .failed(redoNothingChanged(redoWroteNothing)) }
+            return settled ? .runAgain(redoStopped) : .failed(noMinutes)
+        case swapExit:
+            return .runAgain(line.isEmpty ? redoStopped : line)
+        case 128...:
+            // A signal: its last line is only how far it got, so it is not the reason.
+            return kind != .process || settled ? .runAgain(redoStopped) : .failed(failure(kind, status: status, line: line))
+        default:
+            return .failed(failure(kind, status: status, line: line))
+        }
+    }
+
+    private func finish(_ dir: URL, _ kind: JobKind, _ outcome: Outcome) {
+        switch outcome {
+        case .done: succeed(dir, kind)
+        case .failed(let reason): fail(dir, kind, reason)
+        case .runAgain(let reason): runAgain(dir, kind, reason: reason)
+        }
     }
 
     /// A run that stopped part way runs again as the same kind, up to `maxAttempts` runs in all; then the
@@ -779,8 +858,13 @@ final class ProcessingQueue {
     /// Launches the kind the record names, built from the record and the settings of this moment: a
     /// process with the Preferences transcriber and tidying; Transcribe again with its own transcriber,
     /// tidying and counts, any it lacks taken from Preferences; every kind with the meeting's writer, else
-    /// the Preferences one, used only if agreed.
+    /// the Preferences one, used only if agreed. A job this version cannot read is not run at all: it ends
+    /// as a redo that could not run.
     private func launch(_ dir: URL, attempts: Int) {
+        if ProcessingQueue.read(dir)?.jobUnknown == true {
+            fail(dir, nil, ProcessingQueue.redoNothingChanged(ProcessingQueue.unknownJob))
+            return
+        }
         let attempt = UUID().uuidString
         var record: MeetingRecord?
         do {
@@ -826,35 +910,26 @@ final class ProcessingQueue {
         _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     }
 
-    /// A run of ours ended. Exit 3 (a swap left to finish) runs the same kind again; so does a signal for
-    /// a redo (a process stopped by a signal fails, as it always has). Any other status but 0 is a
-    /// failure in the engine's words.
+    /// A run of ours ended: finished by `outcome`, where its meeting is now. A folder moved or renamed in
+    /// Finder while it ran is found by its id, and the status this run gave is used there, so nothing is
+    /// run twice (the engine's own `.process-result` went to the old path).
     private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {
         guard case .running(let started, let t, let kind)? = job, t == mine,
               let cur = current, cur.path == dir.path else { return }
-        pollProgress(dir)
+        let here = locate(dir) ?? dir
+        current = here
+        pollProgress(here)
         if status == ProcessingQueue.busyExit {
             // Refused: nothing ran, so this run is not counted. Wait for the holder, then settle.
-            try? store.update(dir) { if let n = $0.attempts { $0.attempts = max(0, n - 1) } }
-            wait(dir)
+            try? store.update(here) { if let n = $0.attempts { $0.attempts = max(0, n - 1) } }
+            wait(here)
             onChange?()
             updateTimer()
             return
         }
         job = nil
-        if status == 0 {
-            if ProcessingQueue.fresh(dir, since: started, kind: kind) {
-                succeed(dir, kind)
-            } else {
-                fail(dir, kind, kind == .process ? ProcessingQueue.noMinutes : ProcessingQueue.redoNothingChanged(ProcessingQueue.redoWroteNothing))
-            }
-        } else if status == ProcessingQueue.swapExit {
-            runAgain(dir, kind, reason: line.isEmpty ? ProcessingQueue.redoStopped : line)
-        } else if status >= 128 && kind != .process {
-            runAgain(dir, kind, reason: ProcessingQueue.redoStopped) // its last line is only where it was
-        } else {
-            fail(dir, kind, ProcessingQueue.failure(kind, status: status, line: line))
-        }
+        finish(here, kind, ProcessingQueue.outcome(kind, status: status, fresh: ProcessingQueue.fresh(here, since: started, kind: kind),
+                                                   line: line, settled: false))
         advance()
     }
 
@@ -873,12 +948,14 @@ final class ProcessingQueue {
             $0.error = nil
             ProcessingQueue.clearJob(&$0)
         }
+        forget(dir)
         onFinished?(dir, true, kind)
     }
 
-    /// A process that failed is Failed. A redo that did not work goes back to Done while the meeting has
-    /// its minutes (else Failed), with `reason` as the error line the window shows on it.
-    private func fail(_ dir: URL, _ kind: JobKind, _ reason: String) {
+    /// A process that failed is Failed. A redo that did not work, or a job this version cannot read
+    /// (`kind` nil), goes back to Done while the meeting has its minutes (else Failed), with `reason` as
+    /// the error line the window shows on it.
+    private func fail(_ dir: URL, _ kind: JobKind?, _ reason: String) {
         clearProgress(dir)
         let minutes = FileManager.default.fileExists(atPath: dir.appendingPathComponent("notes.md").path)
         try? store.update(dir) {
@@ -887,6 +964,7 @@ final class ProcessingQueue {
             $0.error = reason
             ProcessingQueue.clearJob(&$0)
         }
+        forget(dir)
         onFinished?(dir, false, kind)
     }
 
