@@ -158,26 +158,54 @@ do {
 }
 
 // MARK: - SampleExtractor (task R1)
-// A WhatsApp call put the MacBook microphone into Apple's voice processing, which delivered a format
-// with three channels and no channel layout, and the recorder crashed inside the extractor (SIGSEGV).
+// A WhatsApp call put the MacBook microphone into Apple's voice processing, and the recorder crashed
+// inside the extractor (SIGSEGV). The format the microphone delivered is not in the logs. The most
+// likely one, more than two channels with no channel layout, gives exactly that crash.
 // Each case runs in a child process, so a case that crashes the extractor shows as a FAIL here
 // instead of ending the suite.
 
+/// A channel layout as a format description carries one: a tag, channel labels, or a bitmap.
+enum Layout {
+    case tag(AudioChannelLayoutTag)
+    case labels([AudioChannelLabel])
+    case bitmap(AudioChannelBitmap)
+
+    /// The AudioChannelLayout's bytes, with one channel description for each label.
+    var bytes: [UInt8] {
+        var tag = kAudioChannelLayoutTag_UseChannelDescriptions
+        var bitmap: UInt32 = 0
+        var labels: [AudioChannelLabel] = []
+        switch self {
+        case .tag(let t): tag = t
+        case .labels(let l): labels = l
+        case .bitmap(let b): tag = kAudioChannelLayoutTag_UseChannelBitmap; bitmap = b.rawValue
+        }
+        let first = MemoryLayout<AudioChannelLayout>.offset(of: \AudioChannelLayout.mChannelDescriptions)!
+        let step = MemoryLayout<AudioChannelDescription>.stride
+        var bytes = [UInt8](repeating: 0, count: max(MemoryLayout<AudioChannelLayout>.size, first + labels.count * step))
+        bytes.withUnsafeMutableBytes { raw in
+            raw.storeBytes(of: tag, toByteOffset: 0, as: UInt32.self)
+            raw.storeBytes(of: bitmap, toByteOffset: 4, as: UInt32.self)
+            raw.storeBytes(of: UInt32(labels.count), toByteOffset: 8, as: UInt32.self)
+            for (i, label) in labels.enumerated() {
+                raw.storeBytes(of: label, toByteOffset: first + i * step, as: UInt32.self)
+            }
+        }
+        return bytes
+    }
+}
+
 /// A sample buffer as a capture callback gets one: a format description, with a channel layout only
-/// when `layout` names one (the voice-processing microphone gave none), over a block holding `bytes`,
+/// when `layout` gives one (none is the likeliest voice-processing case), over a block holding `bytes`,
 /// or over no data at all when `bytes` is nil. `packets` describes compressed data.
-func sampleBuffer(_ asbd: AudioStreamBasicDescription, frames: Int, bytes: [UInt8]?,
-                  layout: AudioChannelLayoutTag? = nil,
+func sampleBuffer(_ asbd: AudioStreamBasicDescription, frames: Int, bytes: [UInt8]?, layout: Layout? = nil,
                   packets: [AudioStreamPacketDescription]? = nil) -> CMSampleBuffer? {
     var asbd = asbd
-    var channelLayout = AudioChannelLayout()
-    channelLayout.mChannelLayoutTag = layout ?? 0
     var description: CMAudioFormatDescription?
-    let made = withUnsafePointer(to: &channelLayout) { pointer in
+    let made = (layout?.bytes ?? []).withUnsafeBytes { raw in
         CMAudioFormatDescriptionCreate(
-            allocator: nil, asbd: &asbd,
-            layoutSize: layout == nil ? 0 : MemoryLayout<AudioChannelLayout>.size,
-            layout: layout == nil ? nil : pointer,
+            allocator: nil, asbd: &asbd, layoutSize: raw.count,
+            layout: raw.isEmpty ? nil : raw.baseAddress!.assumingMemoryBound(to: AudioChannelLayout.self),
             magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &description)
     }
     guard made == noErr, let description else { return nil }
@@ -216,9 +244,12 @@ func pcmDescription(channels: Int, rate: Double, int16: Bool, interleaved: Bool)
         mChannelsPerFrame: UInt32(channels), mBitsPerChannel: sampleBytes * 8, mReserved: 0)
 }
 
+/// The value Int16 storage gives a sample back as.
+func int16Value(_ v: Float) -> Float { Float(Int16((v * 32767).rounded())) / 32768 }
+
 /// A PCM sample buffer holding these channels' samples.
 func pcmBuffer(_ channels: [[Float]], rate: Double, int16: Bool = false, interleaved: Bool = false,
-               layout: AudioChannelLayoutTag? = nil) -> CMSampleBuffer? {
+               layout: Layout? = nil) -> CMSampleBuffer? {
     let frames = channels[0].count
     let ordered = interleaved ? (0..<frames).flatMap { f in channels.map { $0[f] } } : channels.flatMap { $0 }
     let bytes = ordered.flatMap { v -> [UInt8] in
@@ -245,6 +276,12 @@ func decibels(_ level: Double, _ reference: Double) -> Double { 20 * log10(level
 
 func show(_ x: Double) -> String { String(format: "%.4f", x) }
 
+/// How many frames 0.1 s comes out as: exactly 4800 at 48 kHz, where nothing is resampled, and
+/// otherwise at most 400 short, for what the converter holds back for the next buffer (360 at 44.1 kHz).
+func plausibleLength(_ count: Int, rate: Double, expected: Int) -> Bool {
+    rate == AudioMixer.sampleRate ? count == expected : (expected - 400...expected + 64).contains(count)
+}
+
 /// One extractor per run, as each source has its own, so no run hears another's leftovers.
 func extract(_ buffer: CMSampleBuffer?, _ name: String) -> [Float]? {
     guard let buffer else {
@@ -254,10 +291,44 @@ func extract(_ buffer: CMSampleBuffer?, _ name: String) -> [Float]? {
     return SampleExtractor().samples(from: buffer)
 }
 
-/// A multichannel buffer three ways: the same tone on every channel, then on the first channel
-/// only, then on the last only. Each comes out as mono at 48 kHz carrying the tone.
+/// What 24e9ddc's extractor gave for one buffer: AVAudioFormat(cmAudioFormatDescription:), then the
+/// converter's downmix unless the buffer was already in the mixer's format. That initialiser always
+/// takes mono and stereo, so this pins them as they were. The extractor itself no longer calls it.
+func before(_ buffer: CMSampleBuffer?) -> [Float]? {
+    guard let buffer, let description = buffer.formatDescription else { return nil }
+    let format = AVAudioFormat(cmAudioFormatDescription: description)
+    let frames = AVAudioFrameCount(buffer.numSamples)
+    guard let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+    input.frameLength = frames
+    guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
+              buffer, at: 0, frameCount: Int32(frames), into: input.mutableAudioBufferList) == noErr
+    else { return nil }
+    if format == AudioMixer.format {
+        return Array(UnsafeBufferPointer(start: input.floatChannelData![0], count: Int(frames)))
+    }
+    let capacity = AVAudioFrameCount(Double(frames) * AudioMixer.sampleRate / format.sampleRate) + 64
+    guard let converter = AVAudioConverter(from: format, to: AudioMixer.format),
+          let output = AVAudioPCMBuffer(pcmFormat: AudioMixer.format, frameCapacity: capacity) else { return nil }
+    converter.downmix = true
+    var fed = false
+    var error: NSError?
+    converter.convert(to: output, error: &error) { _, status in
+        if fed {
+            status.pointee = .noDataNow
+            return nil
+        }
+        fed = true
+        status.pointee = .haveData
+        return input
+    }
+    guard error == nil else { return nil }
+    return Array(UnsafeBufferPointer(start: output.floatChannelData![0], count: Int(output.frameLength)))
+}
+
+/// A buffer of several channels three ways: the same tone on every channel, then on the first
+/// channel only, then on the last only. Each comes out as mono at 48 kHz carrying the tone.
 func multichannel(_ name: String, channels n: Int, rate: Double, int16: Bool, interleaved: Bool,
-                  layout: AudioChannelLayoutTag? = nil) {
+                  layout: Layout? = nil) {
     let signal = tone(rate)
     let silence = [Float](repeating: 0, count: signal.count)
     let one = rms(signal[...])
@@ -267,7 +338,7 @@ func multichannel(_ name: String, channels n: Int, rate: Double, int16: Bool, in
     }
     let all = run(Array(repeating: signal, count: n))
     let level = rms(settled(all))
-    check(all.count > expected / 2 && all.count <= expected + 64 && abs(decibels(level, one)) <= 1,
+    check(plausibleLength(all.count, rate: rate, expected: expected) && abs(decibels(level, one)) <= 1,
           "\(name): the same tone on every channel comes out at 48 kHz within 1 dB of one channel (\(all.count) frames, rms \(show(level)) against \(show(one)))")
     for (which, index) in [("first", 0), ("last", n - 1)] {
         var channels = Array(repeating: silence, count: n)
@@ -277,7 +348,20 @@ func multichannel(_ name: String, channels n: Int, rate: Double, int16: Bool, in
     }
 }
 
-/// A buffer the extractor cannot read gives nil, and nothing crashes.
+/// Ramps that differ on every channel and every frame, at 48 kHz, where the averaged buffer skips
+/// the converter: each frame must come out as the mean of its channels. Reading interleaved samples
+/// at the wrong stride gives errors of 0.1 or more.
+func exactMean(_ name: String, channels n: Int, int16: Bool, interleaved: Bool, layout: Layout? = nil) {
+    let frames = 480
+    let channels = (0..<n).map { c in (0..<frames).map { f in Float(f) / 1000 + Float(c) / 10 } }
+    let stored = int16 ? channels.map { $0.map(int16Value) } : channels
+    let expected = (0..<frames).map { f in stored.reduce(0) { $0 + $1[f] } / Float(n) }
+    let out = extract(pcmBuffer(channels, rate: 48000, int16: int16, interleaved: interleaved, layout: layout), name) ?? []
+    let error = out.count == frames ? zip(out, expected).map { abs($0 - $1) }.max() ?? 0 : .infinity
+    check(error < 1e-6, "\(name): each frame comes out as the mean of its channels (\(out.count) of \(frames) frames, largest error \(error))")
+}
+
+/// A buffer the extractor cannot read, or will not average, gives nil, and nothing crashes.
 func unreadable(_ name: String, _ buffer: CMSampleBuffer?) {
     guard let buffer else {
         check(false, "\(name): the test could not make its sample buffer")
@@ -289,6 +373,7 @@ func unreadable(_ name: String, _ buffer: CMSampleBuffer?) {
 func zeros(_ count: Int) -> [UInt8] { [UInt8](repeating: 0, count: count) }
 
 func extractorCase(_ name: String) {
+    let discreteStereo = Layout.tag(kAudioChannelLayoutTag_DiscreteInOrder | 2)
     switch name {
     case "3 channels, Float32, planar, 48 kHz, no layout":
         multichannel(name, channels: 3, rate: 48000, int16: false, interleaved: false)
@@ -298,10 +383,30 @@ func extractorCase(_ name: String) {
         multichannel(name, channels: 8, rate: 44100, int16: true, interleaved: false)
     case "3 channels, Float32, interleaved, 96 kHz, an explicit discrete layout":
         multichannel(name, channels: 3, rate: 96000, int16: false, interleaved: true,
-                     layout: kAudioChannelLayoutTag_DiscreteInOrder | 3)
+                     layout: .tag(kAudioChannelLayoutTag_DiscreteInOrder | 3))
     case "3 channels, Float32, planar, 48 kHz, an explicit 3.0 layout":
         multichannel(name, channels: 3, rate: 48000, int16: false, interleaved: false,
-                     layout: kAudioChannelLayoutTag_MPEG_3_0_A)
+                     layout: .tag(kAudioChannelLayoutTag_MPEG_3_0_A))
+    case "3 channels, Float32, interleaved, 48 kHz, a bitmap layout AVAudioFormat refuses":
+        // One channel's bitmap on three channels: the averaging never uses the layout, so a discrete one stands in.
+        multichannel(name, channels: 3, rate: 48000, int16: false, interleaved: true,
+                     layout: .bitmap(AudioChannelBitmap(rawValue: 1)))
+    case "stereo, Float32, interleaved, 44.1 kHz, a discrete layout":
+        // The converter's downmix silences these stereo layouts, so they are averaged.
+        multichannel(name, channels: 2, rate: 44100, int16: false, interleaved: true, layout: discreteStereo)
+    case "stereo, Int16, planar, 16 kHz, an Unknown layout":
+        multichannel(name, channels: 2, rate: 16000, int16: true, interleaved: false,
+                     layout: .tag(kAudioChannelLayoutTag_Unknown | 2))
+    case "stereo, Float32, planar, 48 kHz, both channels labelled Unused":
+        multichannel(name, channels: 2, rate: 48000, int16: false, interleaved: false,
+                     layout: .labels([kAudioChannelLabel_Unused, kAudioChannelLabel_Unused]))
+    case "averaged at 48 kHz, exact":
+        exactMean("\(name): 3 channels, Float32, interleaved", channels: 3, int16: false, interleaved: true)
+        exactMean("\(name): 3 channels, Float32, planar", channels: 3, int16: false, interleaved: false)
+        exactMean("\(name): 4 channels, Int16, interleaved", channels: 4, int16: true, interleaved: true)
+        exactMean("\(name): 4 channels, Int16, planar", channels: 4, int16: true, interleaved: false)
+        exactMean("\(name): stereo, Float32, interleaved, a discrete layout", channels: 2, int16: false,
+                  interleaved: true, layout: discreteStereo)
     case "mono, Float32, 48 kHz":
         // The path every recording so far has taken: the mixer's own format, returned as it is.
         let signal = tone(48000)
@@ -316,10 +421,46 @@ func extractorCase(_ name: String) {
         let left = extract(pcmBuffer([signal, silence], rate: 44100, interleaved: true), name) ?? []
         let bothLevel = rms(settled(both))
         let leftLevel = rms(settled(left))
-        check(both.count > 2400 && both.count <= 4864 && abs(decibels(bothLevel, one)) <= 1,
+        check(plausibleLength(both.count, rate: 44100, expected: 4800) && abs(decibels(bothLevel, one)) <= 1,
               "\(name): the same tone on both channels comes out at 48 kHz within 1 dB of one channel (\(both.count) frames, rms \(show(bothLevel)))")
         check(abs(decibels(leftLevel, one / 2)) <= 1,
               "\(name): a tone on the left only comes out at half its level (rms \(show(leftLevel)))")
+    case "mono and left and right stereo, exactly as on 24e9ddc":
+        // These keep the converter: a left and right layout in any of its three forms, or none.
+        let left = tone(44100)
+        let right = left.map { $0 * -0.5 }
+        let stereo: [(String, Layout?)] = [
+            ("no layout", nil),
+            ("the Stereo tag", .tag(kAudioChannelLayoutTag_Stereo)),
+            ("Left and Right labels", .labels([kAudioChannelLabel_Left, kAudioChannelLabel_Right])),
+            ("a Left and Right bitmap", .bitmap([.bit_Left, .bit_Right])),
+        ]
+        for (form, layout) in stereo {
+            for (int16, interleaved) in [(false, true), (true, false)] {
+                let buffer = pcmBuffer([left, right], rate: 44100, int16: int16, interleaved: interleaved, layout: layout)
+                let out = extract(buffer, name)
+                let label = "stereo, \(int16 ? "Int16, planar" : "Float32, interleaved"), 44.1 kHz, \(form)"
+                check(out != nil && out == before(buffer), "\(name): \(label) (\(out?.count ?? 0) frames)")
+            }
+        }
+        let mono = pcmBuffer([left], rate: 44100, int16: true, layout: .tag(kAudioChannelLayoutTag_Mono))
+        let out = extract(mono, name)
+        check(out != nil && out == before(mono), "\(name): mono, Int16, 44.1 kHz, the Mono tag (\(out?.count ?? 0) frames)")
+    case "mono, Float32, 44.1 kHz, an Unknown layout, four buffers in a row":
+        // An Unknown layout never equals its twin, so a cache keyed on the format rebuilt the
+        // converter on every buffer, losing its latency and leaving a seam at each one.
+        let signal = tone(44100)
+        func stream(_ layout: Layout?) -> [Float] {
+            let extractor = SampleExtractor()
+            return (0..<4).flatMap { k in
+                pcmBuffer([Array(signal[k * 480..<(k + 1) * 480])], rate: 44100, layout: layout)
+                    .flatMap(extractor.samples(from:)) ?? []
+            }
+        }
+        let unknown = stream(.tag(kAudioChannelLayoutTag_Unknown | 1))
+        let plain = stream(nil)
+        check(!plain.isEmpty && unknown == plain,
+              "\(name): the same samples as with no layout (\(unknown.count) and \(plain.count) frames)")
     case "no channels":
         var asbd = pcmDescription(channels: 1, rate: 48000, int16: false, interleaved: false)
         asbd.mChannelsPerFrame = 0
@@ -340,6 +481,23 @@ func extractorCase(_ name: String) {
     case "PCM with no data behind it":
         let asbd = pcmDescription(channels: 1, rate: 48000, int16: false, interleaved: false)
         unreadable(name, sampleBuffer(asbd, frames: 480, bytes: nil))
+    case "2 channels, Float32, planar, 536,870,912 frames":
+        // 4 GiB in two planes: AVAudioPCMBuffer's size arithmetic overflows and aborts.
+        let asbd = pcmDescription(channels: 2, rate: 48000, int16: false, interleaved: false)
+        unreadable(name, sampleBuffer(asbd, frames: 536_870_912, bytes: nil))
+    case "3 channels, big-endian Float32":
+        // Only native-endian Float32 and Int16 are averaged.
+        var asbd = pcmDescription(channels: 3, rate: 48000, int16: false, interleaved: true)
+        asbd.mFormatFlags |= kAudioFormatFlagIsBigEndian
+        unreadable(name, sampleBuffer(asbd, frames: 480, bytes: zeros(480 * 12)))
+    case "3 channels, unsigned 16-bit":
+        var asbd = pcmDescription(channels: 3, rate: 48000, int16: true, interleaved: false)
+        asbd.mFormatFlags &= ~kAudioFormatFlagIsSignedInteger
+        unreadable(name, sampleBuffer(asbd, frames: 480, bytes: zeros(480 * 2 * 3)))
+    case "stereo, big-endian Float32, a discrete layout":
+        var asbd = pcmDescription(channels: 2, rate: 48000, int16: false, interleaved: true)
+        asbd.mFormatFlags |= kAudioFormatFlagIsBigEndian
+        unreadable(name, sampleBuffer(asbd, frames: 480, bytes: zeros(480 * 8), layout: discreteStereo))
     default:
         check(false, "no extractor case called \(name)")
     }
@@ -351,12 +509,23 @@ let extractorCases = [
     "8 channels, Int16, planar, 44.1 kHz, no layout",
     "3 channels, Float32, interleaved, 96 kHz, an explicit discrete layout",
     "3 channels, Float32, planar, 48 kHz, an explicit 3.0 layout",
+    "3 channels, Float32, interleaved, 48 kHz, a bitmap layout AVAudioFormat refuses",
+    "stereo, Float32, interleaved, 44.1 kHz, a discrete layout",
+    "stereo, Int16, planar, 16 kHz, an Unknown layout",
+    "stereo, Float32, planar, 48 kHz, both channels labelled Unused",
+    "averaged at 48 kHz, exact",
     "mono, Float32, 48 kHz",
     "stereo, Float32, interleaved, 44.1 kHz",
+    "mono and left and right stereo, exactly as on 24e9ddc",
+    "mono, Float32, 44.1 kHz, an Unknown layout, four buffers in a row",
     "no channels",
     "AAC, not linear PCM",
     "PCM whose sizes do not add up",
     "PCM with no data behind it",
+    "2 channels, Float32, planar, 536,870,912 frames",
+    "3 channels, big-endian Float32",
+    "3 channels, unsigned 16-bit",
+    "stereo, big-endian Float32, a discrete layout",
 ]
 for name in extractorCases {
     let child = Process()

@@ -135,12 +135,13 @@ final class AudioMixer: @unchecked Sendable {
 /// A buffer it cannot read gives nil, never a crash.
 final class SampleExtractor {
     private var converter: AVAudioConverter?
-    private var sourceFormat: AVAudioFormat?
 
     func samples(from sampleBuffer: CMSampleBuffer) -> [Float]? {
         guard let description = sampleBuffer.formatDescription,
-              let format = Self.format(of: description),
+              let stream = CMAudioFormatDescriptionGetStreamBasicDescription(description),
               let count = Int32(exactly: sampleBuffer.numSamples), count > 0,
+              Self.fitsPCMBuffer(stream.pointee, frames: count),
+              let format = Self.format(of: description, stream),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count))
         else { return nil }
         buffer.frameLength = AVAudioFrameCount(count)
@@ -148,85 +149,116 @@ final class SampleExtractor {
             sampleBuffer, at: 0, frameCount: count, into: buffer.mutableAudioBufferList)
         guard status == noErr else { return nil }
 
-        // AVAudioConverter's downmix turns a discrete layout into silence, so more than two channels
-        // (a microphone in voice processing can give three or more) are averaged here first.
-        guard let input = format.channelCount > 2 ? Self.average(buffer) : buffer else { return nil }
+        // AVAudioConverter's downmix silences discrete, Unknown and Unused channels, so anything but
+        // mono and left and right stereo is averaged here first. A microphone in voice processing can
+        // give three or more channels.
+        let averaged = !Self.keepsConverter(channels: format.channelCount, layout: format.channelLayout)
+        guard let input = averaged ? Self.average(buffer) : buffer else { return nil }
 
         if input.format == AudioMixer.format {
             guard let data = input.floatChannelData else { return nil }
             return Array(UnsafeBufferPointer(start: data[0], count: Int(input.frameLength)))
         }
 
-        if sourceFormat != input.format {
+        // The converter is kept while the stream description stays the same. AVAudioFormat's equality
+        // also compares layouts, and an Unknown layout never equals its twin, which rebuilt the
+        // converter on every buffer. A kept converter takes only its own format object, so a buffer of
+        // the same stream under another is passed in its format, over the same memory.
+        let inputStream = input.format.streamDescription.pointee
+        if converter.map({ !Self.same($0.inputFormat.streamDescription.pointee, inputStream) }) ?? true {
             converter = AVAudioConverter(from: input.format, to: AudioMixer.format)
             converter?.downmix = true
-            sourceFormat = input.format
         }
-        guard let converter else { return nil }
+        guard let converter,
+              let source = input.format == converter.inputFormat ? input : AVAudioPCMBuffer(
+                  pcmFormat: converter.inputFormat, bufferListNoCopy: input.audioBufferList, deallocator: nil)
+        else { return nil }
 
-        let capacity = Double(input.frameLength) * AudioMixer.sampleRate / input.format.sampleRate
+        let capacity = Double(source.frameLength) * AudioMixer.sampleRate / source.format.sampleRate
         guard capacity < Double(Int32.max),
               let output = AVAudioPCMBuffer(pcmFormat: AudioMixer.format, frameCapacity: AVAudioFrameCount(capacity) + 64)
         else { return nil }
         var fed = false
         var error: NSError?
-        converter.convert(to: output, error: &error) { _, inputStatus in
-            if fed {
-                inputStatus.pointee = .noDataNow
-                return nil
+        // A relabelled buffer borrows the input's memory, so the input lives until the conversion ends.
+        withExtendedLifetime(input) {
+            _ = converter.convert(to: output, error: &error) { _, inputStatus in
+                if fed {
+                    inputStatus.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
+                inputStatus.pointee = .haveData
+                return source
             }
-            fed = true
-            inputStatus.pointee = .haveData
-            return input
         }
         guard error == nil, let data = output.floatChannelData else { return nil }
         return Array(UnsafeBufferPointer(start: data[0], count: Int(output.frameLength)))
     }
 
+    private static let leftAndRight = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_Stereo)
+
+    /// Mono, and stereo with no layout or a left and right one (as a tag, as labels or as a bitmap:
+    /// AVAudioChannelLayout's equality takes them as one), keep AVAudioConverter's downmix exactly as
+    /// before. Every other layout is averaged.
+    private static func keepsConverter(channels: AVAudioChannelCount, layout: AVAudioChannelLayout?) -> Bool {
+        channels == 1 || (channels == 2 && (layout == nil || layout == leftAndRight))
+    }
+
     /// The buffer's format, built only through initialisers that can fail. In Swift,
     /// AVAudioFormat(cmAudioFormatDescription:) cannot, yet it gives nil for more than two channels with
     /// no layout, which crashed the recorder when a call put the microphone into voice processing.
-    private static func format(of description: CMAudioFormatDescription) -> AVAudioFormat? {
-        guard let stream = CMAudioFormatDescriptionGetStreamBasicDescription(description),
-              fitsPCMBuffer(stream.pointee), stream.pointee.mSampleRate > 0 else { return nil }
-        var layoutSize = 0
-        if let layout = CMAudioFormatDescriptionGetChannelLayout(description, sizeOut: &layoutSize) {
-            return AVAudioFormat(streamDescription: stream, channelLayout: AVAudioChannelLayout(layout: layout))
-        }
+    private static func format(of description: CMAudioFormatDescription,
+                               _ stream: UnsafePointer<AudioStreamBasicDescription>) -> AVAudioFormat? {
+        guard stream.pointee.mSampleRate > 0 else { return nil }
         let channels = stream.pointee.mChannelsPerFrame
-        if channels > 2 {
-            guard let discrete = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | channels)
-            else { return nil }
-            return AVAudioFormat(streamDescription: stream, channelLayout: discrete)
+        var layoutSize = 0
+        let given = CMAudioFormatDescriptionGetChannelLayout(description, sizeOut: &layoutSize)
+            .map { AVAudioChannelLayout(layout: $0) }
+        if keepsConverter(channels: channels, layout: given) {
+            if let given { return AVAudioFormat(streamDescription: stream, channelLayout: given) }
+            return AVAudioFormat(streamDescription: stream)
         }
-        return AVAudioFormat(streamDescription: stream)
+        // Averaged, where the layout plays no part, so one AVAudioFormat refuses gives way to a discrete one.
+        if let given, let format = AVAudioFormat(streamDescription: stream, channelLayout: given) { return format }
+        guard let discrete = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | channels)
+        else { return nil }
+        return AVAudioFormat(streamDescription: stream, channelLayout: discrete)
     }
 
-    /// Whether AVAudioPCMBuffer takes the description as PCM. For one it does not, it raises an
-    /// Objective-C exception, which Swift cannot catch: anything but linear PCM, no channels, or sizes
-    /// that do not add up. Tried on 12,096 combinations of flags, sample sizes, frame sizes and channel
-    /// counts and on 900,000 random descriptions, it raised for none that pass these checks.
-    private static func fitsPCMBuffer(_ a: AudioStreamBasicDescription) -> Bool {
+    /// Whether AVAudioPCMBuffer can hold `frames` of the description. It raises an Objective-C
+    /// exception, which Swift cannot catch, for a description it does not take as PCM: anything but
+    /// linear PCM, no channels, or sizes that do not add up. Tried on 12,096 combinations of flags,
+    /// sample sizes, frame sizes and channel counts and on 900,000 random descriptions, it raised for
+    /// none that pass these checks. Its size arithmetic also overflows and aborts once the buffers
+    /// reach 2^32 bytes in all, so anything from 2^31 bytes is refused: over 90 minutes of stereo.
+    private static func fitsPCMBuffer(_ a: AudioStreamBasicDescription, frames: Int32) -> Bool {
         let floatAndInteger = kAudioFormatFlagIsFloat | kAudioFormatFlagIsSignedInteger
         let interleaved = a.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0
         guard a.mFormatID == kAudioFormatLinearPCM, a.mFormatFlags & floatAndInteger != floatAndInteger,
               a.mChannelsPerFrame > 0, a.mFramesPerPacket == 1, a.mBytesPerPacket == a.mBytesPerFrame,
               !interleaved || a.mBytesPerFrame % a.mChannelsPerFrame == 0 else { return false }
         let sampleBytes = interleaved ? a.mBytesPerFrame / a.mChannelsPerFrame : a.mBytesPerFrame
-        return UInt64(a.mBitsPerChannel) <= 8 * UInt64(sampleBytes)
+        let buffers = UInt64(interleaved ? 1 : a.mChannelsPerFrame)
+        let (bytes, overflow) = (UInt64(frames) * UInt64(a.mBytesPerFrame)).multipliedReportingOverflow(by: buffers)
+        return UInt64(a.mBitsPerChannel) <= 8 * UInt64(sampleBytes) && !overflow && bytes < 1 << 31
     }
 
-    /// The mean of the buffer's channels, as one Float32 channel at the buffer's own rate.
-    /// Nil for a sample type other than Float32 or Int16.
+    /// The mean of the buffer's channels, as one Float32 channel at the buffer's own rate. Nil unless
+    /// the samples are native-endian Float32 or Int16: AVAudioPCMBuffer offers the same pointers for
+    /// big-endian, unsigned or padded samples, which would be read as noise.
     private static func average(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         let channels = Int(buffer.format.channelCount)
         let stride = buffer.stride
         let sample: (_ channel: Int, _ frame: Int) -> Float
-        if let data = buffer.floatChannelData {
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let data = buffer.floatChannelData else { return nil }
             sample = { data[$0][$1 * stride] }
-        } else if let data = buffer.int16ChannelData {
+        case .pcmFormatInt16:
+            guard let data = buffer.int16ChannelData else { return nil }
             sample = { Float(data[$0][$1 * stride]) / 32768 }
-        } else {
+        default:
             return nil
         }
         guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: buffer.format.sampleRate,
@@ -238,5 +270,9 @@ final class SampleExtractor {
             out[frame] = (0..<channels).reduce(0) { $0 + sample($1, frame) } / Float(channels)
         }
         return mono
+    }
+
+    private static func same(_ a: AudioStreamBasicDescription, _ b: AudioStreamBasicDescription) -> Bool {
+        withUnsafeBytes(of: a) { x in withUnsafeBytes(of: b) { y in x.elementsEqual(y) } }
     }
 }
