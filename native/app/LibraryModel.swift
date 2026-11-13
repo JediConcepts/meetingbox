@@ -2,13 +2,15 @@ import AppKit
 import Combine
 
 /// Everything the meetingbox window remembers: the meetings and which are listed, the selection and the
-/// pane, the search, the text of the selected meeting, and the rename sheet with its text and error.
-/// `AppModel` owns it and `LibraryWindow` draws it; the decisions are `LibraryPresentation`'s.
+/// pane, the search, the text of the selected meeting and which transcript of it is shown, the rename
+/// sheet with its text and error, and the redo sheets. `AppModel` owns it and `LibraryWindow` draws it;
+/// the decisions are `LibraryPresentation`'s.
 ///
 /// It runs on the main queue, which is also the session's and the processing queue's tick queue, so
-/// reading `session.phase` and `queue.current` and calling `queue.process` here is safe. Nothing slow
-/// runs on it: the scan, the transcripts, the search and the reading of a meeting's files are done on
-/// two background queues and published back here, and a result that a newer request has overtaken is dropped.
+/// reading `session.phase` and `queue.current` and calling `queue.process` and `queue.redo` here is safe.
+/// Nothing slow runs on it: the scan, the transcripts, the search, the reading of a meeting's files and
+/// the check a redo makes before it is queued are done on two background queues and published back
+/// here, and a result that a newer request has overtaken is dropped.
 @MainActor
 final class LibraryModel: ObservableObject {
     enum Pane: CaseIterable {
@@ -30,6 +32,21 @@ final class LibraryModel: ObservableObject {
         let minutes: AttributedString?
         let transcript: String?
         let files: MeetingFiles
+        /// What the Transcript view's picker lists (`LibraryPresentation.transcriptVersions`).
+        let versions: [TranscriptVersion]
+    }
+
+    /// A redo sheet: Redo minutes (`minutes`) or Transcribe again (`transcribe`) for one meeting, and what
+    /// it will run with. Redo minutes uses only the writer.
+    struct RedoDraft: Equatable {
+        let folder: URL
+        let kind: JobKind
+        var transcriber: Transcriber
+        /// The counts; nil is Work it out.
+        var room: Int?
+        var call: Int?
+        var tidy: Bool
+        var writer: MeetingWriter
     }
 
     struct RenameDraft: Equatable {
@@ -74,6 +91,12 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var searchText = ""
     @Published var pane: Pane = .minutes
     @Published private(set) var renaming: RenameDraft?
+    /// The redo sheet that is open, if one is.
+    @Published private(set) var redoing: RedoDraft?
+    /// The transcript the Transcript view shows: nil for Current (`transcript.txt`), else another file
+    /// from the picker. Read only: choosing one changes no file. Back to Current when another meeting is
+    /// selected and when `show` is asked for one; a rescan keeps it.
+    @Published private(set) var version: URL?
     /// Why the last action did nothing (Play audio without QuickTime Player), until the next action or
     /// another meeting is chosen.
     @Published private(set) var problem: String?
@@ -85,24 +108,32 @@ final class LibraryModel: ObservableObject {
     private let session: Session
     private let queue: ProcessingQueue
     private let opener: Opener
+    /// What a job launched now would run with (the app's Preferences), read when a sheet opens and when
+    /// it is committed.
+    private let settings: () -> RunSettings
     /// Pause, resume and stop: `AppModel.perform`, so they take the path every recording command takes.
     var control: (@MainActor (MenuAction) -> Void)?
+    /// Told when `select` or `show` changes which meeting is selected, and not otherwise.
+    var onSelectionChange: (() -> Void)?
 
     private let reader = DispatchQueue(label: "meetingbox.library.read", qos: .userInitiated)
     private let searcher = DispatchQueue(label: "meetingbox.library.search", qos: .userInitiated)
     private var scanToken = 0
     private var searchToken = 0
     private var loadToken = 0
+    private var redoToken = 0
     /// The store has read the transcripts of the meetings in `meetings`. Cleared by each scan.
     private var indexed = false
     /// The folder `show` was last asked for, until another meeting is chosen.
     private var shown: URL?
 
-    init(store: MeetingStore, session: Session, queue: ProcessingQueue, opener: Opener = .system) {
+    init(store: MeetingStore, session: Session, queue: ProcessingQueue, opener: Opener = .system,
+         settings: @escaping () -> RunSettings = { .defaults }) {
         self.store = store
         self.session = session
         self.queue = queue
         self.opener = opener
+        self.settings = settings
     }
 
     // MARK: what the views read
@@ -132,7 +163,7 @@ final class LibraryModel: ObservableObject {
     }
 
     func actions(for meeting: Meeting) -> [LibraryAction] {
-        LibraryPresentation.actions(for: meeting, phase: live.phase, files: files(of: meeting))
+        LibraryPresentation.actions(for: meeting, phase: live.phase, files: files(of: meeting), processing: live.processing)
     }
 
     /// What the detail says under the meeting's title (`LibraryPresentation.notes`).
@@ -180,7 +211,8 @@ final class LibraryModel: ObservableObject {
         loadContent()
     }
 
-    /// Reads the selected meeting's minutes and transcript, and what it has to play, off the main queue.
+    /// Reads the selected meeting's minutes, the transcript `version` names (else `transcript.txt`), the
+    /// transcripts the picker lists, and what its folder holds, off the main queue.
     private func loadContent() {
         loadToken += 1
         let token = loadToken
@@ -188,17 +220,59 @@ final class LibraryModel: ObservableObject {
             content = nil
             return
         }
+        let version = self.version
         reader.async { [weak self] in
-            func read(_ name: String) -> String? { try? String(contentsOf: folder.url.appendingPathComponent(name), encoding: .utf8) }
-            let loaded = Content(key: key, minutes: read("notes.md").map(LibraryPresentation.minutes),
-                                 transcript: read("transcript.txt"), files: MeetingFiles.read(folder))
-            Task { @MainActor in self?.loaded(loaded, token) }
+            let dir = folder.url
+            func read(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
+            let loaded = Content(key: key, minutes: read(dir.appendingPathComponent("notes.md")).map(LibraryPresentation.minutes),
+                                 transcript: read(version ?? dir.appendingPathComponent("transcript.txt")), files: MeetingFiles.read(folder),
+                                 versions: LibraryModel.versions(in: dir))
+            Task { @MainActor in self?.loaded(loaded, token, version) }
         }
     }
 
-    private func loaded(_ new: Content, _ token: Int) {
-        guard token == loadToken, content != new else { return }
+    /// Dropped when a newer read has begun, or when another version has been chosen since this one began.
+    private func loaded(_ new: Content, _ token: Int, _ version: URL?) {
+        guard token == loadToken, version == self.version, content != new else { return }
         content = new
+    }
+
+    /// The transcripts a meeting's folder holds: its own `transcript*.txt` files, and the `transcript.txt`
+    /// in each folder in its `earlier/`. Call it off the main queue.
+    nonisolated private static func versions(in dir: URL) -> [TranscriptVersion] {
+        let fm = FileManager.default
+        let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isRegularFileKey])) ?? [])
+            .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
+            .map(\.lastPathComponent)
+        let earlier = dir.appendingPathComponent("earlier", isDirectory: true)
+        let kept = ((try? fm.contentsOfDirectory(atPath: earlier.path)) ?? []).filter {
+            !$0.hasPrefix(".") && fm.fileExists(atPath: earlier.appendingPathComponent($0).appendingPathComponent("transcript.txt").path)
+        }
+        return LibraryPresentation.transcriptVersions(in: dir, files: files, earlier: kept)
+    }
+
+    /// What the transcript picker offers: the selected meeting's versions when there is more than Current,
+    /// or while another is chosen (even one deleted since, which reads as no transcript), so there is
+    /// always a way back to Current. Empty when there is nothing to choose.
+    var versionChoices: [TranscriptVersion] {
+        guard let versions = shownContent?.versions, versions.count > 1 || version != nil else { return [] }
+        return versions
+    }
+
+    /// Shows another of the selected meeting's transcripts, one the picker lists, read only: nothing is
+    /// written, and search and the minutes still use `transcript.txt`. Current (the first) or nil goes back.
+    func chooseVersion(_ url: URL?) {
+        guard let versions = shownContent?.versions else { return }
+        let next: URL?
+        if let url = url {
+            guard let index = versions.firstIndex(where: { $0.url == url }) else { return }
+            next = index == 0 ? nil : url
+        } else {
+            next = nil
+        }
+        guard next != version else { return }
+        version = next
+        loadContent()
     }
 
     // MARK: search
@@ -242,30 +316,38 @@ final class LibraryModel: ObservableObject {
 
     // MARK: selection
 
+    /// Another meeting is chosen: its Current transcript is shown, and `onSelectionChange` is told.
     func select(_ key: String?) {
         guard key != selection else { return }
         selection = key
         problem = nil
+        version = nil
         if let dir = shown, LibraryPresentation.key(dir) != key {
             shown = nil
             outside = nil
         }
         loadContent()
+        onSelectionChange?()
     }
 
     /// The window is asked to show this meeting's minutes (a job finished, or "Minutes ready" was
     /// chosen): the search is cleared so the meeting is in the list, and the list is read again. A
     /// meeting outside the meetings folder (recorded in a folder of its own) is read with it and shown,
-    /// but not listed.
+    /// but not listed. Its Current transcript is shown, even when it was the one selected; only a change
+    /// of selection tells `onSelectionChange`.
     func show(_ dir: URL) {
+        let key = LibraryPresentation.key(dir)
+        let changed = key != selection
         searchText = ""
         pane = .minutes
-        selection = LibraryPresentation.key(dir)
+        selection = key
+        version = nil
         shown = dir
         problem = nil
         refilter()
         loadContent()
         reload()
+        if changed { onSelectionChange?() }
     }
 
     /// The session or the queue moved on. A new phase is a new list: a recording that has just begun
@@ -299,7 +381,72 @@ final class LibraryModel: ObservableObject {
             // A failed meeting goes through retry; one that was never processed is written queued first.
             if meeting.state == .failed { queue.retry(meeting.folder.url) } else { queue.process(meeting.folder.url) }
             reload()
+        case .redoMinutes, .transcribeAgain:
+            // Only while it is offered: never for a meeting something has a claim on.
+            guard actions(for: meeting).contains(action) else { return }
+            beginRedo(meeting, kind: action == .redoMinutes ? .minutes : .transcribe)
         }
+    }
+
+    // MARK: redo
+
+    /// Opens a redo sheet. It starts at the transcriber and tidying chosen in Preferences (never those of
+    /// the meeting's last redo), at the meeting's saved counts, and at the meeting's own writer, else the
+    /// Preferences one.
+    func beginRedo(_ meeting: Meeting, kind: JobKind) {
+        guard kind != .process else { return }
+        let settings = self.settings()
+        let record = meeting.record
+        redoing = RedoDraft(folder: meeting.folder.url, kind: kind, transcriber: settings.transcriber, room: record?.people.room,
+                            call: record?.people.call, tidy: settings.tidy, writer: record?.writer ?? settings.preferredWriter)
+    }
+
+    /// The sheet's choices, as its controls change them.
+    func updateRedo(_ change: (inout RedoDraft) -> Void) {
+        guard var draft = redoing else { return }
+        change(&draft)
+        redoing = draft
+    }
+
+    /// Closes the sheet and queues nothing; a check already under way is dropped.
+    func cancelRedo() {
+        redoToken += 1
+        redoing = nil
+    }
+
+    /// Queues the sheet's redo. An outside writer is taken only when Preferences have agreed to its
+    /// source (`RunSettings.agrees`); otherwise nothing is queued or written and the sheet stays open
+    /// (asking for agreement here comes later). Then the meeting is checked again off the main queue: its
+    /// record as it is on the disk, and the live lock a `meetingbox` run in Terminal would hold. Back on
+    /// this queue, with the session and the queue's job, it is queued only if it is still free and the
+    /// queue takes it; otherwise "That meeting is busy" is shown under the actions. The sheet closes once
+    /// the check is done.
+    func commitRedo() {
+        guard let draft = redoing else { return }
+        if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) { return }
+        redoToken += 1
+        let token = redoToken
+        let ps = URL(fileURLWithPath: "/bin/ps")
+        reader.async { [weak self] in
+            let recorded = LibraryPresentation.recordedState(draft.folder)
+            let lock = ProcessingLock.owner(draft.folder, ps: ps, now: Date())
+            Task { @MainActor in self?.redoChecked(draft, token: token, recorded: recorded, lock: lock) }
+        }
+    }
+
+    private func redoChecked(_ draft: RedoDraft, token: Int, recorded: MeetingState?, lock: ProcessingLock.Owner) {
+        guard token == redoToken, redoing != nil else { return }
+        redoing = nil
+        let options = draft.kind == .transcribe
+            ? JobOptions(transcriber: draft.transcriber, room: draft.room, call: draft.call, tidy: draft.tidy, writer: draft.writer)
+            : JobOptions(writer: draft.writer)
+        let free = lock == .gone
+            && !LibraryPresentation.isBusy(draft.folder, phase: session.phase, current: queue.current, recorded: recorded)
+        if !(free && queue.redo(draft.folder, kind: draft.kind, options: options)),
+           selection == LibraryPresentation.key(draft.folder) {
+            problem = LibraryPresentation.busy
+        }
+        reload()
     }
 
     // MARK: rename
@@ -360,7 +507,10 @@ final class LibraryModel: ObservableObject {
             shown = folder.url
         }
         if processable.remove(before) != nil { processable.insert(LibraryPresentation.key(folder.url)) }
-        if selection == before { selection = LibraryPresentation.key(folder.url) }
+        if selection == before {
+            selection = LibraryPresentation.key(folder.url)
+            version = nil // the file it named has moved with the folder: Current again
+        }
         loadContent()
         reload()
     }

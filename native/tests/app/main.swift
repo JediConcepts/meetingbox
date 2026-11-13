@@ -1628,14 +1628,67 @@ final class FakeRunner: PipelineRunner {
         return Int32(40000 + calls.count)
     }
     var folders: [String] { calls.map { $0.audio.deletingLastPathComponent().lastPathComponent } }
+    /// A run to finish that was never started is a failed check, not a crash that hides the checks after it.
+    private func has(_ i: Int) -> Bool {
+        if calls.indices.contains(i) { return true }
+        check(false, "FakeRunner: there is no run \(i) to finish")
+        return false
+    }
     /// Ends run `i`: on success it writes the transcript and minutes, as `meetingbox process` does.
     func finish(_ i: Int, _ status: Int32, _ line: String = "", writeOutputs: Bool = true) {
+        guard has(i) else { return }
         let dir = calls[i].audio.deletingLastPathComponent()
         if status == 0 && writeOutputs {
             try! "[00:00:01] Me: hello\n".write(to: dir.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
             try! "the minutes\n".write(to: dir.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
         }
         calls[i].done(status, line)
+    }
+    /// Ends run `i` writing only notes.md on success, as `meetingbox notes` does.
+    func finishNotes(_ i: Int, _ status: Int32, _ line: String = "") {
+        guard has(i) else { return }
+        if status == 0 {
+            try! "new minutes\n".write(to: calls[i].job.folder.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        }
+        calls[i].done(status, line)
+    }
+    /// Ends run `i` as a run does that only finishes an interrupted swap: each file in `stage` is moved over
+    /// its target and, unless `touch` is false, marked as written now; then it exits with `status`.
+    func finishSwap(_ i: Int, _ status: Int32, stage: String, touch: Bool = true) {
+        guard has(i) else { return }
+        moveInStaged(calls[i].job.folder, stage: stage, touch: touch)
+        calls[i].done(status, "")
+    }
+}
+
+/// Files staged by a run that was killed before its swap finished, written an hour ago.
+func stageFiles(_ dir: URL, _ stage: String, _ files: [String: String]) {
+    let s = dir.appendingPathComponent(stage, isDirectory: true)
+    try! fm.createDirectory(at: s, withIntermediateDirectories: true)
+    for (f, body) in files {
+        let u = s.appendingPathComponent(f)
+        try! body.write(to: u, atomically: true, encoding: .utf8)
+        try! fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)], ofItemAtPath: u.path)
+    }
+}
+/// Moves every staged file over its target, as finishing a swap does, touching each to now unless told not to.
+func moveInStaged(_ dir: URL, stage: String, touch: Bool) {
+    let s = dir.appendingPathComponent(stage, isDirectory: true)
+    for name in names(s) {
+        let target = dir.appendingPathComponent(name)
+        _ = Darwin.rename(s.appendingPathComponent(name).path, target.path)
+        if touch { try! fm.setAttributes([.modificationDate: Date()], ofItemAtPath: target.path) }
+    }
+    try? fm.removeItem(at: s)
+}
+/// Every plain file in the folder made an hour old, so only what a run writes counts as fresh.
+func age(_ dir: URL) {
+    for name in names(dir) {
+        var isDir: ObjCBool = false
+        let path = dir.appendingPathComponent(name).path
+        if fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue {
+            try! fm.setAttributes([.modificationDate: Date().addingTimeInterval(-3600)], ofItemAtPath: path)
+        }
     }
 }
 
@@ -1668,6 +1721,8 @@ final class QRig {
     let runner = FakeRunner()
     var queue: ProcessingQueue!
     var finished: [(String, Bool)] = []
+    /// The kind of each job `finished` reports, in the same order.
+    var kinds: [JobKind] = []
     var changes = 0
 
     init() {
@@ -1675,9 +1730,12 @@ final class QRig {
         try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
     }
     @discardableResult
-    func make() -> ProcessingQueue {
-        queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil)
-        queue.onFinished = { [unowned self] in self.finished.append(($0.lastPathComponent, $1)) }
+    func make(settings: @escaping () -> RunSettings = { .defaults }) -> ProcessingQueue {
+        queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil, settings: settings)
+        queue.onFinished = { [unowned self] dir, ok, kind in
+            self.finished.append((dir.lastPathComponent, ok))
+            self.kinds.append(kind)
+        }
         queue.onChange = { [unowned self] in self.changes += 1 }
         return queue
     }
@@ -3256,9 +3314,10 @@ do {
     let old = MeetingFiles(audio: here.appendingPathComponent("2026-10-28_1508_meeting.m4a"), runnable: false)
     let none = MeetingFiles()
     func acts(_ m: Meeting, _ files: MeetingFiles, _ phase: Session.Phase = .idle) -> [LibraryAction] {
-        LibraryPresentation.actions(for: m, phase: phase, files: files)
+        LibraryPresentation.actions(for: m, phase: phase, files: files, processing: nil)
     }
-    check(acts(libMeeting(name, .done), audio) == [.rename, .showInFinder, .playAudio], "L5: a done meeting: Rename, Show in Finder, Play audio")
+    check(acts(libMeeting(name, .done), audio) == [.rename, .showInFinder, .playAudio, .transcribeAgain],
+          "L5: a done meeting: Rename, Show in Finder, Play audio, and Transcribe again for the audio a job runs")
     check(acts(libMeeting(name, .done), none) == [.rename, .showInFinder], "L5: no audio, no Play")
     check(acts(libMeeting(name, .done), old) == [.rename, .showInFinder, .playAudio], "L5: a v1.2 audio file plays")
     check(acts(libMeeting(name, .unprocessed), audio) == [.rename, .showInFinder, .playAudio, .process], "L5: unprocessed with audio: Process too")
@@ -3271,18 +3330,19 @@ do {
         check(!acts(libMeeting(name, s), audio).contains(.process), "L5: no Process for \(s)")
     }
     check(acts(libMeeting(name, .recording), audio, .idle) == [.rename, .showInFinder, .playAudio], "L5: a stale recording record is just a meeting")
-    check(LibraryAction.allCases.map(\.title) == ["Pause", "Resume", "Stop", "Rename…", "Show in Finder", "Play audio", "Process"], "L5: the words")
+    check(LibraryAction.allCases.map(\.title) == ["Pause", "Resume", "Stop", "Rename…", "Show in Finder", "Play audio", "Process",
+                                                  "Redo minutes…", "Transcribe again…"], "L5: the words")
     // the meeting being recorded
     let live = libMeeting(name, .recording)
     check(acts(live, none, .recording(here)) == [.pause, .stop, .showInFinder], "L5: recording: Pause, Stop, Show in Finder")
     check(acts(live, none, .paused(here)) == [.resume, .stop, .showInFinder], "L5: paused: Resume, Stop, Show in Finder")
     check(acts(live, none, .finalising(here)) == [.showInFinder], "L5: finalising: only Show in Finder")
     // C5: nothing is played while a recording or a pause is under way: system audio would take it in
-    check(acts(libMeeting(name, .done), audio, .recording(libURL("2026-10-28_1600"))) == [.rename, .showInFinder],
-          "L5, C5: while another meeting records, no Play audio")
+    check(acts(libMeeting(name, .done), audio, .recording(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .transcribeAgain],
+          "L5, C5: while another meeting records, no Play audio (a redo is still offered)")
     check(acts(libMeeting(name, .unprocessed), audio, .paused(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .process],
           "L5, C5: nor while it is paused; Process is still offered")
-    check(acts(libMeeting(name, .done), audio, .finalising(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .playAudio],
+    check(acts(libMeeting(name, .done), audio, .finalising(libURL("2026-10-28_1600"))) == [.rename, .showInFinder, .playAudio, .transcribeAgain],
           "L5, C5: once it is only being saved, Play audio again")
 }
 do {
@@ -3496,7 +3556,7 @@ MainActor.assumeIsolated {
     check(shownMinutes == "Decisions\n- ship on Friday" && model.shownContent?.transcript == "[00:00:01] Me: the café budget"
           && model.shownContent?.files.audio?.lastPathComponent == "audio.m4a" && model.shownContent?.files.runnable == true,
           "W2: notes.md as inline markdown, transcript.txt as it is, the audio")
-    check(model.actions(for: model.selectedMeeting!) == [.rename, .showInFinder, .playAudio], "W2: its actions")
+    check(model.actions(for: model.selectedMeeting!) == [.rename, .showInFinder, .playAudio, .redoMinutes, .transcribeAgain], "W2: its actions")
     model.select(keyB)
     check(model.shownContent == nil, "W2: the previous meeting's text is gone at once")
     check(settle { model.shownContent?.key == keyB }, "W2: and the new one's arrives")
@@ -5773,6 +5833,729 @@ MainActor.assumeIsolated {
     plain.shutDown()
     try? fm.removeItem(at: state)
     try? fm.removeItem(at: state2)
+}
+
+// MARK: - Redo minutes, Transcribe again and transcript versions (Stage 3, Task 8)
+
+/// meeting.json written by hand, as another version of meetingbox or a person might leave it.
+func writeRecord(_ dir: URL, _ object: [String: Any]) {
+    try! JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]).write(to: dir.appendingPathComponent("meeting.json"))
+}
+func recordJSON(_ dir: URL) -> [String: Any] {
+    ((try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+}
+let t8Local = OutsideWriter(kind: .standard, address: "http://127.0.0.1:11434/v1", model: "llama")
+let t8Claude = OutsideWriter(kind: .claude, address: "https://api.anthropic.com", model: "claude-model")
+/// A meeting a job has finished: its audio, a transcript and, unless `notes` is false (then it failed), the
+/// minutes, all an hour old, with these meeting.json fields.
+func t8Done(_ r: QRig, _ name: String, notes: Bool = true, _ change: ((inout MeetingRecord) -> Void)? = nil) -> URL {
+    var files = ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello\n"]
+    if notes { files["notes.md"] = "the old minutes\n" }
+    let dir = r.meeting(name, files: files) {
+        $0.state = notes ? .done : .failed
+        change?(&$0)
+    }
+    age(dir)
+    return dir
+}
+/// The engine's arguments are `head`, then the folder or file `at` (however a scan spells its path), then `tail`.
+func argsAre(_ got: [String]?, _ head: String, _ at: URL, _ tail: [String]) -> Bool {
+    guard let got = got, got.count == tail.count + 2 else { return false }
+    return got[0] == head && LibraryPresentation.key(URL(fileURLWithPath: got[1])) == LibraryPresentation.key(at) && Array(got[2...]) == tail
+}
+/// Every file under a folder, with its bytes.
+func snapshot(_ dir: URL) -> [String: Data] {
+    var all: [String: Data] = [:]
+    let items = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey])?.compactMap { $0 as? URL } ?? []
+    for u in items where (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true {
+        all[String(u.path.dropFirst(dir.path.count))] = try? Data(contentsOf: u)
+    }
+    return all
+}
+
+// The record: the job options and the kept settings, in meeting.json's words, and read back. Values out of
+// range or unknown are not taken; keys it does not know survive an update.
+do {
+    let root = freshRoot()
+    let store = MeetingStore(root: root)
+    let dir = make(root, "2026-11-13_0900")
+    try! store.update(dir) {
+        $0.state = .queued
+        $0.job = .transcribe
+        $0.jobTranscriber = .apple
+        $0.jobTidy = false
+        $0.people = MeetingRecord.People(room: 2, call: nil)
+        $0.writer = .outside(t8Local)
+    }
+    let j = recordJSON(dir)
+    let people = j["people"] as? [String: Any]
+    let writer = j["writer"] as? [String: Any]
+    check(j["job"] as? String == "transcribe" && j["jobTranscriber"] as? String == "apple" && (j["jobTidy"] as? Bool) == false
+          && (people?["room"] as? NSNumber)?.intValue == 2 && people?["call"] == nil && people?.count == 1
+          && writer?["kind"] as? String == "standard" && writer?["address"] as? String == t8Local.address
+          && writer?["model"] as? String == "llama" && writer?.count == 3,
+          "T8 record: job, jobTranscriber, jobTidy, people (no key for Work it out) and writer, in meeting.json's words (\(j))")
+    let back = MeetingStore.record(in: dir)
+    check(back?.job == .transcribe && back?.jobTranscriber == .apple && back?.jobTidy == false
+          && back?.people == MeetingRecord.People(room: 2, call: nil) && back?.writer == .outside(t8Local), "T8 record: and read back as they were")
+    try! store.update(dir) {
+        $0.writer = .apple
+        $0.job = nil
+        $0.jobTranscriber = nil
+        $0.jobTidy = nil
+        $0.people = MeetingRecord.People()
+    }
+    let k = recordJSON(dir)
+    check(k["writer"] as? String == "apple" && k["job"] == nil && k["jobTranscriber"] == nil && k["jobTidy"] == nil && k["people"] == nil,
+          "T8 record: Apple is \"apple\"; cleared options and counts leave no key (\(k))")
+    writeRecord(dir, ["id": "x", "started": "2026-11-13T09:00:00Z", "state": "done", "job": "everything", "jobTranscriber": "whisper",
+                      "jobTidy": "yes", "people": ["room": 9, "call": 0], "writer": ["kind": "gemini", "address": "a", "model": "m"]])
+    let odd = MeetingStore.record(in: dir)
+    check(odd != nil && odd?.job == nil && odd?.jobTranscriber == nil && odd?.jobTidy == nil && odd?.people == MeetingRecord.People()
+          && odd?.writer == nil, "T8 record: an unknown job, transcriber or writer, a tidying that is not true or false, and counts outside 1 to 6 are not taken")
+    writeRecord(dir, ["id": "x", "started": "2026-11-13T09:00:00Z", "state": "done", "people": ["room": 1, "call": 6, "names": ["A"]], "future": 1])
+    check(MeetingStore.record(in: dir)?.people == MeetingRecord.People(room: 1, call: 6), "T8 record: counts of 1 and 6 are taken")
+    try! store.update(dir) { $0.title = "Renamed" }
+    let kept = recordJSON(dir)
+    let keptPeople = kept["people"] as? [String: Any]
+    check(keptPeople?["names"] != nil && (keptPeople?["room"] as? NSNumber)?.intValue == 1 && (keptPeople?["call"] as? NSNumber)?.intValue == 6
+          && kept["future"] != nil, "T8 record: an update elsewhere keeps the counts, and keys it does not know (\(kept))")
+}
+
+// The arguments for the two redo kinds (contracts, "App to engine arguments").
+do {
+    let dir = URL(fileURLWithPath: "/Users/someone/Meetings/2026-11-13 0900 Weekly sync", isDirectory: true)
+    func args(_ kind: JobKind, _ t: Transcriber = .parakeet, room: Int? = nil, call: Int? = nil, tidy: Bool = true,
+              writer: OutsideWriter? = nil) -> [String] {
+        ScriptRunner.arguments(kind: kind, folder: dir, transcriber: t, room: room, call: call, tidy: tidy, writer: writer)
+    }
+    check(JobKind.process.rawValue == "process" && JobKind.minutes.rawValue == "minutes" && JobKind.transcribe.rawValue == "transcribe",
+          "T8 kinds: process, minutes and transcribe, the words meeting.json and .swap use")
+    check(args(.minutes) == ["notes", dir.path, "--writer", "apple"], "T8 arguments: a minutes job is notes <dir> --writer apple")
+    check(args(.minutes, .apple, room: 2, call: 3, tidy: false) == args(.minutes), "T8 arguments: a minutes job takes no transcriber, counts or tidying")
+    check(args(.minutes, writer: t8Claude) == ["notes", dir.path, "--writer", "outside", "--kind", "claude", "--address", "https://api.anthropic.com",
+                                               "--writer-model", "claude-model"], "T8 arguments: a minutes job with an outside writer")
+    check(args(.transcribe, .apple, room: 2, tidy: false) == ["redo", dir.path, "--native", "--room", "2", "--no-tidy", "--writer", "apple"],
+          "T8 arguments: a transcribe job is redo <dir> --native --room 2 --no-tidy --writer apple")
+    check(args(.transcribe, call: 4) == ["redo", dir.path, "--parakeet", "--call", "4", "--tidy", "--writer", "apple"],
+          "T8 arguments: --parakeet, --call alone, --tidy")
+    check(args(.transcribe, room: 1, call: 6, writer: t8Local) == ["redo", dir.path, "--parakeet", "--room", "1", "--call", "6", "--tidy",
+                                                                   "--writer", "outside", "--kind", "standard", "--address", t8Local.address,
+                                                                   "--writer-model", "llama"], "T8 arguments: both counts and an outside writer")
+}
+
+// ProcessingQueue.redo: what it takes, what it writes before anything runs, and what it refuses.
+do {
+    let r = QRig()
+    let q = r.make()
+    let busy = r.meeting("2026-11-13_0800", files: ["audio.m4a": "a"], queued)
+    q.enqueue(busy)
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .outside(t8Local); $0.error = "an old redo did not finish" }
+    let accepted = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, call: nil, tidy: false, writer: .apple))
+    let j = r.json(a)
+    check(accepted && j["state"] as? String == "queued" && j["job"] as? String == "transcribe" && j["jobTranscriber"] as? String == "apple"
+          && (j["jobTidy"] as? Bool) == false && (j["people"] as? [String: Any]).map { ($0["room"] as? NSNumber)?.intValue == 2 && $0["call"] == nil } == true
+          && j["writer"] as? String == "apple" && j["error"] == nil && j["attempts"] == nil,
+          "T8 redo: writes queued, the kind and the options, with no error or attempts, before anything runs (\(j))")
+    check(r.runner.calls.count == 1 && q.current?.lastPathComponent == busy.lastPathComponent, "T8 redo: it queues behind another meeting's job")
+    check(!q.redo(a, kind: .minutes, options: JobOptions(writer: .apple)) && r.json(a)["job"] as? String == "transcribe",
+          "T8 redo: a meeting already queued is not taken again")
+
+    func refused(_ dir: URL, _ kind: JobKind, _ label: String) {
+        let before = try? Data(contentsOf: dir.appendingPathComponent("meeting.json"))
+        let taken = q.redo(dir, kind: kind, options: JobOptions(transcriber: .apple, room: 2, tidy: false, writer: .apple))
+        check(!taken && (try? Data(contentsOf: dir.appendingPathComponent("meeting.json"))) == before, "T8 redo: refused, its record untouched: \(label)")
+    }
+    let files = ["audio.m4a": "a", "transcript.txt": "t", "notes.md": "n"]
+    for (i, s) in [MeetingState.queued, .processing, .recording, .finalising].enumerated() {
+        refused(r.meeting("2026-11-12_0\(i)00", files: files) { $0.state = s }, .minutes, "a \(s) meeting")
+    }
+    refused(busy, .transcribe, "the queue's own job")
+    refused(r.meeting("2026-11-11_0900", files: ["audio.m4a": "a", "transcript.txt": "t"]) { $0.state = .unprocessed }, .minutes, "an unprocessed meeting")
+    refused(t8Done(r, "2026-11-11_1000", notes: false), .transcribe, "Transcribe again on a failed meeting")
+    refused(r.meeting("2026-11-11_1100", files: ["2026-11-11_1100_meeting.m4a": "a", "transcript.txt": "t", "notes.md": "n"]) { $0.state = .done },
+            .transcribe, "Transcribe again without the audio a job runs (a v1.2 recording)")
+    refused(r.meeting("2026-11-11_1200", files: ["audio.m4a": "a", "notes.md": "n"]) { $0.state = .done }, .minutes, "Redo minutes without a transcript")
+    refused(r.meeting("2026-11-11_1300", files: ["audio.m4a": "a"]) { $0.state = .failed }, .minutes, "Redo minutes on a failed meeting without a transcript")
+    let unfinished = r.meeting("2026-11-11_1400", files: ["audio.m4a": "a", "transcript.txt": "t", "notes.md": "n", "mic.caf": "c"]) { $0.state = .done }
+    refused(unfinished, .minutes, "an unfinished recording, minutes")
+    refused(unfinished, .transcribe, "an unfinished recording, transcribe")
+    refused(t8Done(r, "2026-11-11_1500"), .process, "a process kind")
+    let bare = r.meeting("2026-11-11_1600", files: ["audio.m4a": "a", "transcript.txt": "t"])
+    check(!q.redo(bare, kind: .minutes, options: JobOptions(writer: .apple)) && !fm.fileExists(atPath: bare.appendingPathComponent("meeting.json").path),
+          "T8 redo: a folder a scan calls unprocessed is refused, and no record is made for it")
+    // taken: a v1.2 meeting with minutes and no record (a scan calls it done), and a failed one with a transcript
+    let v12 = r.meeting("2026-11-10_0900", files: ["2026-11-10_0900_meeting.m4a": "a", "transcript.txt": "t", "notes.md": "n"])
+    check(q.redo(v12, kind: .minutes, options: JobOptions(writer: .apple)) && r.state(v12) == "queued" && r.json(v12)["job"] as? String == "minutes"
+          && r.json(v12)["writer"] as? String == "apple", "T8 redo: Redo minutes on a v1.2 meeting with no record: a record is made, queued")
+    let failedText = t8Done(r, "2026-11-10_1000", notes: false)
+    check(q.redo(failedText, kind: .minutes, options: JobOptions(writer: .apple)) && r.state(failedText) == "queued",
+          "T8 redo: Redo minutes on a failed meeting with a transcript is queued")
+    check(r.runner.calls.count == 1, "T8 redo: all of them wait behind the running job")
+    r.runner.finish(0, 0)
+    let run = r.runner.calls.last
+    check(r.runner.calls.count == 2 && run?.job.kind == .transcribe && run?.stateAtRun == "processing" && run?.attemptsAtRun == 1
+          && run?.arguments == ["redo", a.path, "--native", "--room", "2", "--no-tidy", "--writer", "apple"],
+          "T8 redo: then it runs as its kind with the options written: redo <dir> --native --room 2 --no-tidy --writer apple (\(run?.arguments ?? []))")
+}
+
+// A redo survives a relaunch: the same kind, with the transcriber, counts, tidying and writer chosen in the
+// sheet, whatever Preferences say by then (Review Focus 6).
+do {
+    let r = QRig()
+    let agreedLocal = [Source(kind: .standard, address: t8Local.address, agreed: true)]
+    var prefs = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: agreedLocal)
+    var q1: ProcessingQueue? = r.make(settings: { prefs })
+    let busy = r.meeting("2026-11-13_0800", files: ["audio.m4a": "a"], queued)
+    q1!.enqueue(busy)
+    let a = t8Done(r, "2026-11-13_0900")
+    check(q1!.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, call: 3, tidy: false, writer: .outside(t8Local))),
+          "T8 relaunch: a Transcribe again is queued behind another job")
+    q1 = nil
+    r.queue = nil // the app quits before it runs
+    prefs = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .outside(t8Claude), agreed: agreedLocal)
+    let runs = r.runner.calls.count
+    var q2: ProcessingQueue? = r.make(settings: { prefs })
+    q2!.resume()
+    r.runner.finish(runs, 0) // the other job, taken up again first, ends
+    let expected = ["--native", "--room", "2", "--call", "3", "--no-tidy", "--writer", "outside", "--kind", "standard",
+                    "--address", t8Local.address, "--writer-model", "llama"]
+    let run = r.runner.calls.last
+    check(r.runner.calls.count == runs + 2 && run?.job.kind == .transcribe && argsAre(run?.arguments, "redo", a, expected),
+          "T8 relaunch: after a relaunch it runs as the same kind with the sheet's choices, though Preferences changed (\(run?.arguments ?? []))")
+    q2 = nil
+    r.queue = nil // and the app quits again while it runs
+    let q3 = r.make(settings: { prefs })
+    q3.resume()
+    let again = r.runner.calls.last
+    check(r.runner.calls.count == runs + 3 && again?.job.kind == .transcribe && argsAre(again?.arguments, "redo", a, expected)
+          && again?.attemptsAtRun == 2, "T8 relaunch: a redo cut off by a crash is settled and run again as the same kind, attempts 2")
+    r.runner.finish(runs + 2, 0)
+    check(r.state(a) == "done" && r.error(a) == nil, "T8 relaunch: and ends done")
+}
+
+// Success by kind: Redo minutes needs only a fresh notes.md; Transcribe again a fresh transcript.txt and
+// notes.md. Every final outcome clears the job options and keeps the counts and the writer.
+do {
+    let r = QRig()
+    let q = r.make()
+    func jobCleared(_ dir: URL) -> Bool { r.json(dir)["job"] == nil && r.json(dir)["jobTranscriber"] == nil && r.json(dir)["jobTidy"] == nil }
+    func settingsKept(_ dir: URL) -> Bool {
+        ((r.json(dir)["people"] as? [String: Any])?["room"] as? NSNumber)?.intValue == 3 && r.json(dir)["writer"] as? String == "apple"
+    }
+    let a = t8Done(r, "2026-11-13_0900") { $0.people = MeetingRecord.People(room: 3, call: nil) }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    check(r.runner.calls.last?.arguments == ["notes", a.path, "--writer", "apple"] && r.runner.calls.last?.job.kind == .minutes,
+          "T8 minutes: a minutes job launches notes <dir> --writer apple")
+    r.runner.finishNotes(0, 0)
+    check(r.state(a) == "done" && r.error(a) == nil && r.finished.last.map { $0 == (a.lastPathComponent, true) } == true && r.kinds.last == .minutes,
+          "T8 minutes: a fresh notes.md alone is success (the transcript is an hour old)")
+    check(jobCleared(a) && settingsKept(a), "T8 clearing: success clears job, jobTranscriber and jobTidy and keeps people and writer")
+    let b = t8Done(r, "2026-11-13_1000") { $0.people = MeetingRecord.People(room: 3, call: nil) }
+    _ = q.redo(b, kind: .transcribe, options: JobOptions(transcriber: .parakeet, room: 3, tidy: true, writer: .apple))
+    r.runner.finishNotes(1, 0)
+    check(r.state(b) == "done" && r.error(b) == "The redo did not finish: meetingbox finished but wrote nothing new. Nothing was changed."
+          && r.finished.last.map { $0 == (b.lastPathComponent, false) } == true,
+          "T8 transcribe: exit 0 with only notes.md fresh is not success for Transcribe again (\(r.error(b) ?? "-"))")
+    check(jobCleared(b) && settingsKept(b), "T8 clearing: so does a failure")
+    _ = q.redo(b, kind: .transcribe, options: JobOptions(transcriber: .parakeet, room: 3, tidy: true, writer: .apple))
+    r.runner.finish(2, 0)
+    check(r.state(b) == "done" && r.error(b) == nil && jobCleared(b) && settingsKept(b),
+          "T8 transcribe: a fresh transcript.txt and notes.md is success, and the error line its last redo left goes")
+}
+
+// Failure: nothing changed, back to Done with minutes or Failed without, in the fixed words.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.people = MeetingRecord.People(room: 2, call: nil); $0.writer = .apple }
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, tidy: false, writer: .apple))
+    r.runner.finish(0, 1, "the call side has no words now.")
+    check(r.state(a) == "done" && r.error(a) == "The redo did not finish: the call side has no words now. Nothing was changed.",
+          "T8 failure: exit 1 on a meeting with minutes: Done, nothing changed, the engine's reason in the fixed words (\(r.error(a) ?? "-"))")
+    check(r.finished.last.map { $0 == (a.lastPathComponent, false) } == true && r.kinds.last == .transcribe,
+          "T8 failure: onFinished says it did not work, and the kind")
+    check(r.json(a)["job"] == nil && (r.json(a)["people"] as? [String: Any]) != nil && r.json(a)["writer"] as? String == "apple",
+          "T8 clearing: the job is cleared, the counts and writer kept")
+    let f = t8Done(r, "2026-11-13_1000", notes: false)
+    _ = q.redo(f, kind: .minutes, options: JobOptions(writer: .apple))
+    r.runner.finish(1, 1, "")
+    check(r.state(f) == "failed" && r.error(f) == "The redo did not finish: meetingbox failed (exit 1). Nothing was changed.",
+          "T8 failure: without minutes it is Failed; with nothing on stderr the exit status is the reason (\(r.error(f) ?? "-"))")
+    check(ProcessingQueue.redoNothingChanged("x.") == "The redo did not finish: x. Nothing was changed."
+          && ProcessingQueue.redoPartWay("y") == "The redo stopped part way: y. Choose it again to finish it.", "T8 failure: the two fixed sentences")
+}
+
+// A killed engine: a signal, or a swap left to finish (exit 3), runs the same kind again, up to three runs.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.people = MeetingRecord.People(room: 2, call: nil); $0.writer = .apple }
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, tidy: false, writer: .apple))
+    let args = r.runner.calls.first?.arguments
+    r.runner.finish(0, 137, "meetingbox transcribing")
+    check(r.runner.calls.count == 2 && r.runner.calls[1].arguments == args && r.runner.calls[1].job.kind == .transcribe
+          && r.runner.calls[1].attemptsAtRun == 2 && r.runner.calls[1].attempt != r.runner.calls[0].attempt && r.finished.isEmpty,
+          "T8 killed: a redo stopped by a signal (137) runs again as the same kind, attempts 2")
+    r.runner.finish(1, 3, "not every new file could be moved into place")
+    check(r.runner.calls.count == 3 && r.runner.calls[2].arguments == args && r.runner.calls[2].attemptsAtRun == 3 && r.finished.isEmpty,
+          "T8 killed: one that left a swap to finish (exit 3) runs again too, attempts 3")
+    r.runner.finish(2, 137, "meetingbox transcribing")
+    check(r.runner.calls.count == 3 && r.state(a) == "done"
+          && r.error(a) == "The redo stopped part way: meetingbox was stopped before it finished. Choose it again to finish it.",
+          "T8 killed: after three runs it stops: Done, stopped part way (\(r.error(a) ?? "-"))")
+    check(r.json(a)["job"] == nil && r.json(a)["writer"] as? String == "apple" && r.finished.last.map { $0.1 } == false,
+          "T8 clearing: stopped part way clears the job and keeps the writer")
+    let b = t8Done(r, "2026-11-13_1000", notes: false)
+    _ = q.redo(b, kind: .minutes, options: JobOptions(writer: .apple))
+    r.runner.finish(3, 3, "not every new file could be moved into place")
+    r.runner.finish(4, 143, "")
+    r.runner.finish(5, 3, "not every new file could be moved into place")
+    check(r.runner.calls.count == 6 && r.state(b) == "failed"
+          && r.error(b) == "The redo stopped part way: not every new file could be moved into place. Choose it again to finish it.",
+          "T8 killed: a third run that leaves a swap gives the engine's reason; without minutes it is Failed (\(r.error(b) ?? "-"))")
+    // a process that leaves a swap runs again as a process; one stopped by a signal fails, as before
+    let p = r.meeting("2026-11-13_1100", files: ["audio.m4a": "a"], queued)
+    q.enqueue(p)
+    r.runner.finish(6, 3, "not every new file could be moved into place")
+    check(r.runner.calls.count == 8 && r.runner.calls[7].job.kind == .process && r.runner.calls[7].attemptsAtRun == 2,
+          "T8 process: a process that left a swap (exit 3) runs again as a process")
+    r.runner.finish(7, 137, "meetingbox transcribing")
+    check(r.runner.calls.count == 8 && r.state(p) == "failed" && r.error(p) == "meetingbox transcribing",
+          "T8 process: a process stopped by a signal fails with its last line, as before")
+}
+
+// The same rules when a job is settled after a relaunch, from its lock and .process-result.
+func resumedRedo(_ kind: JobKind, attempts: Int, notes: Bool = true, _ setUp: (QRig, URL) -> Void) -> QRig {
+    let r = QRig()
+    let dir = t8Done(r, "2026-11-13_0900", notes: notes) {
+        $0.state = .processing
+        $0.attempts = attempts
+        $0.attempt = "attempt-x"
+        $0.job = kind
+        $0.jobTranscriber = .apple
+        $0.jobTidy = false
+        $0.people = MeetingRecord.People(room: 2, call: nil)
+        $0.writer = .apple
+    }
+    setUp(r, dir)
+    r.make().resume()
+    return r
+}
+do {
+    let started = Date().addingTimeInterval(-30)
+    var dir = URL(fileURLWithPath: "/")
+    let three = resumedRedo(.transcribe, attempts: 1) { r, d in dir = d; r.result(d, attempt: "attempt-x", status: 3, started: started) }
+    check(three.runner.calls.count == 1 && three.runner.calls[0].job.kind == .transcribe && three.runner.calls[0].attemptsAtRun == 2
+          && argsAre(three.runner.calls[0].arguments, "redo", dir, ["--native", "--room", "2", "--no-tidy", "--writer", "apple"]),
+          "T8 settle: our result with exit 3 runs the same kind again, with the options written, attempts 2")
+    let killed = resumedRedo(.minutes, attempts: 2) { r, d in r.result(d, attempt: "attempt-x", status: 137, started: started) }
+    check(killed.runner.calls.count == 1 && killed.runner.calls[0].job.kind == .minutes && killed.runner.calls[0].attemptsAtRun == 3,
+          "T8 settle: our result ended by a signal runs the same kind again")
+    let spent = resumedRedo(.transcribe, attempts: 3) { r, d in dir = d; r.result(d, attempt: "attempt-x", status: 3, started: started) }
+    check(spent.runner.calls.isEmpty && spent.state(dir) == "done"
+          && spent.error(dir) == "The redo stopped part way: meetingbox was stopped before it finished. Choose it again to finish it."
+          && spent.json(dir)["job"] == nil && spent.json(dir)["writer"] as? String == "apple",
+          "T8 settle: at attempts 3 it stops: Done, stopped part way, the job cleared (\(spent.error(dir) ?? "-"))")
+    let failed = resumedRedo(.minutes, attempts: 1, notes: false) { r, d in dir = d; r.result(d, attempt: "attempt-x", status: 1, started: started) }
+    check(failed.runner.calls.isEmpty && failed.state(dir) == "failed"
+          && failed.error(dir) == "The redo did not finish: meetingbox failed (exit 1). Nothing was changed.",
+          "T8 settle: our result with exit 1 is nothing changed; without minutes, Failed (\(failed.error(dir) ?? "-"))")
+    let swapped = resumedRedo(.transcribe, attempts: 2) { r, d in
+        dir = d
+        stageFiles(d, ".stage.abc123", ["transcript.txt": "new transcript\n", "notes.md": "new minutes\n"])
+        moveInStaged(d, stage: ".stage.abc123", touch: true)
+        r.result(d, attempt: "attempt-x", status: 0, started: started)
+    }
+    check(swapped.runner.calls.isEmpty && swapped.state(dir) == "done" && swapped.error(dir) == nil && swapped.json(dir)["job"] == nil,
+          "T8 settle: a run that only moved in its staged files, touched to now, and exited 0 is Done with no error line")
+}
+
+// The second run only finishes the first one's swap: the staged files moved in and touched to now, exit 0.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900")
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .parakeet, tidy: true, writer: .apple))
+    r.runner.finish(0, 137) // killed between two renames
+    stageFiles(a, ".stage.abc123", ["transcript.txt": "new transcript\n", "notes.md": "new minutes\n"])
+    r.runner.finishSwap(1, 0, stage: ".stage.abc123")
+    check(r.state(a) == "done" && r.error(a) == nil && r.finished.last.map { $0 == (a.lastPathComponent, true) } == true
+          && (try? String(contentsOf: a.appendingPathComponent("transcript.txt"), encoding: .utf8)) == "new transcript\n",
+          "T8 killed: a second run that only moves in the staged files, touched to now, ends Done with no error line")
+    let b = t8Done(r, "2026-11-13_1000")
+    _ = q.redo(b, kind: .transcribe, options: JobOptions(transcriber: .parakeet, tidy: true, writer: .apple))
+    stageFiles(b, ".stage.def456", ["transcript.txt": "new transcript\n", "notes.md": "new minutes\n"])
+    r.runner.finishSwap(2, 0, stage: ".stage.def456", touch: false)
+    check(r.error(b) != nil, "T8 killed: (files moved in without being touched would not count as this run's)")
+}
+
+// Process and Try again after a failed redo: a full process, with the Preferences transcriber and tidying
+// and the meeting's own writer.
+do {
+    let r = QRig()
+    let current = RunSettings(transcriber: .apple, tidy: false, preferredWriter: .outside(t8Claude),
+                              agreed: [Source(kind: .standard, address: t8Local.address, agreed: true)])
+    let q = r.make(settings: { current })
+    let a = t8Done(r, "2026-11-13_0900", notes: false) { $0.writer = .outside(t8Local); $0.people = MeetingRecord.People(room: 2, call: nil) }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .outside(t8Local)))
+    check(r.runner.calls.first?.arguments == ["notes", a.path, "--writer", "outside", "--kind", "standard", "--address", t8Local.address,
+                                          "--writer-model", "llama"], "T8 writer: a redo runs with the meeting's writer when it is agreed")
+    r.runner.finish(0, 1, "the minutes could not be written")
+    check(r.state(a) == "failed", "T8 after a redo: a failed Redo minutes without minutes leaves the meeting Failed")
+    // job options a crash left behind are ignored, and cleared
+    try! r.store.update(a) { $0.job = .transcribe; $0.jobTranscriber = .parakeet; $0.jobTidy = true }
+    q.retry(a)
+    let expected = ["process", a.appendingPathComponent("audio.m4a").path, "--native", "--no-tidy", "--writer", "outside", "--kind", "standard",
+                    "--address", t8Local.address, "--writer-model", "llama"]
+    check(r.runner.calls.count == 2 && r.runner.calls[1].job.kind == .process && r.runner.calls[1].arguments == expected
+          && r.json(a)["job"] == nil && r.json(a)["jobTranscriber"] == nil && r.json(a)["jobTidy"] == nil && r.json(a)["people"] != nil,
+          "T8 Try again after a redo: process <dir>/audio.m4a with the Preferences transcriber and tidying and the meeting's writer, the options cleared (\(r.runner.calls.last?.arguments ?? []))")
+    r.runner.finish(1, 1, "nope")
+    try! r.store.update(a) { $0.job = .minutes }
+    q.process(a)
+    check(r.runner.calls.count == 3 && r.runner.calls[2].job.kind == .process && r.runner.calls[2].arguments == expected && r.json(a)["job"] == nil,
+          "T8 Process after a redo: the same full process")
+    r.runner.finish(2, 0)
+    check(r.state(a) == "done", "T8 Process after a redo: and it ends done")
+}
+
+// What the window offers: Redo minutes and Transcribe again, never on a busy meeting; the error line a redo
+// left on a done meeting; the sheets' words.
+do {
+    let name = "2026-11-13_0900"
+    let here = libURL(name)
+    let full = MeetingFiles(audio: here.appendingPathComponent("audio.m4a"), runnable: true, transcript: true)
+    let v12 = MeetingFiles(audio: here.appendingPathComponent("2026-11-13_0900_meeting.m4a"), runnable: false, transcript: true)
+    let textOnly = MeetingFiles(transcript: true)
+    let noText = MeetingFiles(audio: here.appendingPathComponent("audio.m4a"), runnable: true)
+    var held = full
+    held.lockHeld = true
+    func acts(_ m: Meeting, _ files: MeetingFiles, _ phase: Session.Phase = .idle, processing: URL? = nil) -> [LibraryAction] {
+        LibraryPresentation.actions(for: m, phase: phase, files: files, processing: processing)
+    }
+    let redo: Set<LibraryAction> = [.redoMinutes, .transcribeAgain]
+    check(acts(libMeeting(name, .done), full) == [.rename, .showInFinder, .playAudio, .redoMinutes, .transcribeAgain],
+          "T8 offered: a done meeting with a transcript and the audio a job runs offers both")
+    check(acts(libMeeting(name, .done), v12) == [.rename, .showInFinder, .playAudio, .redoMinutes]
+          && acts(libMeeting(name, .done, record: false), v12) == [.rename, .showInFinder, .playAudio, .redoMinutes]
+          && acts(libMeeting(name, .done), textOnly) == [.rename, .showInFinder, .redoMinutes],
+          "T8 offered: a done meeting that cannot be run (a v1.2 *_meeting.m4a, or no audio) offers only Redo minutes")
+    check(acts(libMeeting(name, .failed), full) == [.rename, .showInFinder, .playAudio, .process, .redoMinutes]
+          && acts(libMeeting(name, .failed), textOnly) == [.rename, .showInFinder, .redoMinutes],
+          "T8 offered: a failed meeting with a transcript offers Redo minutes, and Process when it can be run")
+    check(acts(libMeeting(name, .failed), noText) == [.rename, .showInFinder, .playAudio, .process]
+          && acts(libMeeting(name, .done), noText) == [.rename, .showInFinder, .playAudio, .transcribeAgain],
+          "T8 offered: no transcript, no Redo minutes")
+    check(acts(libMeeting(name, .unprocessed), full) == [.rename, .showInFinder, .playAudio, .process], "T8 offered: neither for a meeting never processed")
+    for s in [MeetingState.recording, .finalising, .queued, .processing] {
+        check(redo.isDisjoint(with: acts(libMeeting(name, s), full)), "T8 offered: neither for a \(s) meeting")
+    }
+    check(redo.isDisjoint(with: acts(libMeeting(name, .done), full, processing: here))
+          && redo.isDisjoint(with: acts(libMeeting(name, .done), full, processing: URL(fileURLWithPath: "/Meetings/./2026-11-13_0900/"))),
+          "T8 offered: neither for the queue's live job, however its folder is spelled")
+    check(redo.isDisjoint(with: acts(libMeeting(name, .done), held)), "T8 offered: neither while another process holds the lock (files.lockHeld)")
+    check(acts(libMeeting(name, .done), full, .recording(libURL("2026-11-13_1000"))) == [.rename, .showInFinder, .redoMinutes, .transcribeAgain]
+          && acts(libMeeting(name, .done), full, processing: libURL("2026-11-13_1000")).contains(.transcribeAgain),
+          "T8 offered: both while another meeting records, or is processed")
+    check(acts(libMeeting(name, .recording), full, .recording(here)) == [.pause, .stop, .showInFinder], "T8 offered: the recording itself is as before")
+    check(LibraryAction.redoMinutes.title == "Redo minutes…" && LibraryAction.transcribeAgain.title == "Transcribe again…", "T8 words: the two actions")
+
+    let left = "The redo did not finish: the call side has no words now. Nothing was changed."
+    let doneLeft = libMeeting(name, .done, error: left + "\nmore")
+    check(LibraryPresentation.notes(for: doneLeft, row: LibraryPresentation.row(doneLeft), files: full) == [left],
+          "T8 window: a done meeting shows the error line its last redo left, one line")
+    check(LibraryPresentation.notes(for: libMeeting(name, .done), row: LibraryPresentation.row(libMeeting(name, .done)), files: full).isEmpty,
+          "T8 window: and nothing without one")
+    let processing = libMeeting(name, .processing, error: left)
+    check(LibraryPresentation.notes(for: processing, row: LibraryPresentation.row(processing), files: full).isEmpty, "T8 window: nor while it is processed")
+    check(LibraryPresentation.redoTitle(.minutes) == "Redo minutes" && LibraryPresentation.redoTitle(.transcribe) == "Transcribe again",
+          "T8 words: the sheets' titles and buttons")
+    check(LibraryPresentation.roomLabel == "People in the room, including you" && LibraryPresentation.callLabel == "People on the other end of the call",
+          "T8 words: the two counts")
+    check(LibraryPresentation.countChoices.map(LibraryPresentation.roomChoice) == ["Work it out", "1 (just you)", "2", "3", "4", "5", "6"]
+          && LibraryPresentation.countChoices.map(LibraryPresentation.callChoice) == ["Work it out", "1", "2", "3", "4", "5", "6"],
+          "T8 words: Work it out, 1 (just you), 2 to 6; Work it out, 1 to 6")
+    check(LibraryPresentation.busy == "That meeting is busy" && LibraryPresentation.renameMessage(RenameError.busy) == LibraryPresentation.busy,
+          "T8 words: That meeting is busy")
+    check(StatusPresentation.redoNotFinished == "Redo did not finish", "T8 words: the amber line")
+}
+
+// MeetingFiles.read: the transcript, and whether another process holds the lock (through the ps given);
+// `actions` itself runs no process.
+do {
+    let root = freshRoot()
+    let dir = make(root, "2026-11-13_0900", files: ["audio.m4a": "a", "transcript.txt": "t"])
+    let folder = MeetingFolder.parse(dir)!
+    let tools = freshRoot()
+    let psLog = tools.appendingPathComponent("ps.log")
+    let ps = tools.appendingPathComponent("ps")
+    try! "#!/bin/bash\necho ran >> '\(psLog.path)'\nprintf '%s\\n' 'Thu Nov 13 09:00:00 2026'\n".write(to: ps, atomically: true, encoding: .utf8)
+    chmod(ps.path, 0o700)
+    func runs() -> Int { ((try? String(contentsOf: psLog, encoding: .utf8)) ?? "").split(separator: "\n").count }
+    let free = MeetingFiles.read(folder, ps: ps)
+    check(free.transcript && free.runnable && !free.lockHeld && runs() == 0, "T8 files: a transcript, no lock, and ps is not asked")
+    let l = dir.appendingPathComponent(".processing")
+    try! fm.createDirectory(at: l, withIntermediateDirectories: true)
+    try! "\(me) Thu Nov 13 09:00:00 2026\n".write(to: l.appendingPathComponent("owner"), atomically: true, encoding: .utf8)
+    let held = MeetingFiles.read(folder, ps: ps)
+    check(held.lockHeld && runs() == 1, "T8 files: a lock whose owner the given ps finds alive is held")
+    let meeting = Meeting(folder: folder, record: nil, state: .done)
+    for _ in 0..<5 { _ = LibraryPresentation.actions(for: meeting, phase: .idle, files: held, processing: nil) }
+    check(runs() == 1, "T8 files: actions reads only its arguments and runs no process")
+    try! "\(me) Mon Jan  5 09:00:00 2026\n".write(to: l.appendingPathComponent("owner"), atomically: true, encoding: .utf8)
+    check(!MeetingFiles.read(folder, ps: ps).lockHeld, "T8 files: an owner whose start time differs is gone: not held")
+    check(MeetingFiles.read(folder, ps: tools.appendingPathComponent("no-such-ps")).lockHeld,
+          "T8 files: a lock ps cannot tell about counts as held")
+    try! fm.removeItem(at: dir.appendingPathComponent("transcript.txt"))
+    check(!MeetingFiles.read(folder, ps: ps).transcript, "T8 files: no transcript.txt, no transcript")
+}
+
+// Transcript versions, in the order and words the picker shows.
+do {
+    let dir = URL(fileURLWithPath: "/Meetings/2026-11-13_0900", isDirectory: true)
+    let versions = LibraryPresentation.transcriptVersions(
+        in: dir,
+        files: ["transcript.txt", "notes.md", "transcript-speakers-2.txt", "transcript-original.txt", "transcript-parakeet.txt", "transcript-a.txt",
+                "old-transcript.txt", "transcript.txt.bak", "transcripts.md"],
+        earlier: ["2026-11-12 1405", "2026-11-13 0910", "2026-11-12 1405-2", "2026-11-12 0900", "my copy", "2026-11-12 1405-10"])
+    check(versions.map(\.title) == ["Current", "Parakeet (MLX)", "Original", "transcript-a.txt", "transcript-speakers-2.txt",
+                                    "Earlier, 13 Nov 2026 09:10", "Earlier, 12 Nov 2026 14:05 (10)", "Earlier, 12 Nov 2026 14:05 (2)",
+                                    "Earlier, 12 Nov 2026 14:05", "Earlier, 12 Nov 2026 09:00", "Earlier, my copy"],
+          "T8 versions: Current, Parakeet (MLX), Original, the others by name, then each earlier one newest first, a -N folder told apart (\(versions.map(\.title)))")
+    check(versions.first?.url == dir.appendingPathComponent("transcript.txt") && versions[1].url == dir.appendingPathComponent("transcript-parakeet.txt")
+          && versions[5].url == dir.appendingPathComponent("earlier/2026-11-13 0910/transcript.txt"),
+          "T8 versions: each names its file")
+    check(LibraryPresentation.transcriptVersions(in: dir, files: [], earlier: []).map(\.title) == ["Current"], "T8 versions: Current is always there")
+}
+
+// LibraryModel: the picker, read only; search unchanged; when it goes back to Current; onSelectionChange.
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let queue = ProcessingQueue(store: r.store, runner: FakeRunner(), tickQueue: nil)
+    let model = LibraryModel(store: r.store, session: session, queue: queue)
+    var changed = 0
+    model.onSelectionChange = { changed += 1 }
+    let root = r.store.root
+    let a = make(root, "2026-11-13_0900", files: ["transcript.txt": "[00:00:01] Me: the current words", "notes.md": "minutes",
+                                                  "transcript-parakeet.txt": "[00:00:01] Me: the mlx words", "transcript-original.txt": "original words"])
+    for (stamp, words) in [("2026-11-12 1405", "the zebra words"), ("2026-11-12 1405-2", "the zebra words")] {
+        let earlier = a.appendingPathComponent("earlier/\(stamp)", isDirectory: true)
+        try! fm.createDirectory(at: earlier, withIntermediateDirectories: true)
+        try! "[00:00:01] Me: \(words)".write(to: earlier.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
+    }
+    let minutesOnly = a.appendingPathComponent("earlier/2026-11-11 0800", isDirectory: true)
+    try! fm.createDirectory(at: minutesOnly, withIntermediateDirectories: true)
+    try! "kept minutes".write(to: minutesOnly.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    try! r.store.update(a) { $0.state = .done }
+    let b = make(root, "2026-11-12_0900", files: ["transcript.txt": "b words"])
+    let keyA = LibraryPresentation.key(a), keyB = LibraryPresentation.key(b)
+    model.reload()
+    check(settle { model.meetings.count == 2 }, "T8 versions: the meetings are read")
+    model.select(keyA)
+    check(changed == 1, "T8 selection: select calls onSelectionChange when the selection changes")
+    check(settle { model.shownContent?.versions.count == 5 }, "T8 versions: the versions are listed off the main queue")
+    let versions = model.shownContent?.versions ?? []
+    check(versions.map(\.title) == ["Current", "Parakeet (MLX)", "Original", "Earlier, 12 Nov 2026 14:05 (2)", "Earlier, 12 Nov 2026 14:05"]
+          && model.version == nil && model.shownContent?.transcript == "[00:00:01] Me: the current words",
+          "T8 versions: the folder's transcripts and each earlier/*/transcript.txt; Current is shown (\(versions.map(\.title)))")
+    check(model.versionChoices == versions, "T8 versions: the picker offers them")
+    guard versions.count == 5 else { return }
+    let before = snapshot(a)
+    let mlx = versions[1].url
+    model.chooseVersion(mlx)
+    check(model.version == mlx && settle { model.shownContent?.transcript == "[00:00:01] Me: the mlx words" }, "T8 versions: choosing one shows that file's text")
+    check(snapshot(a) == before, "T8 versions: and changes no file")
+    model.chooseVersion(versions[0].url)
+    check(model.version == nil && settle { model.shownContent?.transcript == "[00:00:01] Me: the current words" }, "T8 versions: choosing Current shows transcript.txt")
+    let zebra = versions[3].url
+    model.chooseVersion(zebra)
+    check(settle { model.shownContent?.transcript == "[00:00:01] Me: the zebra words" }, "T8 versions: an earlier one")
+    model.search("zebra")
+    check(settle { model.visible.isEmpty } && model.meetings.count == 2, "T8 versions: search still matches only transcript.txt: not an earlier version")
+    model.search("")
+    check(model.visible.count == 2, "T8 versions: a blank search lists both again")
+    model.search("mlx")
+    check(settle { model.visible.isEmpty }, "T8 versions: nor another transcript in the folder")
+    model.search("")
+    model.search("current")
+    check(settle { model.visible.map { LibraryPresentation.key($0.folder.url) } == [keyA] }, "T8 versions: transcript.txt is searched")
+    model.search("")
+    _ = make(root, "2026-11-11_0900")
+    model.reload()
+    check(settle { model.meetings.count == 3 } && model.version == zebra && settle { model.shownContent?.transcript == "[00:00:01] Me: the zebra words" },
+          "T8 versions: a rescan keeps the chosen version")
+    try! fm.removeItem(at: zebra)
+    model.reload()
+    // A read already under way may list the folder after the file went: wait for the read that follows.
+    check(settle { model.shownContent?.versions.count == 4 && model.shownContent?.transcript == nil } && model.version == zebra,
+          "T8 versions: a version deleted in Finder shows No transcript yet (nil), without a crash (\(model.shownContent?.versions.map(\.title) ?? []), \(model.shownContent?.transcript ?? "nil"), \(model.version?.path ?? "nil"))")
+    check(model.versionChoices.count == 4, "T8 versions: the picker stays while a deleted version is chosen, so Current can be chosen again")
+    model.select(keyB)
+    check(changed == 2 && model.version == nil, "T8 versions: selecting another meeting goes back to Current")
+    check(settle { model.shownContent?.key == keyB } && model.versionChoices.isEmpty, "T8 versions: a meeting with only Current offers no picker")
+    model.select(keyB)
+    check(changed == 2, "T8 selection: the same selection again calls nothing")
+    model.select(keyA)
+    check(changed == 3 && settle { model.shownContent?.key == keyA && model.shownContent?.transcript == "[00:00:01] Me: the current words" },
+          "T8 versions: back on the meeting, Current")
+    model.chooseVersion(mlx)
+    check(settle { model.shownContent?.transcript == "[00:00:01] Me: the mlx words" }, "T8 versions: chosen again")
+    model.show(a)
+    check(changed == 3 && model.version == nil && settle { model.shownContent?.transcript == "[00:00:01] Me: the current words" },
+          "T8 versions: show (a job finished) goes back to Current; the selection is the same, so onSelectionChange is not called")
+    model.show(b)
+    check(changed == 4, "T8 selection: show calls it when the selection changes")
+    model.show(b)
+    check(changed == 4, "T8 selection: and not when it does not")
+}
+
+// LibraryModel: the two sheets, what they start at, Cancel, an outside writer not agreed, and the check off
+// the main queue that refuses a busy meeting; a redo is accepted while another meeting records.
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let runner = FakeRunner()
+    let queue = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil)
+    var settings = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
+    let model = LibraryModel(store: r.store, session: session, queue: queue, settings: { settings })
+    let root = r.store.root
+    func done(_ name: String, _ change: @escaping (inout MeetingRecord) -> Void = { _ in }) -> URL {
+        let dir = make(root, name, files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello", "notes.md": "minutes"])
+        try! r.store.update(dir) { $0.state = .done; change(&$0) }
+        return dir
+    }
+    let m1 = done("2026-11-13_0900") {
+        $0.jobTranscriber = .apple
+        $0.jobTidy = false
+        $0.people = MeetingRecord.People(room: 3, call: 2)
+        $0.writer = .outside(t8Local)
+    }
+    let m2 = done("2026-11-13_1000")
+    let m3 = done("2026-11-13_1100")
+    let m4 = done("2026-11-13_1200")
+    model.reload()
+    check(settle { model.meetings.count == 4 }, "T8 sheet: the meetings are read")
+    @MainActor func open(_ dir: URL) -> Bool {
+        model.select(LibraryPresentation.key(dir))
+        return settle { model.shownContent?.key == LibraryPresentation.key(dir) && model.shownContent?.files.transcript == true }
+    }
+    check(open(m1) && model.actions(for: model.selectedMeeting!) == [.rename, .showInFinder, .playAudio, .redoMinutes, .transcribeAgain],
+          "T8 sheet: a done meeting with a transcript and its audio offers both")
+    model.perform(.transcribeAgain)
+    let draft = model.redoing
+    check(isAt(draft?.folder, m1) && draft?.kind == .transcribe && draft?.transcriber == .parakeet && draft?.tidy == true
+          && draft?.room == 3 && draft?.call == 2 && draft?.writer == .outside(t8Local),
+          "T8 sheet: Transcribe again starts at the Preferences transcriber and tidying, not the last redo's, at the meeting's counts and its writer (\(String(describing: draft)))")
+    model.cancelRedo()
+    _ = settle({ false }, timeout: 0.2)
+    check(model.redoing == nil && runner.calls.isEmpty && r.stateOf(m1) == "done", "T8 sheet: Cancel queues nothing")
+
+    settings.preferredWriter = .outside(t8Claude)
+    check(open(m2), "T8 sheet: another meeting")
+    model.perform(.redoMinutes)
+    check(model.redoing?.kind == .minutes && model.redoing?.writer == .outside(t8Claude) && model.redoing?.room == nil && model.redoing?.call == nil,
+          "T8 sheet: without a writer of its own the meeting starts at the Preferences writer; without counts, Work it out")
+    let bytes = r.raw(m2)
+    model.commitRedo()
+    _ = settle({ false }, timeout: 0.3)
+    check(runner.calls.isEmpty && r.raw(m2) == bytes && model.redoing != nil,
+          "T8 sheet: an outside writer that Preferences have not agreed queues nothing and leaves meeting.json byte-identical")
+    model.updateRedo { $0.writer = .apple }
+    model.commitRedo()
+    check(runner.calls.isEmpty && model.redoing != nil && r.stateOf(m2) == "done", "T8 sheet: the meeting is checked off the main queue: nothing is queued as commitRedo returns")
+    check(settle { runner.calls.count == 1 } && model.redoing == nil && runner.calls.first?.job.kind == .minutes
+          && argsAre(runner.calls.first?.arguments, "notes", m2, ["--writer", "apple"])
+          && r.json(m2)["writer"] as? String == "apple" && model.problem == nil,
+          "T8 sheet: once found free it is queued and runs, notes <dir> --writer apple, and the writer chosen is kept (\(runner.calls.first?.arguments ?? []))")
+
+    // refused at the click: a record that became busy since the list was read; the live lock; the queue's job
+    settings.preferredWriter = .apple
+    check(open(m3), "T8 refusal: a third meeting")
+    model.perform(.transcribeAgain)
+    try! r.store.update(m3) { $0.state = .queued }
+    model.commitRedo()
+    check(settle { model.redoing == nil } && model.problem == "That meeting is busy" && runner.calls.count == 1,
+          "T8 refusal: a meeting whose record says queued since the list was read is refused: That meeting is busy (\(model.problem ?? "-"), \(runner.calls.count), \(model.redoing == nil))")
+    try! r.store.update(m3) { $0.state = .done }
+    check(open(m4), "T8 refusal: a fourth meeting")
+    let lock = m4.appendingPathComponent(".processing")
+    try! fm.createDirectory(at: lock, withIntermediateDirectories: true)
+    try! "\(me) \(lstartOf(me))\n".write(to: lock.appendingPathComponent("owner"), atomically: true, encoding: .utf8)
+    model.perform(.redoMinutes)
+    check(model.redoing != nil, "T8 refusal: the window read the folder before the lock was taken, so it still offers Redo minutes")
+    model.commitRedo()
+    check(settle { model.redoing == nil } && model.problem == "That meeting is busy" && runner.calls.count == 1 && r.stateOf(m4) == "done",
+          "T8 refusal: a meeting a meetingbox run in Terminal holds (the live lock) is refused at the click (\(model.problem ?? "-"), \(runner.calls.count), \(r.stateOf(m4) ?? "-"))")
+    model.reload()
+    check(settle { model.shownContent?.files.lockHeld == true } && !model.actions(for: model.selectedMeeting!).contains(.redoMinutes),
+          "T8 refusal: once read, the held lock offers neither")
+    try! fm.removeItem(at: lock)
+    model.select(LibraryPresentation.key(m2))
+    model.beginRedo(model.selectedMeeting!, kind: .minutes)
+    model.commitRedo()
+    check(settle { model.redoing == nil } && model.problem == "That meeting is busy" && runner.calls.count == 1,
+          "T8 refusal: the queue's own job is refused at the click")
+
+    // accepted while another meeting records, behind the running job
+    let live = try! session.start(root: root, mic: nil)
+    check(session.phase == .recording(live), "T8 queueing: another meeting is recording")
+    check(open(m3) && model.actions(for: model.selectedMeeting!).contains(.transcribeAgain), "T8 queueing: Transcribe again is offered meanwhile")
+    model.perform(.transcribeAgain)
+    model.commitRedo()
+    check(settle { r.stateOf(m3) == "queued" } && runner.calls.count == 1 && model.problem == nil && model.redoing == nil,
+          "T8 queueing: a redo is accepted while another meeting records, and waits behind the running job (\(model.problem ?? "-"), \(runner.calls.count), \(r.stateOf(m3) ?? "-"), \(model.redoing == nil))")
+    runner.finishNotes(0, 0)
+    check(runner.calls.count == 2 && runner.calls[1].job.kind == .transcribe && runner.calls[1].arguments.first == "redo",
+          "T8 queueing: and runs once that job ends")
+}
+
+// AppModel: the window gets the Preferences settings and the selection hook; a redo that did not finish is
+// the amber line "Redo did not finish" and an error line on the done meeting, which the next success clears.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    prefs.transcriber = .apple
+    prefs.tidyLines = false
+    let runner = FakeRunner()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: runner, freeBytes: { _ in 50 * GB })
+    model.launch()
+    check(model.library.onSelectionChange != nil, "T8 app: AppModel sets the window's onSelectionChange")
+    let dir = make(root, "2026-11-13_0900", files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello", "notes.md": "minutes"])
+    try! model.store.update(dir) { $0.state = .done }
+    age(dir)
+    let key = LibraryPresentation.key(dir)
+    model.library.reload()
+    model.library.select(key)
+    check(settle { model.library.shownContent?.key == key && model.library.shownContent?.files.transcript == true }, "T8 app: the meeting is shown")
+    model.library.perform(.transcribeAgain)
+    check(model.library.redoing?.transcriber == .apple && model.library.redoing?.tidy == false,
+          "T8 app: the sheet starts at the Preferences transcriber and tidying, through the settings AppModel passes")
+    model.library.commitRedo()
+    check(settle { runner.calls.count == 1 } && runner.calls[0].arguments.first == "redo" && runner.calls[0].arguments.contains("--native")
+          && runner.calls[0].arguments.contains("--no-tidy"), "T8 app: it runs as a transcribe job (\(runner.calls.first?.arguments ?? []))")
+    runner.finish(0, 1, "the call side has no words now")
+    let left = "The redo did not finish: the call side has no words now. Nothing was changed."
+    check(settle { model.status.notice?.line == "Redo did not finish" } && model.status.notice?.kind == .unfinished
+          && model.presentation.button.tint == .amber && isAt(model.status.notice?.folder, dir),
+          "T8 app: a redo that did not finish is the amber line Redo did not finish, about that meeting (\(model.status.notice?.line ?? "-"))")
+    check(settle { model.library.selectedMeeting.map { model.library.notes(for: $0) } == [left] }
+          && model.library.selectedMeeting?.state == .done, "T8 app: the done meeting shows the error line in the window")
+    check(settle { model.library.shownContent?.key == key && model.library.actions(for: model.library.selectedMeeting!).contains(.redoMinutes) },
+          "T8 app: Redo minutes is offered again")
+    model.library.perform(.redoMinutes)
+    model.library.commitRedo()
+    check(settle { runner.calls.count == 2 } && runner.calls[1].job.kind == .minutes, "T8 app: Redo minutes runs")
+    runner.finishNotes(1, 0)
+    check(settle { model.status.notice?.kind == .minutesReady } && settle { model.library.selectedMeeting.map { model.library.notes(for: $0) } == [] }
+          && MeetingStore.record(in: dir)?.error == nil, "T8 app: the next success clears the error line, and Minutes ready replaces the amber line")
+    model.shutDown()
+    try? fm.removeItem(at: state)
 }
 
 try? fm.removeItem(at: scratch)

@@ -88,16 +88,19 @@ final class AppModel: ObservableObject {
         let session = Session(stateDir: stateDir, recorder: recorder, store: store, now: Date.init,
                               freeBytes: freeBytes)
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")
-        // Each job reads the transcriber and tidying chosen here as it launches.
+        // Each job reads the transcriber and tidying chosen here as it launches; the window's redo sheets
+        // start at them, and check their writer against them.
+        let runSettings = { [preferences] in preferences.runSettings }
         let queue = ProcessingQueue(store: store, runner: runner ?? ScriptRunner.fromBundle() ?? ScriptRunner(script: script),
-                                    settings: { [preferences] in preferences.runSettings })
+                                    settings: runSettings)
         self.store = store
         self.session = session
         self.queue = queue
         self.handler = ControlHandler(session: session, preferences: preferences)
-        self.library = LibraryModel(store: store, session: session, queue: queue)
+        self.library = LibraryModel(store: store, session: session, queue: queue, settings: runSettings)
         // The window's Pause, Resume and Stop take the path the menu's do.
         library.control = { [weak self] action in self?.perform(action) }
+        library.onSelectionChange = { [weak self] in self?.selectionChanged() }
         // A meeting always wins: every start, by any route, first cancels a voice sample being recorded.
         // The handler's queue is the session's tick queue, the main queue.
         handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.cancelSampleForMeeting() } }
@@ -134,12 +137,15 @@ final class AppModel: ObservableObject {
             let (current, stage) = (queue.current, queue.stage)
             Task { @MainActor in self?.apply(.processing(current, stage: stage)) }
         }
-        queue.onFinished = { [weak self] dir, ok in
+        queue.onFinished = { [weak self] dir, ok, kind in
             Task { @MainActor in
                 guard let self = self else { return }
                 self.library.reload()
                 guard ok else {
-                    self.wentWrong(.unfinished(dir, line: StatusPresentation.minutesNotWritten(AppModel.failureReason(dir))))
+                    // A redo's reason is on its meeting in the window; the menu bar only says it did not finish.
+                    let line = kind == .process ? StatusPresentation.minutesNotWritten(AppModel.failureReason(dir))
+                        : StatusPresentation.redoNotFinished
+                    self.wentWrong(.unfinished(dir, line: line))
                     return
                 }
                 self.apply(.minutesReady(dir))
@@ -223,6 +229,9 @@ final class AppModel: ObservableObject {
             library.update(next)
         }
     }
+
+    /// The window chose another meeting. Nothing follows the selection yet; the player will stop here.
+    private func selectionChanged() {}
 
     /// Brings the meetingbox window forward, on that meeting's minutes when one is given.
     func showLibrary(on dir: URL? = nil) {

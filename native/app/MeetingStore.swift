@@ -25,6 +25,24 @@ struct MeetingRecord {
     /// once, when it ends; queued, processing, done and a new attempt leave it as it is.
     var stopReason: String?
 
+    /// How many people a redo is told there are on each side (1 to 6); nil is Work it out.
+    struct People: Equatable {
+        var room: Int?
+        var call: Int?
+
+        static let range = 1...6
+    }
+
+    /// A redo's kind and choices, written before it runs and cleared on every final outcome: `job`
+    /// (absent for a process), and for Transcribe again `jobTranscriber` and `jobTidy`.
+    var job: JobKind?
+    var jobTranscriber: Transcriber?
+    var jobTidy: Bool?
+    /// Kept settings, never cleared by the queue: the writer last chosen and agreed in a sheet for this
+    /// meeting, and the counts last chosen in Transcribe again.
+    var writer: MeetingWriter?
+    var people = People()
+
     init(id: String = UUID().uuidString, title: String? = nil, started: Date = Date(), seconds: Int = 0,
          state: MeetingState) {
         self.id = id
@@ -60,9 +78,39 @@ struct MeetingRecord {
         self.attempts = (json["attempts"] as? NSNumber)?.intValue
         self.attempt = json["attempt"] as? String
         self.stopReason = json["stopReason"] as? String
+        // A redo's own: only values in their words are taken; anything else reads as absent.
+        self.job = (json["job"] as? String).flatMap(JobKind.init(rawValue:))
+        self.jobTranscriber = (json["jobTranscriber"] as? String).flatMap(Transcriber.init(rawValue:))
+        self.jobTidy = MeetingRecord.flag(json["jobTidy"])
+        self.writer = MeetingRecord.writer(json["writer"])
+        let people = json["people"] as? [String: Any]
+        self.people = People(room: MeetingRecord.count(people?["room"]), call: MeetingRecord.count(people?["call"]))
     }
 
-    /// Writes every known field into `json`, removing keys whose value is nil. Other keys are untouched.
+    /// true or false, as JSON writes them; nil for anything else (a number or a string included).
+    private static func flag(_ value: Any?) -> Bool? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else { return nil }
+        return number.boolValue
+    }
+
+    /// A whole number from 1 to 6; nil for anything else.
+    private static func count(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let n = Int(exactly: number.doubleValue), People.range.contains(n) else { return nil }
+        return n
+    }
+
+    /// `"apple"`, or `{"kind", "address", "model"}` with a kind meetingbox knows.
+    private static func writer(_ value: Any?) -> MeetingWriter? {
+        if let word = value as? String { return word == "apple" ? .apple : nil }
+        guard let object = value as? [String: Any],
+              let kind = (object["kind"] as? String).flatMap(SourceKind.init(rawValue:)),
+              let address = object["address"] as? String, let model = object["model"] as? String else { return nil }
+        return .outside(OutsideWriter(kind: kind, address: address, model: model))
+    }
+
+    /// Writes every known field into `json`, removing keys whose value is nil. Other keys are untouched,
+    /// and so are keys inside `people` other than `room` and `call`.
     func apply(to json: inout [String: Any]) {
         let iso = ISO8601DateFormatter()
         func put(_ key: String, _ value: Any?) {
@@ -80,6 +128,19 @@ struct MeetingRecord {
         put("attempts", attempts)
         put("attempt", attempt)
         put("stopReason", stopReason)
+        put("job", job == .process ? nil : job?.rawValue)
+        put("jobTranscriber", jobTranscriber?.rawValue)
+        put("jobTidy", jobTidy)
+        switch writer {
+        case .apple?: json["writer"] = "apple"
+        case .outside(let w)?: json["writer"] = ["kind": w.kind.rawValue, "address": w.address, "model": w.model]
+        case nil: json.removeValue(forKey: "writer")
+        }
+        var counts = json["people"] as? [String: Any] ?? [:]
+        for (key, value) in [("room", people.room), ("call", people.call)] {
+            if let value = value { counts[key] = value } else { counts.removeValue(forKey: key) }
+        }
+        put("people", counts.isEmpty ? nil : counts)
     }
 }
 

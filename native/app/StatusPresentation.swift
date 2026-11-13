@@ -137,6 +137,8 @@ struct StatusPresentation: Equatable {
     static let diskLow = "Disk space low"
     static let recordingNotFinished = "The recording could not be finished; its files are kept"
     static func minutesNotWritten(_ reason: String) -> String { "Minutes could not be written: \(reason)" }
+    /// A redo (Redo minutes or Transcribe again) that did not work; the window says why, on the meeting.
+    static let redoNotFinished = "Redo did not finish"
     static func recordingStopped(_ reason: String) -> String { "Recording stopped: \(reason)" }
 
     let button: StatusButton

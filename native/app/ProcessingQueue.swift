@@ -3,9 +3,22 @@ import Foundation
 
 // MARK: - jobs, writers and the settings a run takes
 
-/// What a job runs. Task 8 adds the redo kinds.
+/// What a job runs: `process` (the first processing, and Process and Try again), or one of the redos,
+/// `minutes` (Redo minutes, `meetingbox notes`) and `transcribe` (Transcribe again, `meetingbox redo`).
+/// The raw values are the words `meeting.json`'s `job` and the engine's `.swap` use.
 enum JobKind: String {
-    case process
+    case process, minutes, transcribe
+}
+
+/// What a redo's sheet chose, written into `meeting.json` by `ProcessingQueue.redo` before it runs. The
+/// transcriber and tidying are for Transcribe again only. For Transcribe again the counts replace the
+/// meeting's (nil is Work it out); Redo minutes leaves them as they are. A nil writer leaves the meeting's.
+struct JobOptions: Equatable {
+    var transcriber: Transcriber?
+    var room: Int?
+    var call: Int?
+    var tidy: Bool?
+    var writer: MeetingWriter?
 }
 
 /// One run of the engine for one meeting: its kind, its folder, and the engine's arguments, built at
@@ -50,6 +63,11 @@ struct RunSettings: Equatable {
     var agreed: [Source]
 
     static let defaults = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
+
+    /// `agreed` holds an agreed source of this writer's kind at its address.
+    func agrees(to writer: OutsideWriter) -> Bool {
+        agreed.contains { $0.agreed && $0.kind == writer.kind && $0.address == writer.address }
+    }
 }
 
 /// Runs the engine for one job. Returns the worker's PID (or -1 when it could not be started); `done`
@@ -91,10 +109,11 @@ final class ScriptRunner: PipelineRunner {
         return env
     }
 
-    /// The engine's arguments for a job (contracts, "App to engine arguments"):
-    /// `process <dir>/audio.m4a --parakeet|--native --tidy|--no-tidy <writer>`, where `<writer>` is
-    /// `--writer apple`, or `--writer outside --kind K --address A --writer-model M` for `writer`. A
-    /// process job takes no people counts.
+    /// The engine's arguments for a job (contracts, "App to engine arguments"), where `<writer>` is
+    /// `--writer apple`, or `--writer outside --kind K --address A --writer-model M` for `writer`:
+    /// - process: `process <dir>/audio.m4a --parakeet|--native --tidy|--no-tidy <writer>`, no counts;
+    /// - minutes: `notes <dir> <writer>`;
+    /// - transcribe: `redo <dir> --parakeet|--native [--room N] [--call N] --tidy|--no-tidy <writer>`.
     static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, tidy: Bool,
                           writer: OutsideWriter?) -> [String] {
         let engine = transcriber == .parakeet ? "--parakeet" : "--native"
@@ -104,6 +123,11 @@ final class ScriptRunner: PipelineRunner {
         switch kind {
         case .process:
             return ["process", folder.appendingPathComponent("audio.m4a").path, engine, lines] + writes
+        case .minutes:
+            return ["notes", folder.path] + writes
+        case .transcribe:
+            let counts = (room.map { ["--room", String($0)] } ?? []) + (call.map { ["--call", String($0)] } ?? [])
+            return ["redo", folder.path, engine] + counts + [lines] + writes
         }
     }
 
@@ -112,8 +136,7 @@ final class ScriptRunner: PipelineRunner {
     /// its address; otherwise Apple's model writes and the outside one is `setAside`, for the log.
     static func writer(meeting: MeetingWriter?, settings: RunSettings) -> (use: OutsideWriter?, setAside: OutsideWriter?) {
         guard case .outside(let wanted) = meeting ?? settings.preferredWriter else { return (nil, nil) }
-        let agreed = settings.agreed.contains { $0.agreed && $0.kind == wanted.kind && $0.address == wanted.address }
-        return agreed ? (wanted, nil) : (nil, wanted)
+        return settings.agrees(to: wanted) ? (wanted, nil) : (nil, wanted)
     }
 
     /// The line `.process-log` gets when an outside writer is set aside at launch.
@@ -434,19 +457,44 @@ struct ProcessResult: Equatable {
 }
 
 /// The durable processing queue. Its state lives in each meeting's `meeting.json` (`queued`,
-/// `processing`, `attempts`, `attempt`), so a crash loses nothing: `resume()` picks up every
-/// `queued` and `processing` meeting, and never touches `unprocessed` or `done` ones. One job runs
-/// at a time, oldest first. A job found `processing` after a crash is settled from its lock and
-/// `.process-result`: a live owner is waited for; our attempt's success is done; anything that
-/// stopped part way is run again, at most three runs in all.
+/// `processing`, `attempts`, `attempt`, and a redo's `job` and its options), so a crash loses nothing:
+/// `resume()` picks up every `queued` and `processing` meeting, and never touches `unprocessed` or
+/// `done` ones. One job runs at a time, oldest first, as the kind its record names. A job found
+/// `processing` after a crash is settled from its lock and `.process-result`: a live owner is waited
+/// for; our attempt's success is done; anything that stopped part way is run again as the same kind,
+/// at most three runs in all.
 /// Call it from one queue (the main queue in the app); a 1 s timer there follows the progress file
 /// and waits on a lock held by another process.
 final class ProcessingQueue {
     static let maxAttempts = 3
     static let keptStopping = "processing kept stopping part way"
     static let noMinutes = "processing finished but wrote no minutes"
+    /// The engine could not finish its swap and left `.swap` for the next run of the same kind to finish.
+    static let swapExit: Int32 = 3
     /// `meetingbox process` refused: another process holds the folder (EX_TEMPFAIL).
     static let busyExit: Int32 = 75
+    /// The reason a redo gives when it was stopped by a signal, or kept stopping, with nothing better said.
+    static let redoStopped = "meetingbox was stopped before it finished"
+    /// The reason a redo gives when the engine said it was done but its files are not new.
+    static let redoWroteNothing = "meetingbox finished but wrote nothing new"
+
+    /// A redo that did not finish and changed nothing (Copy, fixed).
+    static func redoNothingChanged(_ reason: String) -> String {
+        "The redo did not finish: \(clause(reason)). Nothing was changed."
+    }
+
+    /// A redo that left its swap part done, after its runs were spent (Copy, fixed).
+    static func redoPartWay(_ reason: String) -> String {
+        "The redo stopped part way: \(clause(reason)). Choose it again to finish it."
+    }
+
+    /// The engine's reason inside one of those sentences, without a full stop of its own.
+    private static func clause(_ reason: String) -> String {
+        var text = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.hasSuffix(".") { text.removeLast() }
+        return text
+    }
+
     static let progressName = ".process-progress"
     /// `stage` while another process holds the folder: its progress is not ours to read.
     static let waitingStage = "waiting for another meetingbox"
@@ -470,8 +518,9 @@ final class ProcessingQueue {
     /// The last stage in its progress file.
     private(set) var stage: String?
     var onChange: (() -> Void)?
-    /// The folder, and whether it ended done (true) or failed (false).
-    var onFinished: ((URL, Bool) -> Void)?
+    /// The folder, whether the job worked (true) or not (false), and its kind. A redo that did not work
+    /// can leave its meeting Done, with the reason in its record's `error`.
+    var onFinished: ((URL, Bool, JobKind) -> Void)?
 
     private let store: MeetingStore
     private let runner: PipelineRunner
@@ -484,8 +533,8 @@ final class ProcessingQueue {
 
     private var pending: [URL] = []
     private enum Job {
-        /// Our run, started at `started`. `token` ignores a late `done` from an earlier run.
-        case running(started: Date, token: Int)
+        /// Our run of this kind, started at `started`. `token` ignores a late `done` from an earlier run.
+        case running(started: Date, token: Int, kind: JobKind)
         /// Another process holds the folder: wait for its lock to go, then settle from the result.
         case waiting
     }
@@ -550,7 +599,8 @@ final class ProcessingQueue {
     }
 
     /// Writes a meeting in one of the `accepted` states `queued`, with attempts and error reset, and
-    /// queues it. A state that changed under us is left as it is.
+    /// queues it as a full process: any redo options left in its record are cleared. A state that
+    /// changed under us is left as it is.
     private func queueAgain(_ dir: URL, from accepted: [MeetingState]) {
         var requeued = false
         do {
@@ -561,10 +611,65 @@ final class ProcessingQueue {
                 $0.stage = nil
                 $0.attempts = nil
                 $0.attempt = nil
+                ProcessingQueue.clearJob(&$0)
                 requeued = true
             }
         } catch { return }
         if requeued { enqueue(dir) }
+    }
+
+    /// Redo minutes (`minutes`) or Transcribe again (`transcribe`), from the window: true when it is
+    /// queued. Redo minutes takes a finished or failed meeting that has a `transcript.txt`; Transcribe
+    /// again a finished meeting with the `audio.m4a` a job runs. Neither takes a meeting this queue
+    /// holds, any other state, or a recording that never finished; a meeting with no `meeting.json` has
+    /// the state a scan infers for it. The kind and `options` are written into `meeting.json`, with the
+    /// meeting `queued` and its attempts and error reset, before anything runs, so after a crash the same
+    /// kind runs again with the same choices. A refusal writes nothing.
+    func redo(_ folder: URL, kind: JobKind, options: JobOptions) -> Bool {
+        onTickQueue()
+        let dir = ProcessingQueue.normal(folder)
+        let has = { (name: String) in FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path) }
+        let accepted: [MeetingState]
+        switch kind {
+        case .process: return false
+        case .minutes: accepted = has("transcript.txt") ? [.done, .failed] : []
+        case .transcribe: accepted = has("audio.m4a") ? [.done] : []
+        }
+        guard !known(dir), !MeetingFolder.recordingUnfinished(dir) else { return false }
+        let state = ProcessingQueue.read(dir)?.state ?? (has("notes.md") ? .done : .unprocessed)
+        guard accepted.contains(state) else { return false }
+        var queued = false
+        do {
+            try store.update(dir) {
+                guard accepted.contains($0.state) else { return }
+                $0.state = .queued
+                $0.error = nil
+                $0.stage = nil
+                $0.attempts = nil
+                $0.attempt = nil
+                $0.job = kind
+                if kind == .transcribe {
+                    $0.jobTranscriber = options.transcriber
+                    $0.jobTidy = options.tidy
+                    $0.people = MeetingRecord.People(room: options.room, call: options.call)
+                } else {
+                    $0.jobTranscriber = nil
+                    $0.jobTidy = nil
+                }
+                if let writer = options.writer { $0.writer = writer }
+                queued = true
+            }
+        } catch { return false }
+        if queued { enqueue(dir) }
+        return queued
+    }
+
+    /// A redo's options go on every final outcome, and when Process or Try again queue a full process.
+    /// The counts and the writer stay: only a later sheet changes them.
+    private static func clearJob(_ record: inout MeetingRecord) {
+        record.job = nil
+        record.jobTranscriber = nil
+        record.jobTidy = nil
     }
 
     /// Picks up every meeting left `queued` or `processing`, oldest first, in the meetings folder and
@@ -631,31 +736,53 @@ final class ProcessingQueue {
         updateTimer()
     }
 
-    /// A `processing` meeting nobody holds: done when its result is our attempt's success with fresh
-    /// minutes; failed when that run failed on its own; otherwise it stopped part way and runs again.
+    /// A `processing` meeting nobody holds, settled by the kind its record names: done when its result is
+    /// our attempt's success with what that kind writes fresh; failed when that run failed on its own;
+    /// otherwise it stopped part way (a signal, a swap left to finish, or no result) and runs again.
     private func settle(_ dir: URL) {
         job = nil
         guard let record = ProcessingQueue.read(dir), record.state == .processing else { return }
+        let kind = record.job ?? .process
         if let result = ProcessResult.read(dir), let attempt = record.attempt, result.attempt == attempt {
-            if result.status == 0, let started = result.started, ProcessingQueue.fresh(dir, since: started) {
-                succeed(dir)
+            if result.status == 0, let started = result.started, ProcessingQueue.fresh(dir, since: started, kind: kind) {
+                succeed(dir, kind)
                 return
             }
-            if result.status != 0 && result.status < 128 {
-                fail(dir, "processing failed (exit \(result.status))")
+            if result.status != 0 && result.status < 128 && result.status != Int(ProcessingQueue.swapExit) {
+                fail(dir, kind, ProcessingQueue.failure(kind, status: Int32(clamping: result.status), line: ""))
                 return
             }
         }
-        let attempts = record.attempts ?? 0
+        runAgain(dir, kind, reason: ProcessingQueue.redoStopped)
+    }
+
+    /// A run that stopped part way runs again as the same kind, up to `maxAttempts` runs in all; then the
+    /// job fails: a process kept stopping, or a redo stopped part way for `reason`.
+    private func runAgain(_ dir: URL, _ kind: JobKind, reason: String) {
+        let attempts = ProcessingQueue.read(dir)?.attempts ?? 0
         if attempts >= ProcessingQueue.maxAttempts {
-            fail(dir, ProcessingQueue.keptStopping)
+            fail(dir, kind, kind == .process ? ProcessingQueue.keptStopping : ProcessingQueue.redoPartWay(reason))
         } else {
             launch(dir, attempts: attempts + 1)
         }
     }
 
+    /// Why a run that exited on its own with `status` failed: the engine's last line, else the status.
+    /// A redo's reason is put in its sentence: nothing was changed.
+    private static func failure(_ kind: JobKind, status: Int32, line: String) -> String {
+        switch kind {
+        case .process: return line.isEmpty ? "processing failed (exit \(status))" : line
+        case .minutes, .transcribe: return redoNothingChanged(line.isEmpty ? "meetingbox failed (exit \(status))" : line)
+        }
+    }
+
+    /// Launches the kind the record names, built from the record and the settings of this moment: a
+    /// process with the Preferences transcriber and tidying; Transcribe again with its own transcriber,
+    /// tidying and counts, any it lacks taken from Preferences; every kind with the meeting's writer, else
+    /// the Preferences one, used only if agreed.
     private func launch(_ dir: URL, attempts: Int) {
         let attempt = UUID().uuidString
+        var record: MeetingRecord?
         do {
             try store.update(dir) {
                 $0.state = .processing
@@ -663,24 +790,28 @@ final class ProcessingQueue {
                 $0.attempt = attempt
                 $0.error = nil
                 $0.stage = nil
+                record = $0
             }
         } catch {
             return // cannot even record it: leave it queued for the next resume
         }
+        let kind = record?.job ?? .process
         let progress = dir.appendingPathComponent(ProcessingQueue.progressName)
         try? MeetingStore.writePrivately(Data(), to: progress)
         stage = nil
         token += 1
         let mine = token
         let started = now()
-        job = .running(started: started, token: mine)
+        job = .running(started: started, token: mine, kind: kind)
         // The settings of this moment, read once; an outside writer that cannot be used is said first.
         let settings = self.settings()
-        let writer = ScriptRunner.writer(meeting: nil, settings: settings)
+        let writer = ScriptRunner.writer(meeting: record?.writer, settings: settings)
         if let aside = writer.setAside { ProcessingQueue.appendLog(dir, ScriptRunner.setAsideLine(aside)) }
-        let arguments = ScriptRunner.arguments(kind: .process, folder: dir, transcriber: settings.transcriber, room: nil, call: nil,
-                                               tidy: settings.tidy, writer: writer.use)
-        _ = runner.run(PipelineJob(kind: .process, folder: dir, arguments: arguments), progress: progress, attempt: attempt) { [weak self] status, line in
+        let own = kind == .transcribe ? record : nil // only Transcribe again carries its own choices
+        let arguments = ScriptRunner.arguments(kind: kind, folder: dir, transcriber: own?.jobTranscriber ?? settings.transcriber,
+                                               room: own?.people.room, call: own?.people.call, tidy: own?.jobTidy ?? settings.tidy,
+                                               writer: writer.use)
+        _ = runner.run(PipelineJob(kind: kind, folder: dir, arguments: arguments), progress: progress, attempt: attempt) { [weak self] status, line in
             self?.onQueue { self?.ended(mine, dir, status, line) }
         }
     }
@@ -695,8 +826,11 @@ final class ProcessingQueue {
         _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     }
 
+    /// A run of ours ended. Exit 3 (a swap left to finish) runs the same kind again; so does a signal for
+    /// a redo (a process stopped by a signal fails, as it always has). Any other status but 0 is a
+    /// failure in the engine's words.
     private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {
-        guard case .running(let started, let t)? = job, t == mine,
+        guard case .running(let started, let t, let kind)? = job, t == mine,
               let cur = current, cur.path == dir.path else { return }
         pollProgress(dir)
         if status == ProcessingQueue.busyExit {
@@ -709,9 +843,17 @@ final class ProcessingQueue {
         }
         job = nil
         if status == 0 {
-            if ProcessingQueue.fresh(dir, since: started) { succeed(dir) } else { fail(dir, ProcessingQueue.noMinutes) }
+            if ProcessingQueue.fresh(dir, since: started, kind: kind) {
+                succeed(dir, kind)
+            } else {
+                fail(dir, kind, kind == .process ? ProcessingQueue.noMinutes : ProcessingQueue.redoNothingChanged(ProcessingQueue.redoWroteNothing))
+            }
+        } else if status == ProcessingQueue.swapExit {
+            runAgain(dir, kind, reason: line.isEmpty ? ProcessingQueue.redoStopped : line)
+        } else if status >= 128 && kind != .process {
+            runAgain(dir, kind, reason: ProcessingQueue.redoStopped) // its last line is only where it was
         } else {
-            fail(dir, line.isEmpty ? "processing failed (exit \(status))" : line)
+            fail(dir, kind, ProcessingQueue.failure(kind, status: status, line: line))
         }
         advance()
     }
@@ -723,24 +865,29 @@ final class ProcessingQueue {
         try? store.update(dir) { $0.stage = ProcessingQueue.waitingStage }
     }
 
-    private func succeed(_ dir: URL) {
+    private func succeed(_ dir: URL, _ kind: JobKind) {
         clearProgress(dir)
         try? store.update(dir) {
             $0.state = .done
             $0.stage = nil
             $0.error = nil
+            ProcessingQueue.clearJob(&$0)
         }
-        onFinished?(dir, true)
+        onFinished?(dir, true, kind)
     }
 
-    private func fail(_ dir: URL, _ reason: String) {
+    /// A process that failed is Failed. A redo that did not work goes back to Done while the meeting has
+    /// its minutes (else Failed), with `reason` as the error line the window shows on it.
+    private func fail(_ dir: URL, _ kind: JobKind, _ reason: String) {
         clearProgress(dir)
+        let minutes = FileManager.default.fileExists(atPath: dir.appendingPathComponent("notes.md").path)
         try? store.update(dir) {
-            $0.state = .failed
+            $0.state = kind != .process && minutes ? .done : .failed
             $0.stage = nil
             $0.error = reason
+            ProcessingQueue.clearJob(&$0)
         }
-        onFinished?(dir, false)
+        onFinished?(dir, false, kind)
     }
 
     // MARK: helpers
@@ -789,10 +936,13 @@ final class ProcessingQueue {
         if let q = tickQueue { q.async(execute: work) } else { work() }
     }
 
-    /// `transcript.txt` and `notes.md` both exist and were written at or after `since` (to the second).
-    private static func fresh(_ dir: URL, since: Date) -> Bool {
+    /// What a job of this kind writes exists and was written at or after `since` (to the second): for
+    /// Redo minutes `notes.md`; for a process and Transcribe again `transcript.txt` and `notes.md`. A run
+    /// that only finishes an interrupted swap touches each file it moves in, so they count.
+    private static func fresh(_ dir: URL, since: Date, kind: JobKind) -> Bool {
         let floor = since.addingTimeInterval(-1)
-        return ["transcript.txt", "notes.md"].allSatisfy { name in
+        let written = kind == .minutes ? ["notes.md"] : ["transcript.txt", "notes.md"]
+        return written.allSatisfy { name in
             let attrs = try? FileManager.default.attributesOfItem(atPath: dir.appendingPathComponent(name).path)
             guard let modified = attrs?[.modificationDate] as? Date else { return false }
             return modified >= floor

@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 
 // The meetingbox window: a sidebar of meetings and, beside it, the selected meeting's minutes or
-// transcript. A SwiftUI `NavigationSplitView` in an `NSWindow`, drawing `LibraryModel` and deciding
+// transcript (any version of it, read only), with the rename and redo sheets. A SwiftUI
+// `NavigationSplitView` in an `NSWindow`, drawing `LibraryModel` and deciding
 // nothing: every word, badge and action comes from `LibraryPresentation`. The views take the model as
 // an `@ObservedObject` and bind to it with `Binding(get:set:)`; the build's rules for SwiftUI are no
 // `@State` or other property wrapper that keeps state, and no macros.
@@ -54,7 +55,11 @@ struct LibraryView: View {
         NavigationSplitView {
             LibrarySidebar(model: model)
         } detail: {
+            // The redo sheet hangs here, so that it and the rename sheet are on different views.
             LibraryDetail(model: model, app: app)
+                .sheet(isPresented: Binding(get: { model.redoing != nil }, set: { if !$0 { model.cancelRedo() } })) {
+                    RedoSheet(model: model)
+                }
         }
         .frame(minWidth: 720, minHeight: 420)
         .toolbar {
@@ -183,14 +188,20 @@ struct LibraryDetail: View {
                 if actions.contains(.pause) || actions.contains(.resume) {
                     RecordingTimer(app: app)
                 } else {
-                    Picker("", selection: Binding(get: { model.pane }, set: { model.pane = $0 })) {
-                        ForEach(LibraryModel.Pane.allCases, id: \.self) { pane in
-                            Text(pane.title).tag(pane)
+                    HStack {
+                        Picker("", selection: Binding(get: { model.pane }, set: { model.pane = $0 })) {
+                            ForEach(LibraryModel.Pane.allCases, id: \.self) { pane in
+                                Text(pane.title).tag(pane)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                        Spacer()
+                        if model.pane == .transcript {
+                            VersionPicker(model: model)
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
                     LibraryText(pane: model.pane, content: model.shownContent)
                 }
             }
@@ -206,6 +217,24 @@ struct LibraryDetail: View {
     /// The caption and the badge, as the row has them.
     private func subtitle(_ row: LibraryRow) -> String {
         [row.caption, row.badge?.text].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+}
+
+/// Which transcript the Transcript view shows: Current, another transcript in the folder, or an earlier
+/// version, read only, when `LibraryModel.versionChoices` offers any.
+struct VersionPicker: View {
+    @ObservedObject var model: LibraryModel
+
+    var body: some View {
+        if let current = model.versionChoices.first {
+            Picker("", selection: Binding(get: { model.version ?? current.url }, set: { model.chooseVersion($0) })) {
+                ForEach(model.versionChoices, id: \.url) { version in
+                    Text(version.title).tag(version.url)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+        }
     }
 }
 
@@ -272,5 +301,59 @@ struct RenameSheet: View {
         }
         .padding(20)
         .frame(width: 380)
+    }
+}
+
+// MARK: redo
+
+/// Redo minutes and Transcribe again. Transcribe again chooses the transcriber, the two counts and
+/// tidying for this meeting; Redo minutes only confirms. Each control binds to `LibraryModel.redoing`;
+/// the button queues it after the model's check, and a refusal is said under the meeting's actions.
+struct RedoSheet: View {
+    @ObservedObject var model: LibraryModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let draft = model.redoing {
+                Text(LibraryPresentation.redoTitle(draft.kind)).font(.headline)
+                if draft.kind == .transcribe {
+                    Form {
+                        Picker(LibraryPresentation.transcriberLabel, selection: Binding(
+                            get: { model.redoing?.transcriber ?? .parakeet },
+                            set: { choice in model.updateRedo { $0.transcriber = choice } })) {
+                            ForEach(Transcriber.allCases, id: \.self) { transcriber in
+                                Text(PreferencesPresentation.transcriberTitle(transcriber)).tag(transcriber)
+                            }
+                        }
+                        Picker(LibraryPresentation.roomLabel, selection: Binding(
+                            get: { model.redoing?.room },
+                            set: { count in model.updateRedo { $0.room = count } })) {
+                            ForEach(LibraryPresentation.countChoices, id: \.self) { count in
+                                Text(LibraryPresentation.roomChoice(count)).tag(count)
+                            }
+                        }
+                        Picker(LibraryPresentation.callLabel, selection: Binding(
+                            get: { model.redoing?.call },
+                            set: { count in model.updateRedo { $0.call = count } })) {
+                            ForEach(LibraryPresentation.countChoices, id: \.self) { count in
+                                Text(LibraryPresentation.callChoice(count)).tag(count)
+                            }
+                        }
+                        Toggle(PreferencesPresentation.tidyTitle, isOn: Binding(
+                            get: { model.redoing?.tidy ?? true },
+                            set: { on in model.updateRedo { $0.tidy = on } }))
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("Cancel") { model.cancelRedo() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(LibraryPresentation.redoTitle(draft.kind)) { model.commitRedo() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 460)
     }
 }

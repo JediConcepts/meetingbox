@@ -45,9 +45,10 @@ struct LibraryRow: Equatable, Identifiable {
     }
 }
 
-/// What a meeting offers, in the order shown. The first three are for the meeting being recorded.
+/// What a meeting offers, in the order shown. The first three are for the meeting being recorded; the
+/// last two open a sheet (`LibraryModel.beginRedo`).
 enum LibraryAction: CaseIterable, Hashable {
-    case pause, resume, stop, rename, showInFinder, playAudio, process
+    case pause, resume, stop, rename, showInFinder, playAudio, process, redoMinutes, transcribeAgain
 
     var title: String {
         switch self {
@@ -58,6 +59,8 @@ enum LibraryAction: CaseIterable, Hashable {
         case .showInFinder: return "Show in Finder"
         case .playAudio: return "Play audio"
         case .process: return "Process"
+        case .redoMinutes: return "Redo minutes…"
+        case .transcribeAgain: return "Transcribe again…"
         }
     }
 }
@@ -72,14 +75,29 @@ struct MeetingFiles: Equatable {
     var runnable = false
     /// The recording was never finished (`MeetingFolder.recordingUnfinished`): `meetingbox recover` finishes it.
     var unfinished = false
+    /// `transcript.txt` is there: Redo minutes writes the minutes from it.
+    var transcript = false
+    /// Another process may hold the folder's lock (`.processing`): `ProcessingLock.owner` finds a live
+    /// owner, or cannot tell. A `meetingbox` run in Terminal, say; the window offers no redo meanwhile.
+    var lockHeld = false
 
-    static func read(_ folder: MeetingFolder) -> MeetingFiles {
-        MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url), unfinished: MeetingFolder.recordingUnfinished(folder.url))
+    /// Reads the folder; `ps` (injectable, as in the queue) is run only when there is a lock to ask about.
+    /// Call it off the main queue.
+    static func read(_ folder: MeetingFolder, ps: URL = URL(fileURLWithPath: "/bin/ps"), now: Date = Date()) -> MeetingFiles {
+        MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url), unfinished: MeetingFolder.recordingUnfinished(folder.url),
+                     transcript: FileManager.default.fileExists(atPath: folder.url.appendingPathComponent("transcript.txt").path),
+                     lockHeld: ProcessingLock.owner(folder.url, ps: ps, now: now) != .gone)
     }
 
     static func canRun(_ dir: URL) -> Bool {
         FileManager.default.fileExists(atPath: dir.appendingPathComponent("audio.m4a").path) && !MeetingFolder.recordingUnfinished(dir)
     }
+}
+
+/// A transcript the Transcript view's picker can show, read only: its words in the picker and its file.
+struct TranscriptVersion: Equatable {
+    let title: String
+    let url: URL
 }
 
 /// The folder is named as it should be but its title could not be written into `meeting.json`: the list
@@ -164,11 +182,7 @@ enum LibraryPresentation {
         let titled = !recorded.isEmpty || !(meeting.folder.title ?? "").isEmpty
         // The record's length is for a finished recording; the one in progress shows its timer instead.
         let length = live ? nil : lengthText(meeting.record?.seconds ?? 0)
-        var problem: String? = nil
-        if badge == .failed {
-            problem = (meeting.record?.error ?? "").split(whereSeparator: \.isNewline)
-                .map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
-        }
+        let problem = badge == .failed ? firstLine(meeting.record?.error) : nil
         return LibraryRow(id: key(url), title: title, date: dateFormatter.string(from: meeting.folder.date),
                           length: length, titled: titled, badge: badge, problem: problem)
     }
@@ -180,12 +194,18 @@ enum LibraryPresentation {
                            processable: processable?.contains(key($0.folder.url)) ?? true) }
     }
 
-    /// What the detail says under a meeting's title and caption: why it failed (`row.problem`); for a
-    /// failed recording that was never finished, how to finish it (there is no Recover in the window);
-    /// and why a recording stopped early, when it did (`stopReason`).
+    /// What the detail says under a meeting's title and caption: why it failed (`row.problem`), or for a
+    /// done meeting that nothing is using, why its last redo did not finish (the first line of its
+    /// record's `error`, until a job succeeds); for a failed recording that was never finished, how to
+    /// finish it (there is no Recover in the window); and why a recording stopped early, when it did
+    /// (`stopReason`).
     static func notes(for meeting: Meeting, row: LibraryRow, files: MeetingFiles) -> [String] {
         var lines: [String] = []
-        if let problem = row.problem { lines.append(problem) }
+        if let problem = row.problem {
+            lines.append(problem)
+        } else if meeting.state == .done, row.badge == nil, let left = firstLine(meeting.record?.error) {
+            lines.append(left)
+        }
         if row.badge == .failed && files.unfinished {
             lines.append("To finish it, run: meetingbox recover \(shellWord(meeting.folder.url.path)), then choose Process here.")
         }
@@ -193,6 +213,11 @@ enum LibraryPresentation {
             lines.append("Recording stopped early: \(reason)")
         }
         return lines
+    }
+
+    /// The first line of `text` with anything on it, trimmed; nil when there is none.
+    private static func firstLine(_ text: String?) -> String? {
+        (text ?? "").split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
     }
 
     /// A path as one word for the shell: as it is when nothing in it needs quoting, else in single quotes.
@@ -220,10 +245,15 @@ enum LibraryPresentation {
     }
 
     /// The meeting the session is on offers what the recording can be asked to do; any other offers
-    /// Rename and Show in Finder, Play audio when there is audio, and Process when `canProcess`. Nothing
-    /// is played while a recording runs or is paused: the recorder takes in the Mac's own sound, so the
-    /// meeting played would be recorded into this one.
-    static func actions(for meeting: Meeting, phase: Session.Phase, files: MeetingFiles) -> [LibraryAction] {
+    /// Rename and Show in Finder, Play audio when there is audio, Process when `canProcess`, and the two
+    /// redos when nothing has a claim on it. Redo minutes is for a done or failed meeting with a
+    /// transcript; Transcribe again for a done meeting the queue can run. A claim is the session, the
+    /// queue's live job (`processing`), a busy state in its record (`isBusy`, as for a rename), or a lock
+    /// another process may hold (`files.lockHeld`). Nothing is played while a recording runs or is
+    /// paused: the recorder takes in the Mac's own sound, so the meeting played would be recorded into
+    /// this one. A redo is offered meanwhile, since it may run while another meeting records. Reads only
+    /// its arguments: never the disk, and never `ps`.
+    static func actions(for meeting: Meeting, phase: Session.Phase, files: MeetingFiles, processing: URL?) -> [LibraryAction] {
         let capturing: Bool
         switch phase {
         case .recording, .paused: capturing = true
@@ -240,6 +270,10 @@ enum LibraryPresentation {
         var list: [LibraryAction] = [.rename, .showInFinder]
         if files.audio != nil && !capturing { list.append(.playAudio) }
         if canProcess(meeting, files: files) { list.append(.process) }
+        if !files.lockHeld && !isBusy(meeting.folder.url, phase: phase, current: processing, recorded: meeting.state) {
+            if files.transcript && (meeting.state == .done || meeting.state == .failed) { list.append(.redoMinutes) }
+            if files.runnable && meeting.state == .done { list.append(.transcribeAgain) }
+        }
         return list
     }
 
@@ -248,6 +282,102 @@ enum LibraryPresentation {
     /// upload it. Without QuickTime Player nothing is opened, and the window says why.
     static let quickTimePlayer = "com.apple.QuickTimePlayerX"
     static let needsQuickTime = "QuickTime Player is needed to play recordings"
+
+    // MARK: the redo sheets
+
+    /// A sheet's title, and the button that queues it: the action's words without the ellipsis.
+    static func redoTitle(_ kind: JobKind) -> String {
+        switch kind {
+        case .minutes: return "Redo minutes"
+        case .transcribe: return "Transcribe again"
+        case .process: return LibraryAction.process.title
+        }
+    }
+
+    static let transcriberLabel = "Transcriber"
+    static let roomLabel = "People in the room, including you"
+    static let callLabel = "People on the other end of the call"
+    static let workItOut = "Work it out"
+    /// Work it out (nil), then 1 to 6, for either side.
+    static let countChoices: [Int?] = [nil] + MeetingRecord.People.range.map { Optional($0) }
+
+    static func roomChoice(_ count: Int?) -> String {
+        guard let count = count else { return workItOut }
+        return count == 1 ? "1 (just you)" : String(count)
+    }
+
+    static func callChoice(_ count: Int?) -> String {
+        count.map(String.init) ?? workItOut
+    }
+
+    /// Why a rename, or a redo at the click, was refused: something has a claim on the meeting.
+    static let busy = "That meeting is busy"
+
+    // MARK: transcript versions
+
+    static let currentVersion = "Current"
+    /// Transcripts another tool wrote into the folder, by their words in the picker, in this order.
+    private static let namedVersions = [("transcript-parakeet.txt", "Parakeet (MLX)"), ("transcript-original.txt", "Original")]
+
+    /// What the Transcript view's picker lists for a folder, given the names of the files in it (`files`)
+    /// and of the folders in its `earlier/` that hold a `transcript.txt` (`earlier`): "Current"
+    /// (`transcript.txt`) first; then `transcript-parakeet.txt` as "Parakeet (MLX)" and
+    /// `transcript-original.txt` as "Original"; then every other `transcript*.txt` by file name; then
+    /// "Earlier, <date> <time>" for each earlier version, newest first, a second one kept in the same
+    /// minute (`-2`, `-3`) told apart as "(2)", "(3)" and listed before the first. A folder in `earlier/`
+    /// not named by meetingbox is listed last, by its name.
+    static func transcriptVersions(in folder: URL, files: [String], earlier: [String]) -> [TranscriptVersion] {
+        var list = [TranscriptVersion(title: currentVersion, url: folder.appendingPathComponent("transcript.txt"))]
+        let others = Set(files.filter { $0.hasPrefix("transcript") && $0.hasSuffix(".txt") && $0 != "transcript.txt" })
+        for (name, title) in namedVersions where others.contains(name) {
+            list.append(TranscriptVersion(title: title, url: folder.appendingPathComponent(name)))
+        }
+        for name in others.subtracting(namedVersions.map(\.0)).sorted() {
+            list.append(TranscriptVersion(title: name, url: folder.appendingPathComponent(name)))
+        }
+        let kept = earlier.map { (name: $0, stamp: EarlierStamp($0)) }
+        let dated = kept.compactMap { k in k.stamp.map { (name: k.name, stamp: $0) } }
+            .sorted { $0.stamp.minute != $1.stamp.minute ? $0.stamp.minute > $1.stamp.minute : $0.stamp.copy > $1.stamp.copy }
+        let titled = dated.map { ($0.name, "Earlier, \($0.stamp.text)" + ($0.stamp.copy > 1 ? " (\($0.stamp.copy))" : "")) }
+            + kept.filter { $0.stamp == nil }.map(\.name).sorted().map { ($0, "Earlier, \($0)") }
+        for (name, title) in titled {
+            let url = folder.appendingPathComponent("earlier", isDirectory: true).appendingPathComponent(name, isDirectory: true)
+                .appendingPathComponent("transcript.txt")
+            list.append(TranscriptVersion(title: title, url: url))
+        }
+        return list
+    }
+
+    /// An `earlier/` folder's name as the engine makes it, `YYYY-MM-DD HHMM` with `-N` for a later copy
+    /// kept in the same minute: the minute (which sorts as text), which copy, and the words for it. The
+    /// stamp is local time and is only reworded, never converted.
+    private struct EarlierStamp: Equatable {
+        let minute: String
+        let copy: Int
+        let text: String
+
+        private static let pattern = try! NSRegularExpression(pattern: "^([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{4})(?:-([0-9]{1,4}))?$")
+        private static func formatter(_ format: String, _ locale: String) -> DateFormatter {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: locale)
+            f.calendar = Calendar(identifier: .gregorian)
+            f.timeZone = TimeZone(identifier: "UTC")
+            f.isLenient = false
+            f.dateFormat = format
+            return f
+        }
+        private static let reading = formatter("yyyy-MM-dd HHmm", "en_US_POSIX")
+        private static let words = formatter("d MMM yyyy HH:mm", "en_GB")
+
+        init?(_ name: String) {
+            let range = NSRange(name.startIndex..., in: name)
+            guard let m = EarlierStamp.pattern.firstMatch(in: name, range: range), let minuteRange = Range(m.range(at: 1), in: name),
+                  let date = EarlierStamp.reading.date(from: String(name[minuteRange])) else { return nil }
+            minute = String(name[minuteRange])
+            copy = Range(m.range(at: 2), in: name).flatMap { Int(name[$0]) } ?? 1
+            text = EarlierStamp.words.string(from: date)
+        }
+    }
 
     // MARK: busy and rename
 
@@ -300,7 +430,7 @@ enum LibraryPresentation {
     static func renameMessage(_ error: Error) -> String {
         if error is TitleNotSaved { return "Renamed, but the title could not be saved" }
         switch error as? RenameError {
-        case .busy?: return "That meeting is busy"
+        case .busy?: return busy
         case .exists?: return "A meeting with that name already exists"
         case .emptyTitle?: return "Type a title"
         case nil: return "Could not rename: \(error.localizedDescription)"
