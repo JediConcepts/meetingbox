@@ -293,6 +293,21 @@ check(resolve(twoSentences, [["A"], ["A"], ["A", "B"], ["B"], ["A"]], names: ab,
       "resolve: only the word's own sentence votes")
 check(resolve([w(0, 0.3, "so."), w(0.4, 0.6, "and.")], [["A", "C"], ["A", "B"]], names: ["A": "Me", "C": "Me", "B": "Room 1"], fallback: "Unknown")
       == ["Me", "Room 1"], "resolve: candidates with the same label are one candidate label")
+// Gate A, 13 November: a word with no candidate takes its sentence's label when the sentence's words with
+// exactly one candidate label all hold the same label (spec 6.2, step 4); otherwise the fallback, as before.
+// Checked before smoothing, and with the words that have no candidate as a run too long to smooth.
+let fillWords = spread("so we will look at the numbers tomorrow.", 0, 8)
+check(resolve(fillWords, [["A"], ["A"], ["A"], ["A"], [], [], [], []], names: ab, fallback: "Unknown") == Array(repeating: "Me", count: 8),
+      "resolve: words with no candidate in a sentence whose single-label words are all Me are Me, on a side with Me and Room 1")
+check(resolve(fillWords, [["A"], ["A"], ["B"], ["B"], [], [], [], []], names: ab, fallback: "Unknown")
+      == ["Me", "Me", "Room 1", "Room 1", "Unknown", "Unknown", "Unknown", "Unknown"],
+      "resolve: words with no candidate in a sentence whose single-label words hold Me and Room 1 keep the fallback")
+check(resolve(fillWords, [[], [], ["A", "B"], [], [], [], [], []], names: ab, fallback: "Unknown")
+      == ["Unknown", "Unknown", "Room 1", "Unknown", "Unknown", "Unknown", "Unknown", "Unknown"],
+      "resolve: words with no candidate in a sentence with no single-label word keep the fallback")
+check(resolve(fillWords, [["T2"], ["T2"], ["T2"], ["T2"], [], [], [], []], names: ["T1": "Them 1", "T2": "Them 2"], fallback: "Them")
+      == Array(repeating: "Them 2", count: 8),
+      "resolve: on the call side, words with no candidate in a sentence held by Them 2 are Them 2, not plain Them")
 
 // --- smoothing, on labels after naming ---
 let six = spread("one two three four five six.", 0, 6)
@@ -380,8 +395,19 @@ check(micNamed(rooms, ["S1": 10, "S2": 10, "S4": 10], first: ["S1": 30, "S2": 10
       "nameMic: Room numbers follow the first kept word, with no gaps for a speaker without one")
 check(micNamed([sp("A", vector: e1), sp("B", vector: e2), sp("C", vector: e3)], ["A": 85, "B": 10, "C": 5])
       == ["A": "Room 1", "B": "Room 2", "C": "Room 3"], "nameMic: with no usable print in a room recording, Room 1 to N and no Me")
+// Gate A, 13 November: on the microphone side only a share under 5% makes a voice Unknown for size; the
+// call side's median segment test is not used there, as people in a room talk in quick turns.
 check(micNamed([sp("A", vector: e1), sp("B", median: 2.4, vector: e2), sp("C", vector: e3)], ["A": 90, "B": 6, "C": 4])
-      == ["A": "Room 1", "B": "Unknown", "C": "Unknown"], "nameMic: without a count, under 5% or a median under 2.5 s is Unknown")
+      == ["A": "Room 1", "B": "Room 2", "C": "Unknown"],
+      "nameMic: without a count, under 5% is Unknown, and a median under 2.5 s is still numbered")
+let quickTurns = sp("Q", median: 1.8, vector: e2)
+check(micNamed([sp("A", vector: e1), quickTurns], ["A": 19, "Q": 1]) == ["A": "Room 1", "Q": "Room 2"],
+      "nameMic: without a count, exactly 5% of the kept words with a 1.8 s median is numbered (the share test is inclusive)")
+check(micNamed([sp("A", vector: e1), quickTurns], ["A": 20, "Q": 1]) == ["A": "Room 1", "Q": "Unknown"],
+      "nameMic: without a count, under 5% of the kept words is still Unknown")
+check(nameCall([t1, sp("T2", seconds: 60, median: 1.8, vector: e4)], keptWords: ["T1": 80, "T2": 20], firstWord: ["T1": 0, "T2": 30],
+               userVoice: [], print: nil, counted: false) == ["T1": "Them", "T2": "Them"],
+      "nameCall: the call side keeps the median test: 20% with a 1.8 s median is plain Them")
 
 // --- the voice print ---
 check(usablePrint(vp(seconds: 59.9), model: model) == nil && usablePrint(vp(meetings: 1), model: model) == nil
@@ -764,6 +790,124 @@ for leak in [0.0, 0.03] {
           && keptCount(far, in: r.call, r.callLabels, prefix: "Them") == far.count,
           "labelWords (reverse, a long far turn, leak +\(leak) s): the user's 8 words stay Me, no leaked word is kept, and the far "
           + "side's \(far.count) words stay Them (\(r.mic.map(\.text)) \(r.call.map(\.text)) \(r.callLabels))")
+}
+
+// Gate A, 13 November (spec 6.2 as changed in b929871).
+func leftOut(_ l: LabelledWords) -> String? { l.log.first { $0.hasPrefix("Left out") } }
+let gateUser = said("hello everyone thanks for joining.", from: 0) + said("yes let us do that.", from: 30)
+let gateUserSegments = [Segment(speaker: "U", start: 0, end: 2.5), Segment(speaker: "U", start: 29.8, end: 32.5)]
+let gateU = sp("U", seconds: 45, vector: at(0.9))
+// A person in the room whose voice is like a small far-side voice (R at 0.80 with F2, neither the print's):
+// 4 of R's 40 words are echo-paired with F2's, the microphone copy 0.3 s later. Only those 4 go; R is
+// named, and nothing is left out as the call heard through the speakers.
+do {
+    var texts = (0..<40).map { "room\($0)" }
+    texts.replaceSubrange(10..<14, with: ["budget", "review", "next", "week"])
+    texts[39] += "."
+    let rWords = said(texts.joined(separator: " "), from: 5)
+    let farSmall = Array(shifted(Array(rWords[10..<14]), -0.3))
+    let farMain = said("we should look at the numbers again before friday.", from: 40)
+    let r = labelWords(mic: gateUser + rWords, call: farSmall + farMain,
+                       micSpeakers: side(gateUserSegments + [Segment(speaker: "R", start: 4.8, end: 21.2)],
+                                         [gateU, sp("R", seconds: 16, vector: e4)]),
+                       callSpeakers: side([Segment(speaker: "F2", start: 8.6, end: 10.2), Segment(speaker: "T", start: 39.8, end: 44)],
+                                          [sp("F2", seconds: 2, vector: [0, 0, 0.6, 0.8]), sp("T", seconds: 30, vector: e3)]),
+                       print: usable)
+    let others = Array(rWords[0..<10]) + Array(rWords[14...])
+    check(keptCount(others, in: r.mic, r.micLabels, label: "Room 1") == 36 && keptCount(Array(rWords[10..<14]), in: r.mic, r.micLabels) == 0
+          && keptCount(gateUser, in: r.mic, r.micLabels, label: "Me") == 10 && leftOut(r) == nil,
+          "labelWords (Gate A, G): a room voice like a far-side voice, with 4 of its 40 words copies, keeps its other 36 words as "
+          + "Room 1, loses only the 4, and nothing is left out as the call (\(r.mic.count) \(Set(r.micLabels)) \(r.log))")
+}
+// The share boundary (Rule.leakShare, inclusive): a leak cluster L of 10 words whose sole candidate is L,
+// k of them copies of the far side's words 0.3 s later. With 5 copies it is the far side leaking, so all
+// 10 go and the log counts the 5 left; with 4 it is a person in the room: only the 4 go, and the other 6
+// are named.
+let farSays10 = said("we should look at the numbers again before friday.", from: 20)
+let leakVoice = sp("L", seconds: 6, vector: [0, 0, 0.7, (1 - 0.49).squareRoot()])
+for copies in [5, 4] {
+    let copied = shifted(Array(farSays10.prefix(copies)), 0.3)
+    let own = said(Array(["something", "else", "entirely", "here", "and", "there."].suffix(10 - copies)).joined(separator: " "), from: 23.5)
+    let r = labelWords(mic: gateUser + copied + own, call: farSays10,
+                       micSpeakers: side(gateUserSegments + [Segment(speaker: "L", start: 20.2, end: 26)], [gateU, leakVoice]),
+                       callSpeakers: side([Segment(speaker: "C", start: 19.8, end: 24)], [sp("C", seconds: 30, vector: e3)]),
+                       print: usable)
+    let userMe = keptCount(gateUser, in: r.mic, r.micLabels, label: "Me") == 10 && r.mic.count == (copies == 5 ? 10 : 16)
+    if copies == 5 {
+        check(userMe && keptCount(copied + own, in: r.mic, r.micLabels) == 0 && leftOut(r)?.hasPrefix("Left out 5 microphone words") == true,
+              "labelWords: a paired voice with 5 of its 10 words copies is the far side leaking: all 10 go and the log counts the "
+              + "5 left (\(r.mic.map(\.text)) \(r.log))")
+    } else {
+        check(userMe && keptCount(copied, in: r.mic, r.micLabels) == 0 && keptCount(own, in: r.mic, r.micLabels, label: "Room 1") == 6
+              && leftOut(r) == nil,
+              "labelWords: a paired voice with 4 of its 10 words copies is a person in the room: only the 4 go, the other 6 are "
+              + "Room 1, and nothing is left out (\(r.mic.map(\.text)) \(r.micLabels) \(r.log))")
+    }
+}
+// The copies count against any call word: L's 6 copies are of two far voices, C1 (at 0.70 with L, so
+// paired) and C2 (unlike L). 6 of 10 is the leak, though only 3 are shared with the voice it is paired with.
+do {
+    let c1 = said("we should look at the numbers again before friday.", from: 20)
+    let c2 = said("and the budget for next quarter too.", from: 26)
+    let copied = shifted(Array(c1.prefix(3)), 0.3) + shifted(Array(c2.prefix(3)), 0.3)
+    let own = said("something else entirely here.", from: 28.0)
+    let r = labelWords(mic: gateUser + copied + own, call: c1 + c2,
+                       micSpeakers: side(gateUserSegments + [Segment(speaker: "L", start: 20.2, end: 29.6)], [gateU, leakVoice]),
+                       callSpeakers: side([Segment(speaker: "C1", start: 19.8, end: 24), Segment(speaker: "C2", start: 25.8, end: 29)],
+                                          [sp("C1", seconds: 30, vector: e3), sp("C2", seconds: 10, vector: e2)]),
+                       print: usable)
+    check(keptCount(gateUser, in: r.mic, r.micLabels, label: "Me") == 10 && r.mic.count == 10
+          && leftOut(r)?.hasPrefix("Left out 4 microphone words") == true,
+          "labelWords: a voice's copies of any call speaker's words count towards its share, so 6 of 10 (3 of them of a far voice "
+          + "it is not paired with) is the leak (\(r.mic.map(\.text)) \(r.log))")
+}
+// The leak itself still goes: see "an echo cluster's 3 remaining words are dropped" above (9 of its 12
+// words are copies) and the leak cluster stamped 0.03 s early (all 16 are).
+
+// A room recording without a count: the other person talks in quick turns (a 1.8 s median) and holds 20%
+// of the kept words. Room 1, not Unknown.
+do {
+    let mine = said("hello everyone thanks for joining.", from: 0) + said("we can begin with the numbers now.", from: 6)
+        + said("yes let us go.", from: 14)
+    let theirs = said("shall we start then.", from: 3)
+    let r = labelWords(mic: mine + theirs, call: [],
+                       micSpeakers: side([Segment(speaker: "U", start: 0, end: 2.2), Segment(speaker: "A", start: 2.8, end: 4.8),
+                                          Segment(speaker: "U", start: 5.8, end: 9), Segment(speaker: "U", start: 13.8, end: 16)],
+                                         [sp("U", seconds: 45, vector: at(0.9)), sp("A", seconds: 8, median: 1.8, vector: e3)]),
+                       callSpeakers: nil, print: usable)
+    check(keptCount(mine, in: r.mic, r.micLabels, label: "Me") == 16 && keptCount(theirs, in: r.mic, r.micLabels, label: "Room 1") == 4,
+          "labelWords (Gate A, I and F): a room voice with 20% of the words and a 1.8 s median is Room 1 (\(r.micLabels))")
+}
+
+// Words with no candidate (more than 1.0 s from every segment) take their sentence's label when its
+// single-label words hold one. Each run of them is four words, so smoothing cannot give the label.
+do {
+    let s1Me = said("so we will look at", from: 0), s1Gap = said("the numbers again tomorrow.", from: 3.5)
+    let s2Me = said("we can", from: 10), s2Room = said("do that", from: 11.2), s2Gap = said("later on this week.", from: 13.5)
+    let s3Room = said("I think that works for me.", from: 20)
+    let s4Gap = said("okay then.", from: 30)
+    let r = labelWords(mic: s1Me + s1Gap + s2Me + s2Room + s2Gap + s3Room + s4Gap, call: [],
+                       micSpeakers: side([Segment(speaker: "U", start: 0, end: 2), Segment(speaker: "U", start: 9.8, end: 10.8),
+                                          Segment(speaker: "R", start: 11.0, end: 12.0), Segment(speaker: "R", start: 19.8, end: 22.5)],
+                                         [sp("U", seconds: 45, vector: at(0.9)), sp("R", seconds: 20, vector: e3)]),
+                       callSpeakers: nil, print: usable)
+    check(keptCount(s1Me + s1Gap, in: r.mic, r.micLabels, label: "Me") == 9,
+          "labelWords: words with no candidate in a sentence whose single-label words are all Me are Me, though the side "
+          + "also has Room 1 (\(r.micLabels))")
+    check(keptCount(s2Gap, in: r.mic, r.micLabels, label: "Unknown") == 4 && keptCount(s4Gap, in: r.mic, r.micLabels, label: "Unknown") == 2
+          && keptCount(s3Room, in: r.mic, r.micLabels, label: "Room 1") == 6,
+          "labelWords: words with no candidate stay Unknown in a sentence held by Me and Room 1, and in one with no "
+          + "single-label word (\(r.micLabels))")
+}
+do {
+    let far1 = said("we should look at the numbers again before friday.", from: 20)
+    let far2 = said("and then send them", from: 25), far2Gap = said("to the finance team.", from: 28)
+    let r = labelWords(mic: said("hello everyone thanks for joining.", from: 0), call: far1 + far2 + far2Gap, micSpeakers: nil,
+                       callSpeakers: side([Segment(speaker: "T1", start: 19.8, end: 23.6), Segment(speaker: "T2", start: 24.8, end: 26.6)],
+                                          [sp("T1", seconds: 30, vector: e3), sp("T2", seconds: 30, vector: e4)]),
+                       print: nil)
+    check(keptCount(far1, in: r.call, r.callLabels, label: "Them 1") == 9 && keptCount(far2 + far2Gap, in: r.call, r.callLabels, label: "Them 2") == 8,
+          "labelWords: on the call side, words with no candidate in a sentence held by Them 2 are Them 2 (\(r.callLabels))")
 }
 
 // A usable print that matches nobody on the microphone side.

@@ -404,7 +404,8 @@ enum Rule {
     static let learnCallLimit = 0.40   // learning needs every call voice further from the user's than this
     static let dominantShare = 0.80    // of the microphone's kept words: the user, on a call
     static let smallShare = 0.05       // under this share of a side, without a count, a voice is not numbered
-    static let shortMedian = 2.5       // a median segment under this, without a count, is not numbered either
+    static let shortMedian = 2.5       // on the call side, a median segment under this, without a count, is not numbered either
+    static let leakShare = 0.5         // of a paired microphone voice's own words, the copies that make it the far side leaking
     static let meSeconds = 10.0        // talk a print match needs to be Me
     static let usableSeconds = 60.0    // speech a print needs to be used
     static let callSeconds = 20.0      // call-side speech that makes a meeting a call
@@ -542,7 +543,12 @@ private func likeness(_ speaker: SpeakerInfo, _ print: VoicePrint?) -> Double? {
 /// mostly come later is the echo. A shared word counts as later on the call side only when its call copy
 /// is later by a real round trip (`Rule.returnLag`); otherwise the microphone copy counts as the later,
 /// since a leak through the speakers lags by less than the transcribers' timing jitter.
-/// - micEcho: the far side leaking into the microphone. Its words are dropped.
+/// - micEcho: the far side leaking into the microphone, when the microphone copies mostly come later and
+///   at least half (`Rule.leakShare`) of the words whose one candidate is the microphone speaker are
+///   copies: the microphone word of a pair, with any call word of any call speaker, whose microphone copy
+///   counts as the later. Its words are dropped. Short of that share it is a person in the room whose
+///   voice is like one on the far side: this pairing puts it in no set, so it is named as usual and only
+///   its words that echo removal matches are dropped.
 /// - callEcho: the user's voice coming back on the call side, treated as a print match there.
 /// - micUnknown: no shared words, or as many later on each side, so the microphone speaker cannot be
 ///   told. A speaker that another pairing shows to be an echo, or the source of the call side's echo,
@@ -551,6 +557,16 @@ func pairVoices(mic: [SpeakerInfo], call: [SpeakerInfo], pairs: [(micWord: Int, 
                 micCandidates: [[String]], callCandidates: [[String]], print: VoicePrint?)
     -> (micEcho: Set<String>, callEcho: Set<String>, micUnknown: Set<String>) {
     func matchesPrint(_ s: SpeakerInfo) -> Bool { likeness(s, print).map { atLeast($0, Rule.printMatch) } ?? false }
+    // The microphone words that are copies of a call word, whoever said it.
+    let copies = Set(pairs.filter { p in
+        p.micWord < micWords.count && p.callWord < callWords.count
+            && !atLeast(callWords[p.callWord].start - micWords[p.micWord].start, Rule.returnLag)
+    }.map(\.micWord))
+    func mostlyCopies(_ m: SpeakerInfo) -> Bool {
+        let sole = micCandidates.indices.filter { micCandidates[$0] == [m.id] }
+        if sole.isEmpty { return true }
+        return atLeast(Double(sole.filter(copies.contains).count) / Double(sole.count), Rule.leakShare)
+    }
     var micEcho = Set<String>(), callEcho = Set<String>(), micUnknown = Set<String>(), micSource = Set<String>()
     for m in mic where !matchesPrint(m) {
         for c in call where !matchesPrint(c) && atLeast(cosine(m.vector, c.vector), Rule.printMatch) {
@@ -559,7 +575,7 @@ func pairVoices(mic: [SpeakerInfo], call: [SpeakerInfo], pairs: [(micWord: Int, 
                 && micCandidates[p.micWord].contains(m.id) && callCandidates[p.callWord].contains(c.id) {
                 if atLeast(callWords[p.callWord].start - micWords[p.micWord].start, Rule.returnLag) { callLater += 1 } else { micLater += 1 }
             }
-            if micLater > callLater { micEcho.insert(m.id) }
+            if micLater > callLater { if mostlyCopies(m) { micEcho.insert(m.id) } }
             else if callLater > micLater { callEcho.insert(c.id); micSource.insert(m.id) }
             else { micUnknown.insert(m.id) }
         }
@@ -624,7 +640,8 @@ func nameCall(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [S
 /// 1. a print match with 10 s or more of talk: Me;
 /// 2. on a call, 80% or more of the kept words, with no print or a cosine of 0.45 or more with it: Me;
 /// 3. a cosine of 0.45 or more with the print: Unknown;
-/// 4. without a count: under 5% of the kept words, or a median segment under 2.5 s: Unknown;
+/// 4. without a count: under 5% of the kept words: Unknown (the call side's median segment test is not
+///    used here, since people in a room often talk in quick turns);
 /// 5. otherwise Room 1, Room 2, numbered by first kept word; one with no kept word is Unknown.
 /// Shares leave out the echo speakers.
 func nameMic(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [String: Double], echo: Set<String>, unknown: Set<String>,
@@ -643,7 +660,7 @@ func nameMic(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [St
             names[s.id] = "Me"
         } else if let c = like, atLeast(c, Rule.printNear) {
             names[s.id] = "Unknown"
-        } else if !counted, !atLeast(part, Rule.smallShare) || !atLeast(s.median, Rule.shortMedian) {
+        } else if !counted, !atLeast(part, Rule.smallShare) {
             names[s.id] = "Unknown"
         } else {
             rest.append(s)
@@ -655,8 +672,9 @@ func nameMic(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [St
     return names
 }
 
-/// The label of a word with no candidate: the side's one label when every named speaker there has
-/// it; Me or Them on a side with no speakers; otherwise Unknown on the microphone side and Them on the call side.
+/// The label of a word with no candidate whose sentence gives none (see resolve): the side's one label
+/// when every named speaker there has it; Me or Them on a side with no speakers; otherwise Unknown on the
+/// microphone side and Them on the call side.
 func fallbackLabel(_ names: [String: String], side: Side) -> String {
     let labels = Set(names.values)
     if labels.count == 1, let only = labels.first { return only }
@@ -678,9 +696,10 @@ private func sentences(_ words: [Word]) -> [Range<Int>] {
 }
 
 /// Each word's label, `words` in time order with their candidates as `candidates` gives them. A word
-/// whose candidates have one label takes it; one with none takes `fallback`. One with two or more
-/// different labels takes the label most words of its sentence with exactly one candidate label hold,
-/// and a tie goes to the label of the latest-starting segment among them.
+/// whose candidates have one label takes it. One with none takes its sentence's label when the words of
+/// the sentence with exactly one candidate label all hold the same label, and `fallback` otherwise. One
+/// with two or more different labels takes the label most words of its sentence with exactly one
+/// candidate label hold, and a tie goes to the label of the latest-starting segment among them.
 func resolve(_ words: [Word], _ candidates: [[String]], names: [String: String], fallback: String) -> [String] {
     // Each word's candidate labels, each placed where its latest-starting segment is, so the last is the latest.
     let options: [[String]] = words.indices.map { i in
@@ -696,6 +715,9 @@ func resolve(_ words: [Word], _ candidates: [[String]], names: [String: String],
     for range in sentences(words) {
         var votes: [String: Int] = [:]
         for i in range where options[i].count == 1 { votes[options[i][0], default: 0] += 1 }
+        if votes.count == 1, let only = votes.keys.first {
+            for i in range where options[i].isEmpty { labels[i] = only }
+        }
         for i in range where !options[i].isEmpty {
             let best = options[i].map { votes[$0] ?? 0 }.max() ?? 0
             labels[i] = options[i].last { (votes[$0] ?? 0) == best } ?? fallback
