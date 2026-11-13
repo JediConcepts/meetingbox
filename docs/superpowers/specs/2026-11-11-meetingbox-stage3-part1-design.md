@@ -198,7 +198,8 @@ New:
   3. The rest: one speaker is "Them", several are "Them 1", "Them 2" in order of their first word.
 - **One voice heard on both sides, on a call.** A microphone speaker and a call-side speaker whose cosine is 0.60 or more, neither matching the print, are one voice heard twice.
   - Their shared words are the pairs echo removal matches. Whichever side's copies of those words mostly come later is the echo.
-  - **If the microphone speaker is the echo:** the far side leaked into the microphone. Its remaining words are dropped, the log gives the count, and its talk is left out of the microphone totals below.
+  - **If the microphone speaker is the echo:** the far side leaked into the microphone, but only when at least half of the microphone words whose sole candidate is that speaker are shared words whose microphone copy counts as the later. Its remaining words are then dropped, the log gives the count, and its talk is left out of the microphone totals below.
+    - Otherwise it is a person in the room whose voice is like one on the far side. It is named by the microphone rules below, and only its words that echo removal matches are dropped. (Gate A, 13 November: a room speaker with 593 words was dropped over 15 shared words; the leak beside it shared all 72 of its words.)
   - **If the call-side speaker is the echo:** the user's voice came back. That speaker is treated as in call-side rule 1, and the microphone speaker is named by the rules below.
   - With no shared words, the microphone speaker is "Unknown".
 - **Shares and order.**
@@ -208,7 +209,7 @@ New:
   1. The speaker matches a usable print, with 10 s or more of talk: "Me".
   2. On a call, the speaker holds 80% or more of the microphone words kept after echo removal, and either there is no usable print or its cosine with the print is 0.45 or more: "Me". The channel proves it.
   3. The speaker's cosine with a usable print is 0.45 or more: "Unknown".
-  4. Without a people count: under 5% of the side's talk, or a median segment under 2.5 s: "Unknown".
+  4. Without a people count: under 5% of the side's talk: "Unknown". The call side's median segment test is not used here, because people in a room often talk in quick turns. (Gate A, 13 November: the other person in a two-person room recording, with 60% of the words and a median segment of 2.26 s, was "Unknown".)
   5. Otherwise "Room 1", "Room 2", numbered by first word. Only speakers that keep at least one word are numbered, so there are no gaps.
 
   When a usable print exists and no microphone speaker becomes "Me" by rule 1 or 2, the log says "Your voice was not recognised on the microphone side (best match 0.52)". In a room recording with no usable print, the log says the user's voice has not been learnt yet.
@@ -216,7 +217,7 @@ New:
   1. **Load:** a word's end is capped at its start plus 1.2 s.
   2. **Candidates:** the speakers whose segments contain the word's midpoint (start at or before it, end after it). If there are none, the speaker of the segment whose nearer edge is closest to the midpoint, if within 1.0 s.
   3. **Name the speakers** by the rules above. Words whose only candidate is an echo speaker are dropped.
-  4. **A word with no candidate** takes the side's label when every speaker on that side has the same label. Otherwise it is "Unknown" on the microphone side and "Them" on the call side.
+  4. **A word with no candidate** takes its sentence's label (sentences as in step 5) when the words of that sentence with exactly one candidate label all hold the same label. Failing that, it takes the side's label when every speaker on that side has the same label. Otherwise it is "Unknown" on the microphone side and "Them" on the call side.
   5. **A word with two or more different candidate labels** takes the label held by most words of its sentence that have exactly one candidate label. A tie goes to the label of the latest-starting segment. A sentence runs up to and including a word ending in `.`, `?` or `!`.
   6. **Smoothing:** the runs of equal labels in each sentence are computed once. Then, in one pass, a run of one or two words with the same label on both sides takes that label. A single word at a sentence's start or end takes the label of its neighbouring run when that run has three or more words.
 - **The user's voice print** is learnt from video calls, or recorded on purpose.
