@@ -829,6 +829,16 @@ if [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && printf '%s' "$out1" | grep -q 'meetin
   pass "process <dir>/meeting.json with KEEP_AUDIO=0 is refused and deletes nothing (and so is a .json brief)"
 else fail "process <dir>/meeting.json with KEEP_AUDIO=0 is refused and deletes nothing (and so is a .json brief) ($rc1 $rc2): $(ls "$d") $out1"; fi
 
+# --- round 2: other recordings are still taken, in any case: .mp3 and .M4A reach the transcriber ---
+for rec in talk.mp3 TALK.M4A; do
+  reset_run; d="$HOME/r2-$rec"; mkdir -p "$d"; printf 'audio' > "$d/$rec"
+  engine process "$d/$rec"
+  if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 1 ] && grep -qF "afconvert -f WAVE -d LEI16@16000 -c 1 ./$rec " "$HOME/calls.log" \
+     && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ]; then
+    pass "process takes $rec as a recording, and it reaches the transcriber"
+  else fail "process takes $rec as a recording, and it reaches the transcriber (rc $rc): $out"; fi
+done
+
 # --- 6: a copy that cp says it made but that differs stops the keep, with nothing changed ---
 cp() {
   case "$*" in

@@ -2921,8 +2921,9 @@ finish_run() {
   end_processing 0
 }
 
-# process: a recording (a meeting folder's audio.m4a, or any .m4a, .wav or .caf) or a transcript file
-# (.txt, .md, .vtt or .srt), to a transcript and minutes; anything else is refused. The meeting's own
+# process: a recording (a meeting folder's audio.m4a, or any .m4a, .mp3, .wav, .caf, .aiff, .aif, .aac,
+# .mp4 or .flac, in any case) or a transcript file (.txt, .md, .vtt or .srt), to a transcript and
+# minutes; anything else, a .json included, is refused. The meeting's own
 # transcript.txt is a notes run. When the minutes fail, the new transcript and words still go in,
 # keeping what they replace, and the run fails: the meeting is Failed with a transcript, and Redo
 # minutes can finish it. Only process removes audio, for --no-keep-audio, only once the minutes are in
@@ -2939,8 +2940,8 @@ process() {
   if [ "$name" = transcript.txt ]; then notes_cmd "$dir"; return; fi
   case "$(printf '%s' "${name##*.}" | tr '[:upper:]' '[:lower:]')" in
     txt|md|vtt|srt) audio=0 ;;
-    m4a|wav|caf)    audio=1 ;;
-    *) die "$name is neither a recording (.m4a, .wav or .caf) nor a transcript (.txt, .md, .vtt or .srt), so it is not processed" ;;
+    m4a|mp3|wav|caf|aiff|aif|aac|mp4|flac) audio=1 ;;
+    *) die "$name is neither a recording (.m4a, .mp3, .wav, .caf, .aiff, .aif, .aac, .mp4 or .flac) nor a transcript (.txt, .md, .vtt or .srt), so it is not processed" ;;
   esac
   begin_run "$dir" process
   [ -e "$name" ] || die "no such file: $input"
