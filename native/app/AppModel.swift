@@ -185,10 +185,7 @@ final class AppModel: ObservableObject {
         case .waiting, .capturing:
             endSample(.idle)
         case .stopping:
-            sampleFolder = nil
-            sampleStep = .none
-            samplesAsked += 1
-            sample = .idle
+            dropStopping(.idle)
         case .none, .building:
             return
         }
@@ -474,9 +471,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The sampler's word on a start: capturing (nil), or why it cannot. A word about a sample that has
-    /// already ended (Stop before it was capturing, a meeting, a quit) that it is capturing stops the
-    /// sampler again, unless a newer sample is under way, and that sample's folder goes once it has.
+    /// The sampler's word on a start: capturing (nil), or why it cannot, which can also come later, once,
+    /// when capturing fails. A failure before Stop ends the sample with that reason, and nothing is
+    /// built; one after Stop leaves what was recorded to be built. A word about a sample that has already
+    /// ended (Stop before it was capturing, a meeting, a quit) that it is capturing stops the sampler
+    /// again, unless a newer sample is under way, and that sample's folder goes once it has.
     private func sampleStarted(_ asked: Int, folder: URL, reason: String?) {
         guard asked == samplesAsked else {
             if reason == nil, sampleStep == .none, let sampler = sampler {
@@ -486,12 +485,14 @@ final class AppModel: ObservableObject {
             }
             return
         }
-        guard sampleStep == .waiting else { return }
-        if let reason = reason {
-            endSample(.failed(reason))
-        } else {
+        switch (sampleStep, reason) {
+        case (.waiting, nil):
             sampleStep = .capturing
             startSampleClock()
+        case (.waiting, let reason?), (.capturing, let reason?):
+            endSample(.failed(reason))
+        default:
+            break
         }
     }
 
@@ -565,12 +566,25 @@ final class AppModel: ObservableObject {
     }
 
     /// A recording is about to start (`ControlHandler.willStart`, on the main queue just before the
-    /// recorder is launched): a sample being recorded fails, saying why, and the sampler is asked to
-    /// stop. Nothing waits for it, so the meeting starts at once; the folder goes once the sampler is done.
-    /// One already stopping to be built, or being built, has left the microphone and is left to finish.
+    /// recorder is launched): a sample not yet being built fails, saying why. One being recorded has its
+    /// sampler asked to stop; one already stopping keeps the stop it has, and is not built once that is
+    /// done. Nothing waits for the sampler, so the meeting starts at once; the folder goes once the
+    /// sampler is done. One being built has left the microphone and is left to finish.
     private func cancelSampleForMeeting() {
-        guard sampleStep == .waiting || sampleStep == .capturing else { return }
-        endSample(.failed(PreferencesPresentation.sampleStoppedForMeeting))
+        switch sampleStep {
+        case .waiting, .capturing: endSample(.failed(PreferencesPresentation.sampleStoppedForMeeting))
+        case .stopping: dropStopping(.failed(PreferencesPresentation.sampleStoppedForMeeting))
+        case .none, .building: break
+        }
+    }
+
+    /// A sample whose sampler is already stopping is let go: that stop's `done` then finds it gone, so
+    /// it removes the folder and builds nothing.
+    private func dropStopping(_ outcome: SampleState) {
+        sampleFolder = nil
+        sampleStep = .none
+        samplesAsked += 1
+        sample = outcome
     }
 
     /// Ends a sample being recorded without building it: the clock stops, the outcome is shown, any

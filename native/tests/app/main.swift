@@ -5346,6 +5346,8 @@ do {
           == "meetingbox is not allowed to use the microphone. Allow it in System Settings, under Privacy & Security, Microphone."
           && PreferencesPresentation.sampleStoppedForMeeting == "Stopped because a meeting started recording."
           && PreferencesPresentation.sampleNeedsParakeet == noParakeet, "T6 sample words: the microphone, a meeting starting, and Parakeet")
+    check(PreferencesPresentation.sampleMicrophoneFailed == "The microphone stopped working, so the voice sample was not used. Record again.",
+          "R2 sample words: the microphone failing while the sample records")
 }
 
 // AppModel: the settings, the engine's status, forgetting, and the voice sample.
@@ -5670,6 +5672,89 @@ MainActor.assumeIsolated {
     slow.finishStop()
     check(m3.sample == .idle && voiceAdds3() == 2, "R1 shutDown: and the stop finishing later builds nothing")
     try? fm.removeItem(at: state3)
+
+    // Round 2: the stopping step (Stop pressed, the sampler not done yet), and a capture that fails.
+    let state4 = shortTemp()
+    let prefs4 = Preferences(defaults: testDefaults(), home: root)
+    prefs4.meetingsFolder = freshRoot()
+    prefs4.sounds = false
+    let rec4 = FakeRecorder()
+    let engine4 = FakeEngine()
+    let held = FakeSampler()
+    held.stopsAtOnce = false
+    let m4 = AppModel(stateDir: state4, preferences: prefs4, recorder: rec4, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                      engine: engine4, sampler: held)
+    m4.launch()
+    func voiceAdds4() -> Int { engine4.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count }
+    /// A sample recorded for a second, then stopped: the sampler has been asked to stop and has not said it is done.
+    @MainActor func stopping(_ i: Int) -> URL {
+        m4.recordSample()
+        let folder = held.starts[i].folder
+        held.starts[i].started(nil)
+        m4.tickSample()
+        m4.stopSample()
+        return folder
+    }
+    let failedMic = PreferencesPresentation.sampleMicrophoneFailed
+
+    // closeSample while stopping changes nothing: the sample the user stopped still builds.
+    let c1 = stopping(0)
+    m4.closeSample()
+    check(m4.sample == .recording(secondsLeft: 89) && held.pendingStops.count == 1 && lexists(c1) && voiceAdds4() == 0,
+          "R2 stopping: closeSample changes nothing while the sampler stops")
+    held.finishStop()
+    check(m4.sample == .building && voiceAdds4() == 1 && engine4.calls.last?.arguments == ["voice", "add", c1.appendingPathComponent("sample.caf").path],
+          "R2 stopping: the sample still builds once the sampler is done")
+    engine4.answerLast(0, "sample 66\n")
+    engine4.answerLast(0, "parakeet ready\napple ready\nvoice 66 1 sample\n")
+    m4.closeSample()
+
+    // A meeting starting while the sampler stops: it starts at once, and the sample is cancelled.
+    let c2 = stopping(1)
+    let stopsBeforeMeeting = held.stops
+    let reply4 = m4.handler.reply(for: .start(mic: nil, dir: nil))
+    check(reply4.hasPrefix("ok recording") && rec4.launches.count == 1 && m4.sample == .failed("Stopped because a meeting started recording.")
+          && held.stops == stopsBeforeMeeting && held.pendingStops.count == 1 && lexists(c2),
+          "R2 stopping: a meeting start records at once and cancels the sample with the meeting line, with no second stop (\(reply4))")
+    held.finishStop()
+    check(!lexists(c2) && voiceAdds4() == 1 && m4.sample == .failed("Stopped because a meeting started recording."),
+          "R2 stopping: the folder goes once the sampler is done, and nothing is built")
+    m4.closeSample()
+    let pid5 = rec4.nextPid
+    m4.perform(.stop)
+    _ = settle { if case .finalising = m4.session.phase { return true }; return false }
+    rec4.exit(pid5, 0, verifies: true)
+    check(settle { m4.session.phase == .idle }, "R2: (the recording is finished)")
+
+    // The microphone fails while the sample records (the capture session's error).
+    m4.recordSample()
+    let c3 = held.starts[2].folder
+    held.starts[2].started(nil)
+    m4.tickSample()
+    held.starts[2].started(failedMic)
+    check(m4.sample == .failed(failedMic) && held.pendingStops.count == 1 && lexists(c3) && voiceAdds4() == 1,
+          "R2 capture fails: the sample fails with the reason, the sampler is asked to stop, and nothing is built")
+    held.finishStop()
+    check(!lexists(c3) && voiceAdds4() == 1 && m4.sample == .failed(failedMic), "R2 capture fails: the folder goes once the sampler is done")
+    m4.closeSample()
+    // A failure the sampler reports after Stop leaves the sample it stopped to be built.
+    let c3b = stopping(3)
+    held.starts[3].started(failedMic)
+    check(m4.sample == .recording(secondsLeft: 89) && held.pendingStops.count == 1, "R2 capture fails after Stop: the sample stopping is left alone")
+    held.finishStop()
+    check(m4.sample == .building && voiceAdds4() == 2 && engine4.calls.last?.arguments == ["voice", "add", c3b.appendingPathComponent("sample.caf").path],
+          "R2 capture fails after Stop: and it builds from what was recorded")
+    engine4.answerLast(1, "Not enough speech: 1 second of the 60 needed. Record again and read for the whole 90 seconds.\n")
+    engine4.answerLast(0, "parakeet ready\napple ready\nvoice 66 1 sample\n")
+    m4.closeSample()
+
+    // Quitting while the sampler stops: the folder goes at once, since the app may be gone before done.
+    let c4 = stopping(4)
+    m4.shutDown()
+    check(m4.sample == .idle && !lexists(c4) && voiceAdds4() == 2, "R2 stopping: quitting removes the folder at once and builds nothing")
+    held.finishStop()
+    check(m4.sample == .idle && voiceAdds4() == 2 && !lexists(c4), "R2 stopping: and the stop finishing later builds nothing")
+    try? fm.removeItem(at: state4)
 
     // Without a sampler there is no sample, and without an engine nothing runs.
     let state2 = shortTemp()

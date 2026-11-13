@@ -71,11 +71,18 @@ final class MicSampleRecorder: SampleRecorder {
             let output = SampleFile(file)
             // One extractor for the one source; MicRecorder calls back on its own serial queue.
             let extractor = SampleExtractor()
-            let recorder = MicRecorder { buffer, _ in output.write(extractor.samples(from: buffer)) }
+            // startRunning never throws: a session that cannot start, or that fails later, posts its
+            // runtime error, which MicRecorder passes to onError (on whatever thread posted it). The
+            // first one ends the sample, unless it has been stopped since.
+            let failure = CaptureFailure()
+            let recorder = MicRecorder(onError: { [weak self] in
+                guard failure.mark(), self?.isCurrent(mine) == true else { return }
+                tell(PreferencesPresentation.sampleMicrophoneFailed)
+            }, onBuffer: { buffer, _ in output.write(extractor.samples(from: buffer)) })
             try recorder.start(device: device)
             self.output = output
             self.recorder = recorder
-            tell(nil)
+            if !failure.happened { tell(nil) }
         } catch {
             tell("The voice sample could not be recorded: \(error.localizedDescription)")
         }
@@ -92,6 +99,27 @@ final class MicSampleRecorder: SampleRecorder {
         lock.lock()
         defer { lock.unlock() }
         return mine == generation
+    }
+}
+
+/// Whether the capture session has reported an error: only the first is told.
+private final class CaptureFailure: @unchecked Sendable {
+    private let lock = NSLock()
+    private var failed = false
+
+    /// True the first time only.
+    func mark() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if failed { return false }
+        failed = true
+        return true
+    }
+
+    var happened: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return failed
     }
 }
 

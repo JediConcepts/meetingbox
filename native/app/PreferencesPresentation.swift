@@ -270,6 +270,7 @@ extension PreferencesPresentation {
     static let sampleTookTooLong = "Finding your voice in the sample took too long, so it was not used."
     static let sampleNoFolder = "The voice sample could not be recorded: meetingbox could not make a folder for it."
     static let sampleNoMicrophone = "The voice sample could not be recorded: no microphone was found."
+    static let sampleMicrophoneFailed = "The microphone stopped working, so the voice sample was not used. Record again."
 
     static func transcriberTitle(_ transcriber: Transcriber) -> String {
         switch transcriber {
