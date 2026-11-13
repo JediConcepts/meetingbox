@@ -225,7 +225,16 @@ cp "$ROOT/native/speech/Sources/mb-speech/Fetch.swift" "$FETCH_SRC"
 out="$(install_speech 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && speech_ready && pass "after the failures, setup installs again" || fail "after the failures, setup installs again: $out"
 
-(
+# Checks in a subshell keep its stubs to themselves, and their counts too: this reads the PASS and
+# FAIL lines it prints and counts them here, passing anything else through.
+recount() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in "PASS "*) pass "${l#PASS }" ;; "FAIL "*) fail "${l#FAIL }" ;; *) printf '%s\n' "$l" ;; esac
+  done
+}
+
+recount < <(
   macos_major() { echo 27; }
   refuse_while_busy() { return 0; }
   need_xcode_clt() { return 1; }
@@ -252,7 +261,7 @@ out="$(install_speech 2>&1)"; rc=$?
 )
 
 # --- the survey: on a release update, Parakeet is due whenever the recorder is ---
-(
+recount < <(
   speech_ready() { return 0; }
   recorder_ready() { return 1; }
   need_speech && pass "Parakeet is due when the recorder step is" || fail "Parakeet is due when the recorder step is"
@@ -337,12 +346,35 @@ if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/elsewhe
 else fail "a link at the dependency cache's path is left as it is, with what it points at, unrecorded, and not used ($rc): $out $(swift_log)"; fi
 rm -rf "$HOME/elsewhere"
 
+# A link there is never used, even one on the record: meetingbox makes a folder there, not a link.
+fresh
+mkdir -p "$SRC_DIR" "$HOME/elsewhere"; ln -s "$HOME/elsewhere" "$DEPS"; record_install "$DEPS"
+out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/elsewhere" ] && [ -z "$(ls -A "$HOME/elsewhere")" ] \
+   && swift_calls temp temp && printf '%s' "$out" | grep -qF "$DEPS is not meetingbox's, so the build fetches FluidAudio as before"; then
+  pass "a recorded link at the dependency cache's path is not used either: what it points at gets no files, and the build is as before"
+else fail "a recorded link at the dependency cache's path is not used either: what it points at gets no files, and the build is as before ($rc): $out $(swift_log) $(ls -AR "$HOME/elsewhere")"; fi
+rm -rf "$HOME/elsewhere"
+
+# The folder cannot be made (here SRC_DIR is read-only, so the helper cannot be installed either):
+# its record is forgotten, and the build is as before.
+fresh
+mkdir -p "$SRC_DIR"; chmod 555 "$SRC_DIR"
+out="$(install_speech 2>&1)"; rc=$?
+chmod 755 "$SRC_DIR"
+if [ ! -e "$DEPS" ] && [ ! -L "$DEPS" ] && ! installed_by_us "$DEPS" && swift_calls temp temp \
+   && printf '%s' "$out" | grep -qF "compiling. The first build fetches FluidAudio and takes a few minutes." \
+   && ! printf '%s' "$out" | grep -qF "Later builds reuse it"; then
+  pass "a dependency cache that cannot be made is not left on the record, and the build is as before"
+else fail "a dependency cache that cannot be made is not left on the record, and the build is as before ($rc): $out $(swift_log) $(cat "$INSTALLED")"; fi
+
 # A build that fails with the cache: the cache goes, through the record, and the build is tried
 # once more as before. The next build makes it again.
 fresh
 out="$(SWIFT_FAILS_WITH_CACHE=1 install_speech 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && swift_calls deps temp temp && [ ! -e "$DEPS" ] && [ ! -L "$DEPS" ] && ! installed_by_us "$DEPS" \
-   && installed_by_us "$SPEECH_BIN" && speech_ready; then
+   && installed_by_us "$SPEECH_BIN" && speech_ready \
+   && [ "$(printf '%s\n' "$out" | grep -cF "the build with meetingbox's FluidAudio cache failed, so it is tried once more without the cache")" = 1 ]; then
   pass "a build that fails with the dependency cache removes it, unrecorded, and one more build as before installs the helper"
 else fail "a build that fails with the dependency cache removes it, unrecorded, and one more build as before installs the helper ($rc): $out $(swift_log)"; fi
 printf '// changed\n' >> "$FETCH_SRC"
@@ -446,5 +478,20 @@ for level in tools all; do
     pass "reset_cmd $level lists an unrecorded helper, models, cache and voice print as left alone"
   else fail "reset_cmd $level lists an unrecorded helper, models, cache and voice print as left alone: $out"; fi
 done
+
+# A dangling link at the dependency cache's path is not meetingbox's either: setup does not record
+# or use it, and says so, and reset --tools leaves it.
+fresh
+mkdir -p "$SRC_DIR"; ln -s "$HOME/nowhere" "$DEPS"
+out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/nowhere" ] && [ ! -e "$HOME/nowhere" ] \
+   && ! installed_by_us "$DEPS" && swift_calls temp temp \
+   && [ "$(printf '%s\n' "$out" | grep -cF "$DEPS is not meetingbox's, so the build fetches FluidAudio as before")" = 1 ]; then
+  pass "a dangling link at the dependency cache's path is not recorded or used, and setup says it is not meetingbox's"
+else fail "a dangling link at the dependency cache's path is not recorded or used, and setup says it is not meetingbox's ($rc): $out $(swift_log) $(cat "$INSTALLED")"; fi
+out="$(reset_cmd tools 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/nowhere" ]; then
+  pass "reset_cmd tools leaves a dangling link at the dependency cache's path"
+else fail "reset_cmd tools leaves a dangling link at the dependency cache's path ($rc): $out"; fi
 
 finish

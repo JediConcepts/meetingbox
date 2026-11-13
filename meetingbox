@@ -692,13 +692,16 @@ install_speech() {
   else
     # The dependency cache keeps FluidAudio's fetched source, so a rebuild of the same pinned
     # version does not fetch it again. The versions in Package.resolved are forced, so the cache
-    # never changes what is built. It is made and recorded the first time, and after that used
-    # as it is: never claimed, which would empty it. A folder there that meetingbox did not make
-    # is not used or touched, and the build caches in its temporary folder, as before.
+    # never changes what is built. It is made and recorded the first time (a record whose folder
+    # could not be made is forgotten), and after that used as it is: never claimed, which would
+    # empty it. A folder there that meetingbox did not make, or any link, even a recorded one, is
+    # not used or touched, and the build caches in its temporary folder, as before.
     tries=temp
     if [ ! -e "$SPEECH_DEPS" ] && [ ! -L "$SPEECH_DEPS" ]; then
-      mkdir -p "$SRC_DIR" && record_install "$SPEECH_DEPS" && mkdir -m 700 "$SPEECH_DEPS" && tries="deps temp"
-    elif installed_by_us "$SPEECH_DEPS"; then
+      if mkdir -p "$SRC_DIR" && record_install "$SPEECH_DEPS"; then
+        if mkdir -m 700 "$SPEECH_DEPS"; then tries="deps temp"; else forget_install "$SPEECH_DEPS"; fi
+      fi
+    elif [ ! -L "$SPEECH_DEPS" ] && installed_by_us "$SPEECH_DEPS"; then
       tries="deps temp"
     else
       info "$SPEECH_DEPS is not meetingbox's, so the build fetches FluidAudio as before"
@@ -730,7 +733,7 @@ install_speech() {
       rm -rf -- "$tmp"
       [ "$try" = deps ] || { speech_step_failed "the speech helper did not build"; return 1; }
       remove_installed "$SPEECH_DEPS"
-      info "the build with the cached FluidAudio failed, so the cache is removed and the build tried once more without it"
+      info "the build with meetingbox's FluidAudio cache failed, so it is tried once more without the cache"
     done
     # A recorded helper is replaced by a rename over it, never removed first, so a failed
     # install leaves the old one working. The first install claims the path.
