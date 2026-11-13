@@ -1738,6 +1738,8 @@ final class QRig {
     var finished: [(String, Bool)] = []
     /// The kind of each job `finished` reports, in the same order (nil: a kind this version cannot read).
     var kinds: [JobKind?] = []
+    /// The reason each job `finished` reports gives, in the same order (nil: the record's own error).
+    var reasons: [String?] = []
     var changes = 0
 
     init() {
@@ -1747,9 +1749,10 @@ final class QRig {
     @discardableResult
     func make(settings: @escaping () -> RunSettings = { .defaults }) -> ProcessingQueue {
         queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil, settings: settings)
-        queue.onFinished = { [unowned self] dir, ok, kind, _ in
+        queue.onFinished = { [unowned self] dir, ok, kind, reason in
             self.finished.append((dir.lastPathComponent, ok))
             self.kinds.append(kind)
+            self.reasons.append(reason)
         }
         queue.onChange = { [unowned self] in self.changes += 1 }
         return queue
@@ -7326,6 +7329,165 @@ do {
     r.runner.calls.first?.done(0, "")
     check(snapshot(a) == before && r.runner.calls.count == 1 && !q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true,
           "R3 pin (RR2-4): a folder whose meeting.json now holds another id is not the job's meeting: nothing written, ended as not done")
+}
+
+// MARK: - Redo in the window, round 4
+
+// A relaunch while the last instance's run still goes on (ADV-R3-2). Quitting never stops a run: the engine
+// carries on, holding its live lock. The new queue waits for it before it starts anything else, whether the
+// meeting queued behind it is older or newer, for a redo or a plain process. Once the lock goes and the run
+// settles, the meeting queued behind it runs once, as its kind.
+for (running, waiting, kind) in [("2026-11-13_0900", "2026-11-01_0900", JobKind.minutes),
+                                 ("2026-11-01_0900", "2026-11-13_0900", JobKind.minutes),
+                                 ("2026-11-13_0900", "2026-11-01_0900", JobKind.process)] {
+    let r = QRig()
+    var q1: ProcessingQueue? = r.make()
+    let made = { (name: String) -> URL in
+        kind == .process ? r.meeting(name, files: ["audio.m4a": "a"], queued) : t8Done(r, name) { $0.writer = .apple }
+    }
+    let ask = { (dir: URL) in
+        if kind == .process { q1?.enqueue(dir) } else { _ = q1?.redo(dir, kind: kind, options: JobOptions(writer: .apple)) }
+    }
+    let a = made(running)
+    let b = made(waiting)
+    ask(a)
+    r.lock(a, owner: "\(me) \(lstartOf(me))") // the engine's own lock, its owner alive
+    ask(b)
+    let label = "\(kind == .process ? "two processes" : "two redos"), the one queued \(waiting < running ? "older" : "newer")"
+    check(r.runner.calls.count == 1 && r.state(a) == "processing" && r.state(b) == "queued",
+          "R4 relaunch: before quitting, one run and the other meeting queued (\(label))")
+    // Quit: the run goes on, and its end never reaches this instance.
+    q1 = nil
+    r.queue = nil
+    let q2 = r.make()
+    q2.resume()
+    check(r.runner.calls.count == 1 && q2.stage == "waiting for another meetingbox"
+          && q2.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(a) && r.state(b) == "queued",
+          "R4 relaunch: no new run while the last run holds its live lock; the queue waits on it (\(label); runs \(r.runner.folders))")
+    // That run ends on its own: what its kind writes, our attempt's result, and its lock gone.
+    if kind == .process {
+        r.outputs(a, at: Date())
+    } else {
+        try! "new minutes\n".write(to: a.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    }
+    r.result(a, attempt: r.attempt(a) ?? "", status: 0, started: Date().addingTimeInterval(-60))
+    r.unlock(a)
+    q2.tick()
+    check(r.state(a) == "done" && r.runner.calls.count == 2 && r.runner.calls[1].job.kind == kind
+          && r.runner.calls[1].arguments.first == (kind == .process ? "process" : "notes")
+          && LibraryPresentation.key(r.runner.calls[1].job.folder) == LibraryPresentation.key(b),
+          "R4 relaunch: once it goes and settles Done, the meeting queued behind it runs, as its kind (\(label))")
+    if kind == .process { r.runner.finish(1, 0) } else { r.runner.finishNotes(1, 0) }
+    q2.tick()
+    check(r.state(b) == "done" && r.runner.calls.count == 2 && !q2.hasWork, "R4 relaunch: and runs once (\(label))")
+}
+// Each group keeps its order: two runs the last instance left part way (no lock, no result) run again oldest
+// first, and then the meeting found queued, though it is older than both.
+do {
+    let r = QRig()
+    let older = r.meeting("2026-11-01_0900", queued)
+    let p1 = r.meeting("2026-11-02_0900") { $0.state = .processing; $0.attempts = 1; $0.attempt = "attempt-one" }
+    let p2 = r.meeting("2026-11-03_0900") { $0.state = .processing; $0.attempts = 1; $0.attempt = "attempt-two" }
+    let q = r.make()
+    q.resume()
+    for i in 0..<3 { r.runner.finish(i, 0) }
+    check(r.runner.folders == [p1, p2, older].map { $0.lastPathComponent } && [older, p1, p2].allSatisfy { r.state($0) == "done" } && !q.hasWork,
+          "R4 relaunch: the meetings found processing run first, oldest first, then those found queued (\(r.runner.folders))")
+}
+
+// A running meeting that left every root and comes back is followed again (R3-1, ADV-R3-1): to the path it was
+// last found at (Finder's Undo, a volume back), or under another name in the root. It is current again, onChange
+// tells the menu bar, and its progress is read; its run then ends there.
+for samePath in [true, false] {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, tidy: false, writer: .apple))
+    try! "transcribing\n".write(to: r.runner.calls[0].progress, atomically: false, encoding: .utf8)
+    q.tick()
+    let away = freshRoot().appendingPathComponent("2026-11-13_0900", isDirectory: true)
+    _ = Darwin.rename(a.path, away.path)
+    q.tick()
+    let label = samePath ? "to the same path" : "under another name in the root"
+    check(q.current == nil && q.hasWork && q.stage == "transcribing", "R4 back: while it is in no root, it is not current (\(label))")
+    let back = samePath ? a : r.store.root.appendingPathComponent("2026-11-13 0900 Weekly", isDirectory: true)
+    _ = Darwin.rename(away.path, back.path)
+    try! "transcribing\nminutes\n".write(to: back.appendingPathComponent(".process-progress"), atomically: false, encoding: .utf8)
+    let told = r.changes
+    q.tick()
+    check(q.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(back) && r.changes > told,
+          "R4 back: once it comes back it is current again, and onChange is called (\(label))")
+    check(q.stage == "minutes" && r.json(back)["stage"] as? String == "minutes", "R4 back: and its progress is read again (\(label))")
+    try! "[00:00:01] Me: again\n".write(to: back.appendingPathComponent("transcript.txt"), atomically: true, encoding: .utf8)
+    try! "new minutes\n".write(to: back.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    r.runner.calls[0].done(0, "")
+    check(r.state(back) == "done" && r.runner.calls.count == 1 && !q.hasWork
+          && r.finished.last.map { $0 == (back.lastPathComponent, true) } == true,
+          "R4 back: and its run ends Done there, once (\(label))")
+}
+
+// A job that ends where its meeting cannot be found gives exactly this reason when its own run says nothing better
+// (R3-2, R3-3): the window and the docs quote it.
+let lostReason = "the meeting folder was moved where meetingbox cannot find it"
+// Exit 0 after the meeting left every root.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    _ = Darwin.rename(a.path, freshRoot().appendingPathComponent("2026-11-13_0900").path)
+    r.runner.calls[0].done(0, "")
+    check(!q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true && r.reasons.last == lostReason,
+          "R4 reason: exit 0 with the meeting in no root ends as not done, with the lost-folder reason (\(r.reasons.last.flatMap { $0 } ?? "nil"))")
+}
+// Exit 75 after the meeting left every root, with another meeting renamed onto its old path: nothing is written in
+// either folder (no attempts given back, no waiting stage), nothing more runs, and the job ends as not done.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    let b = t8Done(r, "2026-11-13_1000") { $0.writer = .apple; $0.attempts = 2 }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    let moved = freshRoot().appendingPathComponent("2026-11-13_0900", isDirectory: true)
+    _ = Darwin.rename(a.path, moved.path)
+    _ = Darwin.rename(b.path, a.path)
+    let (there, away) = (snapshot(a), snapshot(moved))
+    r.runner.calls[0].done(75, "this meeting is already being processed")
+    q.tick()
+    q.tick()
+    check(snapshot(a) == there && snapshot(moved) == away && r.runner.calls.count == 1 && !q.hasWork
+          && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true,
+          "R4 exit 75 in no root: both folders byte-identical, one run, ended as not done (\(r.runner.calls.count) runs)")
+    check(r.reasons.last == lostReason,
+          "R4 reason: exit 75 with the meeting in no root gives the lost-folder reason (\(r.reasons.last.flatMap { $0 } ?? "nil"))")
+}
+// A queued turn whose meeting left every root.
+do {
+    let r = QRig()
+    let q = r.make()
+    let first = t8Done(r, "2026-11-13_0800") { $0.writer = .apple }
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(first, kind: .minutes, options: JobOptions(writer: .apple))
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    _ = Darwin.rename(a.path, freshRoot().appendingPathComponent("2026-11-13_0900").path)
+    r.runner.finishNotes(0, 0)
+    check(r.runner.calls.count == 1 && !q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true
+          && r.reasons.last == lostReason,
+          "R4 reason: a queued turn whose meeting is in no root runs nothing, with the lost-folder reason (\(r.reasons.last.flatMap { $0 } ?? "nil"))")
+}
+// A job waiting on another meetingbox whose meeting left every root.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    r.lock(a, owner: "\(me) \(lstartOf(me))")
+    r.runner.calls[0].done(75, "this meeting is already being processed")
+    _ = Darwin.rename(a.path, freshRoot().appendingPathComponent("2026-11-13_0900").path)
+    q.tick()
+    check(r.runner.calls.count == 1 && !q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true
+          && r.reasons.last == lostReason,
+          "R4 reason: a waiting job whose meeting is in no root ends with the lost-folder reason (\(r.reasons.last.flatMap { $0 } ?? "nil"))")
 }
 
 try? fm.removeItem(at: scratch)

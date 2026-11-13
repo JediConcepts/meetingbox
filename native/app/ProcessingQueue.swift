@@ -459,10 +459,12 @@ struct ProcessResult: Equatable {
 /// The durable processing queue. Its state lives in each meeting's `meeting.json` (`queued`,
 /// `processing`, `attempts`, `attempt`, and a redo's `job` and its options), so a crash loses nothing:
 /// `resume()` picks up every `queued` and `processing` meeting, and never touches `unprocessed` or
-/// `done` ones. One job runs at a time, oldest first, as the kind its record names. A job found
-/// `processing` after a crash is settled from its lock and `.process-result`: a live owner is waited
-/// for; our attempt's success is done; anything that stopped part way is run again as the same kind,
-/// at most three runs in all.
+/// `done` ones. One job runs at a time, as the kind its record names, in the order asked; at launch,
+/// the meetings found `processing` come first and then those found `queued`, each oldest first, since
+/// a run the last instance left going may still be at work. A job found `processing` after a quit or a
+/// crash is settled from its lock and `.process-result`: a live owner is waited for; our attempt's
+/// success is done; anything that stopped part way is run again as the same kind, at most three runs in
+/// all.
 /// Call it from one queue (the main queue in the app); a 1 s timer there follows the progress file
 /// and waits on a lock held by another process.
 final class ProcessingQueue {
@@ -720,14 +722,19 @@ final class ProcessingQueue {
         record.jobTidy = nil
     }
 
-    /// Picks up every meeting left `queued` or `processing`, oldest first, in the meetings folder and
-    /// in every other folder a recording was started in (`MeetingStore.roots`). Safe to call again.
+    /// Picks up every meeting left `processing`, then every one left `queued`, each oldest first, in the
+    /// meetings folder and in every other folder a recording was started in (`MeetingStore.roots`). A run
+    /// the last instance started goes on after it quits, holding its lock, so it is waited for before
+    /// anything else starts. Safe to call again.
     func resume() {
         onTickQueue()
-        for meeting in store.scanEveryRoot().reversed() {
-            guard let record = meeting.record, record.state == .queued || record.state == .processing else { continue }
-            let dir = ProcessingQueue.normal(meeting.folder.url)
-            if !known(dir), let entry = Held(dir, record) { pending.append(entry) }
+        let found = store.scanEveryRoot().reversed().compactMap { meeting in
+            meeting.record.map { (ProcessingQueue.normal(meeting.folder.url), $0) }
+        }
+        for state in [MeetingState.processing, .queued] {
+            for (dir, record) in found where record.state == state {
+                if !known(dir), let entry = Held(dir, record) { pending.append(entry) }
+            }
         }
         onChange?()
         advance()
@@ -736,27 +743,29 @@ final class ProcessingQueue {
     // MARK: running
 
     /// Follows the progress file, and settles a job whose lock another process held once it goes. A
-    /// folder moved meanwhile is followed, with the other process's lock in it.
+    /// folder moved meanwhile is followed, with the other process's lock in it. A running meeting in no
+    /// root is current again when it comes back, wherever in a root it is.
     func tick() {
         guard let held = holding, let job = job else { return }
         switch job {
         case .running:
             // Nothing is read or written for the run until its folder is checked to be its meeting; the
             // usual case is one look at the folder it was last found in.
-            if !ProcessingQueue.holds(held, at: held.dir) {
-                guard let here = locate(held) else {
-                    // In no root (or another meeting is at its path): touch nothing, point at nothing.
-                    if !held.lost {
-                        holding?.lost = true
-                        onChange?()
-                    }
-                    return
+            guard let here = locate(held) else {
+                // In no root (or another meeting is at its path): touch nothing, point at nothing.
+                if !held.lost {
+                    holding?.lost = true
+                    onChange?()
                 }
+                return
+            }
+            if here != held.dir || held.lost {
+                // Moved, or back from no root, at the path it was last found at or another: followed again.
                 holding?.dir = here
                 holding?.lost = false
                 onChange?()
             }
-            if let dir = current { pollProgress(dir) }
+            pollProgress(here)
         case .waiting:
             guard let entry = holding else { return }
             guard let here = locate(entry) else {
