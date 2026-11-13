@@ -40,6 +40,9 @@ final class LibraryModel: ObservableObject {
     /// it will run with. Redo minutes uses only the writer.
     struct RedoDraft: Equatable {
         let folder: URL
+        /// The meeting's `meeting.json` id when the sheet opened (nil for a folder with no record), so the
+        /// check at the click can tell that the folder at the path is still that meeting.
+        let id: String?
         let kind: JobKind
         var transcriber: Transcriber
         /// The counts; nil is Work it out.
@@ -420,7 +423,7 @@ final class LibraryModel: ObservableObject {
         guard kind != .process else { return }
         let settings = self.settings()
         let record = meeting.record
-        redoing = RedoDraft(folder: meeting.folder.url, kind: kind, transcriber: settings.transcriber, room: record?.people.room,
+        redoing = RedoDraft(folder: meeting.folder.url, id: record?.id, kind: kind, transcriber: settings.transcriber, room: record?.people.room,
                             call: record?.people.call, tidy: settings.tidy, writer: record?.writer ?? settings.preferredWriter)
     }
 
@@ -440,10 +443,10 @@ final class LibraryModel: ObservableObject {
     /// Queues the sheet's redo. An outside writer is taken only when Preferences have agreed to its
     /// source (`RunSettings.agrees`); otherwise nothing is queued or written and the sheet stays open
     /// (asking for agreement here comes later). Then the meeting is checked again off the main queue: its
-    /// record as it is on the disk, and the live lock a `meetingbox` run in Terminal would hold. Back on
-    /// this queue, with the session and the queue's job, it is queued only if it is still free and the
-    /// queue takes it; otherwise "That meeting is busy" is shown under the actions. The sheet closes once
-    /// the check is done.
+    /// record as it is on the disk (still the same meeting's id, and its state), and the live lock a
+    /// `meetingbox` run in Terminal would hold. Back on this queue, with the session and the queue's job,
+    /// it is queued only if it is still that meeting, still free, and the queue takes it; otherwise "That
+    /// meeting is busy" is shown under the actions. The sheet closes once the check is done.
     func commitRedo() {
         guard let draft = redoing else { return }
         if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) { return }
@@ -451,19 +454,20 @@ final class LibraryModel: ObservableObject {
         let token = redoToken
         let ps = self.ps
         reader.async { [weak self] in
-            let recorded = LibraryPresentation.recordedState(draft.folder)
+            let record = MeetingStore.record(in: draft.folder)
             let lock = ProcessingLock.owner(draft.folder, ps: ps, now: Date())
-            Task { @MainActor in self?.redoChecked(draft, token: token, recorded: recorded, lock: lock) }
+            Task { @MainActor in self?.redoChecked(draft, token: token, recorded: record?.state, id: record?.id, lock: lock) }
         }
     }
 
-    private func redoChecked(_ draft: RedoDraft, token: Int, recorded: MeetingState?, lock: ProcessingLock.Owner) {
+    private func redoChecked(_ draft: RedoDraft, token: Int, recorded: MeetingState?, id: String?, lock: ProcessingLock.Owner) {
         guard token == redoToken, redoing != nil else { return }
         redoing = nil
         let options = draft.kind == .transcribe
             ? JobOptions(transcriber: draft.transcriber, room: draft.room, call: draft.call, tidy: draft.tidy, writer: draft.writer)
             : JobOptions(writer: draft.writer)
-        let free = lock == .gone
+        // Another meeting at the path (the folders were swapped or renamed in Finder) is not this one.
+        let free = id == draft.id && lock == .gone
             && !LibraryPresentation.isBusy(draft.folder, phase: session.phase, current: queue.current, recorded: recorded)
         if !(free && queue.redo(draft.folder, kind: draft.kind, options: options)),
            selection == LibraryPresentation.key(draft.folder) {

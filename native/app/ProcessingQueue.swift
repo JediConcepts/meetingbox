@@ -516,19 +516,24 @@ final class ProcessingQueue {
         }
     }
 
-    /// The meeting being processed, or waited on, where it was last found.
-    var current: URL? { holding?.dir }
+    /// The meeting being processed, or waited on, where it was last found; nil while its run goes on in a
+    /// meeting that is in no root, so no other meeting at its old path is taken for it.
+    var current: URL? { holding.flatMap { $0.lost ? nil : $0.dir } }
     /// That meeting, with what identifies it.
     private var holding: Held?
     /// A job is running or waited on, or more are queued behind it.
-    var hasWork: Bool { current != nil || !pending.isEmpty }
+    var hasWork: Bool { holding != nil || !pending.isEmpty }
     /// The last stage in its progress file.
     private(set) var stage: String?
     var onChange: (() -> Void)?
-    /// The folder (where it is now), whether the job worked (true) or not (false), and its kind: nil for a
-    /// job this version could not read, which ends as a redo that could not run. A redo that did not work
-    /// can leave its meeting Done, with the reason in its record's `error`.
-    var onFinished: ((URL, Bool, JobKind?) -> Void)?
+    /// The folder (where it is now), whether the job worked (true) or not (false), its kind (nil for a job
+    /// this version could not read, which ends as a redo that could not run), and the reason when it ended
+    /// where its meeting could not be found: then nothing was written, and the record at the folder's old
+    /// path, if any, is another meeting's. Otherwise the reason is the record's `error`. A redo that did
+    /// not work can leave its meeting Done.
+    var onFinished: ((URL, Bool, JobKind?, String?) -> Void)?
+    /// The reason a job gives when its meeting was moved out of every root and its own outcome says nothing.
+    static let lostFolder = "the meeting folder was moved where meetingbox cannot find it"
 
     private let store: MeetingStore
     private let runner: PipelineRunner
@@ -548,6 +553,8 @@ final class ProcessingQueue {
         let identity: FolderIdentity
         let id: String
         let kind: JobKind?
+        /// Its run goes on, but the meeting is in no root: nothing is read or written for it until found.
+        var lost = false
 
         init?(_ dir: URL, _ record: MeetingRecord) {
             guard let identity = FolderIdentity(dir) else { return nil }
@@ -731,10 +738,25 @@ final class ProcessingQueue {
     /// Follows the progress file, and settles a job whose lock another process held once it goes. A
     /// folder moved meanwhile is followed, with the other process's lock in it.
     func tick() {
-        guard let dir = current, let job = job else { return }
+        guard let held = holding, let job = job else { return }
         switch job {
         case .running:
-            pollProgress(dir)
+            // Nothing is read or written for the run until its folder is checked to be its meeting; the
+            // usual case is one look at the folder it was last found in.
+            if !ProcessingQueue.holds(held, at: held.dir) {
+                guard let here = locate(held) else {
+                    // In no root (or another meeting is at its path): touch nothing, point at nothing.
+                    if !held.lost {
+                        holding?.lost = true
+                        onChange?()
+                    }
+                    return
+                }
+                holding?.dir = here
+                holding?.lost = false
+                onChange?()
+            }
+            if let dir = current { pollProgress(dir) }
         case .waiting:
             guard let entry = holding else { return }
             guard let here = locate(entry) else {
@@ -754,7 +776,7 @@ final class ProcessingQueue {
     private func advance() {
         while job == nil {
             guard !pending.isEmpty else {
-                if current != nil || stage != nil {
+                if holding != nil || stage != nil {
                     holding = nil
                     stage = nil
                     onChange?()
@@ -767,7 +789,7 @@ final class ProcessingQueue {
             guard let dir = locate(entry) else {
                 // In no root any more: nothing is written anywhere, and the job ends as not done.
                 holding = nil
-                onFinished?(entry.dir, false, entry.kind)
+                onFinished?(entry.dir, false, entry.kind, ProcessingQueue.lostFolder)
                 onChange?()
                 continue
             }
@@ -821,9 +843,9 @@ final class ProcessingQueue {
     /// The meeting is in no root any more (moved off the volume, out of the meetings folder, or to the
     /// Trash): nothing is written anywhere, the old path included, since another meeting may be there
     /// now. The job ends as not done; a relaunch's resume takes the meeting up if it comes back.
-    private func endNowhere(_ entry: Held, kind: JobKind?) {
+    private func endNowhere(_ entry: Held, kind: JobKind?, reason: String = ProcessingQueue.lostFolder) {
         job = nil
-        onFinished?(entry.dir, false, kind)
+        onFinished?(entry.dir, false, kind, reason)
         advance()
     }
 
@@ -963,15 +985,23 @@ final class ProcessingQueue {
     /// A run of ours ended: finished by `outcome`, where its meeting is now. A folder moved or renamed in
     /// Finder while it ran is found again (`locate`), and the status this run gave is used there, so
     /// nothing is run twice (the engine's own `.process-result` went to the old path). A meeting in no
-    /// root is finished nowhere (`endNowhere`).
+    /// root is finished nowhere (`endNowhere`), with the reason its own run gave. The run is known by its
+    /// token: the tick may have followed its folder since it was launched.
     private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {
-        guard case .running(let started, let t, let kind)? = job, t == mine,
-              let entry = holding, entry.dir.path == dir.path else { return }
+        guard case .running(let started, let t, let kind)? = job, t == mine, let entry = holding else { return }
         guard let here = locate(entry) else {
-            endNowhere(entry, kind: kind)
+            var reason = ProcessingQueue.lostFolder
+            if status != 0 && status != ProcessingQueue.busyExit {
+                switch ProcessingQueue.outcome(kind, status: status, fresh: false, line: line, settled: false) {
+                case .failed(let said), .runAgain(let said): reason = said
+                case .done: break
+                }
+            }
+            endNowhere(entry, kind: kind, reason: reason)
             return
         }
         holding?.dir = here
+        holding?.lost = false
         pollProgress(here)
         if status == ProcessingQueue.busyExit {
             // Refused: nothing ran, so this run is not counted. Wait for the holder, then settle.
@@ -1002,7 +1032,7 @@ final class ProcessingQueue {
             $0.error = nil
             ProcessingQueue.clearJob(&$0)
         }
-        onFinished?(dir, true, kind)
+        onFinished?(dir, true, kind, nil)
     }
 
     /// A process that failed is Failed. A redo that did not work, or a job this version cannot read
@@ -1017,7 +1047,7 @@ final class ProcessingQueue {
             $0.error = reason
             ProcessingQueue.clearJob(&$0)
         }
-        onFinished?(dir, false, kind)
+        onFinished?(dir, false, kind, nil)
     }
 
     // MARK: helpers

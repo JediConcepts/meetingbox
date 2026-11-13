@@ -137,13 +137,15 @@ final class AppModel: ObservableObject {
             let (current, stage) = (queue.current, queue.stage)
             Task { @MainActor in self?.apply(.processing(current, stage: stage)) }
         }
-        queue.onFinished = { [weak self] dir, ok, kind in
+        queue.onFinished = { [weak self] dir, ok, kind, reason in
             Task { @MainActor in
                 guard let self = self else { return }
                 self.library.reload()
                 guard ok else {
-                    // A redo's reason is on its meeting in the window; the menu bar only says it did not finish.
-                    let line = kind == .process ? StatusPresentation.minutesNotWritten(AppModel.failureReason(dir))
+                    // A redo's reason is on its meeting in the window; the menu bar only says it did not finish. A
+                    // job that ended where its meeting could not be found gives its own reason: the record at
+                    // its old path, if any, is another meeting's.
+                    let line = kind == .process ? StatusPresentation.minutesNotWritten(reason ?? AppModel.failureReason(dir))
                         : StatusPresentation.redoNotFinished
                     self.wentWrong(.unfinished(dir, line: line))
                     return

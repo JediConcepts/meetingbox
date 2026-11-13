@@ -1747,7 +1747,7 @@ final class QRig {
     @discardableResult
     func make(settings: @escaping () -> RunSettings = { .defaults }) -> ProcessingQueue {
         queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil, settings: settings)
-        queue.onFinished = { [unowned self] dir, ok, kind in
+        queue.onFinished = { [unowned self] dir, ok, kind, _ in
             self.finished.append((dir.lastPathComponent, ok))
             self.kinds.append(kind)
         }
@@ -7141,6 +7141,191 @@ MainActor.assumeIsolated {
           "R2 app (RR-5): a job this version cannot read ends with the amber line Redo did not finish (\(model.status.notice?.line ?? "-"))")
     model.shutDown()
     try? fm.removeItem(at: state)
+}
+
+// MARK: - Redo in the window, round 3
+
+// While a run goes on, nothing is read or written for it in a folder that is not its meeting: the tick follows a
+// moved folder, and a meeting renamed onto the old path stays byte-identical (RR2-5, ADV-R2-1).
+for movedOut in [true, false] {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    let b = t8Done(r, "2026-11-13_1000") { $0.writer = .apple }
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, tidy: false, writer: .apple))
+    let progress = r.runner.calls[0].progress
+    try! "transcribing\n".write(to: progress, atomically: false, encoding: .utf8)
+    q.tick()
+    check(r.json(a)["stage"] as? String == "transcribing", "R3 progress: the stage is followed while the folder is in place")
+    let moved = movedOut ? freshRoot().appendingPathComponent("2026-11-13_0900", isDirectory: true)
+        : r.store.root.appendingPathComponent("2026-11-13 0900 Weekly", isDirectory: true)
+    _ = Darwin.rename(a.path, moved.path)
+    _ = Darwin.rename(b.path, a.path)
+    // the engine appends to the path it was given, which is now inside the other meeting
+    try! "transcribing\nminutes\n".write(to: progress, atomically: false, encoding: .utf8)
+    let there = snapshot(a)
+    let away = snapshot(moved)
+    q.tick()
+    q.tick()
+    check(snapshot(a) == there, "R3 progress: the meeting renamed onto the old path stays byte-identical across ticks (moved \(movedOut ? "out of every root" : "within the root"))")
+    if movedOut {
+        check(snapshot(moved) == away && q.current == nil && q.hasWork,
+              "R3 progress: a running meeting in no root is not pointed at, nor written, while its run goes on")
+    } else {
+        check(q.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(moved) && q.hasWork,
+              "R3 progress: a running meeting renamed within the root is followed")
+    }
+    r.runner.calls.first?.done(1, "the meeting folder was moved, nothing was changed")
+    check(snapshot(a) == there && !q.hasWork, "R3 progress: and its end leaves that meeting byte-identical too")
+}
+
+// A job whose meeting left every root takes its reason from its own outcome, never from a record at the old
+// path (ADV-R2-3).
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    let runner = FakeRunner()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: runner, freeBytes: { _ in 50 * GB })
+    model.launch()
+    let a = make(root, "2026-11-13_0900", files: ["audio.m4a": "a"])
+    try! model.store.update(a) { $0.state = .queued }
+    let b = make(root, "2026-11-13_1000", files: ["audio.m4a": "a"])
+    try! model.store.update(b) { $0.state = .failed; $0.error = "the microphone was off for the whole meeting" }
+    model.queue.enqueue(a)
+    check(settle { runner.calls.count == 1 }, "R3 reason: the process runs")
+    _ = Darwin.rename(a.path, freshRoot().appendingPathComponent("2026-11-13_0900").path)
+    _ = Darwin.rename(b.path, a.path)
+    let bytes = try? Data(contentsOf: a.appendingPathComponent("meeting.json"))
+    runner.calls[0].done(1, "the meeting folder was moved, nothing was changed")
+    check(settle { model.status.notice?.kind == .unfinished }
+          && model.status.notice?.line == "Minutes could not be written: the meeting folder was moved, nothing was changed"
+          && (try? Data(contentsOf: a.appendingPathComponent("meeting.json"))) == bytes,
+          "R3 reason: the line gives the job's own reason, not the record now at the old path, which is untouched (\(model.status.notice?.line ?? "-"))")
+    model.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// The sheet carries the meeting's id: two folders swapped while it is open are refused, both untouched (ADV-R2-4).
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let runner = FakeRunner()
+    let model = LibraryModel(store: r.store, session: session, queue: ProcessingQueue(store: r.store, runner: runner, tickQueue: nil))
+    let root = r.store.root
+    let a = make(root, "2026-11-13_0900", files: ["audio.m4a": "a", "transcript.txt": "a words", "notes.md": "m"])
+    try! r.store.update(a) { $0.state = .done; $0.writer = .apple; $0.people = MeetingRecord.People(room: 2, call: 3) }
+    let b = make(root, "2026-11-13_1000", files: ["audio.m4a": "a", "transcript.txt": "b words", "notes.md": "m"])
+    try! r.store.update(b) { $0.state = .done; $0.writer = .apple; $0.people = MeetingRecord.People(room: 5, call: 1) }
+    model.reload()
+    check(settle { model.meetings.count == 2 }, "R3 sheet: the meetings are read")
+    model.select(LibraryPresentation.key(a))
+    check(settle { model.shownContent?.files.runnable == true }, "R3 sheet: and the first one's folder")
+    model.perform(.transcribeAgain)
+    check(model.redoing?.room == 2 && model.redoing?.id == MeetingStore.record(in: a)?.id, "R3 sheet: the sheet carries the meeting's id")
+    let swap = root.appendingPathComponent("swap", isDirectory: true)
+    _ = Darwin.rename(a.path, swap.path)
+    _ = Darwin.rename(b.path, a.path)
+    _ = Darwin.rename(swap.path, b.path)
+    let atA = try? Data(contentsOf: a.appendingPathComponent("meeting.json"))
+    let atB = try? Data(contentsOf: b.appendingPathComponent("meeting.json"))
+    model.commitRedo()
+    check(settle { model.redoing == nil } && model.problem == "That meeting is busy" && runner.calls.isEmpty
+          && (try? Data(contentsOf: a.appendingPathComponent("meeting.json"))) == atA && (try? Data(contentsOf: b.appendingPathComponent("meeting.json"))) == atB,
+          "R3 sheet: another meeting now at the path is refused with That meeting is busy; both meeting.json files are byte-identical")
+}
+
+// Pins.
+// RR2-1: an id-only match would land on a duplicate whichever order the folder is listed in: one on each side of
+// the original's new name.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13 0900 Weekly") { $0.writer = .apple }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    let before = r.store.root.appendingPathComponent("2026-11-13 0900 Aardvark copy", isDirectory: true)
+    let after = r.store.root.appendingPathComponent("2026-11-13 0900 Zebra copy", isDirectory: true)
+    try! fm.copyItem(at: a, to: before)
+    try! fm.copyItem(at: a, to: after)
+    let board = r.store.root.appendingPathComponent("2026-11-13 0900 Board", isDirectory: true)
+    _ = Darwin.rename(a.path, board.path)
+    try! "new minutes\n".write(to: board.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    let (one, two) = (snapshot(before), snapshot(after))
+    r.runner.calls.first?.done(0, "")
+    check(snapshot(before) == one && snapshot(after) == two && r.state(board) == "done" && r.runner.calls.count == 1,
+          "R3 pin (RR2-1): duplicates sorting before and after the original's new name both get nothing; the original ends Done")
+}
+// RR2-2: a job waiting on another meetingbox whose meeting leaves every root, with another meeting (left
+// processing) renamed onto its path: nothing is written or run.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    let b = t8Done(r, "2026-11-13_1000") { $0.writer = .apple }
+    var other = recordJSON(b)
+    other["state"] = "processing"
+    other["attempts"] = 1
+    other["attempt"] = "att-b"
+    writeRecord(b, other)
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    r.lock(a, owner: "\(me) \(lstartOf(me))")
+    r.runner.calls.first?.done(75, "this meeting is already being processed")
+    let moved = freshRoot().appendingPathComponent("2026-11-13_0900", isDirectory: true)
+    _ = Darwin.rename(a.path, moved.path)
+    _ = Darwin.rename(b.path, a.path)
+    let (there, away) = (snapshot(a), snapshot(moved))
+    q.tick()
+    q.tick()
+    check(snapshot(a) == there && snapshot(moved) == away && r.runner.calls.count == 1 && !q.hasWork
+          && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true,
+          "R3 pin (RR2-2): a waiting job whose meeting left every root writes and runs nothing, and ends as not done (\(r.runner.calls.count) runs)")
+}
+// RR2-3: following a moved meeting reads no meeting.json but the one whose folder matches: a sibling's
+// meeting.json that is a FIFO is never opened.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    let sibling = r.store.root.appendingPathComponent("2026-11-13_1100", isDirectory: true)
+    try! fm.createDirectory(at: sibling, withIntermediateDirectories: true)
+    let fifo = sibling.appendingPathComponent("meeting.json")
+    check(mkfifo(fifo.path, 0o600) == 0, "R3 pin (RR2-3): a sibling's meeting.json is a FIFO")
+    let opened = MainSeen()
+    let path = fifo.path
+    Thread {
+        let fd = open(path, O_WRONLY) // waits until something opens it to read
+        opened.note(true)
+        if fd >= 0 { close(fd) }
+    }.start()
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    let board = r.store.root.appendingPathComponent("2026-11-13 0900 Board", isDirectory: true)
+    _ = Darwin.rename(a.path, board.path)
+    try! "new minutes\n".write(to: board.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    r.runner.calls.first?.done(0, "")
+    usleep(300_000)
+    check(r.state(board) == "done" && opened.seen.isEmpty,
+          "R3 pin (RR2-3): the moved meeting is found and Done, and no other meeting.json was opened (\(opened.seen))")
+    let release = open(path, O_RDONLY | O_NONBLOCK)
+    if release >= 0 { close(release) }
+}
+// RR2-4: the id half of the match: the same folder whose meeting.json now holds another id is not the job's
+// meeting, so nothing is written there and the job ends as not done.
+do {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .minutes, options: JobOptions(writer: .apple))
+    var replaced = recordJSON(a)
+    replaced["id"] = "another-meetings-id"
+    writeRecord(a, replaced)
+    try! "new minutes\n".write(to: a.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    let before = snapshot(a)
+    r.runner.calls.first?.done(0, "")
+    check(snapshot(a) == before && r.runner.calls.count == 1 && !q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true,
+          "R3 pin (RR2-4): a folder whose meeting.json now holds another id is not the job's meeting: nothing written, ended as not done")
 }
 
 try? fm.removeItem(at: scratch)
