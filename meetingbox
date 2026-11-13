@@ -2230,10 +2230,11 @@ fm_fold() {
 
 # Fold by word count, keeping the lines: each line of a transcript is one
 # speaker's turn. Break at a line end once past the target, with a hard cap so a
-# transcript that arrives as one long paragraph still splits.
+# transcript that arrives as one long paragraph still splits. False when the chunks could not be
+# written whole.
 split_chunks() {
   infile="$1"; outdir="$2"; n="$3"
-  mkdir -p "$outdir"
+  mkdir -p "$outdir" || return 1
   awk -v n="$n" -v dir="$outdir" '
     function newfile() { part++; w = 0; file = sprintf("%s/chunk-%03d.txt", dir, part) }
     BEGIN { part = 0; newfile() }
@@ -2250,7 +2251,7 @@ split_chunks() {
       if (w >= n) { close(file); newfile() }
     }
     END { close(file) }
-  ' "$infile"
+  ' "$infile" || return 1
 
   for f in "$outdir"/chunk-*.txt; do
     [ -e "$f" ] || continue
@@ -2558,6 +2559,17 @@ moved_die() {
   die "the meeting folder was moved, nothing was changed"
 }
 
+# DIR (a full path) is the earlier/ folder of a meeting folder (one holding meeting.json or audio.m4a),
+# or a version kept in it. A folder named earlier anywhere else is a folder like any other.
+kept_versions() {
+  local e
+  case "$(basename -- "$1")" in
+    earlier) e="$1" ;;
+    *) [ "$(basename -- "$(dirname -- "$1")")" = earlier ] || return 1; e="$(dirname -- "$1")" ;;
+  esac
+  [ -e "$(dirname -- "$e")/meeting.json" ] || [ -e "$(dirname -- "$e")/audio.m4a" ]
+}
+
 # Steps 1 to 5 of every run: the lock, taken in the folder itself; a swap a killed run left, finished
 # or discarded; leftovers cleared; an unfinished recording refused; and the run's stage, in STAGE. A
 # version kept in earlier/ is refused before anything is written in it. KIND is the run's own:
@@ -2567,8 +2579,8 @@ moved_die() {
 begin_run() {
   local dir="$1" kind="$2"
   cd -P "$dir" || die "no such folder: $dir"
-  if [ "$(basename "$(dirname "$dir")")" = earlier ] || [ "$(basename "$(cd .. && pwd -P)")" = earlier ]; then
-    die "$dir is a version kept in earlier/, not a meeting folder, so it is left as it is"
+  if kept_versions "$dir" || kept_versions "$(pwd -P)"; then
+    die "$dir is a meeting's earlier/ folder, or a version kept in it, not a meeting folder, so it is left as it is"
   fi
   RUN_DIR="$dir"
   take_processing_lock . "$RUN_DIR"
@@ -2634,30 +2646,43 @@ read_swap() {
 # earlier/ is a real folder, or not there yet.
 earlier_usable() { [ ! -L earlier ] && { [ ! -e earlier ] || [ -d earlier ]; }; }
 
-# Before a swap moves new files over FILE...: each is not the copy the run kept (it changed since, or
-# it was not there when the run kept nothing of it), so a copy is made now, in the stage, compared byte
-# for byte, and renamed to the first free earlier/<YYYY-MM-DD HHMM>[-N]. False, with nothing moved,
-# when that fails.
+# The copy the run kept of FILE: earlier/<marker's name>/FILE, a plain file, with no link on the way to
+# it. A link there could lead back to FILE itself, or out of the meeting folder.
+kept_copy() {
+  [ "$SWAP_EARLIER" != - ] && [ ! -L earlier ] && [ ! -L "earlier/$SWAP_EARLIER" ] \
+    && [ ! -L "earlier/$SWAP_EARLIER/$1" ] && [ -f "earlier/$SWAP_EARLIER/$1" ]
+}
+
+# Before a swap moves new files over FILE...: none is the copy the run kept of it (it changed since, or
+# no copy of it was kept), so a copy is made now, in the stage, compared byte for byte, and renamed to
+# the first free earlier/<YYYY-MM-DD HHMM>[-N]. Each line says which it was. False, with a line saying
+# why and nothing moved, when that fails.
 # Usage: keep_again FILE...
 keep_again() {
   local f tmp stamp name n
   earlier_usable || { warn "earlier in $RUN_DIR is not a folder, so nothing is moved over $*"; return 1; }
-  tmp="$(mktemp -d "$SWAP_STAGE/kept.XXXXXX")" || { warn "could not make a folder for the copies of $*"; return 1; }
+  tmp="$(mktemp -d "$SWAP_STAGE/kept.XXXXXX")" \
+    || { warn "could not make a folder for copies of $* in $SWAP_STAGE, so nothing is moved over them"; return 1; }
   for f in "$@"; do
-    { cp -- "$f" "$tmp/$f" && chmod 600 "$tmp/$f" && cmp -s -- "$f" "$tmp/$f"; } \
-      || { warn "could not keep a copy of $f, which changed after its copy was kept"; return 1; }
+    if [ -d "$f" ]; then warn "$f is a folder, so no copy of it can be kept and nothing is moved over it"; return 1; fi
+    { cp -- "$f" "$tmp/$f" && chmod 600 "$tmp/$f"; } || { warn "$f could not be copied, so nothing is moved over it"; return 1; }
+    cmp -s -- "$f" "$tmp/$f" || { warn "the copy of $f does not match it, so nothing is moved over it"; return 1; }
   done
-  [ -d earlier ] || mkdir earlier || { warn "could not make earlier/ in $RUN_DIR"; return 1; }
+  [ -d earlier ] || mkdir earlier || { warn "could not make earlier/ in $RUN_DIR, so nothing is moved over $*"; return 1; }
   stamp="$(date '+%Y-%m-%d %H%M')"; name="$stamp"; n=1
   while [ -e "earlier/$name" ] || [ -L "earlier/$name" ]; do n=$((n + 1)); name="$stamp-$n"; done
-  mv -- "$tmp" "earlier/$name" || { warn "could not move the copies of $* into earlier/$name"; return 1; }
-  warn "changed after its copy was kept, so kept again in earlier/$name before the new one goes in: $*"
+  mv -- "$tmp" "earlier/$name" || { warn "could not move the copies of $* into earlier/$name, so nothing is moved over them"; return 1; }
+  for f in "$@"; do
+    if kept_copy "$f"; then warn "$f is not the copy kept in earlier/$SWAP_EARLIER, so it is kept in earlier/$name before the new one goes in"
+    else warn "no copy of $f was kept, so it is kept in earlier/$name before the new one goes in"; fi
+  done
 }
 
 # Step 9's renames, for this run's swap and for one a killed run left, as the SWAP_ variables give it.
 # First, a file a move would overwrite that is not the copy kept of it in the earlier folder (changed
-# since, or there since nothing was kept) is kept again, in a new earlier folder; if that fails,
-# nothing moves. .notes-written, never kept, is never checked. Then each file moves from the stage over
+# since, or there since nothing was kept, or that copy reached through a link) is kept again, in a new
+# earlier folder; if that fails, nothing moves. A displacement through a linked earlier folder is
+# refused before anything moves. .notes-written, never kept, is never checked. Then each file moves from the stage over
 # its target, .notes-written last, and each displaced file moves into the earlier folder (made again if
 # it has gone), where nothing of that name may be, and is made 0600. A file already moved is skipped,
 # so a swap a killed run began finishes the same way. Every file moved in is touched, so the app counts
@@ -2667,6 +2692,10 @@ keep_again() {
 apply_swap() {
   local f failed=0 changed=""
   trap '' INT TERM HUP
+  if [ -n "$SWAP_DISPLACES" ] && { [ -L earlier ] || [ -L "earlier/$SWAP_EARLIER" ]; }; then
+    warn "earlier/$SWAP_EARLIER leads through a link, so nothing is moved through it out of the meeting folder"
+    run_traps; return 1
+  fi
   if [ -n "$SWAP_DISPLACES" ] && [ ! -d "earlier/$SWAP_EARLIER" ]; then
     if ! earlier_usable || ! mkdir -p "earlier/$SWAP_EARLIER"; then
       warn "could not make earlier/$SWAP_EARLIER again for the files this swap moves aside"
@@ -2676,7 +2705,7 @@ apply_swap() {
   fi
   for f in $SWAP_MOVES; do
     [ "$f" != .notes-written ] && [ -e "$SWAP_STAGE/$f" ] && [ -e "$f" ] || continue
-    if [ "$SWAP_EARLIER" != - ] && [ -f "earlier/$SWAP_EARLIER/$f" ] && cmp -s -- "$f" "earlier/$SWAP_EARLIER/$f"; then continue; fi
+    if kept_copy "$f" && cmp -s -- "$f" "earlier/$SWAP_EARLIER/$f"; then continue; fi
     changed="$changed $f"
   done
   # shellcheck disable=SC2086   # file names, without spaces
@@ -2950,7 +2979,9 @@ process() {
     cp -- "$name" "$STAGE/transcript.txt" || die "could not copy $name"
   else
     progress transcribing
-    if [ -f mic.m4a ] && [ -f call.m4a ]; then
+    # The meeting's own recording (the folder, or its audio.m4a) is both sides, when it has them. Any
+    # other recording named is transcribed as itself.
+    if [ "$name" = audio.m4a ] && [ -f mic.m4a ] && [ -f call.m4a ]; then
       # process, never a redo, so a call may teach meetingbox the user's voice
       transcribe_channels . "$STAGE" "$(meeting_id .)"
       two=1

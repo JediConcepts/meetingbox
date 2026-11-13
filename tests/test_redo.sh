@@ -71,17 +71,19 @@ speech-analyzer() {
   esac
 }
 # fm: the new minutes are FM_TEXT and the new brief names itself. fm-empty makes every answer empty,
-# brief-fail fails the structured pass. fm_hook is a test's own step, run inside the engine as fm
-# answers.
+# brief-fail fails the structured pass, FM_MAP_FAIL=1 fails every slice of a long transcript, and
+# FM_TOKENS is the count it gives. fm_hook is a test's own step, run inside the engine as fm answers.
+FM_TOKENS=100; FM_MAP_FAIL=0
 FM_TEXT="the new minutes"
 fm_hook() { :; }
 fm() {
   echo "fm $1" >> "$HOME/calls.log"
   case "$1" in
-    count-tokens) cat >/dev/null; echo 100 ;;
+    count-tokens) cat >/dev/null; echo "$FM_TOKENS" ;;
     respond)
       cat >/dev/null
       fm_hook
+      case "$3" in "You are taking minutes"*) [ "$FM_MAP_FAIL" != 1 ] || return 1 ;; esac
       [ ! -e "$HOME/fm-empty" ] || return 0
       case " $* " in
         *" --schema "*) [ ! -e "$HOME/brief-fail" ] || return 1; echo '{"summary": "the new brief"}' ;;
@@ -139,7 +141,7 @@ reset_run() {
   grep -q '^curl' "$HOME/calls.log" 2>/dev/null && CURLED=1
   : > "$HOME/calls.log"
   rm -f "$HOME"/pk-* "$HOME"/sp-* "$HOME/mbt-fail" "$HOME/fm-empty" "$HOME/brief-fail" "$HOME/progress"
-  SA_FAIL=""; HAVE_FM=1; ENGINE=auto; TIDY=auto; ROOM_COUNT=""; CALL_COUNT=""; KEEP_AUDIO=1
+  SA_FAIL=""; HAVE_FM=1; ENGINE=auto; TIDY=auto; ROOM_COUNT=""; CALL_COUNT=""; KEEP_AUDIO=1; FM_TOKENS=100; FM_MAP_FAIL=0
   fm_hook() { :; }
 }
 # An engine command as the script runs it, with set -euo pipefail, in a subshell: sets out and rc.
@@ -936,6 +938,125 @@ reset_run; finished f14
 KILL_AT=2; KILL_SIG=TERM; kill_mv; killed_run notes_cmd "$d"; unset -f mv; KILL_SIG=""
 if [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && no_stage "$d"; then pass "a TERM during the swap is ignored, and the run completes"
 else fail "a TERM during the swap is ignored, and the run completes (rc $rc): $(ls -A "$d") $(cat "$HOME/killed.out")"; fi
+
+# ======================================================================== review round 3
+
+# --- N1: a write error while slicing a long transcript is the minutes failing, never exit 0 ---
+reset_run; finished n1x
+for i in $(seq 1 400); do printf 'word%03d ' "$i"; done > "$d/transcript.txt"; printf '\n' >> "$d/transcript.txt"
+touch -t 202601010000 "$d/transcript.txt"
+before="$(snap "$d")"
+FM_TOKENS=5000; FM_MAP_FAIL=1
+# awk for split_chunks only, with a 1 KB file size limit: its chunk files cannot be written whole
+awk() {
+  if [ "${FUNCNAME[1]:-}" = split_chunks ]; then ( trap '' XFSZ; ulimit -f 1; command awk "$@" ); else command awk "$@"; fi
+}
+engine notes_cmd "$d"
+unset -f awk
+FM_TOKENS=100; FM_MAP_FAIL=0
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ] && [ "$(snap "$d")" = "$before" ] && [ ! -e "$d/earlier" ] && no_stage "$d"; then
+  pass "a write error while slicing a long transcript fails the minutes, with nothing changed"
+else fail "a write error while slicing a long transcript fails the minutes, with nothing changed (rc $rc): $(ls -A "$d") $out"; fi
+
+# --- N2: keep_again compares its copy: a copy cut short without an error stops the swap ---
+reset_run; finished n2x
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+printf 'MY EDIT under a short copy\n' >> "$d/notes.md"; command cp "$d/notes.md" "$HOME/n2x.edited"
+cp() {
+  case "$*" in
+    */kept.??????/*) local a src="" dst=""; for a in "$@"; do src="$dst"; dst="$a"; done; head -c 3 "$src" > "$dst"; return 0 ;;
+  esac
+  command cp "$@"
+}
+engine notes_cmd "$d"
+unset -f cp
+if [ "$rc1" = 137 ] && [ "$rc" = 3 ] && same "$d/notes.md" "$HOME/n2x.edited" && [ -f "$d/.swap" ]; then
+  pass "a copy kept again that is cut short without an error stops the swap with exit 3, the edit intact"
+else fail "a copy kept again that is cut short without an error stops the swap with exit 3, the edit intact ($rc1, $rc): $out"; fi
+
+# --- N3: a link inside earlier/ is never taken for the kept copy, and nothing is moved through one ---
+# A1c: the kept notes.md replaced by a link to the live one, then an edit
+reset_run; finished n3c
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+rm -f "$d/earlier/$STAMP/notes.md"; ln -s ../../notes.md "$d/earlier/$STAMP/notes.md"
+printf 'MY EDIT beside a linked copy\n' >> "$d/notes.md"
+engine notes_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] \
+   && [ -n "$(grep -rl 'MY EDIT beside a linked copy' "$d/earlier")" ]; then
+  pass "a kept notes.md replaced by a link to the live one is not trusted: the edit is kept before the new one lands"
+else fail "a kept notes.md replaced by a link to the live one is not trusted: the edit is kept before the new one lands ($rc1, $rc): $out"; fi
+# A1d: the earlier folder itself replaced by a link to the meeting folder, then an edit
+reset_run; finished n3d
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+command mv "$d/earlier/$STAMP" "$HOME/n3d-kept-away"; ln -s .. "$d/earlier/$STAMP"
+printf 'MY EDIT beside a linked folder\n' >> "$d/notes.md"
+engine notes_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && [ -L "$d/earlier/$STAMP" ] \
+   && [ -n "$(grep -l 'MY EDIT beside a linked folder' "$d"/earlier/"$STAMP"-*/notes.md 2>/dev/null)" ]; then
+  pass "an earlier folder replaced by a link to the meeting folder is not trusted: the edit is kept before the new one lands"
+else fail "an earlier folder replaced by a link to the meeting folder is not trusted: the edit is kept before the new one lands ($rc1, $rc): $out"; fi
+# a displacement through a linked earlier folder is refused: exit 3, nothing leaves the folder
+reset_run; finished n3e; touch "$HOME/brief-fail"
+KILL_AT=2; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+rm -f "$HOME/brief-fail"
+mkdir -p "$HOME/n3e-outside"; command mv "$d/earlier/$STAMP" "$HOME/n3e-kept-away"; ln -s "$HOME/n3e-outside" "$d/earlier/$STAMP"
+engine notes_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$rc" = 3 ] && same "$d/brief.json" "$HOME/n3e.old/brief.json" && [ -z "$(ls -A "$HOME/n3e-outside")" ] \
+   && [ -f "$d/.swap" ] && same "$d/notes.md" "$HOME/n3e.old/notes.md"; then
+  pass "a displacement through a linked earlier folder is refused with exit 3, and nothing leaves the meeting folder"
+else fail "a displacement through a linked earlier folder is refused with exit 3, and nothing leaves the meeting folder ($rc1, $rc): $(ls -A "$HOME/n3e-outside") $out"; fi
+
+# --- N4: what keep_again says is true ---
+reset_run; finished n4a
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; unset -f mv
+printf 'an edit\n' >> "$d/notes.md"
+engine notes_cmd "$d"; out_a="$out"; rc_a=$rc
+reset_run; recorded n4b
+KILL_AT=2; kill_mv; killed_run process "$d/audio.m4a"; unset -f mv
+printf 'my own notes\n' > "$d/notes.md"
+engine process "$d/audio.m4a"; out_b="$out"; rc_b=$rc
+reset_run; finished n4c
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; unset -f mv
+command mv "$d/notes.md" "$HOME/n4c-notes"; mkdir "$d/notes.md"
+engine notes_cmd "$d"; out_c="$out"; rc_c=$rc
+if [ "$rc_a" -eq 0 ] && printf '%s' "$out_a" | grep -qF "notes.md is not the copy kept in earlier/$STAMP, so it is kept in earlier/$STAMP-2 before the new one goes in" \
+   && [ "$rc_b" -eq 0 ] && printf '%s' "$out_b" | grep -qF "no copy of notes.md was kept, so it is kept in earlier/$STAMP before the new one goes in" \
+   && [ "$rc_c" = 3 ] && printf '%s' "$out_c" | grep -q 'notes.md is a folder' && [ -d "$d/notes.md" ] && [ -z "$(ls -A "$d/notes.md")" ]; then
+  pass "keep_again says which copy a file is not, or that none was kept, and why it could not keep a folder"
+else fail "keep_again says which copy a file is not, or that none was kept, and why it could not keep a folder ($rc_a $rc_b $rc_c): [$out_a] [$out_b] [$out_c]"; fi
+
+# --- N5: earlier/ itself is refused; a folder named earlier that is not in a meeting folder is not ---
+reset_run; finished n5; engine redo_cmd "$d"
+before="$(snap "$d")"; before_e="$(ls -A "$d/earlier")"
+engine notes_cmd "$d/earlier"; rc1=$rc
+engine process "$d/earlier/"; rc2=$rc
+if [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && [ "$(snap "$d")" = "$before" ] && [ "$(ls -A "$d/earlier")" = "$before_e" ]; then
+  pass "notes <dir>/earlier and process <dir>/earlier/ are refused, leaving it as it was"
+else fail "notes <dir>/earlier and process <dir>/earlier/ are refused, leaving it as it was ($rc1 $rc2): $(ls -A "$d/earlier")"; fi
+reset_run; d="$HOME/own/earlier/standup"; mkdir -p "$d"; printf 'aac mix' > "$d/audio.m4a"
+printf '[00:00:01] Me: our standup\n' > "$d/transcript.txt"
+engine notes_cmd "$d"
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ]; then
+  pass "a user's own folder inside a folder named earlier, outside a meeting, is not refused"
+else fail "a user's own folder inside a folder named earlier, outside a meeting, is not refused (rc $rc): $out"; fi
+
+# --- N6: a named recording in a meeting folder is transcribed as itself; the folder or audio.m4a uses both sides ---
+reset_run; finished n6; printf 'mp3 audio' > "$d/talk.mp3"; KEEP_AUDIO=0
+before_a="$(snap_of "$d" audio.m4a mic.m4a call.m4a)"
+engine process "$d/talk.mp3"
+KEEP_AUDIO=1
+if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 1 ] && grep -qF 'afconvert -f WAVE -d LEI16@16000 -c 1 ./talk.mp3 ' "$HOME/calls.log" \
+   && [ "$(calls 'mb-speech speakers')" = 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] \
+   && [ ! -e "$d/talk.mp3" ] && [ "$(snap_of "$d" audio.m4a mic.m4a call.m4a)" = "$before_a" ]; then
+  pass "process <meeting>/talk.mp3 transcribes talk.mp3 itself, and --no-keep-audio removes only it"
+else fail "process <meeting>/talk.mp3 transcribes talk.mp3 itself, and --no-keep-audio removes only it (rc $rc): $(ls "$d") $(grep '^afconvert\|^mb-speech' "$HOME/calls.log")"; fi
+reset_run; finished n6b; printf 'mp3 audio' > "$d/talk.mp3"; KEEP_AUDIO=0
+engine process "$d"
+KEEP_AUDIO=1
+if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 2 ] && [ ! -e "$d/audio.m4a" ] && [ ! -e "$d/mic.m4a" ] && [ ! -e "$d/call.m4a" ] \
+   && [ -e "$d/talk.mp3" ] && grep -q 'Them: ' "$d/transcript.txt"; then
+  pass "process <meeting> uses both sides, and --no-keep-audio removes the meeting's three files and nothing else"
+else fail "process <meeting> uses both sides, and --no-keep-audio removes the meeting's three files and nothing else (rc $rc): $(ls "$d")"; fi
 
 # ======================================================================== the command line
 
