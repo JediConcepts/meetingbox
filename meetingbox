@@ -89,6 +89,9 @@ TRANSCRIPT_BIN="$SRC_DIR/mb-transcript"
 # the pinned models it checks before every use. The voice print is learnt from video calls.
 SPEECH_BIN="$SRC_DIR/mb-speech"
 SPEECH_MODELS="$SRC_DIR/models"
+# SwiftPM's dependency cache for the helper's build: FluidAudio is fetched into it once, and later
+# builds of the same pinned version reuse it.
+SPEECH_DEPS="$SRC_DIR/swiftpm-cache"
 VOICE_FILE="$STATE_DIR/voice.json"
 # The app is signed with a certificate setup makes in the login keychain. macOS
 # ties the permissions to that certificate, so they survive a rebuild.
@@ -669,12 +672,13 @@ speech_step_failed() {
 }
 
 # Parakeet and speaker labels (on device). Builds mb-speech in a temporary folder that holds every
-# SwiftPM cache, clone and setting, so nothing lands in the user's shared Swift folders, and
-# replaces the installed helper only once the build has worked. Then fetches the pinned models
-# when they fail the helper's check or differ from the source's manifest, and warms them. Any
-# failure says so and returns 1; setup carries on, and a working helper or model is kept.
+# SwiftPM clone and setting, so nothing lands in the user's shared Swift folders, and replaces the
+# installed helper only once the build has worked. The one thing kept between builds is the
+# fetched FluidAudio, in meetingbox's own dependency cache (SPEECH_DEPS). Then fetches the pinned
+# models when they fail the helper's check or differ from the source's manifest, and warms them.
+# Any failure says so and returns 1; setup carries on, and a working helper or model is kept.
 install_speech() {
-  local tmp bin cache reason hash
+  local tmp bin cache reason hash tries try
   say "Parakeet and speaker labels (on device)"
   info "a more accurate transcriber and speaker labels, about 630 MB of models"
   have swift || { speech_step_failed "swift build is not installed"; return 1; }
@@ -686,27 +690,48 @@ install_speech() {
      && [ "$("$SPEECH_BIN" version 2>/dev/null | cut -d' ' -f3)" = "$hash" ]; then
     ok "speech helper is up to date"
   else
-    tmp="$(mktemp -d)" || { speech_step_failed "no temporary folder"; return 1; }
-    cp -R "$SOURCE_DIR/native/speech" "$tmp/speech" \
-      && printf 'let buildVersion = "%s"\nlet speechHash = "%s"\n' "$VERSION" "$hash" \
-           > "$tmp/speech/Sources/mb-speech/BuildStamp.swift" \
-      || { rm -rf -- "$tmp"; speech_step_failed "the source could not be copied"; return 1; }
-    set -- --package-path "$tmp/speech" --scratch-path "$tmp/build" --cache-path "$tmp/cache" \
-      --config-path "$tmp/config" --security-path "$tmp/security" --manifest-cache local \
-      --disable-dependency-cache --force-resolved-versions
-    # Whatever those flags say, swift build still makes folders and URL caches under HOME
-    # (~/.swiftpm, ~/Library/org.swift.swiftpm, ~/Library/Caches) and lock files in TMPDIR, so it
-    # runs with both, and the home Foundation reads, inside the temporary folder as well.
-    mkdir "$tmp/home" "$tmp/tmp" || { rm -rf -- "$tmp"; speech_step_failed "no temporary folder"; return 1; }
-    info "compiling. The first build fetches FluidAudio and takes a few minutes."
-    if ! HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" swift build -c release "$@" >&2 \
-       || ! bin="$(HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" \
-                   swift build -c release "$@" --show-bin-path)" \
-       || [ ! -x "$bin/mb-speech" ]; then
-      rm -rf -- "$tmp"
-      speech_step_failed "the speech helper did not build"
-      return 1
+    # The dependency cache keeps FluidAudio's fetched source, so a rebuild of the same pinned
+    # version does not fetch it again. The versions in Package.resolved are forced, so the cache
+    # never changes what is built. It is made and recorded the first time, and after that used
+    # as it is: never claimed, which would empty it. A folder there that meetingbox did not make
+    # is not used or touched, and the build caches in its temporary folder, as before.
+    tries=temp
+    if [ ! -e "$SPEECH_DEPS" ] && [ ! -L "$SPEECH_DEPS" ]; then
+      mkdir -p "$SRC_DIR" && record_install "$SPEECH_DEPS" && mkdir -m 700 "$SPEECH_DEPS" && tries="deps temp"
+    elif installed_by_us "$SPEECH_DEPS"; then
+      tries="deps temp"
+    else
+      info "$SPEECH_DEPS is not meetingbox's, so the build fetches FluidAudio as before"
     fi
+    if [ "$tries" = temp ]; then info "compiling. The first build fetches FluidAudio and takes a few minutes."
+    else info "compiling. The first build fetches FluidAudio and takes a few minutes. Later builds reuse it."; fi
+    # A build that fails with the cache removes it (the next setup makes it again) and is tried
+    # once more as before, from a fresh temporary folder. Only that one failing is a failure.
+    for try in $tries; do
+      tmp="$(mktemp -d)" || { speech_step_failed "no temporary folder"; return 1; }
+      cp -R "$SOURCE_DIR/native/speech" "$tmp/speech" \
+        && printf 'let buildVersion = "%s"\nlet speechHash = "%s"\n' "$VERSION" "$hash" \
+             > "$tmp/speech/Sources/mb-speech/BuildStamp.swift" \
+        || { rm -rf -- "$tmp"; speech_step_failed "the source could not be copied"; return 1; }
+      if [ "$try" = deps ]; then set -- --cache-path "$SPEECH_DEPS"
+      else set -- --cache-path "$tmp/cache" --disable-dependency-cache; fi
+      set -- --package-path "$tmp/speech" --scratch-path "$tmp/build" --config-path "$tmp/config" \
+        --security-path "$tmp/security" --manifest-cache local --force-resolved-versions "$@"
+      # Whatever those flags say, swift build still makes folders and URL caches under HOME
+      # (~/.swiftpm, ~/Library/org.swift.swiftpm, ~/Library/Caches) and lock files in TMPDIR, so it
+      # runs with both, and the home Foundation reads, inside the temporary folder as well.
+      mkdir "$tmp/home" "$tmp/tmp" || { rm -rf -- "$tmp"; speech_step_failed "no temporary folder"; return 1; }
+      if HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" swift build -c release "$@" >&2 \
+         && bin="$(HOME="$tmp/home" CFFIXED_USER_HOME="$tmp/home" TMPDIR="$tmp/tmp/" \
+                   swift build -c release "$@" --show-bin-path)" \
+         && [ -x "$bin/mb-speech" ]; then
+        break
+      fi
+      rm -rf -- "$tmp"
+      [ "$try" = deps ] || { speech_step_failed "the speech helper did not build"; return 1; }
+      remove_installed "$SPEECH_DEPS"
+      info "the build with the cached FluidAudio failed, so the cache is removed and the build tried once more without it"
+    done
     # A recorded helper is replaced by a rename over it, never removed first, so a failed
     # install leaves the old one working. The first install claims the path.
     if installed_by_us "$SPEECH_BIN" && { [ -e "$SPEECH_BIN" ] || [ -L "$SPEECH_BIN" ]; }; then

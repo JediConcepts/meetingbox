@@ -1,7 +1,8 @@
 #!/bin/bash
 # The Parakeet setup step: install_speech builds mb-speech in a temporary folder with every SwiftPM
-# cache inside it, fetches the pinned models only when needed, and records what it makes. swift,
-# fetch_source and the helper itself are stubs: nothing is built or downloaded.
+# path inside it but the dependency cache, which is meetingbox's own, fetches the pinned models
+# only when needed, and records what it makes. swift, fetch_source and the helper itself are
+# stubs: nothing is built or downloaded.
 . "$(dirname "$0")/lib.sh"
 
 eval "$(sed -n '/^speech_ready() {/,/^}/p' "$HOME/meetingbox.functions")"   # the real one, not lib.sh's stub
@@ -11,20 +12,36 @@ cp -R "$ROOT/native/speech" "$SOURCE_DIR/native/speech"
 MANIFEST="$SOURCE_DIR/native/speech/models.json"
 fetch_source() { echo "fetch_source" >> "$HOME/calls.log"; return 0; }
 TEST_HOME="$HOME"
+# meetingbox's own SwiftPM dependency cache, where the spec puts it, and the mark the stub swift
+# leaves in it when it fetches FluidAudio there
+DEPS="$SRC_DIR/swiftpm-cache"
+MARK="$DEPS/repositories/FluidAudio/fetched"
 
 # The stub swift "builds" a helper script that logs each call and answers like mb-speech.
+# SWIFT_FAILS fails every call; SWIFT_FAILS_WITH_CACHE fails a call that uses meetingbox's cache.
 swift() {
   # swift runs with its own HOME, so the log is the test's, named outright
   echo "swift $*" >> "$TEST_HOME/calls.log"
   echo "HOME=$HOME CFFIXED_USER_HOME=${CFFIXED_USER_HOME:-} TMPDIR=${TMPDIR:-}" >> "$TEST_HOME/swift-env.log"
-  local a prev="" pkg="" scratch="" show=0 stamp hash version
+  local a prev="" pkg="" scratch="" cache="" shared=1 show=0 stamp hash version
   for a in "$@"; do
-    case "$prev" in --package-path) pkg="$a" ;; --scratch-path) scratch="$a" ;; esac
-    [ "$a" = --show-bin-path ] && show=1
+    case "$prev" in --package-path) pkg="$a" ;; --scratch-path) scratch="$a" ;; --cache-path) cache="$a" ;; esac
+    case "$a" in --show-bin-path) show=1 ;; --disable-dependency-cache) shared=0 ;; esac
     prev="$a"
   done
   [ -n "${SWIFT_FAILS:-}" ] && return 1
+  [ -n "${SWIFT_FAILS_WITH_CACHE:-}" ] && [ "$cache" = "$DEPS" ] && [ "$shared" = 1 ] && return 1
   if [ "$show" = 1 ]; then printf '%s\n' "$scratch/release"; return 0; fi
+  # As SwiftPM does: FluidAudio is fetched unless the dependency cache in use already holds it,
+  # and a fetch with that cache in use leaves it there, read-only as git's objects are, marked
+  # with the folder of the build that fetched it.
+  if [ "$shared" = 0 ] || [ ! -e "$cache/repositories/FluidAudio/fetched" ]; then
+    echo "FluidAudio fetched" >> "$TEST_HOME/calls.log"
+    if [ "$shared" = 1 ] && [ -n "$cache" ]; then
+      mkdir -p "$cache/repositories/FluidAudio" && printf '%s\n' "$pkg" > "$cache/repositories/FluidAudio/fetched" \
+        && chmod 444 "$cache/repositories/FluidAudio/fetched"
+    fi
+  fi
   stamp="$pkg/Sources/mb-speech/BuildStamp.swift"
   cp "$stamp" "$TEST_HOME/stamp.seen"
   version="$(sed -n 's/^let buildVersion = "\(.*\)"$/\1/p' "$stamp")"
@@ -49,10 +66,57 @@ fresh() {   # nothing installed, nothing recorded
   rm -rf "$SRC_DIR" "$CACHE" "$HOME/cache-dir.out" "$HOME/check-fails" "$HOME/stamp.seen" "$HOME/swift-env.log"
   rm -f "$INSTALLED" "$VOICE_FILE" "$VOICE_FILE.tmp"
   mkdir -p "$STATE_DIR"
-  : > "$HOME/calls.log"
+  clear_logs
 }
+clear_logs() { : > "$HOME/calls.log"; : > "$HOME/swift-env.log"; }
 calls() { grep -c "^$1" "$HOME/calls.log"; }
 mode() { stat -f '%Lp' "$1"; }
+
+# One logged swift call is right. Always: swift build -c release, with the scratch, config and
+# security paths, and HOME, CFFIXED_USER_HOME and TMPDIR, inside its temporary folder (gone
+# afterwards), the local manifest cache and the forced versions. Then, as $1 says, "deps":
+# meetingbox's own dependency cache, in use; or "temp": a cache inside the temporary folder with
+# --disable-dependency-cache, as every build was before.
+swift_ok() {   # $1: deps | temp, $2: the call, $3: the environment it ran with
+  local a prev="" t="" seen="" cache="" off=0 want
+  case "$2" in "swift build -c release "*) ;; *) return 1 ;; esac
+  for a in ${2#swift }; do
+    case "$prev" in
+      --package-path) t="${a%/speech}" ;;
+      --scratch-path|--config-path|--security-path) case "$a" in "$t"/?*) seen="$seen $prev" ;; esac ;;
+      --manifest-cache) [ "$a" = local ] && seen="$seen $prev" ;;
+      --cache-path) cache="$a" ;;
+    esac
+    case "$a" in --force-resolved-versions) seen="$seen $a" ;; --disable-dependency-cache) off=1 ;; esac
+    prev="$a"
+  done
+  for want in --scratch-path --config-path --security-path --manifest-cache --force-resolved-versions; do
+    case " $seen " in *" $want "*) ;; *) return 1 ;; esac
+  done
+  [ -n "$t" ] && [ ! -e "$t" ] || return 1
+  case "$3" in "HOME=$t/"?*" CFFIXED_USER_HOME=$t/"?*" TMPDIR=$t/"?*) ;; *) return 1 ;; esac
+  case "$1" in
+    deps) [ "$cache" = "$DEPS" ] && [ "$off" = 0 ] ;;
+    temp) case "$cache" in "$t"/?*) [ "$off" = 1 ] ;; *) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+# The swift calls since the logs were cleared are right: exactly these, in order. A build is one
+# call, then one with --show-bin-path if that worked.
+swift_calls() {
+  local n=0 call env
+  [ "$(calls swift)" = "$#" ] || return 1
+  while IFS='|' read -r call env; do
+    n=$((n + 1))
+    swift_ok "${!n}" "$call" "$env" || return 1
+  done < <(paste -d '|' <(grep '^swift ' "$HOME/calls.log") "$HOME/swift-env.log")
+}
+swift_log() { paste -d '|' <(grep '^swift ' "$HOME/calls.log") "$HOME/swift-env.log"; }
+# Every path under a folder with its type, mode, size and time, and each file's contents.
+snapshot() {
+  (cd "$1" && find . | LC_ALL=C sort | while IFS= read -r f; do
+     stat -f '%N %HT %Sp %z %m' "$f"; [ -f "$f" ] && shasum < "$f"; done)
+}
 
 # --- a first install ---
 fresh
@@ -61,36 +125,19 @@ if [ "$rc" -eq 0 ] && [ "$(grep -m1 -n '^fetch_source' "$HOME/calls.log" | cut -
   pass "install_speech fetches the source first, then builds"
 else fail "install_speech fetches the source first, then builds ($rc): $out $(cat "$HOME/calls.log")"; fi
 
-ok_flags=1
-# with no swift call logged, nothing below would be checked: that is a failure too
-[ "$(calls swift)" -ge 1 ] && [ -s "$HOME/swift-env.log" ] || ok_flags=0
-while IFS= read -r line; do
-  set -- ${line#swift }
-  tmp=""; prev=""; seen=""
-  for a in "$@"; do
-    case "$prev" in
-      --package-path) tmp="${a%/speech}" ;;
-      --scratch-path|--cache-path|--config-path|--security-path)
-        case "$a" in "$tmp"/?*) seen="$seen $prev" ;; esac ;;
-      --manifest-cache) [ "$a" = local ] && seen="$seen $prev" ;;
-    esac
-    case "$a" in --disable-dependency-cache|--force-resolved-versions) seen="$seen $a" ;; esac
-    prev="$a"
-  done
-  for want in --scratch-path --cache-path --config-path --security-path --manifest-cache \
-              --disable-dependency-cache --force-resolved-versions; do
-    case " $seen " in *" $want "*) ;; *) ok_flags=0 ;; esac
-  done
-  [ -n "$tmp" ] && [ ! -e "$tmp" ] || ok_flags=0
-  case "$line" in "swift build -c release "*) ;; *) ok_flags=0 ;; esac
-done < <(grep '^swift ' "$HOME/calls.log")
 # swift build writes beside HOME and TMPDIR whatever its flags say: those are in the temporary folder too.
-while IFS= read -r line; do
-  case "$line" in "HOME=$tmp/"?*" CFFIXED_USER_HOME=$tmp/"?*" TMPDIR=$tmp/"?*) ;; *) ok_flags=0 ;; esac
-done < "$HOME/swift-env.log"
-if [ "$ok_flags" = 1 ]; then
-  pass "swift gets every SwiftPM path, and its HOME and TMPDIR, inside the temporary folder, which is gone afterwards"
-else fail "swift gets every SwiftPM path, and its HOME and TMPDIR, inside the temporary folder, which is gone afterwards: $(grep '^swift ' "$HOME/calls.log")"; fi
+if swift_calls deps deps; then
+  pass "swift caches its dependencies in meetingbox's own folder, with no --disable-dependency-cache, and gets every other SwiftPM path, and its HOME and TMPDIR, inside the temporary folder, which is gone afterwards"
+else fail "swift caches its dependencies in meetingbox's own folder, with no --disable-dependency-cache, and gets every other SwiftPM path, and its HOME and TMPDIR, inside the temporary folder, which is gone afterwards: $(swift_log)"; fi
+
+if [ -d "$DEPS" ] && [ ! -L "$DEPS" ] && [ "$(mode "$DEPS")" = 700 ] && installed_by_us "$DEPS" \
+   && [ "$(calls 'FluidAudio fetched')" = 1 ] && [ -e "$MARK" ]; then
+  pass "the first build makes the dependency cache, 700 and recorded, and FluidAudio is fetched into it"
+else fail "the first build makes the dependency cache, 700 and recorded, and FluidAudio is fetched into it: $(ls -ld "$DEPS" 2>&1) $(cat "$INSTALLED")"; fi
+
+if [ "$(printf '%s\n' "$out" | grep -cF 'compiling. The first build fetches FluidAudio and takes a few minutes. Later builds reuse it.')" = 1 ]; then
+  pass "the line before compiling says the first build fetches FluidAudio and later builds reuse it"
+else fail "the line before compiling says the first build fetches FluidAudio and later builds reuse it: $out"; fi
 
 if grep -qxF "let speechHash = \"$(speech_hash)\"" "$HOME/stamp.seen" && grep -qxF "let buildVersion = \"$VERSION\"" "$HOME/stamp.seen" \
    && grep -qxF 'let speechHash = "dev"' "$SOURCE_DIR/native/speech/Sources/mb-speech/BuildStamp.swift"; then
@@ -256,6 +303,65 @@ bad_cache "a path with .." "$HOME/x/../Library/Caches/mb-speech"
 bad_cache "a relative path" "Library/Caches/mb-speech"
 rm -f "$HOME/cache-dir.out"
 
+# --- meetingbox's dependency cache: FluidAudio is fetched once, then reused ---
+fresh
+install_speech >/dev/null 2>&1
+mark="$(cat "$MARK" 2>/dev/null)"
+printf '// changed\n' >> "$FETCH_SRC"   # so the helper is rebuilt, with the same pinned versions
+clear_logs
+out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && swift_calls deps deps && [ -n "$mark" ] && [ "$(cat "$MARK" 2>/dev/null)" = "$mark" ] \
+   && [ "$(calls 'FluidAudio fetched')" = 0 ] && installed_by_us "$DEPS" && [ "$(mode "$DEPS")" = 700 ] && speech_ready; then
+  pass "a rebuild uses the same dependency cache, still holding the first build's FluidAudio, and fetches nothing"
+else fail "a rebuild uses the same dependency cache, still holding the first build's FluidAudio, and fetches nothing ($rc): $(swift_log) [$mark / $(cat "$MARK" 2>&1)]"; fi
+cp "$ROOT/native/speech/Sources/mb-speech/Fetch.swift" "$FETCH_SRC"
+
+# A folder there that meetingbox did not make, or a link, is never used, touched or recorded.
+fresh
+mkdir -p "$DEPS/repositories"; echo mine > "$DEPS/mine"; chmod 755 "$DEPS"
+before="$(snapshot "$DEPS")"
+out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(snapshot "$DEPS")" = "$before" ] && ! installed_by_us "$DEPS" && swift_calls temp temp \
+   && [ "$(printf '%s\n' "$out" | grep -cF "$DEPS is not meetingbox's, so the build fetches FluidAudio as before")" = 1 ] \
+   && speech_ready; then
+  pass "a dependency cache folder meetingbox did not make is left byte for byte, unrecorded, and the build caches in the temporary folder as before"
+else fail "a dependency cache folder meetingbox did not make is left byte for byte, unrecorded, and the build caches in the temporary folder as before ($rc): $out $(swift_log)"; fi
+
+fresh
+mkdir -p "$SRC_DIR" "$HOME/elsewhere"; echo mine > "$HOME/elsewhere/mine"; ln -s "$HOME/elsewhere" "$DEPS"
+before="$(snapshot "$HOME/elsewhere")"
+out="$(install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/elsewhere" ] && [ "$(snapshot "$HOME/elsewhere")" = "$before" ] \
+   && ! installed_by_us "$DEPS" && swift_calls temp temp && printf '%s' "$out" | grep -qF "$DEPS is not meetingbox's"; then
+  pass "a link at the dependency cache's path is left as it is, with what it points at, unrecorded, and not used"
+else fail "a link at the dependency cache's path is left as it is, with what it points at, unrecorded, and not used ($rc): $out $(swift_log)"; fi
+rm -rf "$HOME/elsewhere"
+
+# A build that fails with the cache: the cache goes, through the record, and the build is tried
+# once more as before. The next build makes it again.
+fresh
+out="$(SWIFT_FAILS_WITH_CACHE=1 install_speech 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && swift_calls deps temp temp && [ ! -e "$DEPS" ] && [ ! -L "$DEPS" ] && ! installed_by_us "$DEPS" \
+   && installed_by_us "$SPEECH_BIN" && speech_ready; then
+  pass "a build that fails with the dependency cache removes it, unrecorded, and one more build as before installs the helper"
+else fail "a build that fails with the dependency cache removes it, unrecorded, and one more build as before installs the helper ($rc): $out $(swift_log)"; fi
+printf '// changed\n' >> "$FETCH_SRC"
+clear_logs
+install_speech >/dev/null 2>&1
+if swift_calls deps deps && [ "$(mode "$DEPS")" = 700 ] && installed_by_us "$DEPS" && [ -e "$MARK" ]; then
+  pass "the next build makes the dependency cache again"
+else fail "the next build makes the dependency cache again: $(swift_log)"; fi
+
+# Both builds fail: the step fails as it did, the working helper is kept, and the cache is gone.
+cp "$SPEECH_BIN" "$HOME/helper.before"
+cp "$ROOT/native/speech/Sources/mb-speech/Fetch.swift" "$FETCH_SRC"   # due a rebuild again
+clear_logs
+out="$(SWIFT_FAILS=1 install_speech 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qF "Parakeet could not be updated: the speech helper did not build." \
+   && cmp -s "$SPEECH_BIN" "$HOME/helper.before" && swift_calls deps temp && [ ! -e "$DEPS" ] && ! installed_by_us "$DEPS"; then
+  pass "when the build fails with the dependency cache and without it, the helper did not build, the old one is kept, and the cache is gone, unrecorded"
+else fail "when the build fails with the dependency cache and without it, the helper did not build, the old one is kept, and the cache is gone, unrecorded ($rc): $out $(swift_log)"; fi
+
 # --- doctor ---
 fresh
 install_speech >/dev/null 2>&1
@@ -319,11 +425,16 @@ for level in tools all; do
   fresh
   install_speech >/dev/null 2>&1
   echo '{}' > "$VOICE_FILE"; echo '{}' > "$VOICE_FILE.tmp"
+  had_deps=0; [ -e "$MARK" ] && installed_by_us "$DEPS" && had_deps=1
   out="$(reset_cmd "$level" 2>&1)"; rc=$?
   if [ ! -e "$SPEECH_BIN" ] && [ ! -e "$SPEECH_MODELS" ] && [ ! -e "$CACHE" ] && [ ! -e "$VOICE_FILE" ] \
      && [ ! -e "$VOICE_FILE.tmp" ] && ! grep -q 'mb-speech\|models\|voice' "$INSTALLED" 2>/dev/null; then
     pass "reset_cmd $level removes the helper, models, cache and voice print through the record"
   else fail "reset_cmd $level removes the helper, models, cache and voice print through the record ($rc): $out"; fi
+  if [ "$had_deps" = 1 ] && printf '%s' "$out" | grep -qF "    $DEPS" && [ ! -e "$DEPS" ] && [ ! -L "$DEPS" ] \
+     && ! grep -qxF "$DEPS" "$INSTALLED" 2>/dev/null; then
+    pass "reset_cmd $level lists the recorded dependency cache and removes it, read-only files and all, through the record"
+  else fail "reset_cmd $level lists the recorded dependency cache and removes it, read-only files and all, through the record ($rc, had it: $had_deps): $out"; fi
 
   fresh
   mkdir -p "$SPEECH_MODELS" "$CACHE"; touch "$SPEECH_BIN" "$VOICE_FILE"
