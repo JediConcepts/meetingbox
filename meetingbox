@@ -35,6 +35,8 @@ WRITER="apple"                           # who writes the minutes: apple
 WORK=""                                  # the run's private work folder, once made
 STAGE=""                                 # the run's staging folder in the meeting folder, once made
 RUN_DIR=""                               # the meeting folder a run holds, where it was when the run began
+FINISHED_OTHER=0                         # 1 once a run has finished another kind's interrupted swap, until its own
+MINUTES_FAILED=0                         # 1 when a process run's minutes failed and only the transcript goes in
 LOCALE="${MB_LOCALE:-en-GB}"
 MIC="${MB_MIC:-}"                        # substring match, empty = system default
 WHISPER_MODEL="${MB_WHISPER_MODEL:-}"
@@ -140,7 +142,12 @@ info() { printf '%s\n' "${c_dim}           $*${c_0}" >&2; }
 ok()   { printf '%s\n' "${c_g}         +${c_0} $*" >&2; }
 miss() { printf '%s\n' "${c_y}         -${c_0} $*" >&2; }
 warn() { printf '%s\n' "${c_y}      warn${c_0} $*" >&2; }
-die()  { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit 1; }
+# A run that has finished another kind's interrupted swap has changed the folder, so its failure says so.
+die()  {
+  local m="$*"
+  [ "$FINISHED_OTHER" != 1 ] || m="$m. The interrupted run's new files were put in place first; this run changed nothing else"
+  printf '%s\n' "${c_r}     error${c_0} $m" >&2; exit 1
+}
 rule() { printf '%s\n' "${c_dim}           ------------------------------------------------${c_0}" >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -2208,16 +2215,16 @@ fm_run() {
 fm_fold() {
   local instr="$1" input="$2" words="$3" sub c
   if fm_run "$instr" "$input" > "$input.out" 2>/dev/null; then
-    cat "$input.out"; return 0
+    cat "$input.out"; return
   fi
   [ "$words" -gt 200 ] || return 1
   info "  too dense for one pass, splitting it"
   sub="$input.split"
-  split_chunks "$input" "$sub" $((words / 2)) > "$sub.list"
+  split_chunks "$input" "$sub" $((words / 2)) > "$sub.list" || return 1
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     fm_fold "$instr" "$c" $((words / 2)) || return 1
-    printf '\n'
+    printf '\n' || return 1
   done < "$sub.list"
 }
 
@@ -2251,14 +2258,19 @@ split_chunks() {
   done
 }
 
+# summarise's way out of a failure: MINUTES_WHY says why, and its work folder goes. It reads `work`
+# from the summarise that calls it.
+minutes_failed() { MINUTES_WHY="$1"; remove_own_folder "$work" || true; }
+
 # The minutes of TRANSCRIPT, written into OUT, a run's stage: notes-raw.md, notes.md, brief.json when
 # the structured pass gives a JSON object, and .notes-written, the SHA-256 of that notes.md on one
 # line. They are built in a work folder made inside OUT; the minutes and the brief move out of it only
-# once whole, so a failed brief leaves no file. Returns 1, with MINUTES_WHY saying why, when there are
-# no minutes to write.
+# once whole, so a failed brief leaves no file. It is called as a condition, so errexit is off inside
+# it: every write is checked here. Returns 1, with MINUTES_WHY saying why, when there are no minutes to
+# write, or one of its writes failed.
 # Usage: summarise TRANSCRIPT OUT
 summarise() {
-  local transcript="$1" dir="$2" work merged text tokens list total i c round rlist next schema
+  local transcript="$1" dir="$2" work merged text tokens list total i c notes round rlist next schema
   MINUTES_WHY=""
   if ! have fm; then MINUTES_WHY="fm not found. It ships with macOS 27. Run: meetingbox setup"; return 1; fi
 
@@ -2268,39 +2280,39 @@ summarise() {
 
   # fm reads the words and the speakers. The times are for people, and only cost tokens.
   text="$work/transcript.txt"
-  sed -E 's/^\[[0-9:]+\] //' "$transcript" > "$text"
+  sed -E 's/^\[[0-9:]+\] //' "$transcript" > "$text" || { minutes_failed "could not read the transcript"; return 1; }
 
   tokens="$(token_count "$text")"; tokens="${tokens:-0}"
   info "transcript is ~$tokens tokens, the on device window is ~4000"
 
   if [ "$tokens" -le "$TOKEN_CEILING" ]; then
     info "fits in one pass"
-    cp "$text" "$merged"
+    cp "$text" "$merged" || { minutes_failed "could not write the notes to work from"; return 1; }
   else
     # Chunk lists go through files, not bash arrays: stock macOS bash is 3.2,
     # where `mapfile` is missing and an empty array trips `set -u`.
     list="$work/chunks.list"
-    split_chunks "$text" "$work/chunks" "$CHUNK_WORDS" > "$list"
+    split_chunks "$text" "$work/chunks" "$CHUNK_WORDS" > "$list" || { minutes_failed "could not slice the transcript"; return 1; }
     total="$(grep -c . "$list" 2>/dev/null || true)"
     if [ "${total:-0}" -le 0 ]; then
-      MINUTES_WHY="chunking produced nothing, the transcript may be unreadable"
-      remove_own_folder "$work" || true
+      minutes_failed "chunking produced nothing, the transcript may be unreadable"
       return 1
     fi
     say "summarising in $total slices"
 
-    : > "$merged"
+    : > "$merged" || { minutes_failed "could not write the notes to work from"; return 1; }
     i=0
     while IFS= read -r c; do
       [ -n "$c" ] || continue
       i=$((i + 1))
       info "slice $i/$total"
-      {
-        printf '\n## slice %d of %d\n\n' "$i" "$total"
-        fm_fold "$MAP_INSTRUCTIONS" "$c" "$CHUNK_WORDS" || {
-          warn "slice $i could not be summarised, its text is kept verbatim in notes-raw.md"
-          cat "$c"; }
-      } >> "$merged"
+      notes="$c.notes"
+      if ! fm_fold "$MAP_INSTRUCTIONS" "$c" "$CHUNK_WORDS" > "$notes"; then
+        warn "slice $i could not be summarised, its text is kept verbatim in notes-raw.md"
+        cp "$c" "$notes" || { minutes_failed "could not write the notes of slice $i"; return 1; }
+      fi
+      { printf '\n## slice %d of %d\n\n' "$i" "$total" && cat "$notes"; } >> "$merged" \
+        || { minutes_failed "could not write the notes of slice $i"; return 1; }
     done < "$list"
 
     round=0
@@ -2311,34 +2323,36 @@ summarise() {
       rlist="$work/reduce-$round.list"
       # Merging keeps every item, so the answer is about as long as the input.
       # Half size slices leave room for both inside the window.
-      split_chunks "$merged" "$work/reduce-$round" $((CHUNK_WORDS / 2)) > "$rlist"
+      split_chunks "$merged" "$work/reduce-$round" $((CHUNK_WORDS / 2)) > "$rlist" \
+        || { minutes_failed "could not slice the notes"; return 1; }
       next="$work/merged.r$round.txt"
-      : > "$next"
+      : > "$next" || { minutes_failed "could not write the folded notes"; return 1; }
       while IFS= read -r c; do
         [ -n "$c" ] || continue
         # On failure carry the notes forward unmerged rather than drop them.
-        fm_fold "$REDUCE_INSTRUCTIONS" "$c" $((CHUNK_WORDS / 2)) >> "$next" || cat "$c" >> "$next"
-        printf '\n' >> "$next"
+        notes="$c.notes"
+        fm_fold "$REDUCE_INSTRUCTIONS" "$c" $((CHUNK_WORDS / 2)) > "$notes" || cp "$c" "$notes" \
+          || { minutes_failed "could not write the folded notes"; return 1; }
+        { cat "$notes" && printf '\n'; } >> "$next" || { minutes_failed "could not write the folded notes"; return 1; }
       done < "$rlist"
       merged="$next"
     done
   fi
 
-  cp "$merged" "$dir/notes-raw.md"
+  cp "$merged" "$dir/notes-raw.md" || { minutes_failed "could not write notes-raw.md"; return 1; }
 
   say "writing the minutes"
   # fm streams, so a failed pass would leave half a file. Write aside, then move.
   # If the notes are still too big for the window, ship them whole rather than nothing.
   if ! fm_run "$FINAL_INSTRUCTIONS" "$merged" > "$work/final.md" 2>/dev/null; then
     warn "too much in this meeting for one final pass, so notes.md holds the merged notes in full"
-    cp "$merged" "$work/final.md"
+    cp "$merged" "$work/final.md" || { minutes_failed "could not write the minutes"; return 1; }
   fi
   if [ ! -s "$work/final.md" ]; then
-    MINUTES_WHY="the minutes came out empty"
-    remove_own_folder "$work" || true
+    minutes_failed "the minutes came out empty"
     return 1
   fi
-  mv "$work/final.md" "$dir/notes.md"
+  mv "$work/final.md" "$dir/notes.md" || { minutes_failed "could not write notes.md"; return 1; }
 
   # Structured record beside the prose, so downstream tooling gets something it
   # can parse rather than something it has to interpret. Written aside, and moved
@@ -2360,7 +2374,8 @@ summarise() {
   fi
 
   # What meetingbox wrote, so a later run can tell a notes.md edited by hand.
-  shasum -a 256 "$dir/notes.md" | cut -d' ' -f1 > "$dir/.notes-written"
+  { shasum -a 256 "$dir/notes.md" | cut -d' ' -f1 > "$dir/.notes-written"; } \
+    || { minutes_failed "could not write .notes-written"; return 1; }
 
   [ "${MB_DEBUG:-0}" = "1" ] || remove_own_folder "$work" || true
   ok "minutes written"
@@ -2536,80 +2551,136 @@ listed_file() {
 # write into it, but the app and the user would be looking elsewhere.
 still_here() { [ "$(stat -f %d:%i . 2>/dev/null)" = "$(stat -L -f %d:%i "$RUN_DIR" 2>/dev/null)" ]; }
 
+# Stops a run whose meeting folder was moved. Nothing of this run's is in it; after another kind's
+# swap was finished, that one's files are, and die says so.
+moved_die() {
+  if [ "$FINISHED_OTHER" = 1 ]; then die "the meeting folder was moved"; fi
+  die "the meeting folder was moved, nothing was changed"
+}
+
 # Steps 1 to 5 of every run: the lock, taken in the folder itself; a swap a killed run left, finished
-# or discarded; leftovers cleared; an unfinished recording refused, for a run that transcribes; and
-# the run's stage, in STAGE. KIND is the run's own: process, minutes or transcribe. From here on the
-# run is in the meeting folder, and every path is relative to it.
-# Usage: begin_run DIR KIND AUDIO (DIR a full path; AUDIO is 1 for a run that transcribes the recording)
+# or discarded; leftovers cleared; an unfinished recording refused; and the run's stage, in STAGE. A
+# version kept in earlier/ is refused before anything is written in it. KIND is the run's own:
+# process, minutes or transcribe. From here on the run is in the meeting folder, and every path is
+# relative to it.
+# Usage: begin_run DIR KIND (DIR a full path)
 begin_run() {
-  local dir="$1" kind="$2" audio="$3"
+  local dir="$1" kind="$2"
   cd -P "$dir" || die "no such folder: $dir"
+  if [ "$(basename "$(dirname "$dir")")" = earlier ] || [ "$(basename "$(cd .. && pwd -P)")" = earlier ]; then
+    die "$dir is a version kept in earlier/, not a meeting folder, so it is left as it is"
+  fi
   RUN_DIR="$dir"
   take_processing_lock . "$RUN_DIR"
-  still_here || die "the meeting folder was moved, nothing was changed"
+  still_here || moved_die
   finish_swap "$kind"
   clear_leftovers
-  if [ "$audio" = 1 ] && recording_unfinished .; then
+  if recording_unfinished .; then
     die "this recording was not finished. Run: meetingbox recover $RUN_DIR"
   fi
   STAGE="$(mktemp -d .stage.XXXXXX)" || die "could not make a staging folder in $RUN_DIR"
 }
 
-# Reads the marker .swap into SWAP_KIND, SWAP_STAGE, SWAP_EARLIER, SWAP_MOVES and SWAP_DISPLACES. False,
-# with SWAP_WHY, unless it ends with its end line and names only what a run writes: a kind, a staging
-# folder of the meeting's own that is there, an earlier folder that is there (or - for none), and files
-# on the replace lists.
+# Reads the marker .swap into SWAP_KIND, SWAP_STAGE, SWAP_EARLIER, SWAP_MOVES, SWAP_DISPLACES and
+# SWAP_STATUS. False, with SWAP_WHY saying why and what that means, unless it ends with its end line
+# and names only what a run writes: a kind, a staging folder of the meeting's own that is there, an
+# earlier folder's name (or - for none), files on the replace lists, and at most one status line.
 read_swap() {
   local line key value n=0 ended=0
-  SWAP_KIND=""; SWAP_STAGE=""; SWAP_EARLIER=""; SWAP_MOVES=""; SWAP_DISPLACES=""; SWAP_WHY=""
-  if [ -L .swap ] || [ ! -f .swap ]; then SWAP_WHY="is not a plain file"; return 1; fi
+  SWAP_KIND=""; SWAP_STAGE=""; SWAP_EARLIER=""; SWAP_MOVES=""; SWAP_DISPLACES=""; SWAP_STATUS=""; SWAP_WHY=""
+  if [ -L .swap ] || [ ! -f .swap ]; then SWAP_WHY="is not a plain file, so none of its files is moved in"; return 1; fi
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
-    if [ "$ended" = 1 ]; then SWAP_WHY="goes on after its end line"; return 1; fi
+    if [ "$ended" = 1 ]; then SWAP_WHY="goes on after its end line, so none of its files is moved in"; return 1; fi
     key="${line%% *}"; value="${line#* }"
     case "$n:$key" in
       1:kind)    SWAP_KIND="$value" ;;
       2:stage)   SWAP_STAGE="$value" ;;
       3:earlier) SWAP_EARLIER="$value" ;;
       *:move|*:displace)
-        listed_file "$value" || { SWAP_WHY="names a file no run replaces"; return 1; }
+        listed_file "$value" || { SWAP_WHY="names a file no run replaces, so none of its files is moved in"; return 1; }
         if [ "$key" = move ]; then SWAP_MOVES="$SWAP_MOVES $value"; else SWAP_DISPLACES="$SWAP_DISPLACES $value"; fi ;;
+      *:status)
+        [ -z "$SWAP_STATUS" ] && [ "$value" = 1 ] || { SWAP_WHY="cannot be read, so none of its files is moved in"; return 1; }
+        SWAP_STATUS=1 ;;
       *:end)
-        [ "$line" = end ] || { SWAP_WHY="cannot be read"; return 1; }
+        [ "$line" = end ] || { SWAP_WHY="cannot be read, so none of its files is moved in"; return 1; }
         ended=1 ;;
-      *) SWAP_WHY="cannot be read"; return 1 ;;
+      *) SWAP_WHY="cannot be read, so none of its files is moved in"; return 1 ;;
     esac
   done < .swap
-  if [ "$ended" = 0 ]; then SWAP_WHY="has no end line"; return 1; fi
-  case "$SWAP_KIND" in process|minutes|transcribe) ;; *) SWAP_WHY="names no kind of run"; return 1 ;; esac
-  case "$SWAP_STAGE" in
-    */*) SWAP_WHY="names no staging folder"; return 1 ;;
-    .stage.??????) ;;
-    *) SWAP_WHY="names no staging folder"; return 1 ;;
+  # written to a temporary name and renamed into place whole: without its end line, nothing had moved
+  if [ "$ended" = 0 ]; then SWAP_WHY="has no end line, so it was never whole and no file had moved yet"; return 1; fi
+  case "$SWAP_KIND" in
+    process|minutes|transcribe) ;;
+    *) SWAP_WHY="names no kind of run, so none of its files is moved in"; return 1 ;;
   esac
-  if [ ! -d "$SWAP_STAGE" ] || [ -L "$SWAP_STAGE" ]; then SWAP_WHY="names a staging folder that is not there"; return 1; fi
+  case "$SWAP_STAGE" in
+    */*) SWAP_WHY="names no staging folder, so none of its files is moved in"; return 1 ;;
+    .stage.??????) ;;
+    *) SWAP_WHY="names no staging folder, so none of its files is moved in"; return 1 ;;
+  esac
+  if [ ! -d "$SWAP_STAGE" ] || [ -L "$SWAP_STAGE" ]; then
+    SWAP_WHY="names a staging folder that is not there, so there is nothing left to move in"; return 1
+  fi
   case "$SWAP_EARLIER" in
-    -) [ -z "$SWAP_DISPLACES" ] || { SWAP_WHY="displaces files with no earlier folder"; return 1; } ;;
-    */*) SWAP_WHY="names no earlier folder"; return 1 ;;
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]-[1-9]*)
-      # its copies are what the moves replace: without them, nothing is moved
-      if [ -L earlier ] || [ ! -d "earlier/$SWAP_EARLIER" ] || [ -L "earlier/$SWAP_EARLIER" ]; then
-        SWAP_WHY="names an earlier folder that is not there"; return 1
-      fi ;;
-    *) SWAP_WHY="names no earlier folder"; return 1 ;;
+    -) [ -z "$SWAP_DISPLACES" ] || { SWAP_WHY="displaces files with no earlier folder, so none of its files is moved in"; return 1; } ;;
+    */*) SWAP_WHY="names no earlier folder, so none of its files is moved in"; return 1 ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]-[1-9]*) ;;
+    *) SWAP_WHY="names no earlier folder, so none of its files is moved in"; return 1 ;;
   esac
 }
 
-# Step 9's renames, for this run's swap and for one a killed run left, as the SWAP_ variables give it:
-# each file moved from the stage over its target, .notes-written last, then each displaced file moved
-# into the earlier folder, where nothing of that name may be (a rename there never replaces a file). A
-# file already moved is skipped, so a swap a killed run began finishes the same way. Every file moved
-# in is touched, so the app counts it as written by the run that finished the swap. Interrupt signals
-# are ignored meanwhile. A rename that fails is logged and the rest still move: then it returns 1 and
-# .swap stays. Otherwise .swap is removed.
+# earlier/ is a real folder, or not there yet.
+earlier_usable() { [ ! -L earlier ] && { [ ! -e earlier ] || [ -d earlier ]; }; }
+
+# Before a swap moves new files over FILE...: each is not the copy the run kept (it changed since, or
+# it was not there when the run kept nothing of it), so a copy is made now, in the stage, compared byte
+# for byte, and renamed to the first free earlier/<YYYY-MM-DD HHMM>[-N]. False, with nothing moved,
+# when that fails.
+# Usage: keep_again FILE...
+keep_again() {
+  local f tmp stamp name n
+  earlier_usable || { warn "earlier in $RUN_DIR is not a folder, so nothing is moved over $*"; return 1; }
+  tmp="$(mktemp -d "$SWAP_STAGE/kept.XXXXXX")" || { warn "could not make a folder for the copies of $*"; return 1; }
+  for f in "$@"; do
+    { cp -- "$f" "$tmp/$f" && chmod 600 "$tmp/$f" && cmp -s -- "$f" "$tmp/$f"; } \
+      || { warn "could not keep a copy of $f, which changed after its copy was kept"; return 1; }
+  done
+  [ -d earlier ] || mkdir earlier || { warn "could not make earlier/ in $RUN_DIR"; return 1; }
+  stamp="$(date '+%Y-%m-%d %H%M')"; name="$stamp"; n=1
+  while [ -e "earlier/$name" ] || [ -L "earlier/$name" ]; do n=$((n + 1)); name="$stamp-$n"; done
+  mv -- "$tmp" "earlier/$name" || { warn "could not move the copies of $* into earlier/$name"; return 1; }
+  warn "changed after its copy was kept, so kept again in earlier/$name before the new one goes in: $*"
+}
+
+# Step 9's renames, for this run's swap and for one a killed run left, as the SWAP_ variables give it.
+# First, a file a move would overwrite that is not the copy kept of it in the earlier folder (changed
+# since, or there since nothing was kept) is kept again, in a new earlier folder; if that fails,
+# nothing moves. .notes-written, never kept, is never checked. Then each file moves from the stage over
+# its target, .notes-written last, and each displaced file moves into the earlier folder (made again if
+# it has gone), where nothing of that name may be, and is made 0600. A file already moved is skipped,
+# so a swap a killed run began finishes the same way. Every file moved in is touched, so the app counts
+# it as written by the run that finished the swap. Interrupt signals are ignored meanwhile. A rename
+# that fails is logged and the rest still move: then it returns 1 and .swap stays. Otherwise .swap is
+# removed.
 apply_swap() {
-  local f failed=0
+  local f failed=0 changed=""
   trap '' INT TERM HUP
+  if [ -n "$SWAP_DISPLACES" ] && [ ! -d "earlier/$SWAP_EARLIER" ]; then
+    if ! earlier_usable || ! mkdir -p "earlier/$SWAP_EARLIER"; then
+      warn "could not make earlier/$SWAP_EARLIER again for the files this swap moves aside"
+      run_traps; return 1
+    fi
+    info "earlier/$SWAP_EARLIER, where the interrupted run kept its copies, was not there; it is made again for the files it moves aside"
+  fi
+  for f in $SWAP_MOVES; do
+    [ "$f" != .notes-written ] && [ -e "$SWAP_STAGE/$f" ] && [ -e "$f" ] || continue
+    if [ "$SWAP_EARLIER" != - ] && [ -f "earlier/$SWAP_EARLIER/$f" ] && cmp -s -- "$f" "earlier/$SWAP_EARLIER/$f"; then continue; fi
+    changed="$changed $f"
+  done
+  # shellcheck disable=SC2086   # file names, without spaces
+  if [ -n "$changed" ] && ! keep_again $changed; then run_traps; return 1; fi
   for f in $SWAP_MOVES; do
     if [ -e "$SWAP_STAGE/$f" ] && ! mv -f -- "$SWAP_STAGE/$f" "$f"; then
       warn "could not move the new $f into place"
@@ -2623,23 +2694,26 @@ apply_swap() {
     if [ -e "earlier/$SWAP_EARLIER/$f" ] || [ -L "earlier/$SWAP_EARLIER/$f" ] || ! mv -- "$f" "earlier/$SWAP_EARLIER/$f"; then
       warn "could not move the old $f into earlier/$SWAP_EARLIER"
       failed=1
+      continue
     fi
+    chmod 600 "earlier/$SWAP_EARLIER/$f" || true
   done
   if [ "$failed" = 0 ]; then rm -f .swap || true; fi
   run_traps
   return "$failed"
 }
 
-# Step 2: a .swap marker a killed run left. One that is not whole (no end line), or that names a stage
-# or earlier folder that is not there, is removed with a log line. Otherwise that swap is finished
-# first. A run of the marker's own kind then stops with success, since its result is in place; a run
-# of another kind goes on with its own work.
+# Step 2: a .swap marker a killed run left. One without its end line, or naming a stage that is not
+# there, or that cannot be read, is removed with a log line saying which. Otherwise that swap is
+# finished first. A run of the marker's own kind then stops with the marker's status, since its result
+# is in place: 0, or 1 for a process whose minutes failed. A run of another kind goes on with its own
+# work, and a failure after that says the interrupted run's files were put in place.
 # Usage: finish_swap KIND
 finish_swap() {
   [ -e .swap ] || [ -L .swap ] || return 0
   if [ -d .swap ] && [ ! -L .swap ]; then die ".swap in $RUN_DIR is a folder, not meetingbox's marker. Move it away to go on"; fi
   if ! read_swap; then
-    info "the .swap marker an interrupted run left $SWAP_WHY, so it is removed: none of its files is moved in"
+    info "the .swap marker an interrupted run left $SWAP_WHY; it is removed"
     rm -f .swap
     return 0
   fi
@@ -2648,9 +2722,11 @@ finish_swap() {
   remove_own_folder "$SWAP_STAGE" || true
   ok "the interrupted run's new files are in place"
   if [ "$SWAP_KIND" = "$1" ]; then
+    [ "$SWAP_STATUS" != 1 ] || die "the minutes could not be written, so only the new transcript went in"
     progress done
     exit 0
   fi
+  FINISHED_OTHER=1
 }
 
 # Step 3: what killed runs left: their staging folders, and a marker half written. In a folder the
@@ -2743,8 +2819,8 @@ plan_swap() {
 # EARLIER to the earlier folder's name, or - when nothing is replaced. Anything that fails stops the
 # run with the folder as it was.
 keep_earlier() {
-  local f stamp name n edited=0 made=0 keep=""
-  EARLIER="-"
+  local f stamp name n edited=0 keep=""
+  EARLIER="-"; KEPT_EDITED=""; KEPT_MADE_EARLIER=0
   for f in $REPLACED; do [ "$f" = .notes-written ] || keep="$keep $f"; done
   [ -n "$keep$SWAP_DISPLACES" ] || return 0
   stamp="$(date '+%Y-%m-%d %H%M')"
@@ -2761,13 +2837,13 @@ keep_earlier() {
         edited=1
       fi ;;
   esac
-  still_here || die "the meeting folder was moved, nothing was changed"
-  if [ -L earlier ] || { [ -e earlier ] && [ ! -d earlier ]; }; then die "earlier in $RUN_DIR is not a folder"; fi
-  if [ ! -d earlier ]; then mkdir earlier || die "could not make earlier/ in $RUN_DIR"; made=1; fi
+  still_here || moved_die
+  earlier_usable || die "earlier in $RUN_DIR is not a folder"
+  if [ ! -d earlier ]; then mkdir earlier || die "could not make earlier/ in $RUN_DIR"; KEPT_MADE_EARLIER=1; fi
   name="$stamp"; n=1
   while [ -e "earlier/$name" ] || [ -L "earlier/$name" ]; do n=$((n + 1)); name="$stamp-$n"; done
   if ! mv -- "$STAGE/kept" "earlier/$name"; then
-    [ "$made" = 0 ] || rmdir earlier 2>/dev/null || true
+    unkeep
     die "could not move the copies into earlier/$name"
   fi
   EARLIER="$name"
@@ -2775,35 +2851,49 @@ keep_earlier() {
     name="notes-edited-$stamp.md"; n=1
     while [ -e "$name" ] || [ -L "$name" ]; do n=$((n + 1)); name="notes-edited-$stamp-$n.md"; done
     if ! ln -- "$STAGE/notes-edited" "$name"; then
-      # the copies go back into the stage, so the folder is as it was
-      mv -- "earlier/$EARLIER" "$STAGE/kept" || true
-      [ "$made" = 0 ] || rmdir earlier 2>/dev/null || true
-      EARLIER="-"
+      unkeep
       die "could not keep the edited notes.md as $name"
     fi
+    KEPT_EDITED="$name"
     ok "your edited notes.md is kept as $name"
   fi
   ok "what this run replaces is kept in earlier/$EARLIER"
 }
 
+# Undoes keep_earlier, so the folder is as it was: the copies go back into the stage, the notes-edited
+# copy it put in place is unlinked (the stage holds the same copy), and an earlier/ it made, now empty,
+# goes.
+unkeep() {
+  if [ "$EARLIER" != - ]; then mv -- "earlier/$EARLIER" "$STAGE/kept" || true; fi
+  if [ -n "$KEPT_EDITED" ]; then rm -f -- "$KEPT_EDITED" || true; fi
+  if [ "$KEPT_MADE_EARLIER" = 1 ]; then rmdir earlier 2>/dev/null || true; fi
+  EARLIER="-"; KEPT_EDITED=""; KEPT_MADE_EARLIER=0
+}
+
 # The marker's lines: the kind, the stage, the earlier folder, each file to move in and each to
-# displace, and an end line.
+# displace, status 1 for a process whose minutes failed, and an end line.
 swap_lines() {
   local f
   printf 'kind %s\nstage %s\nearlier %s\n' "$SWAP_KIND" "$SWAP_STAGE" "$SWAP_EARLIER"
   for f in $SWAP_MOVES; do printf 'move %s\n' "$f"; done
   for f in $SWAP_DISPLACES; do printf 'displace %s\n' "$f"; done
+  [ "$SWAP_STATUS" != 1 ] || printf 'status 1\n'
   printf 'end\n'
 }
 
-# Step 9: the marker, written to .swap.tmp (0600) and renamed into place, so it is whole or absent;
-# then the swap itself, and the stage removed. A swap that cannot finish leaves the marker and the
-# stage for the next run, and the run exits 3.
+# Step 9: the folder checked once more, on every run, for a move (what keep_earlier made is undone
+# first); the marker, written to .swap.tmp (0600) and renamed into place, so it is whole or absent; then
+# the swap itself, and the stage removed. A swap that cannot finish leaves the marker and the stage for
+# the next run, and the run exits 3.
 # Usage: swap_in KIND (after plan_swap and keep_earlier)
 swap_in() {
-  SWAP_KIND="$1"; SWAP_STAGE="$STAGE"; SWAP_EARLIER="$EARLIER"
+  SWAP_KIND="$1"; SWAP_STAGE="$STAGE"; SWAP_EARLIER="$EARLIER"; SWAP_STATUS=""
+  [ "$MINUTES_FAILED" != 1 ] || SWAP_STATUS=1
+  if ! still_here; then unkeep; moved_die; fi
   swap_lines > .swap.tmp && mv -f .swap.tmp .swap \
     || { rm -f .swap.tmp || true; die "could not write the .swap marker in $RUN_DIR"; }
+  # from here this run changes the folder itself
+  FINISHED_OTHER=0
   apply_swap || swap_die "not every new file could be moved into place"
   drop_stage
 }
@@ -2831,23 +2921,28 @@ finish_run() {
   end_processing 0
 }
 
-# process: a recording, a meeting folder (its audio.m4a) or a transcript file, to a transcript and
-# minutes. The meeting's own transcript.txt is a notes run. When the minutes fail, the new transcript
-# and words still go in, keeping what they replace, and the run fails: the meeting is Failed with a
-# transcript, and Redo minutes can finish it. Only process removes audio, for --no-keep-audio, and
-# only once the minutes are in place.
+# process: a recording (a meeting folder's audio.m4a, or any .m4a, .wav or .caf) or a transcript file
+# (.txt, .md, .vtt or .srt), to a transcript and minutes; anything else is refused. The meeting's own
+# transcript.txt is a notes run. When the minutes fail, the new transcript and words still go in,
+# keeping what they replace, and the run fails: the meeting is Failed with a transcript, and Redo
+# minutes can finish it. Only process removes audio, for --no-keep-audio, only once the minutes are in
+# place, and only the recording it transcribed: never a file of any other kind.
 process() {
   # transcripts and minutes are as private as the recording
   umask 077
-  local input="$1" dir name audio=1 two=0 required why=""
+  local input="$1" dir name audio two=0 required why=""
   # a meeting folder stands for its recording
   [ -d "$input" ] && input="${input%/}/audio.m4a"
-  [ -d "$(dirname "$input")" ] || die "no such file: $input"
-  dir="$(cd "$(dirname "$input")" && pwd)"
-  name="$(basename "$input")"
+  [ -d "$(dirname -- "$input")" ] || die "no such file: $input"
+  dir="$(cd -- "$(dirname -- "$input")" && pwd)"
+  name="$(basename -- "$input")"
   if [ "$name" = transcript.txt ]; then notes_cmd "$dir"; return; fi
-  case "$name" in *.txt|*.md|*.vtt|*.srt) audio=0 ;; esac
-  begin_run "$dir" process "$audio"
+  case "$(printf '%s' "${name##*.}" | tr '[:upper:]' '[:lower:]')" in
+    txt|md|vtt|srt) audio=0 ;;
+    m4a|wav|caf)    audio=1 ;;
+    *) die "$name is neither a recording (.m4a, .wav or .caf) nor a transcript (.txt, .md, .vtt or .srt), so it is not processed" ;;
+  esac
+  begin_run "$dir" process
   [ -e "$name" ] || die "no such file: $input"
 
   if [ "$audio" = 0 ]; then
@@ -2859,7 +2954,8 @@ process() {
       transcribe_channels . "$STAGE" "$(meeting_id .)"
       two=1
     else
-      transcribe "$name" "$STAGE/transcript.txt"
+      # ./ so that a name starting with a dash is never taken for an option
+      transcribe "./$name" "$STAGE/transcript.txt"
     fi
   fi
   required="transcript.txt"
@@ -2874,14 +2970,16 @@ process() {
   else
     why="${MINUTES_WHY:-$why}"
     warn "the minutes could not be written, so only the new transcript goes in"
+    # the marker says so, so a process that finishes this swap fails as this one does
+    MINUTES_FAILED=1
     # shellcheck disable=SC2086   # file names, without spaces
     replace_files process $TRANSCRIPTION_FILES
     die "${why:-the minutes could not be written}"
   fi
-  # --no-keep-audio: only now the minutes are in place, so a failed run never loses audio.
+  # --no-keep-audio: only now the minutes are in place, so a failed run never loses audio. Only the
+  # recording transcribed goes: the meeting's three files by name, or the one recording given.
   if [ "$KEEP_AUDIO" != "1" ] && [ "$audio" = 1 ]; then
-    rm -f -- "$name"
-    [ "$two" = 0 ] || rm -f mic.m4a call.m4a
+    if [ "$two" = 1 ]; then rm -f audio.m4a mic.m4a call.m4a; else rm -f -- "./$name"; fi
   fi
   finish_run
 }
@@ -2892,8 +2990,8 @@ notes_cmd() {
   umask 077
   local dir why
   [ -d "$1" ] || die "no such folder: $1"
-  dir="$(cd "$1" && pwd)"
-  begin_run "$dir" minutes 0
+  dir="$(cd -- "$1" && pwd)"
+  begin_run "$dir" minutes
   [ -s transcript.txt ] || die "there is no transcript in $RUN_DIR to write the minutes from"
   progress minutes
   summarise transcript.txt "$STAGE" || die "${MINUTES_WHY:-the minutes could not be written}"
@@ -2910,8 +3008,8 @@ redo_cmd() {
   umask 077
   local dir why
   [ -d "$1" ] || die "no such folder: $1"
-  dir="$(cd "$1" && pwd)"
-  begin_run "$dir" transcribe 1
+  dir="$(cd -- "$1" && pwd)"
+  begin_run "$dir" transcribe
   if [ -f mic.m4a ] && [ -f call.m4a ]; then
     progress transcribing
     transcribe_channels . "$STAGE"

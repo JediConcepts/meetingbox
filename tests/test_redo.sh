@@ -565,18 +565,24 @@ else fail "a process killed between renames is finished by the next process, whi
 unset -f mv
 
 # --- a .swap with no end line is discarded: nothing moves in from it, and the run completes normally ---
+# The marker is whole but for its end line (kind, stage, an earlier folder that holds the kept copy,
+# a move line), so only the end-line rule can refuse it.
+no_end_marker() {
+  mkdir -m 700 "$d/.stage.ABCDEF"; printf 'notes a stage left\n' > "$d/.stage.ABCDEF/notes.md"
+  mkdir -p "$d/earlier/2026-01-01 0000"; command cp "$d/notes.md" "$d/earlier/2026-01-01 0000/notes.md"
+  printf 'kind minutes\nstage .stage.ABCDEF\nearlier 2026-01-01 0000\nmove notes.md\n' > "$d/.swap"
+}
 reset_run; finished k4
-mkdir -m 700 "$d/.stage.ABCDEF"; printf 'notes a stage left\n' > "$d/.stage.ABCDEF/notes.md"
-printf 'kind minutes\nstage .stage.ABCDEF\nmove notes.md\n' > "$d/.swap"
+no_end_marker
 before_l="$(snap_of "$d" $LISTED)"
 HAVE_FM=0
 engine notes_cmd "$d"
 HAVE_FM=1
-if [ "$rc" -eq 1 ] && [ "$(snap_of "$d" $LISTED)" = "$before_l" ] && no_stage "$d" && printf '%s' "$out" | grep -qi 'swap'; then
-  pass "a .swap with only kind, stage and move lines is discarded, with a log line, and moves nothing in"
-else fail "a .swap with only kind, stage and move lines is discarded, with a log line, and moves nothing in (rc $rc): $(ls -A "$d") $out"; fi
-printf 'kind minutes\nstage .stage.ABCDEF\nmove notes.md\n' > "$d/.swap"
-mkdir -m 700 "$d/.stage.ABCDEF"; printf 'notes a stage left\n' > "$d/.stage.ABCDEF/notes.md"
+if [ "$rc" -eq 1 ] && [ "$(snap_of "$d" $LISTED)" = "$before_l" ] && no_stage "$d" && printf '%s' "$out" | grep -q 'has no end line'; then
+  pass "a .swap whole but for its end line is discarded, with a log line saying so, and moves nothing in"
+else fail "a .swap whole but for its end line is discarded, with a log line saying so, and moves nothing in (rc $rc): $(ls -A "$d") $out"; fi
+rm -rf "$d/earlier/2026-01-01 0000"
+no_end_marker
 engine notes_cmd "$d"
 if [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && same "$d/earlier/$STAMP/notes.md" "$HOME/k4.old/notes.md" && no_stage "$d"; then
   pass "after discarding such a .swap, the run completes normally"
@@ -685,6 +691,241 @@ if [ "$rc" -eq 0 ] && [ "$(calls mb-transcript)" = 0 ] && [ "$(calls mb-speech)"
   pass "notes never transcribes, so never learns"
 else fail "notes never transcribes, so never learns (rc $rc): $(cat "$HOME/calls.log")"; fi
 forget_install "$VOICE_FILE"
+
+# ======================================================================== review round 1
+
+# The killing mv again, as a definition to switch on: KILL_SIG (KILL unless set) at the KILL_AT'th
+# rename of a staged file over its target. unset -f mv switches it off.
+kill_mv() {
+  mv() {
+    local a last=""
+    for a in "$@"; do last="$a"; done
+    case "$*" in
+      *.stage.*)
+        case " $LISTED " in
+          *" $last "*)
+            local n; n=$(( $(command cat "$HOME/mv.count") + 1 )); echo "$n" > "$HOME/mv.count"
+            [ "$n" -ne "$KILL_AT" ] || kill "-${KILL_SIG:-KILL}" "$(command cat "$HOME/engine.pid")" ;;
+        esac ;;
+    esac
+    command mv "$@"
+  }
+}
+moved_line="the meeting folder was moved, nothing was changed"
+
+# --- 1: a first process whose folder is renamed during the minutes: stopped, nothing new in it ---
+reset_run; recorded mv1
+fm_hook() { if [ -d "$HOME/mv1" ]; then command mv "$HOME/mv1" "$HOME/mv1-renamed"; fi; }
+engine process "$HOME/mv1/audio.m4a"
+fm_hook() { :; }
+m="$HOME/mv1-renamed"
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$moved_line" && [ "$(entries "$m")" = "audio.m4a call.m4a mic.m4a " ] \
+   && [ "$(status_of "$m")" = 1 ]; then
+  pass "a first process whose folder is renamed during the minutes stops, and nothing new is in the folder"
+else fail "a first process whose folder is renamed during the minutes stops, and nothing new is in the folder (rc $rc): [$(entries "$m")] $out"; fi
+# --- and notes on a folder holding only its recording and transcript ---
+reset_run; d="$HOME/mv2"; mkdir -p "$d"; printf 'aac mix' > "$d/audio.m4a"; printf '[00:00:01] Me: a transcript\n' > "$d/transcript.txt"
+before="$(snap "$d")"
+fm_hook() { if [ -d "$HOME/mv2" ]; then command mv "$HOME/mv2" "$HOME/mv2-renamed"; fi; }
+engine notes_cmd "$d"
+fm_hook() { :; }
+m="$HOME/mv2-renamed"
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$moved_line" && [ "$(snap "$m")" = "$before" ] \
+   && [ "$(entries "$m")" = "audio.m4a transcript.txt " ]; then
+  pass "notes on a transcript-only folder renamed mid-run stops, and nothing new is in the folder"
+else fail "notes on a transcript-only folder renamed mid-run stops, and nothing new is in the folder (rc $rc): [$(entries "$m")] $out"; fi
+
+# --- 2: a file changed since it was kept is never overwritten without a copy ---
+# (a) a locked notes.md stops the swap (exit 3); unlocked and edited, the next run keeps the edit
+reset_run; finished e1
+chflags uchg "$d/notes.md"
+engine notes_cmd "$d"; rc1=$rc
+chflags nouchg "$d/notes.md"
+printf 'MY EDIT while the swap waited\n' >> "$d/notes.md"
+engine notes_cmd "$d"
+if [ "$rc1" = 3 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && [ -n "$(grep -rl 'MY EDIT while the swap waited' "$d/earlier")" ] \
+   && no_stage "$d"; then
+  pass "a notes.md edited while a swap waited is kept in earlier/ before the new one lands"
+else fail "a notes.md edited while a swap waited is kept in earlier/ before the new one lands ($rc1, $rc): $(ls -A "$d" "$d/earlier") $out"; fi
+# (b) notes killed just before notes.md moves in; notes.md edited; the next run keeps the edit
+reset_run; finished e2
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+printf 'MY EDIT after the kill\n' >> "$d/notes.md"
+engine notes_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && [ -n "$(grep -rl 'MY EDIT after the kill' "$d/earlier")" ] \
+   && no_stage "$d"; then
+  pass "a notes.md edited after a kill is kept in earlier/ before the finishing run moves the new one in"
+else fail "a notes.md edited after a kill is kept in earlier/ before the finishing run moves the new one in ($rc1, $rc): $(ls -A "$d" "$d/earlier" 2>&1) $out"; fi
+# (c) a first process killed after transcript.txt moved in (earlier -); the user writes a notes.md
+reset_run; recorded e3
+KILL_AT=2; kill_mv; killed_run process "$d/audio.m4a"; rc1=$rc; unset -f mv
+marker_none=0; grep -qx 'earlier -' "$d/.swap" 2>/dev/null && marker_none=1
+printf 'MY OWN NOTES\n' > "$d/notes.md"
+engine process "$d/audio.m4a"
+if [ "$rc1" = 137 ] && [ "$marker_none" = 1 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] \
+   && [ -n "$(grep -rl 'MY OWN NOTES' "$d/earlier" 2>/dev/null)" ] && no_stage "$d"; then
+  pass "a notes.md written where the marker kept nothing (earlier -) is kept in earlier/ before the new one lands"
+else fail "a notes.md written where the marker kept nothing (earlier -) is kept in earlier/ before the new one lands ($rc1, $marker_none, $rc): $(ls -A "$d") $out"; fi
+
+# (d) keeping the changed file again fails: exit 3, nothing moves over it, .swap stays; then it finishes
+reset_run; finished e4
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+printf 'MY EDIT kept through a failed copy\n' >> "$d/notes.md"; command cp "$d/notes.md" "$HOME/e4.edited"
+cp() { case "$*" in */kept.??????/*) return 1 ;; esac; command cp "$@"; }
+engine notes_cmd "$d"; rc2=$rc
+unset -f cp
+held=0; same "$d/notes.md" "$HOME/e4.edited" && [ -f "$d/.swap" ] && held=1
+engine notes_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$rc2" = 3 ] && [ "$held" = 1 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] \
+   && [ -n "$(grep -rl 'MY EDIT kept through a failed copy' "$d/earlier")" ] && no_stage "$d"; then
+  pass "when the changed file cannot be kept again, the swap stops with exit 3 and moves nothing over it"
+else fail "when the changed file cannot be kept again, the swap stops with exit 3 and moves nothing over it ($rc1, $rc2, held $held, $rc): $out"; fi
+
+# --- 1 again: a move seen only at the marker undoes the copies already kept, so nothing is new ---
+reset_run; finished mv3; printf 'a hand edit\n' >> "$d/notes.md"
+before="$(snap "$d")"; before_e="$(entries "$d")"
+eval "$(declare -f still_here | sed '1s/still_here/real_still_here/')"
+echo 0 > "$HOME/here.count"
+still_here() { local n; n=$(( $(command cat "$HOME/here.count") + 1 )); echo "$n" > "$HOME/here.count"; [ "$n" -ne 3 ] && real_still_here; }
+engine notes_cmd "$d"
+eval "$(declare -f real_still_here | sed '1s/real_still_here/still_here/')"
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF "$moved_line" && [ "$(command cat "$HOME/here.count")" = 3 ] \
+   && [ "$(snap "$d")" = "$before" ] && [ "$(entries "$d")" = "$before_e" ] && no_stage "$d"; then
+  pass "a move seen just before the marker undoes the earlier/ copy and the notes-edited copy, so nothing is new"
+else fail "a move seen just before the marker undoes the earlier/ copy and the notes-edited copy, so nothing is new (rc $rc): [$(entries "$d")] $out"; fi
+
+# --- 3: a write that fails inside the minutes is the minutes failing, never a cut-short file ---
+CP_PARTIAL=""
+cp() {
+  if [ -n "$CP_PARTIAL" ]; then
+    # shellcheck disable=SC2254
+    case "$*" in $CP_PARTIAL) head -c 5 "$1" > "$2"; echo "cp: $2: No space left on device" >&2; return 1 ;; esac
+  fi
+  command cp "$@"
+}
+for CP_PARTIAL in '*/merged.txt *notes-raw.md' '*/transcript.txt */merged.txt'; do
+  reset_run; finished w1
+  before="$(snap "$d")"
+  engine notes_cmd "$d"; rc1=$rc; same1=0; [ "$(snap "$d")" = "$before" ] && [ ! -e "$d/earlier" ] && no_stage "$d" && same1=1
+  rm -rf "$HOME/w1" "$HOME/w1.old"; reset_run; finished w1
+  before_m="$(snap_of "$d" notes.md notes-raw.md brief.json .notes-written)"
+  engine process "$d/audio.m4a"
+  if [ "$rc1" -eq 1 ] && [ "$same1" = 1 ] && [ "$rc" -eq 1 ] && [ "$(snap_of "$d" notes.md notes-raw.md brief.json .notes-written)" = "$before_m" ] \
+     && grep -q 'Me: Speaking from this desk' "$d/transcript.txt"; then
+    pass "a cp cut short in the minutes ($CP_PARTIAL) fails notes with nothing changed, and process with only the transcript in"
+  else fail "a cp cut short in the minutes ($CP_PARTIAL) fails notes with nothing changed, and process with only the transcript in ($rc1/$same1, $rc): $out"; fi
+  rm -rf "$HOME/w1" "$HOME/w1.old"
+done
+CP_PARTIAL=""
+unset -f cp
+
+# --- 5: process takes only a recording or a transcript; --no-keep-audio never removes anything else ---
+reset_run; finished a5; before="$(snap "$d")"; KEEP_AUDIO=0
+engine process "$d/meeting.json"; rc1=$rc; out1="$out"
+engine process "$d/brief.json"; rc2=$rc
+KEEP_AUDIO=1
+if [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && printf '%s' "$out1" | grep -q 'meeting.json' && [ "$(snap "$d")" = "$before" ] \
+   && [ "$(calls mb-speech)" = 0 ] && [ "$(calls fm)" = 0 ]; then
+  pass "process <dir>/meeting.json with KEEP_AUDIO=0 is refused and deletes nothing (and so is a .json brief)"
+else fail "process <dir>/meeting.json with KEEP_AUDIO=0 is refused and deletes nothing (and so is a .json brief) ($rc1 $rc2): $(ls "$d") $out1"; fi
+
+# --- 6: a copy that cp says it made but that differs stops the keep, with nothing changed ---
+cp() {
+  case "$*" in
+    $CP_SHORT)
+      local n a src="" dst=""; n=$(( $(command cat "$HOME/cp.count") + 1 )); echo "$n" > "$HOME/cp.count"
+      if [ "$n" -eq "$CP_SHORT_AT" ]; then for a in "$@"; do src="$dst"; dst="$a"; done; head -c 3 "$src" > "$dst"; return 0; fi ;;
+  esac
+  command cp "$@"
+}
+for CP_SHORT in '*/kept/*' '*/notes-edited'; do
+  reset_run; finished fb; echo 0 > "$HOME/cp.count"
+  if [ "$CP_SHORT" = '*/notes-edited' ]; then CP_SHORT_AT=1; printf 'a hand edit\n' >> "$d/notes.md"; else CP_SHORT_AT=2; fi
+  before="$(snap "$d")"
+  engine notes_cmd "$d"
+  if [ "$rc" -eq 1 ] && [ "$(snap "$d")" = "$before" ] && [ ! -e "$d/earlier" ] && no_stage "$d" && ! ls "$d" | grep -q '^notes-edited'; then
+    pass "a copy cut short without an error ($CP_SHORT) is caught by the comparison: nothing changed"
+  else fail "a copy cut short without an error ($CP_SHORT) is caught by the comparison: nothing changed (rc $rc): $(ls -A "$d") $out"; fi
+  rm -rf "$HOME/fb" "$HOME/fb.old"
+done
+unset -f cp
+
+# --- 7 and 13b: notes, and process on a transcript file, refuse an unfinished recording ---
+for how in transcript-original.txt notes; do
+  reset_run; finished u7; printf 'pcm' > "$d/mic.caf"
+  before="$(snap "$d")"
+  if [ "$how" = notes ]; then engine notes_cmd "$d"; else engine process "$d/$how"; fi
+  if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'this recording was not finished. Run: meetingbox recover' \
+     && [ "$(snap "$d")" = "$before" ] && [ "$(calls fm)" = 0 ]; then
+    pass "an unfinished recording is refused with the recover message by $how, changing nothing"
+  else fail "an unfinished recording is refused with the recover message by $how, changing nothing (rc $rc): $out"; fi
+  rm -rf "$HOME/u7" "$HOME/u7.old"
+done
+
+# --- 8: a whole .swap whose earlier folder has gone is finished, not thrown away ---
+reset_run; finished e8; touch "$HOME/brief-fail"
+KILL_AT=2; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+command mv "$d/earlier/$STAMP" "$HOME/e8-kept-away"
+rm -f "$HOME/brief-fail"; HAVE_FM=0
+engine notes_cmd "$d"
+HAVE_FM=1
+if [ "$rc1" = 137 ] && [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && [ ! -e "$d/brief.json" ] \
+   && same "$d/earlier/$STAMP/brief.json" "$HOME/e8.old/brief.json" && same "$d/earlier/$STAMP-2/notes.md" "$HOME/e8.old/notes.md" \
+   && no_stage "$d" && ! printf '%s' "$out" | grep -q 'none of its files' && printf '%s' "$out" | grep -q "earlier/$STAMP"; then
+  pass "a .swap whose earlier folder has gone is finished: displaced files go into it made again, and the old notes.md is kept anew"
+else fail "a .swap whose earlier folder has gone is finished: displaced files go into it made again, and the old notes.md is kept anew ($rc1, $rc): $(ls -A "$d" "$d/earlier" 2>&1) $out"; fi
+
+# --- 9: a loose recording whose name starts with a dash reaches Parakeet ---
+reset_run; d="$HOME/dash"; mkdir -p "$d"; printf 'aac' > "$d/-rec one.m4a"
+engine process "$d/-rec one.m4a"
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] && [ "$(calls 'mb-speech transcribe')" = 1 ] \
+   && grep -q '^afconvert .* \./-rec one\.m4a ' "$HOME/calls.log" && ! printf '%s' "$out" | grep -q 'illegal option'; then
+  pass "a loose recording whose name starts with a dash reaches Parakeet"
+else fail "a loose recording whose name starts with a dash reaches Parakeet (rc $rc): $(grep '^afconvert' "$HOME/calls.log") $out"; fi
+
+# --- 10: a run that finished another kind's swap and then failed says so, not that nothing changed ---
+reset_run; finished f10
+KILL_AT=3; kill_mv; killed_run notes_cmd "$d"; rc1=$rc; unset -f mv
+touch "$HOME/pk-fail-mic" "$HOME/pk-fail-call"; SA_FAIL=both
+engine redo_cmd "$d"
+last="$(printf '%s\n' "$out" | grep . | tail -n 1)"
+if [ "$rc1" = 137 ] && [ "$rc" -eq 1 ] && printf '%s' "$last" | grep -q 'put in place' && ! printf '%s' "$out" | grep -q 'nothing was changed' \
+   && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && no_stage "$d"; then
+  pass "a run that finished another kind's swap and then failed says the interrupted run's files were put in place"
+else fail "a run that finished another kind's swap and then failed says the interrupted run's files were put in place ($rc1, $rc): [$last] $out"; fi
+
+# --- 11: a version kept in earlier/ is never treated as a meeting folder ---
+reset_run; finished f11; engine redo_cmd "$d"
+k="$d/earlier/$STAMP"; before="$(snap "$k")"; before_e="$(ls -A "$k")"
+engine process "$k/transcript.txt"; rc1=$rc
+engine notes_cmd "$k"; rc2=$rc
+if [ "$rc1" -eq 1 ] && [ "$rc2" -eq 1 ] && [ "$(snap "$k")" = "$before" ] && [ "$(ls -A "$k")" = "$before_e" ]; then
+  pass "notes and process refuse a folder inside earlier/, and leave it as it was"
+else fail "notes and process refuse a folder inside earlier/, and leave it as it was ($rc1 $rc2): $(ls -A "$k") $out"; fi
+
+# --- 12: a displaced file is made 0600 in earlier/ ---
+reset_run; finished f12; chmod 644 "$d"/*; touch "$HOME/brief-fail"
+engine notes_cmd "$d"
+if [ "$rc" -eq 0 ] && [ "$(mode_of "$d/earlier/$STAMP/brief.json")" = 600 ]; then pass "a displaced file is made 0600 in earlier/"
+else fail "a displaced file is made 0600 in earlier/ (rc $rc): $(mode_of "$d/earlier/$STAMP/brief.json")"; fi
+
+# --- 13a: a process whose minutes failed, killed in its transcript-only swap: the next process exits 1 ---
+reset_run; finished f13; touch "$HOME/fm-empty"
+KILL_AT=2; kill_mv; killed_run process "$d/audio.m4a"; rc1=$rc; unset -f mv
+status_line=0; [ "$(tail -n 2 "$d/.swap" 2>/dev/null | tr '\n' '|')" = "status 1|end|" ] && status_line=1
+rm -f "$HOME/fm-empty"; : > "$HOME/calls.log"
+engine process "$d/audio.m4a"
+if [ "$rc1" = 137 ] && [ "$status_line" = 1 ] && [ "$rc" -eq 1 ] && [ "$(calls fm)" = 0 ] && [ "$(calls mb-speech)" = 0 ] \
+   && grep -q 'Me: Speaking from this desk' "$d/transcript.txt" && same "$d/notes.md" "$HOME/f13.old/notes.md" \
+   && [ "$(status_of "$d")" = 1 ] && no_stage "$d"; then
+  pass "a process whose minutes failed writes status 1 in .swap, and the process that finishes it exits 1"
+else fail "a process whose minutes failed writes status 1 in .swap, and the process that finishes it exits 1 ($rc1, $status_line, $rc): $out"; fi
+
+# --- 14: a TERM during the swap is ignored, and the run completes ---
+reset_run; finished f14
+KILL_AT=2; KILL_SIG=TERM; kill_mv; killed_run notes_cmd "$d"; unset -f mv; KILL_SIG=""
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/notes.md")" = "$FM_TEXT" ] && no_stage "$d"; then pass "a TERM during the swap is ignored, and the run completes"
+else fail "a TERM during the swap is ignored, and the run completes (rc $rc): $(ls -A "$d") $(cat "$HOME/killed.out")"; fi
 
 # ======================================================================== the command line
 
