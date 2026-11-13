@@ -239,9 +239,11 @@ func runRecorder(_ arguments: [String]) async -> Never {
         abort(CaptureError.systemAudioFailure(error))
     }
 
+    // Only a buffer that gives audio counts for health, so a microphone whose every buffer is
+    // unreadable shows as stalled ("not receiving audio") after 5 s, not as ok.
     let micRecorder = MicRecorder(onError: { health.error(from: .mic) }) { buffer, hostTime in
-        health.buffer(from: .mic)
         if let samples = micExtractor.samples(from: buffer) {
+            health.buffer(from: .mic)
             mixer.append(samples, from: .mic, at: hostTime)
         }
     }
