@@ -33,6 +33,8 @@ ROOM_COUNT=""                            # people in the room, 1 to 6; empty wor
 CALL_COUNT=""                            # people on the other end of the call, 1 to 6; empty works it out
 WRITER="apple"                           # who writes the minutes: apple
 WORK=""                                  # the run's private work folder, once made
+STAGE=""                                 # the run's staging folder in the meeting folder, once made
+RUN_DIR=""                               # the meeting folder a run holds, where it was when the run began
 LOCALE="${MB_LOCALE:-en-GB}"
 MIC="${MB_MIC:-}"                        # substring match, empty = system default
 WHISPER_MODEL="${MB_WHISPER_MODEL:-}"
@@ -1491,6 +1493,20 @@ voice_forget() {
   return 1
 }
 
+# The meeting folders, by name, one a line, holding a stage or a work folder that a stopped run left:
+# they hold copies, new files and, in a work folder, voice vectors. The next run in each removes them.
+leftover_staging() {
+  local root d f
+  for root in "$BASE_DIR" "$(app_meetings_folder)"; do
+    [ -n "$root" ] && [ -d "$root" ] || continue
+    for d in "$root"/*/; do
+      for f in "$d".stage.?????? "$d".work.??????; do
+        if [ -d "$f" ] && [ ! -L "$f" ]; then (cd "$d" && pwd -P); break; fi
+      done
+    done
+  done | LC_ALL=C sort -u | sed 's|.*/||'
+}
+
 doctor() {
   say "check"
   v="$(macos_major)"; [ -n "$v" ] && ok "macOS $v" || miss "not macOS"
@@ -1526,6 +1542,12 @@ doctor() {
     need_fm_license && miss "fm licence not accepted (sudo fm license)" || ok "fm"
   else miss "fm"; fi
   on_path && ok "$BIN_DIR on PATH" || miss "$BIN_DIR not on PATH"
+  left="$(leftover_staging)"
+  if [ -z "$left" ]; then
+    ok "no staging left by a stopped run in the meeting folders"
+  else
+    miss "staging left by a stopped run in: $(printf '%s\n' "$left" | paste -sd ',' - | sed 's/,/, /g'). The next run on that meeting removes it"
+  fi
   if recorder_ready; then
     info "microphones the recorder can see:"
     "$APP_BIN" --record -l 2>&1 | sed 's/^/             /' >&2 || true
@@ -1817,13 +1839,29 @@ engine_chain() {
 engine_name()  { case "$1" in parakeet) echo "Parakeet" ;; native) echo "Apple's transcriber" ;; *) echo "whisper" ;; esac; }
 engine_title() { case "$1" in parakeet) echo "NVIDIA Parakeet" ;; native) echo "Apple SpeechAnalyzer" ;; *) echo "whisper.cpp" ;; esac; }
 
-# The run's private work folder, made inside OUT, for WAVs and the speech helper's own temporary
-# files. drop_work removes it, and so does end_processing whatever happens.
+# The run's private work folder, made inside OUT (a run's stage), for WAVs, speakers files and the
+# speech helper's own temporary files. drop_work removes it, and so does the stage's removal whatever
+# happens.
 make_work() {
   [ -n "$WORK" ] && [ -d "$WORK" ] && return 0
   WORK="$(mktemp -d "${1:?}/.work.XXXXXX")" || die "could not make a working folder in $1"
 }
-drop_work() { [ -z "$WORK" ] || rm -rf "$WORK"; WORK=""; }
+drop_work() { local w="$WORK"; WORK=""; remove_own_folder "$w" || true; }
+
+# Removes a folder meetingbox made with mktemp -d: a stage or a work folder, whose last part is
+# .stage. or .work. and six characters, and which is a real folder, not a link. Anything else is left
+# alone. A removal that fails is a warning, never the end of a run: the next run in that meeting
+# folder removes it under the lock.
+remove_own_folder() {
+  local path="$1"
+  [ -n "$path" ] || return 0
+  case "${path##*/}" in
+    .stage.??????|.work.??????) ;;
+    *) warn "$path is not a staging or work folder, so it is left alone"; return 1 ;;
+  esac
+  [ -d "$path" ] && [ ! -L "$path" ] || return 0
+  rm -rf -- "$path" || { warn "could not remove $path; the next run in that folder removes it"; return 1; }
+}
 
 find_whisper_model() {
   [ -n "$WHISPER_MODEL" ] && { printf '%s' "$WHISPER_MODEL"; return; }
@@ -1926,15 +1964,17 @@ sa_run() {
 # run with its own temporary files in WORK too. The WAV and the helper's error file are removed
 # either way. Returns 0 when the helper succeeded, 2 when the audio could not be read, and 1 when the
 # helper failed, with SPEECH_REASON set to its one line without the "mb-speech: " prefix, or, when it
-# gave none, to a fixed line naming its exit status.
+# gave none, to a fixed line naming its exit status. WORK may be relative to the meeting folder a run
+# is in; the helper's TMPDIR is always a full path.
 # Usage: speech_run WORK AUDIO COMMAND OUT [ARGS...]
 speech_run() {
-  local work="$1" audio="$2" command="$3" out="$4" wav rc=0
+  local work="$1" audio="$2" command="$3" out="$4" wav tmpdir rc=0
   shift 4
   wav="$work/$(basename "${audio%.*}").wav"
+  case "$work" in /*) tmpdir="$work" ;; *) tmpdir="$PWD/$work" ;; esac
   SPEECH_REASON=""
   afconvert -f WAVE -d LEI16@16000 -c 1 "$audio" "$wav" >/dev/null 2>&1 || { rm -f "$wav"; return 2; }
-  TMPDIR="$work" "$SPEECH_BIN" "$command" "$SPEECH_MODELS" "$wav" "$out" "$@" >/dev/null 2>"$wav.err" || rc=$?
+  TMPDIR="$tmpdir" "$SPEECH_BIN" "$command" "$SPEECH_MODELS" "$wav" "$out" "$@" >/dev/null 2>"$wav.err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     SPEECH_REASON="$(head -n 1 "$wav.err")"; SPEECH_REASON="${SPEECH_REASON#mb-speech: }"
     SPEECH_REASON="${SPEECH_REASON:-the speech helper stopped without giving a reason (exit $rc)}"
@@ -1973,26 +2013,33 @@ whisper_words() {
   return "$rc"
 }
 
-# True when a side's transcription worked but heard no words: nothing in it that mb-transcript's
-# loadWords keeps, in any transcriber's shape (Apple's or Parakeet's "words", whisper's
-# "transcription"). loadWords keeps an entry with numeric times whose text, trimmed, is neither empty
-# nor in brackets, like [BLANK_AUDIO]; a file of only white space has no words. A side every
-# transcriber failed on says "engine": "none" and is not this, and nor is a file that cannot be read.
+# mb-transcript's loadWords filter, in jq: kept_words is the entries it keeps from a words file in any
+# transcriber's shape (Apple's or Parakeet's "words", whisper's "transcription"). It keeps an entry
+# with numeric times whose text, trimmed, is neither empty nor in brackets, like [BLANK_AUDIO].
+KEPT_WORDS_JQ='
+  def num: type == "number";
+  def kept: (.text | type) == "string"
+    and (.text | gsub("\\A\\s+|\\s+\\z"; "") | . != "" and ((startswith("[") and endswith("]") and length > 1) | not));
+  def entries(list): list | if type == "array" then .[] | objects else empty end;
+  def kept_words: [entries(.words) | select((.start | num) and (.end | num) and kept)]
+    + [entries(.transcription) | select((.offsets | type) == "object" and (.offsets.from | num)
+                                        and (.offsets.to | num) and kept)];'
+
+# True when a side's transcription worked but heard no words: nothing in it that loadWords keeps. A
+# file of only white space has no words. A side every transcriber failed on says "engine": "none" and
+# is not this, and nor is a file that cannot be read.
 heard_nothing() {
-  jq -e -s '
-    def num: type == "number";
-    def kept: (.text | type) == "string"
-      and (.text | gsub("\\A\\s+|\\s+\\z"; "") | . != "" and ((startswith("[") and endswith("]") and length > 1) | not));
-    def entries(list): list | if type == "array" then .[] | objects else empty end;
+  jq -e -s "$KEPT_WORDS_JQ"'
     if length == 0 then true
     elif length > 1 or (.[0] | type) != "object" then false
-    else .[0]
-      | (.engine // "") != "none"
-        and ([entries(.words) | select((.start | num) and (.end | num) and kept)]
-             + [entries(.transcription) | select((.offsets | type) == "object" and (.offsets.from | num)
-                                                 and (.offsets.to | num) and kept)]
-             | length) == 0
+    else .[0] | (.engine // "") != "none" and (kept_words | length) == 0
     end' "$1" >/dev/null 2>&1
+}
+
+# True when a words file holds at least one word that loadWords keeps.
+has_words() {
+  jq -e -s "$KEPT_WORDS_JQ"'
+    length == 1 and (.[0] | type) == "object" and (.[0] | kept_words | length) > 0' "$1" >/dev/null 2>&1
 }
 
 # The speakers on one side (spec 6.2): speech_run writes WORK/SIDE.speakers.json from the side's
@@ -2021,10 +2068,11 @@ find_speakers() {
 }
 
 # One side of the call to word timed JSON in OUT, for mb-transcript: each transcriber in turn. A
+# transcriber that says it worked but wrote something that is not a JSON object has failed too. A
 # side every transcriber fails on is written as no words, with a warning, and returns 1: one side
 # is better than none, but both failing is a different problem.
 transcribe_words() {
-  local audio="$1" out="$2" first="$3" e tried=""
+  local audio="$1" out="$2" first="$3" e tried="" worked
   for e in $(engine_chain "$first"); do
     case "$e" in
       native)  have speech-analyzer || continue ;;
@@ -2032,11 +2080,16 @@ transcribe_words() {
     esac
     [ -z "$tried" ] || warn "$(engine_name "$tried") could not transcribe $(basename "$audio"), trying $(engine_name "$e")"
     tried="$e"
+    worked=0
     case "$e" in
-      parakeet) pk_run "$audio" "$out" && return 0 ;;
-      native)   sa_run "$out" "$audio" -f json && return 0 ;;
-      whisper)  whisper_words "$audio" "$out" && return 0 ;;
+      parakeet) pk_run "$audio" "$out" && worked=1 ;;
+      native)   sa_run "$out" "$audio" -f json && worked=1 ;;
+      whisper)  whisper_words "$audio" "$out" && worked=1 ;;
     esac
+    if [ "$worked" = 1 ]; then
+      jq -e 'type == "object"' "$out" >/dev/null 2>&1 && return 0
+      info "$(engine_name "$e") wrote $(basename "$out"), but it cannot be read"
+    fi
   done
   warn "could not transcribe $(basename "$audio"), carrying on without it"
   printf '{"engine": "none", "words": []}\n' > "$out"
@@ -2051,18 +2104,19 @@ meeting_id() {
     id="$(jq -r '.id | select(type == "string" and length > 0 and length <= 200 and (test("[[:cntrl:]]") | not))' \
             "$1/meeting.json" 2>/dev/null)" || id=""
   fi
-  printf '%s' "${id:-$(basename "$1")}"
+  printf '%s' "${id:-$(basename "$(cd "$1" && pwd -P)")}"
 }
 
 # Your side and the other side transcribed on their own from the audio in SRC, then merged by
 # mb-transcript into labelled lines: Me, Room N, Them, Them N or Unknown, from the speakers found on
-# each side and the voice print. Every output goes in OUT, with the WAVs in the run's work folder
-# there: nothing in SRC is changed. With MEETING_ID (first processing only, never a redo), a call may
-# add to the voice print, but only to one on the install record.
+# each side and the voice print. Every output goes in OUT (a run's stage), with the WAVs and speakers
+# files in the run's work folder there: nothing in SRC is changed. The people counts, ROOM_COUNT and
+# CALL_COUNT, go to mb-transcript as --mic-count and --call-count. With MEETING_ID (process only, never
+# a redo), a call may add to the voice print, but only to one on the install record.
 # Usage: transcribe_channels SRC OUT [MEETING_ID]
 transcribe_channels() {
   local src="$1" dest="$2" learn="${3:-}" engine tmp err line held="" status=0 failed=0 plain="" side
-  local labels=()
+  local labels=() counts=()
   [ -x "$TRANSCRIPT_BIN" ] || die "mb-transcript is not installed. Run: meetingbox setup"
   engine="$(pick_engine)" || exit 1   # pick_engine has said why
   say "transcribing each side on device ($(engine_title "$engine"))"
@@ -2101,11 +2155,15 @@ transcribe_channels() {
     fi
   fi
 
+  # A count of 1 leaves that side unlabelled (there are no speakers for it), and 2 to 6 is that many.
+  case "$ROOM_COUNT" in [1-6]) counts+=(--mic-count "$ROOM_COUNT") ;; esac
+  case "$CALL_COUNT" in [1-6]) counts+=(--call-count "$CALL_COUNT") ;; esac
+
   # Written aside and moved, so a failure leaves no half transcript behind.
   tmp="$WORK/transcript.txt"; err="$WORK/transcript.err"
   tidy_lines || plain="--plain"
-  "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${labels[@]+"${labels[@]}"} ${plain:+"$plain"} \
-    > "$tmp" 2> "$err" || status=$?
+  "$TRANSCRIPT_BIN" --mic "$dest/mic.words.json" --call "$dest/call.words.json" ${labels[@]+"${labels[@]}"} \
+    ${counts[@]+"${counts[@]}"} ${plain:+"$plain"} > "$tmp" 2> "$err" || status=$?
   # The voice vectors go as soon as mb-transcript is done.
   rm -f "$WORK/mic.speakers.json" "$WORK/call.speakers.json"
   # Its "mb-transcript: " lines are warnings (a side it could not read is not a failure), and the last
@@ -2193,12 +2251,19 @@ split_chunks() {
   done
 }
 
+# The minutes of TRANSCRIPT, written into OUT, a run's stage: notes-raw.md, notes.md, brief.json when
+# the structured pass gives a JSON object, and .notes-written, the SHA-256 of that notes.md on one
+# line. They are built in a work folder made inside OUT; the minutes and the brief move out of it only
+# once whole, so a failed brief leaves no file. Returns 1, with MINUTES_WHY saying why, when there are
+# no minutes to write.
+# Usage: summarise TRANSCRIPT OUT
 summarise() {
-  transcript="$1"; dir="$2"
-  have fm || die "fm not found. It ships with macOS 27. Run: meetingbox setup"
+  local transcript="$1" dir="$2" work merged text tokens list total i c round rlist next schema
+  MINUTES_WHY=""
+  if ! have fm; then MINUTES_WHY="fm not found. It ships with macOS 27. Run: meetingbox setup"; return 1; fi
 
   # A fresh folder made here, so the clean up at the end can only delete that.
-  work="$(mktemp -d "${dir:?}/.work.XXXXXX")" || die "could not make a working folder in $dir"
+  if ! work="$(mktemp -d "${dir:?}/.work.XXXXXX")"; then MINUTES_WHY="could not make a working folder in $dir"; return 1; fi
   merged="$work/merged.txt"
 
   # fm reads the words and the speakers. The times are for people, and only cost tokens.
@@ -2217,7 +2282,11 @@ summarise() {
     list="$work/chunks.list"
     split_chunks "$text" "$work/chunks" "$CHUNK_WORDS" > "$list"
     total="$(grep -c . "$list" 2>/dev/null || true)"
-    [ "${total:-0}" -gt 0 ] || die "chunking produced nothing, the transcript may be unreadable"
+    if [ "${total:-0}" -le 0 ]; then
+      MINUTES_WHY="chunking produced nothing, the transcript may be unreadable"
+      remove_own_folder "$work" || true
+      return 1
+    fi
     say "summarising in $total slices"
 
     : > "$merged"
@@ -2264,10 +2333,16 @@ summarise() {
     warn "too much in this meeting for one final pass, so notes.md holds the merged notes in full"
     cp "$merged" "$work/final.md"
   fi
+  if [ ! -s "$work/final.md" ]; then
+    MINUTES_WHY="the minutes came out empty"
+    remove_own_folder "$work" || true
+    return 1
+  fi
   mv "$work/final.md" "$dir/notes.md"
 
   # Structured record beside the prose, so downstream tooling gets something it
-  # can parse rather than something it has to interpret.
+  # can parse rather than something it has to interpret. Written aside, and moved
+  # beside the minutes only when it reads as a JSON object.
   schema="$work/schema.json"
   if fm schema object --name MeetingBrief \
        --string summary \
@@ -2276,21 +2351,24 @@ summarise() {
        --string open_questions --array \
        --string numbers_and_dates --array > "$schema" 2>/dev/null
   then
-    if fm_run "$BRIEF_INSTRUCTIONS" "$merged" --schema "$schema" > "$dir/brief.json" 2>/dev/null; then
+    if fm_run "$BRIEF_INSTRUCTIONS" "$merged" --schema "$schema" > "$work/brief.json" 2>/dev/null \
+       && jq -e 'type == "object"' "$work/brief.json" >/dev/null 2>&1 && mv "$work/brief.json" "$dir/brief.json"; then
       ok "brief.json"
     else
       warn "structured pass failed, the prose minutes are still good"
-      rm -f "$dir/brief.json"
     fi
   fi
 
-  [ "${MB_DEBUG:-0}" = "1" ] || rm -rf "$work"
-  ok "minutes: $dir/notes.md"
+  # What meetingbox wrote, so a later run can tell a notes.md edited by hand.
+  shasum -a 256 "$dir/notes.md" | cut -d' ' -f1 > "$dir/.notes-written"
+
+  [ "${MB_DEBUG:-0}" = "1" ] || remove_own_folder "$work" || true
+  ok "minutes written"
 }
 
 # ------------------------------------------------------------------- processing
 
-# One `process` per folder at a time. The lock is the folder <dir>/.processing,
+# One run (process, notes or redo) per folder at a time. The lock is the folder <dir>/.processing,
 # made with mkdir, holding `owner`: "<pid> <that pid's start time>", so a PID
 # reused after a crash or reboot never passes for the owner. owner goes in with
 # ln, which never replaces a file, so of two processes taking over one stale
@@ -2322,9 +2400,18 @@ processing_lock_alive() {
 
 busy_die() { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit "$BUSY_EXIT"; }
 
+# A run's own answers to a signal: the exit trap then writes the result and releases the lock.
+run_traps() {
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+# Takes the lock in DIR; SHOWN is how messages name the folder (DIR itself unless given).
+# Usage: take_processing_lock DIR [SHOWN]
 take_processing_lock() {
-  local dir="$1" lock="$1/.processing" tmp me start owner seen moved took tries=0
-  tmp="$(mktemp "$dir/.processing-owner.XXXXXX")" || die "could not write in $dir"
+  local dir="$1" shown="${2:-$1}" lock="$1/.processing" tmp me start owner seen moved took tries=0
+  tmp="$(mktemp "$dir/.processing-owner.XXXXXX")" || die "could not write in $shown"
   # This shell's PID: $$ is the parent's in a subshell, and bash 3.2 has no BASHPID.
   sh -c 'printf "%s" "$PPID"' > "$tmp"
   me="$(cat "$tmp")"
@@ -2335,7 +2422,7 @@ take_processing_lock() {
   printf '%s\n' "$owner" > "$tmp"
   while :; do
     tries=$((tries + 1))
-    [ "$tries" -le 20 ] || { rm -f "$tmp"; busy_die "this meeting is already being processed: $dir"; }
+    [ "$tries" -le 20 ] || { rm -f "$tmp"; busy_die "this meeting is already being processed: $shown"; }
     if mkdir "$lock" 2>/dev/null; then
       ln "$tmp" "$lock/owner" 2>/dev/null && break
       continue   # taken over while we were between mkdir and ln: look again
@@ -2343,7 +2430,7 @@ take_processing_lock() {
     seen="$(cat "$lock/owner" 2>/dev/null || true)"
     if processing_lock_alive "$lock" "$seen"; then
       rm -f "$tmp"
-      busy_die "this meeting is already being processed: $dir"
+      busy_die "this meeting is already being processed: $shown"
     fi
     if [ -z "$seen" ]; then
       ln "$tmp" "$lock/owner" 2>/dev/null && break
@@ -2374,9 +2461,7 @@ take_processing_lock() {
   PROCESSING_DIR="$dir"
   PROCESSING_STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   trap 'end_processing $?' EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  run_traps
 }
 
 # Removes the lock only while it is still ours.
@@ -2389,13 +2474,17 @@ release_processing_lock() {
   PROCESSING_LOCK=""
 }
 
-# The last act of a locked run, on success or failure: .process-result written
-# aside and moved into place (so a reader never sees half of it), then the lock
-# released. The app counts a result only when its attempt is the one it started.
+# The last act of a locked run, on success or failure: the run's work folder and stage removed (a
+# stage that a .swap names stays, for the next run to finish from), then .process-result written aside
+# and moved into place (so a reader never sees half of it), then the lock released. The run is ending,
+# so nothing here may stop it: errexit is off, and a removal that fails is a warning. The app counts a
+# result only when its attempt is the one it started.
 end_processing() {
   local rc="$1" attempt result tmp_result
   trap - EXIT HUP INT TERM
+  set +e
   drop_work
+  drop_stage
   if [ -n "$PROCESSING_LOCK" ]; then
     attempt="$(printf '%s' "${MB_ATTEMPT:-}" | tr -cd 'A-Za-z0-9._-')"
     result="$PROCESSING_DIR/.process-result"
@@ -2418,57 +2507,429 @@ progress() {
   printf '%s\n' "$1" >> "$MB_PROGRESS_FILE" 2>/dev/null || true
 }
 
+# ------------------------------------------------ every run keeps what it replaces
+#
+# process, notes and redo all write a meeting folder the same way (spec 6.4). A run builds its new
+# files in a staging folder of its own inside the meeting folder. Only once they are all there and
+# whole does it copy each file it will overwrite into earlier/<YYYY-MM-DD HHMM>/, and then swap the new
+# files in, one rename at a time, under a .swap marker; a listed file it did not make is moved into
+# that earlier folder instead. A run killed before the swap has changed nothing. One killed during it
+# leaves the marker, and the next run on the folder finishes that swap first. Only the files on a
+# replace list are ever replaced, and none before its copy is in earlier/. Everything else in the
+# folder (the audio, meeting.json, transcripts others wrote) is never touched.
+
+# The replace lists, in the order the swap moves them in: .notes-written always last.
+TRANSCRIPTION_FILES="transcript.txt mic.words.json call.words.json"
+MINUTES_FILES="notes-raw.md brief.json notes.md .notes-written"
+SWAP_EXIT=3   # the swap could not finish, so .swap is left for the next run to finish
+
+swap_die() { printf '%s\n' "${c_r}     error${c_0} $*" >&2; exit "$SWAP_EXIT"; }
+
+# A file on a replace list, by its name in the meeting folder.
+listed_file() {
+  case "$1" in transcript.txt|mic.words.json|call.words.json|notes-raw.md|brief.json|notes.md|.notes-written) return 0 ;; esac
+  return 1
+}
+
+# The meeting folder is still where the run found it: RUN_DIR, the path the run was given, still leads
+# to the folder the run is in. A run works in it by relative paths, so one that was moved would still
+# write into it, but the app and the user would be looking elsewhere.
+still_here() { [ "$(stat -f %d:%i . 2>/dev/null)" = "$(stat -L -f %d:%i "$RUN_DIR" 2>/dev/null)" ]; }
+
+# Steps 1 to 5 of every run: the lock, taken in the folder itself; a swap a killed run left, finished
+# or discarded; leftovers cleared; an unfinished recording refused, for a run that transcribes; and
+# the run's stage, in STAGE. KIND is the run's own: process, minutes or transcribe. From here on the
+# run is in the meeting folder, and every path is relative to it.
+# Usage: begin_run DIR KIND AUDIO (DIR a full path; AUDIO is 1 for a run that transcribes the recording)
+begin_run() {
+  local dir="$1" kind="$2" audio="$3"
+  cd -P "$dir" || die "no such folder: $dir"
+  RUN_DIR="$dir"
+  take_processing_lock . "$RUN_DIR"
+  still_here || die "the meeting folder was moved, nothing was changed"
+  finish_swap "$kind"
+  clear_leftovers
+  if [ "$audio" = 1 ] && recording_unfinished .; then
+    die "this recording was not finished. Run: meetingbox recover $RUN_DIR"
+  fi
+  STAGE="$(mktemp -d .stage.XXXXXX)" || die "could not make a staging folder in $RUN_DIR"
+}
+
+# Reads the marker .swap into SWAP_KIND, SWAP_STAGE, SWAP_EARLIER, SWAP_MOVES and SWAP_DISPLACES. False,
+# with SWAP_WHY, unless it ends with its end line and names only what a run writes: a kind, a staging
+# folder of the meeting's own that is there, an earlier folder that is there (or - for none), and files
+# on the replace lists.
+read_swap() {
+  local line key value n=0 ended=0
+  SWAP_KIND=""; SWAP_STAGE=""; SWAP_EARLIER=""; SWAP_MOVES=""; SWAP_DISPLACES=""; SWAP_WHY=""
+  if [ -L .swap ] || [ ! -f .swap ]; then SWAP_WHY="is not a plain file"; return 1; fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    if [ "$ended" = 1 ]; then SWAP_WHY="goes on after its end line"; return 1; fi
+    key="${line%% *}"; value="${line#* }"
+    case "$n:$key" in
+      1:kind)    SWAP_KIND="$value" ;;
+      2:stage)   SWAP_STAGE="$value" ;;
+      3:earlier) SWAP_EARLIER="$value" ;;
+      *:move|*:displace)
+        listed_file "$value" || { SWAP_WHY="names a file no run replaces"; return 1; }
+        if [ "$key" = move ]; then SWAP_MOVES="$SWAP_MOVES $value"; else SWAP_DISPLACES="$SWAP_DISPLACES $value"; fi ;;
+      *:end)
+        [ "$line" = end ] || { SWAP_WHY="cannot be read"; return 1; }
+        ended=1 ;;
+      *) SWAP_WHY="cannot be read"; return 1 ;;
+    esac
+  done < .swap
+  if [ "$ended" = 0 ]; then SWAP_WHY="has no end line"; return 1; fi
+  case "$SWAP_KIND" in process|minutes|transcribe) ;; *) SWAP_WHY="names no kind of run"; return 1 ;; esac
+  case "$SWAP_STAGE" in
+    */*) SWAP_WHY="names no staging folder"; return 1 ;;
+    .stage.??????) ;;
+    *) SWAP_WHY="names no staging folder"; return 1 ;;
+  esac
+  if [ ! -d "$SWAP_STAGE" ] || [ -L "$SWAP_STAGE" ]; then SWAP_WHY="names a staging folder that is not there"; return 1; fi
+  case "$SWAP_EARLIER" in
+    -) [ -z "$SWAP_DISPLACES" ] || { SWAP_WHY="displaces files with no earlier folder"; return 1; } ;;
+    */*) SWAP_WHY="names no earlier folder"; return 1 ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\ [0-9][0-9][0-9][0-9]-[1-9]*)
+      # its copies are what the moves replace: without them, nothing is moved
+      if [ -L earlier ] || [ ! -d "earlier/$SWAP_EARLIER" ] || [ -L "earlier/$SWAP_EARLIER" ]; then
+        SWAP_WHY="names an earlier folder that is not there"; return 1
+      fi ;;
+    *) SWAP_WHY="names no earlier folder"; return 1 ;;
+  esac
+}
+
+# Step 9's renames, for this run's swap and for one a killed run left, as the SWAP_ variables give it:
+# each file moved from the stage over its target, .notes-written last, then each displaced file moved
+# into the earlier folder, where nothing of that name may be (a rename there never replaces a file). A
+# file already moved is skipped, so a swap a killed run began finishes the same way. Every file moved
+# in is touched, so the app counts it as written by the run that finished the swap. Interrupt signals
+# are ignored meanwhile. A rename that fails is logged and the rest still move: then it returns 1 and
+# .swap stays. Otherwise .swap is removed.
+apply_swap() {
+  local f failed=0
+  trap '' INT TERM HUP
+  for f in $SWAP_MOVES; do
+    if [ -e "$SWAP_STAGE/$f" ] && ! mv -f -- "$SWAP_STAGE/$f" "$f"; then
+      warn "could not move the new $f into place"
+      failed=1
+      continue
+    fi
+    if [ -e "$f" ]; then touch -- "$f" || true; fi
+  done
+  for f in $SWAP_DISPLACES; do
+    [ -e "$f" ] || continue
+    if [ -e "earlier/$SWAP_EARLIER/$f" ] || [ -L "earlier/$SWAP_EARLIER/$f" ] || ! mv -- "$f" "earlier/$SWAP_EARLIER/$f"; then
+      warn "could not move the old $f into earlier/$SWAP_EARLIER"
+      failed=1
+    fi
+  done
+  if [ "$failed" = 0 ]; then rm -f .swap || true; fi
+  run_traps
+  return "$failed"
+}
+
+# Step 2: a .swap marker a killed run left. One that is not whole (no end line), or that names a stage
+# or earlier folder that is not there, is removed with a log line. Otherwise that swap is finished
+# first. A run of the marker's own kind then stops with success, since its result is in place; a run
+# of another kind goes on with its own work.
+# Usage: finish_swap KIND
+finish_swap() {
+  [ -e .swap ] || [ -L .swap ] || return 0
+  if [ -d .swap ] && [ ! -L .swap ]; then die ".swap in $RUN_DIR is a folder, not meetingbox's marker. Move it away to go on"; fi
+  if ! read_swap; then
+    info "the .swap marker an interrupted run left $SWAP_WHY, so it is removed: none of its files is moved in"
+    rm -f .swap
+    return 0
+  fi
+  say "finishing the swap an interrupted run began"
+  apply_swap || swap_die "not every new file could be moved into place"
+  remove_own_folder "$SWAP_STAGE" || true
+  ok "the interrupted run's new files are in place"
+  if [ "$SWAP_KIND" = "$1" ]; then
+    progress done
+    exit 0
+  fi
+}
+
+# Step 3: what killed runs left: their staging folders, and a marker half written. In a folder the
+# recorder made (meeting.json, audio.m4a, mic.m4a or call.m4a is there), also a work folder from before
+# runs had stages, which may hold a WAV and speakers files with voice vectors; elsewhere a .work. folder
+# might not be meetingbox's, so it is left alone. None of them holds the only copy of anything.
+clear_leftovers() {
+  local f folders=".stage.??????"
+  if [ -e meeting.json ] || [ -e audio.m4a ] || [ -e mic.m4a ] || [ -e call.m4a ]; then folders="$folders .work.??????"; fi
+  for f in $folders; do
+    [ -d "$f" ] && [ ! -L "$f" ] || continue
+    info "removing $f, left by a run that stopped"
+    remove_own_folder "$f" || true
+  done
+  rm -f .swap.tmp || true
+}
+
+# Removes this run's stage, unless a .swap names it: then a swap is left part done, and the next run
+# finishes it from there.
+drop_stage() {
+  local s="$STAGE"
+  [ -n "$s" ] || return 0
+  STAGE=""
+  if [ -f .swap ] && grep -qxF "stage $s" .swap 2>/dev/null; then return 0; fi
+  remove_own_folder "$s" || true
+}
+
+# Step 7: the new files in the stage are there and whole. Each REQUIRED file is there; transcript.txt,
+# notes.md and notes-raw.md are not empty; every JSON file reads (a words file with no words does);
+# .notes-written is one SHA-256. Prints why not.
+# Usage: staged_whole REQUIRED...
+staged_whole() {
+  local f
+  for f in "$@"; do
+    [ -f "$STAGE/$f" ] || { printf 'the new %s was not written' "$f"; return 1; }
+  done
+  for f in transcript.txt notes.md notes-raw.md; do
+    [ ! -e "$STAGE/$f" ] || [ -s "$STAGE/$f" ] || { printf 'the new %s came out empty' "$f"; return 1; }
+  done
+  for f in mic.words.json call.words.json brief.json; do
+    [ ! -e "$STAGE/$f" ] || jq -e . "$STAGE/$f" >/dev/null 2>&1 || { printf 'the new %s cannot be read' "$f"; return 1; }
+  done
+  [ ! -e "$STAGE/.notes-written" ] || grep -Eqx '[0-9a-f]{64}' "$STAGE/.notes-written" \
+    || { printf 'the new .notes-written is not a SHA-256'; return 1; }
+}
+
+# For a redo: a side that has words in the folder now must still have words, or the redo fails and
+# nothing is changed. Prints why not.
+sides_keep_words() {
+  local side
+  for side in mic call; do
+    if [ -f "$side.words.json" ] && has_words "$side.words.json" && ! has_words "$STAGE/$side.words.json"; then
+      printf 'the %s side has words now, and transcribing it again found none' "$side"
+      return 1
+    fi
+  done
+}
+
+# notes.md was edited by hand since meetingbox wrote it: its SHA-256 is not the one .notes-written
+# holds, or there is no .notes-written.
+notes_hand_edited() {
+  [ -f .notes-written ] || return 0
+  [ "$(shasum -a 256 notes.md | cut -d' ' -f1)" != "$(head -n 1 .notes-written)" ]
+}
+
+# The swap for the files on a replace list: each one the run made in its stage moves in, made 0600;
+# each one it did not make that is in the folder is displaced: moved into earlier/ itself, in the swap.
+# .notes-written is never displaced, as it is never kept. Sets SWAP_MOVES, SWAP_DISPLACES and REPLACED,
+# the files in the folder that a move overwrites.
+# Usage: plan_swap FILE...
+plan_swap() {
+  local f
+  SWAP_MOVES=""; SWAP_DISPLACES=""; REPLACED=""
+  for f in "$@"; do
+    if [ -f "$STAGE/$f" ]; then
+      chmod 600 "$STAGE/$f" || true
+      SWAP_MOVES="$SWAP_MOVES $f"
+      if [ -e "$f" ]; then REPLACED="$REPLACED $f"; fi
+    elif [ "$f" != .notes-written ] && [ -e "$f" ]; then
+      SWAP_DISPLACES="$SWAP_DISPLACES $f"
+    fi
+  done
+}
+
+# Step 8, after plan_swap: a copy of each file a move overwrites (REPLACED), made in the stage's kept/
+# folder with a checked cp and compared byte for byte, then that folder renamed to the first free
+# earlier/<YYYY-MM-DD HHMM>[-N], so it appears whole or not at all. The displaced files join it in the
+# swap. .notes-written is never kept. A hand-edited notes.md is also copied to the first free
+# notes-edited-<stamp>[-N].md beside it, put in place with ln, which never replaces a file. Sets
+# EARLIER to the earlier folder's name, or - when nothing is replaced. Anything that fails stops the
+# run with the folder as it was.
+keep_earlier() {
+  local f stamp name n edited=0 made=0 keep=""
+  EARLIER="-"
+  for f in $REPLACED; do [ "$f" = .notes-written ] || keep="$keep $f"; done
+  [ -n "$keep$SWAP_DISPLACES" ] || return 0
+  stamp="$(date '+%Y-%m-%d %H%M')"
+  mkdir "$STAGE/kept" || die "could not make a folder for the copies in $RUN_DIR"
+  for f in $keep; do
+    { cp -- "$f" "$STAGE/kept/$f" && chmod 600 "$STAGE/kept/$f" && cmp -s -- "$f" "$STAGE/kept/$f"; } \
+      || die "could not keep a copy of $f"
+  done
+  case " $keep " in
+    *" notes.md "*)
+      if notes_hand_edited; then
+        { cp -- notes.md "$STAGE/notes-edited" && chmod 600 "$STAGE/notes-edited" && cmp -s -- notes.md "$STAGE/notes-edited"; } \
+          || die "could not keep a copy of the edited notes.md"
+        edited=1
+      fi ;;
+  esac
+  still_here || die "the meeting folder was moved, nothing was changed"
+  if [ -L earlier ] || { [ -e earlier ] && [ ! -d earlier ]; }; then die "earlier in $RUN_DIR is not a folder"; fi
+  if [ ! -d earlier ]; then mkdir earlier || die "could not make earlier/ in $RUN_DIR"; made=1; fi
+  name="$stamp"; n=1
+  while [ -e "earlier/$name" ] || [ -L "earlier/$name" ]; do n=$((n + 1)); name="$stamp-$n"; done
+  if ! mv -- "$STAGE/kept" "earlier/$name"; then
+    [ "$made" = 0 ] || rmdir earlier 2>/dev/null || true
+    die "could not move the copies into earlier/$name"
+  fi
+  EARLIER="$name"
+  if [ "$edited" = 1 ]; then
+    name="notes-edited-$stamp.md"; n=1
+    while [ -e "$name" ] || [ -L "$name" ]; do n=$((n + 1)); name="notes-edited-$stamp-$n.md"; done
+    if ! ln -- "$STAGE/notes-edited" "$name"; then
+      # the copies go back into the stage, so the folder is as it was
+      mv -- "earlier/$EARLIER" "$STAGE/kept" || true
+      [ "$made" = 0 ] || rmdir earlier 2>/dev/null || true
+      EARLIER="-"
+      die "could not keep the edited notes.md as $name"
+    fi
+    ok "your edited notes.md is kept as $name"
+  fi
+  ok "what this run replaces is kept in earlier/$EARLIER"
+}
+
+# The marker's lines: the kind, the stage, the earlier folder, each file to move in and each to
+# displace, and an end line.
+swap_lines() {
+  local f
+  printf 'kind %s\nstage %s\nearlier %s\n' "$SWAP_KIND" "$SWAP_STAGE" "$SWAP_EARLIER"
+  for f in $SWAP_MOVES; do printf 'move %s\n' "$f"; done
+  for f in $SWAP_DISPLACES; do printf 'displace %s\n' "$f"; done
+  printf 'end\n'
+}
+
+# Step 9: the marker, written to .swap.tmp (0600) and renamed into place, so it is whole or absent;
+# then the swap itself, and the stage removed. A swap that cannot finish leaves the marker and the
+# stage for the next run, and the run exits 3.
+# Usage: swap_in KIND (after plan_swap and keep_earlier)
+swap_in() {
+  SWAP_KIND="$1"; SWAP_STAGE="$STAGE"; SWAP_EARLIER="$EARLIER"
+  swap_lines > .swap.tmp && mv -f .swap.tmp .swap \
+    || { rm -f .swap.tmp || true; die "could not write the .swap marker in $RUN_DIR"; }
+  apply_swap || swap_die "not every new file could be moved into place"
+  drop_stage
+}
+
+# Steps 8 and 9 for the files on a replace list.
+# Usage: replace_files KIND FILE...
+replace_files() {
+  local kind="$1"
+  shift
+  plan_swap "$@"
+  keep_earlier
+  swap_in "$kind"
+}
+
+# The end of a run that worked: progress, the done sound and banner, and from a terminal the minutes.
+finish_run() {
+  progress done
+  chime done
+  notify "meetingbox" "Minutes ready"
+  ok "minutes: $RUN_DIR/notes.md"
+  if [ -t 1 ]; then
+    printf '\n'; cat notes.md; printf '\n'
+    have open && open notes.md 2>/dev/null || true
+  fi
+  end_processing 0
+}
+
+# process: a recording, a meeting folder (its audio.m4a) or a transcript file, to a transcript and
+# minutes. The meeting's own transcript.txt is a notes run. When the minutes fail, the new transcript
+# and words still go in, keeping what they replace, and the run fails: the meeting is Failed with a
+# transcript, and Redo minutes can finish it. Only process removes audio, for --no-keep-audio, and
+# only once the minutes are in place.
 process() {
   # transcripts and minutes are as private as the recording
   umask 077
-  input="$1"
+  local input="$1" dir name audio=1 two=0 required why=""
   # a meeting folder stands for its recording
   [ -d "$input" ] && input="${input%/}/audio.m4a"
   [ -d "$(dirname "$input")" ] || die "no such file: $input"
   dir="$(cd "$(dirname "$input")" && pwd)"
-  take_processing_lock "$dir"
-  case "${input##*.}" in
-    txt|md|vtt|srt) ;;
-    *) if recording_unfinished "$dir"; then
-         die "this recording was not finished. Run: meetingbox recover $dir"
-       fi ;;
-  esac
-  [ -e "$input" ] || die "no such file: $input"
-  transcript="$dir/transcript.txt"
-  # What --no-keep-audio removes once the minutes exist (summarise reuses $input).
-  spent_audio=""; spent_sides=0
+  name="$(basename "$input")"
+  if [ "$name" = transcript.txt ]; then notes_cmd "$dir"; return; fi
+  case "$name" in *.txt|*.md|*.vtt|*.srt) audio=0 ;; esac
+  begin_run "$dir" process "$audio"
+  [ -e "$name" ] || die "no such file: $input"
 
-  case "${input##*.}" in
-    txt|md|vtt|srt)
-      [ "$input" = "$transcript" ] || cp "$input" "$transcript" ;;
-    *)
-      progress transcribing
-      if [ -f "$dir/mic.m4a" ] && [ -f "$dir/call.m4a" ]; then
-        # the first processing of a meeting, so a call may teach meetingbox the user's voice
-        transcribe_channels "$dir" "$dir" "$(meeting_id "$dir")"
-        spent_audio="$input"; spent_sides=1
-      else
-        transcribe "$input" "$transcript"
-        spent_audio="$input"
-      fi ;;
-  esac
+  if [ "$audio" = 0 ]; then
+    cp -- "$name" "$STAGE/transcript.txt" || die "could not copy $name"
+  else
+    progress transcribing
+    if [ -f mic.m4a ] && [ -f call.m4a ]; then
+      # process, never a redo, so a call may teach meetingbox the user's voice
+      transcribe_channels . "$STAGE" "$(meeting_id .)"
+      two=1
+    else
+      transcribe "$name" "$STAGE/transcript.txt"
+    fi
+  fi
+  required="transcript.txt"
+  [ "$two" = 0 ] || required="$required mic.words.json call.words.json"
+  # shellcheck disable=SC2086   # file names, without spaces
+  why="$(staged_whole $required)" || die "$why"
 
   progress minutes
-  summarise "$transcript" "$dir"
-  # --no-keep-audio: only now the minutes exist, so a failed run never loses audio.
-  if [ "$KEEP_AUDIO" != "1" ] && [ -n "$spent_audio" ]; then
-    rm -f "$spent_audio"
-    [ "$spent_sides" = 0 ] || rm -f "$dir/mic.m4a" "$dir/call.m4a"
+  if summarise "$STAGE/transcript.txt" "$STAGE" && why="$(staged_whole notes.md notes-raw.md .notes-written)"; then
+    # shellcheck disable=SC2086   # file names, without spaces
+    replace_files process $TRANSCRIPTION_FILES $MINUTES_FILES
+  else
+    why="${MINUTES_WHY:-$why}"
+    warn "the minutes could not be written, so only the new transcript goes in"
+    # shellcheck disable=SC2086   # file names, without spaces
+    replace_files process $TRANSCRIPTION_FILES
+    die "${why:-the minutes could not be written}"
   fi
-  progress done
-  chime done
-  notify "meetingbox" "Minutes ready"
+  # --no-keep-audio: only now the minutes are in place, so a failed run never loses audio.
+  if [ "$KEEP_AUDIO" != "1" ] && [ "$audio" = 1 ]; then
+    rm -f -- "$name"
+    [ "$two" = 0 ] || rm -f mic.m4a call.m4a
+  fi
+  finish_run
+}
 
-  if [ -t 1 ]; then
-    printf '\n'; cat "$dir/notes.md"; printf '\n'
-    have open && open "$dir/notes.md" 2>/dev/null || true
+# notes (Redo minutes): the minutes again from the folder's transcript.txt, which it never changes. It
+# never transcribes, so it never learns a voice, and it never removes audio.
+notes_cmd() {
+  umask 077
+  local dir why
+  [ -d "$1" ] || die "no such folder: $1"
+  dir="$(cd "$1" && pwd)"
+  begin_run "$dir" minutes 0
+  [ -s transcript.txt ] || die "there is no transcript in $RUN_DIR to write the minutes from"
+  progress minutes
+  summarise transcript.txt "$STAGE" || die "${MINUTES_WHY:-the minutes could not be written}"
+  why="$(staged_whole notes.md notes-raw.md .notes-written)" || die "$why"
+  # shellcheck disable=SC2086   # file names, without spaces
+  replace_files minutes $MINUTES_FILES
+  finish_run
+}
+
+# redo (Transcribe again): the recording transcribed again, its speakers found again with the people
+# counts given, and the minutes written again. It passes no meeting id, so it never teaches meetingbox
+# the user's voice, and it never removes audio. A side that has words now and none after fails it.
+redo_cmd() {
+  umask 077
+  local dir why
+  [ -d "$1" ] || die "no such folder: $1"
+  dir="$(cd "$1" && pwd)"
+  begin_run "$dir" transcribe 1
+  if [ -f mic.m4a ] && [ -f call.m4a ]; then
+    progress transcribing
+    transcribe_channels . "$STAGE"
+    why="$(staged_whole transcript.txt mic.words.json call.words.json)" || die "$why"
+    why="$(sides_keep_words)" || die "$why"
+  elif [ -f audio.m4a ]; then
+    progress transcribing
+    transcribe audio.m4a "$STAGE/transcript.txt"
+    why="$(staged_whole transcript.txt)" || die "$why"
+  else
+    die "there is no recording in $RUN_DIR to transcribe again"
   fi
-  end_processing 0
+  progress minutes
+  summarise "$STAGE/transcript.txt" "$STAGE" || die "${MINUTES_WHY:-the minutes could not be written}"
+  why="$(staged_whole notes.md notes-raw.md .notes-written)" || die "$why"
+  # shellcheck disable=SC2086   # file names, without spaces
+  replace_files transcribe $TRANSCRIPTION_FILES $MINUTES_FILES
+  finish_run
 }
 
 # ----------------------------------------------------------------------- reset
@@ -2659,7 +3120,9 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox                       toggle: start, or stop and write the minutes
   meetingbox start | stop | status
   meetingbox pause | resume
-  meetingbox process <audio|txt>   run an existing file through the pipeline
+  meetingbox process <file|folder> run a recording or a transcript through the pipeline
+  meetingbox notes <folder>        write the minutes again from its transcript
+  meetingbox redo <folder>         transcribe it again, then write the minutes again
   meetingbox recover <folder>      finish a recording that was interrupted
   meetingbox doctor                what is installed and what is not
   meetingbox engines               which transcribers are ready, and your voice print
@@ -2678,13 +3141,17 @@ Options
   --locale en-GB         transcription locale          (MB_LOCALE)
   --parakeet | --native | --whisper   pick the transcriber   (MB_ENGINE)
   --tidy | --no-tidy     tidy transcript lines, or a line per turn with every word
+  --room N | --call N    people in the room (you included) and on the call, 1 to 6,
+                         for redo; without them it works them out
   --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
-  --no-keep-audio        bin the m4a files once transcribed
+  --no-keep-audio        bin the m4a files once processed (notes and redo never do)
 
 Output lands in ~/Meetings/<date>_<time>/
   audio.m4a  mic.m4a  call.m4a       the mix, your side, the other side
   transcript.txt                     who said what, labelled by speaker
   notes.md  notes-raw.md  brief.json
+  earlier/<date> <time>/             what a later run replaced, kept byte for byte
+  notes-edited-<date> <time>.md      your own edits to notes.md, kept when it is replaced
 USAGE
 }
 
@@ -2706,6 +3173,13 @@ parse_args() {
       --parakeet) ENGINE="parakeet"; shift ;;
       --tidy)    TIDY=1; shift ;;
       --no-tidy) TIDY=0; shift ;;
+      --room|--call)
+        case "${2:-}" in
+          [1-6]) ;;
+          *) die "$1 takes a number of people from 1 to 6" ;;
+        esac
+        if [ "$1" = --room ]; then ROOM_COUNT="$2"; else CALL_COUNT="$2"; fi
+        shift 2 ;;
       --writer)
         case "${2:-}" in
           apple) WRITER="apple" ;;
@@ -2742,6 +3216,10 @@ case "${cmd:-toggle}" in
   stop)    stop_recording ;;
   process) [ -n "$argfile" ] || die "usage: meetingbox process <audio-or-transcript>"
            process "$argfile" ;;
+  notes)   [ -n "$argfile" ] || die "usage: meetingbox notes <folder>"
+           notes_cmd "$argfile" ;;
+  redo)    [ -n "$argfile" ] || die "usage: meetingbox redo <folder>"
+           redo_cmd "$argfile" ;;
   recover) [ -n "$argfile" ] || die "usage: meetingbox recover <folder>"
            recover_cmd "$argfile" ;;
   setup)   setup ;;

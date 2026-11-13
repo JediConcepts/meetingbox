@@ -485,7 +485,8 @@ open() {
 fm() {
   case "$1" in
     count-tokens) cat >/dev/null; echo 100 ;;
-    respond) cat >/dev/null; echo "the minutes" ;;
+    respond) cat >/dev/null
+             case " $* " in *" --schema "*) echo '{"summary": "the brief"}' ;; *) echo "the minutes" ;; esac ;;
     schema) echo '{}' ;;
     *) return 1 ;;
   esac
@@ -493,12 +494,12 @@ fm() {
 d="$(meeting u1 audio.m4a mic.m4a call.m4a)"
 (umask 022; process "$d/audio.m4a") >/dev/null 2>&1
 bad=""
-for f in mic.words.json call.words.json transcript.txt notes.md notes-raw.md brief.json .process-result; do
+for f in mic.words.json call.words.json transcript.txt notes.md notes-raw.md brief.json .notes-written .process-result; do
   [ -e "$d/$f" ] || { bad="$bad $f(missing)"; continue; }
   [ "$(mode_of "$d/$f")" = 600 ] || bad="$bad $f($(mode_of "$d/$f"))"
 done
-if [ -z "$bad" ]; then pass "words.json, transcript, minutes and result are all 0600"
-else fail "words.json, transcript, minutes and result are all 0600:$bad"; fi
+if [ -z "$bad" ]; then pass "words.json, transcript, minutes, .notes-written and result are all 0600"
+else fail "words.json, transcript, minutes, .notes-written and result are all 0600:$bad"; fi
 # M4: and on failure too, when the transcriber wrote a file and then said Error
 open() {
   local o="" e="" prev="" a
@@ -590,10 +591,11 @@ if [ "$(jq -r .engine "$d/mic.words.json")" = parakeet-ultra ] && [ "$(mode_of "
 else fail "Parakeet's words files are kept, 0600"; fi
 line="$(grep '^mb-speech transcribe' "$HOME/calls.log" | head -1)"
 wav="$(printf '%s' "$line" | sed -n 's/.* wav=\([^ ]*\) .*/\1/p')"
-case "$wav" in "$d"/.work.??????/mic.wav) wav_ok=1 ;; *) wav_ok=0 ;; esac
-if [ "$wav_ok" = 1 ] && printf '%s' "$line" | grep -q "exists=yes tmp=$(dirname "$wav")\$" && ! ls -a "$d" | grep -q '^\.work'; then
-  pass "the helper gets a WAV in the run's work folder, with TMPDIR there, and the folder is removed"
-else fail "the helper gets a WAV in the run's work folder, with TMPDIR there, and the folder is removed: $line"; fi
+case "$wav" in .stage.??????/.work.??????/mic.wav) wav_ok=1 ;; *) wav_ok=0 ;; esac
+if [ "$wav_ok" = 1 ] && printf '%s' "$line" | grep -qF "exists=yes tmp=$(cd "$d" && pwd -P)/$(dirname "$wav")" \
+   && ! ls -a "$d" | grep -q '^\.work\|^\.stage'; then
+  pass "the helper gets a WAV in the work folder inside the run's stage, with TMPDIR there as a full path, and both are removed"
+else fail "the helper gets a WAV in the work folder inside the run's stage, with TMPDIR there as a full path, and both are removed: $line"; fi
 if [ "$(pk_calls curl)" = 0 ]; then pass "processing never calls curl"; else fail "processing never calls curl"; fi
 
 # --- --native, or the app's preference for Apple, uses Apple's ---
@@ -636,7 +638,7 @@ d="$(meeting pk6 audio.m4a mic.m4a call.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
 if [ "$rc" -eq 0 ] && grep -q 'Me: Speaking' "$d/transcript.txt" && grep -q 'Them: Hello' "$d/transcript.txt" \
    && [ "$(pk_calls whisper-cli)" = 1 ] \
-   && grep -q "^whisper-cli .*$d/.work" "$HOME/calls.log" && ! ls -a "$d" | grep -q '\.wav$\|^\.work'; then
+   && grep -q '^whisper-cli .* -f \.stage\.[^/ ]*/\.work\.[^/ ]*/call\.16k\.wav ' "$HOME/calls.log" && ! ls -a "$d" | grep -q '\.wav$\|^\.work\|^\.stage'; then
   pass "Parakeet and Apple's failing on the call side: whisper there, its WAV in the work folder"
 else fail "Parakeet and Apple's failing on the call side: whisper there, its WAV in the work folder (rc $rc): $out"; fi
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
@@ -791,10 +793,10 @@ paths_ok=1
 for side in mic call; do
   line="$(sp_line "$side")"
   wav="$(printf '%s' "$line" | sed -n 's/.* wav=\([^ ]*\) .*/\1/p')"
-  case "$wav" in "$d"/.work.??????/"$side".wav) ;; *) paths_ok=0 ;; esac
-  printf '%s' "$line" | grep -qF " exists=yes out=$(dirname "$wav")/$side.speakers.json more= tmp=$(dirname "$wav")" || paths_ok=0
+  case "$wav" in .stage.??????/.work.??????/"$side".wav) ;; *) paths_ok=0 ;; esac
+  printf '%s' "$line" | grep -qF " exists=yes out=$(dirname "$wav")/$side.speakers.json more= tmp=$(cd "$d" && pwd -P)/$(dirname "$wav")" || paths_ok=0
 done
-if [ "$paths_ok" = 1 ] && [ -z "$(find "$d" -name '*speakers*')" ] && ! ls -a "$d" | grep -q '^\.work\|\.wav$'; then
+if [ "$paths_ok" = 1 ] && [ -z "$(find "$d" -name '*speakers*')" ] && ! ls -a "$d" | grep -q '^\.work\|^\.stage\|\.wav$'; then
   pass "each side's WAV and speakers file are in the run's work folder, with TMPDIR there, and none is left"
 else fail "each side's WAV and speakers file are in the run's work folder, with TMPDIR there, and none is left: $(grep '^mb-speech speakers' "$HOME/calls.log") $(find "$d")"; fi
 if [ "$(tr '\n' ' ' < "$HOME/progress-sp1" 2>/dev/null)" = "transcribing speakers minutes done " ]; then
@@ -1099,7 +1101,7 @@ if [ "$rc" -eq 0 ] && grep -q '^\[00:00:00\] Me: Right, so the plan for today is
 else fail "the speaker fixtures give Me, Room 1 and Them lines end to end (rc $rc): $out $(cat "$t" 2>/dev/null)"; fi
 args="$(lb_args)"
 case "$args" in
-  *" --mic-speakers $d/.work."??????"/mic.speakers.json --call-speakers $d/.work."??????"/call.speakers.json --voice $VOICE_FILE"*) args_ok=1 ;;
+  *" --mic-speakers .stage."??????"/.work."??????"/mic.speakers.json --call-speakers .stage."??????"/.work."??????"/call.speakers.json --voice $VOICE_FILE"*) args_ok=1 ;;
   *) args_ok=0 ;;
 esac
 if [ "$args_ok" = 1 ] && [ -z "$(find "$d" -name '*speakers*')" ]; then

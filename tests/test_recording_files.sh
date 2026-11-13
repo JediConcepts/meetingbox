@@ -76,9 +76,17 @@ new_session() {
   rm -rf "$dir"; mkdir -p "$dir"; printf '%s' "$dir" > "$DIR_FILE"; : > "$HOME/calls.log"
 }
 # --- process refuses a recording that was never finished ---
-transcribe_channels() { echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2/transcript.txt"; }   # SRC OUT
+# Stand-ins that write what a run checks before it swaps anything in: the transcript and both words
+# files, then the minutes, the raw notes and .notes-written.
+transcribe_channels() {   # SRC OUT
+  echo "transcribe_channels $*" >> "$HOME/calls.log"; printf 'Me: hi\n' > "$2/transcript.txt"
+  printf '{"words": []}\n' > "$2/mic.words.json"; printf '{"words": []}\n' > "$2/call.words.json"
+}
 transcribe() { echo "transcribe $*" >> "$HOME/calls.log"; printf 'hi\n' > "$2"; }
-summarise() { echo "summarise $*" >> "$HOME/calls.log"; printf '# notes\n' > "$2/notes.md"; }
+summarise() {
+  echo "summarise $*" >> "$HOME/calls.log"; printf '# notes\n' > "$2/notes.md"; printf 'notes\n' > "$2/notes-raw.md"
+  shasum -a 256 "$2/notes.md" | cut -d' ' -f1 > "$2/.notes-written"
+}
 chime() { :; }
 
 new_session; rm -f "$DIR_FILE"; printf 'pcm' > "$dir/mic.caf"; printf 'pcm' > "$dir/call.caf"
