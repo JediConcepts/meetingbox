@@ -757,7 +757,13 @@ install_speech() {
   # Recorded only if it is not there yet: a folder of the user's own is never claimed.
   if cache="$(speech_cache)" && [ ! -e "$cache" ] && [ ! -L "$cache" ]; then record_install "$cache"; fi
   if [ ! -e "$VOICE_FILE" ] && [ ! -L "$VOICE_FILE" ]; then record_install "$VOICE_FILE"; fi
-  if [ ! -e "$VOICE_LOCK" ] && [ ! -L "$VOICE_LOCK" ]; then record_install "$VOICE_LOCK"; fi
+  # The voice print's lock: when absent, or when a writer already made it beside a voice print setup
+  # recorded (a plain file in the state folder, never a link), so reset and uninstall never leave it.
+  if { [ ! -e "$VOICE_LOCK" ] && [ ! -L "$VOICE_LOCK" ]; } \
+     || { [ -f "$VOICE_LOCK" ] && [ ! -L "$VOICE_LOCK" ] && [ "$(dirname "$VOICE_LOCK")" = "$STATE_DIR" ] \
+          && installed_by_us "$VOICE_FILE"; }; then
+    record_install "$VOICE_LOCK"
+  fi
 
   if [ -e "$SPEECH_MODELS" ] || [ -L "$SPEECH_MODELS" ]; then
     installed_by_us "$SPEECH_MODELS" || { claim_path "$SPEECH_MODELS"; speech_step_failed "the models folder is not meetingbox's"; return 1; }
@@ -1390,7 +1396,8 @@ voice_words() {
     printf '%s' "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
     return
   fi
-  minutes=$((seconds / 60)); [ "$minutes" = 1 ] && minutes="1 minute" || minutes="$minutes minutes"
+  # to the nearest minute, a half up, as Preferences rounds them
+  minutes=$(((seconds + 30) / 60)); [ "$minutes" = 1 ] && minutes="1 minute" || minutes="$minutes minutes"
   if [ "$kind" = sample ]; then calls=$((meetings - 1)); else calls="$meetings"; fi
   [ "$calls" = 1 ] && calls="1 call" || calls="$calls calls"
   if [ "$kind" = learnt ]; then printf 'Your voice: learnt from %s (%s of speech)' "$calls" "$minutes"

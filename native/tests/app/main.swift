@@ -1614,14 +1614,17 @@ final class FakeRunner: PipelineRunner {
         let attemptsAtRun: Int?
         let attemptAtRun: String?
         let errorAtRun: String?
+        /// `.process-log` as it was when the run began.
+        let logAtRun: String?
     }
     var calls: [Call] = []
     func run(_ job: PipelineJob, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
         let json = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: job.folder
             .appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
+        let log = try? String(contentsOf: job.folder.appendingPathComponent(".process-log"), encoding: .utf8)
         calls.append(Call(job: job, progress: progress, attempt: attempt, done: done,
                           stateAtRun: json["state"] as? String, attemptsAtRun: (json["attempts"] as? NSNumber)?.intValue,
-                          attemptAtRun: json["attempt"] as? String, errorAtRun: json["error"] as? String))
+                          attemptAtRun: json["attempt"] as? String, errorAtRun: json["error"] as? String, logAtRun: log))
         return Int32(40000 + calls.count)
     }
     var folders: [String] { calls.map { $0.audio.deletingLastPathComponent().lastPathComponent } }
@@ -5103,15 +5106,27 @@ final class FakeEngine: EngineCommands {
 }
 
 /// Records each sample; the test says when it is capturing, or why it cannot. It writes the
-/// sample.caf the real recorder would, so the folder has something in it.
+/// sample.caf the real recorder would, so the folder has something in it. A stop is done at once
+/// (`stopsAtOnce`), or held until the test finishes it, as the real one finishes on its own queue.
 final class FakeSampler: SampleRecorder {
     var starts: [(folder: URL, microphone: String?, started: (String?) -> Void)] = []
     var stops = 0
+    var stopsAtOnce = true
+    /// The stops not finished yet, oldest first.
+    var pendingStops: [() -> Void] = []
+    /// Told at each stop, as it is asked for.
+    var onStop: (() -> Void)?
     func start(folder: URL, microphone: String?, started: @escaping (String?) -> Void) {
         starts.append((folder, microphone, started))
         try? Data("caf".utf8).write(to: folder.appendingPathComponent("sample.caf"))
     }
-    func stop() { stops += 1 }
+    func stop(_ done: @escaping () -> Void) {
+        stops += 1
+        onStop?()
+        if stopsAtOnce { done() } else { pendingStops.append(done) }
+    }
+    /// Finishes the stop at `i` among those pending (the oldest by default).
+    func finishStop(_ i: Int = 0) { pendingStops.remove(at: i)() }
 }
 
 func lexists(_ url: URL) -> Bool { var s = stat(); return lstat(url.path, &s) == 0 }
@@ -5209,6 +5224,7 @@ do {
           && log == "The minutes writer llama3 at localhost was set aside because its source was removed, changed or not agreed. Apple's model writes the minutes.\n"
           && mode(c.appendingPathComponent(".process-log")) == 0o600,
           "T6 queue: a writer set aside at launch: Apple writes, and .process-log (0600) says why first (\(log))")
+    check(r.runner.calls[2].logAtRun == log, "T6 queue: the set-aside line is in .process-log before the engine is launched")
     r.runner.finish(2, 0)
 }
 
@@ -5285,6 +5301,10 @@ do {
           "T6 voice status: 391 s from 1 call")
     check(PreferencesPresentation.voiceStatus(seconds: 754, meetings: 3, sample: false) == "Your voice: learnt from 3 calls (13 minutes of speech)",
           "T6 voice status: 754 s from 3 calls")
+    check(PreferencesPresentation.voiceStatus(seconds: 95, meetings: 1, sample: true) == "Your voice: from a recorded sample (2 minutes of speech)"
+          && PreferencesPresentation.voiceStatus(seconds: 90, meetings: 2, sample: false) == "Your voice: learnt from 2 calls (2 minutes of speech)"
+          && PreferencesPresentation.voiceStatus(seconds: 89, meetings: 2, sample: false) == "Your voice: learnt from 2 calls (1 minute of speech)",
+          "T6 voice status: minutes to the nearest, a half up, as doctor says them (95 s and 90 s are 2 minutes, 89 s is 1)")
     check(PreferencesPresentation.voiceStatus(seconds: 75, meetings: 1, sample: true) == "Your voice: from a recorded sample (1 minute of speech)",
           "T6 voice status: 75 s from a sample")
     check(PreferencesPresentation.voiceStatus(seconds: 200, meetings: 3, sample: true) == "Your voice: from a recorded sample and 2 calls (3 minutes of speech)",
@@ -5349,6 +5369,10 @@ MainActor.assumeIsolated {
     try! fm.createDirectory(at: samples, withIntermediateDirectories: true)
     let plainFile = state.appendingPathComponent("sample.fil789")
     try! Data("x".utf8).write(to: plainFile)
+    let seven = state.appendingPathComponent("sample.abcdefg", isDirectory: true)
+    let five = state.appendingPathComponent("sample.abc12", isDirectory: true)
+    try! fm.createDirectory(at: seven, withIntermediateDirectories: true)
+    try! fm.createDirectory(at: five, withIntermediateDirectories: true)
     let rec = FakeRecorder()
     let runner = FakeRunner()
     let engine = FakeEngine()
@@ -5368,6 +5392,7 @@ MainActor.assumeIsolated {
     model.launch()
     check(!lexists(leftover) && lexists(link) && lexists(target.appendingPathComponent("keep.txt")) && lexists(samples) && lexists(plainFile),
           "T6 launch: a leftover sample.abc123 folder is removed; a sample.* link, its target, a folder named samples and a file are not")
+    check(lexists(seven) && lexists(five), "T6 launch: folders named sample. and seven or five characters are not sample folders, and stay")
     check(settle { runner.calls.count == 1 } && runner.calls[0].arguments
           == ["process", waiting.appendingPathComponent("audio.m4a").path, "--native", "--no-tidy", "--writer", "apple"],
           "T6 app: the queue launches with the transcriber and tidying chosen in Preferences (\(runner.calls.first?.arguments ?? []))")
@@ -5467,13 +5492,18 @@ MainActor.assumeIsolated {
     sampler.starts[3].started(nil)
     model.tickSample()
     let stopsBefore = sampler.stops
+    var launchesAtStop: [Int] = []
+    sampler.onStop = { launchesAtStop.append(rec.launches.count) }
     let reply = model.handler.reply(for: .start(mic: nil, dir: nil))
+    sampler.onStop = nil
     check(sampler.stops == stopsBefore + 1 && !lexists(folder4) && model.sample == .failed("Stopped because a meeting started recording.")
           && reply.hasPrefix("ok recording") && rec.launches.count == 1
           && engine.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count == voiceAdds,
           "T6 willStart: a socket start while sampling stops the sampler, removes its folder, fails the sample, and the recording starts (\(reply))")
+    check(launchesAtStop == [0], "T6 willStart: the sampler is stopped before the recorder is launched (\(launchesAtStop))")
     sampler.starts[3].started(nil)
-    check(model.sample == .failed("Stopped because a meeting started recording."), "T6 willStart: a late word from the cancelled sampler changes nothing")
+    check(model.sample == .failed("Stopped because a meeting started recording.") && sampler.stops == stopsBefore + 2,
+          "T6 willStart: a late word from the cancelled sampler that it is capturing only stops it again")
     model.closeSample()
 
     // Not while recording, paused or finalising.
@@ -5495,10 +5525,14 @@ MainActor.assumeIsolated {
     model.recordSample()
     let folder5 = sampler.starts[4].folder
     sampler.starts[4].started(nil)
+    let stopsBeforeToggle = sampler.stops
+    launchesAtStop = []
+    sampler.onStop = { launchesAtStop.append(rec.launches.count) }
     let reply2 = model.handler.reply(for: .toggle(mic: nil, dir: nil))
-    check(sampler.stops == stopsBefore + 2 && !lexists(folder5) && model.sample == .failed("Stopped because a meeting started recording.")
-          && reply2.hasPrefix("ok recording") && rec.launches.count == 2,
-          "T6 willStart: a toggle that becomes a start does the same (\(reply2))")
+    sampler.onStop = nil
+    check(sampler.stops == stopsBeforeToggle + 1 && !lexists(folder5) && model.sample == .failed("Stopped because a meeting started recording.")
+          && reply2.hasPrefix("ok recording") && rec.launches.count == 2 && launchesAtStop == [1],
+          "T6 willStart: a toggle that becomes a start does the same, the sampler stopped before the recorder is launched (\(reply2), \(launchesAtStop))")
     model.closeSample()
     let pid2 = rec.nextPid
     model.perform(.stop)
@@ -5535,6 +5569,107 @@ MainActor.assumeIsolated {
     check(sampler.stops == stopsBeforeQuit + 1 && !lexists(folder7) && model.sample == .idle,
           "T6 sample: quitting while a sample records stops it and removes its folder")
     watch.cancel()
+
+    // Round 1: the sampler stops on its own queue and says, on the main queue, when the sample is final.
+    // This one holds every stop until the test finishes it.
+    let state3 = shortTemp()
+    let prefs3 = Preferences(defaults: testDefaults(), home: root)
+    prefs3.meetingsFolder = freshRoot()
+    prefs3.sounds = false
+    let rec3 = FakeRecorder()
+    let engine3 = FakeEngine()
+    let slow = FakeSampler()
+    slow.stopsAtOnce = false
+    let m3 = AppModel(stateDir: state3, preferences: prefs3, recorder: rec3, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                      engine: engine3, sampler: slow)
+    m3.launch()
+    func voiceAdds3() -> Int { engine3.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count }
+    let stoppedForMeeting = SampleState.failed("Stopped because a meeting started recording.")
+
+    // Building starts only once the sample is final.
+    m3.recordSample()
+    let s1 = slow.starts[0].folder
+    slow.starts[0].started(nil)
+    m3.tickSample()
+    m3.stopSample()
+    check(slow.stops == 1 && slow.pendingStops.count == 1 && m3.sample == .recording(secondsLeft: 89) && voiceAdds3() == 0 && !m3.canRecordSample,
+          "R1 sample: Stop asks the sampler to stop and returns; nothing is built until the sample is final")
+    m3.stopSample()
+    m3.tickSample()
+    check(slow.stops == 1 && m3.sample == .recording(secondsLeft: 89), "R1 sample: while it stops, Stop and the clock change nothing")
+    slow.finishStop()
+    check(m3.sample == .building && voiceAdds3() == 1 && engine3.calls.last?.arguments == ["voice", "add", s1.appendingPathComponent("sample.caf").path],
+          "R1 sample: once the sampler says the sample is final: building, and voice add")
+    engine3.answerLast(0, "sample 70\n")
+    check(m3.sample == .done("Your voice is learnt from this sample (1 minute of speech).") && !lexists(s1), "R1 sample: and it ends as before")
+    engine3.answerLast(0, "parakeet ready\napple ready\nvoice 70 1 sample\n")
+    m3.closeSample()
+    // The same at the end of the countdown.
+    m3.recordSample()
+    let s1b = slow.starts[1].folder
+    slow.starts[1].started(nil)
+    for _ in 0..<90 { m3.tickSample() }
+    check(m3.sample == .recording(secondsLeft: 0) && slow.pendingStops.count == 1 && voiceAdds3() == 1,
+          "R1 sample: the countdown ends at 0:00 and waits for the sampler, building nothing yet")
+    slow.finishStop()
+    check(m3.sample == .building && voiceAdds3() == 2 && engine3.calls.last?.arguments == ["voice", "add", s1b.appendingPathComponent("sample.caf").path],
+          "R1 sample: then builds")
+    engine3.answerLast(1, "More than one voice was heard. Record again with only you speaking.\n")
+    engine3.answerLast(0, "parakeet ready\napple ready\nvoice 70 1 sample\n")
+    m3.closeSample()
+
+    // A meeting starting during a sample starts at once; the sample's folder goes once the sampler is done.
+    m3.recordSample()
+    let s2 = slow.starts[2].folder
+    slow.starts[2].started(nil)
+    let reply3 = m3.handler.reply(for: .start(mic: nil, dir: nil))
+    check(reply3.hasPrefix("ok recording") && rec3.launches.count == 1 && m3.sample == stoppedForMeeting && slow.pendingStops.count == 1 && lexists(s2),
+          "R1 willStart: the recording starts without waiting for the sampler to stop, and the sample has failed (\(reply3))")
+    slow.finishStop()
+    check(!lexists(s2) && voiceAdds3() == 2 && m3.sample == stoppedForMeeting, "R1 willStart: the folder goes once the sampler is done, and nothing is built")
+    m3.closeSample()
+    let pid4 = rec3.nextPid
+    m3.perform(.stop)
+    _ = settle { if case .finalising = m3.session.phase { return true }; return false }
+    rec3.exit(pid4, 0, verifies: true)
+    check(settle { m3.session.phase == .idle }, "R1: (the recording is finished)")
+
+    // Stop before the sampler is capturing (a first-time permission prompt still up): back to idle.
+    m3.recordSample()
+    let s3 = slow.starts[3].folder
+    m3.tickSample()
+    check(m3.sample == .recording(secondsLeft: 90), "R1 sample: the countdown does not run before the sampler is capturing")
+    m3.stopSample()
+    check(m3.sample == .idle && slow.stops == 4 && voiceAdds3() == 2 && lexists(s3),
+          "R1 stop before capturing: back to idle at once; nothing is built, so no line or path is shown")
+    slow.finishStop()
+    check(!lexists(s3), "R1 stop before capturing: the folder goes once the sampler is done")
+    slow.starts[3].started(nil)
+    check(slow.stops == 5 && m3.sample == .idle && voiceAdds3() == 2, "R1 stop before capturing: a word after the stop that it is capturing stops the sampler again")
+    slow.finishStop()
+    // The word comes while the first stop is still under way: the folder goes once its own stop is done.
+    m3.recordSample()
+    let s4 = slow.starts[4].folder
+    m3.stopSample()
+    slow.starts[4].started(nil)
+    check(slow.stops == 7 && slow.pendingStops.count == 2 && m3.sample == .idle && lexists(s4),
+          "R1 stop before capturing: a late word that it is capturing asks for a second stop")
+    slow.finishStop(1)
+    check(!lexists(s4) && voiceAdds3() == 2, "R1 stop before capturing: and that stop alone removes the folder")
+    slow.finishStop()
+    // A late word from an old sample never stops a newer one.
+    m3.recordSample()
+    let s5 = slow.starts[5].folder
+    slow.starts[5].started(nil)
+    slow.starts[4].started(nil)
+    check(slow.stops == 7 && m3.sample == .recording(secondsLeft: 90) && lexists(s5), "R1: a late word from an old sample leaves a newer one recording")
+
+    // Quitting still ends a sample, at once, though the sampler has not finished stopping.
+    m3.shutDown()
+    check(slow.stops == 8 && m3.sample == .idle && !lexists(s5), "R1 shutDown: a sample being recorded is stopped and its folder removed at once")
+    slow.finishStop()
+    check(m3.sample == .idle && voiceAdds3() == 2, "R1 shutDown: and the stop finishing later builds nothing")
+    try? fm.removeItem(at: state3)
 
     // Without a sampler there is no sample, and without an engine nothing runs.
     let state2 = shortTemp()

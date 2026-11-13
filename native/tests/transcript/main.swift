@@ -1154,6 +1154,9 @@ check(saved == .saved(seconds: 75) && savedPrint?.sample == true && savedPrint?.
       "saveSample: replaces a learnt print, without comparing, and answers sample 75 (\(saved))")
 check(mode(sampleVoice) == 0o600 && !FileManager.default.fileExists(atPath: sampleTmp.path),
       "saveSample: voice.json is 0600 and no voice.json.tmp is left")
+check(saveSample(speakers: speakersFile([("S1", 75.6, 6, [3, 4, 0, 0])]), from: "x", voice: sampleVoice, now: now) == .saved(seconds: 75)
+      && (try? decodePrint(contents(sampleVoice) ?? Data()))?.seconds == 75.6,
+      "saveSample: sample <seconds> is whole seconds, rounded down (75.6 s answers sample 75), and the print keeps 75.6")
 try? FileManager.default.createDirectory(at: sampleTmp, withIntermediateDirectories: true)
 let blockedBefore = contents(sampleVoice)
 if case .failed = saveSample(speakers: speakersFile([("S1", 80, 6, [0, 0, 1, 0])]), from: "x", voice: sampleVoice, now: now) {

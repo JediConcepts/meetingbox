@@ -5,10 +5,12 @@ import Foundation
 // MicSampleRecorder (MicSample.swift), which only the app builds.
 
 /// Records the microphone alone into `<folder>/sample.caf` until `stop`. `started` comes once, on the
-/// main queue: nil once it is capturing, or the reason it cannot (in Preferences' words).
+/// main queue: nil once it is capturing, or the reason it cannot (in Preferences' words). `stop`
+/// returns at once and never blocks its caller; `done` comes on the main queue once capturing has
+/// stopped and sample.caf is final.
 protocol SampleRecorder: AnyObject {
     func start(folder: URL, microphone: String?, started: @escaping (String?) -> Void)
-    func stop()
+    func stop(_ done: @escaping () -> Void)
 }
 
 /// Where the sample stands, as the sheet shows it.

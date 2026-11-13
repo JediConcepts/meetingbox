@@ -48,7 +48,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        model?.shutDown() // the socket only: a recorder still running is left to run
+        model?.shutDown() // the socket, and a voice sample being recorded; a recorder still running is left to run
     }
 
     /// Closing the meetingbox or Preferences window leaves the app running: the menu bar item and the recorder are the app.

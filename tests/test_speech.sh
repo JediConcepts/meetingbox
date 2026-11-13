@@ -422,7 +422,7 @@ voice_case '{"model": "m", "seconds": 75.4, "meetings": 2, "sources": ["a", "b"]
   "Your voice: learnt from 2 calls (1 minute of speech)"
 voice_case '{"model": "m", "seconds": 130, "meetings": 1, "sources": ["a"], "sample": false, "refusals": 0, "vector": [1], "updated": "x"}' \
   "Your voice: learnt from 1 call (2 minutes of speech)"
-voice_case '{"model": "m", "seconds": 95, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
+voice_case '{"model": "m", "seconds": 75, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
   "Your voice: from a recorded sample (1 minute of speech)"
 voice_case '{"model": "m", "seconds": 200, "meetings": 3, "sources": ["a", "b"], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
   "Your voice: from a recorded sample and 2 calls (3 minutes of speech)"
@@ -431,6 +431,16 @@ voice_case '{"model": "m", "seconds": 61, "meetings": 2, "sources": ["a"], "samp
 voice_case '{"model": "m", "seconds": "lots"' "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
 if [ "$voice_ok" = 1 ]; then pass "doctor's voice line: learnt from calls, from a sample, from both, or not learnt yet, with singulars"
 else fail "doctor's voice line: learnt from calls, from a sample, from both, or not learnt yet, with singulars:$voice_wrong"; fi
+# Whole minutes to the nearest, a half up, as Preferences shows them (Task 6 round 1): 95 s and 90 s are 2.
+voice_ok=1; voice_wrong=""
+voice_case '{"model": "m", "seconds": 95, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' \
+  "Your voice: from a recorded sample (2 minutes of speech)"
+voice_case '{"model": "m", "seconds": 90.9, "meetings": 2, "sources": ["a", "b"], "vector": [1], "updated": "x"}' \
+  "Your voice: learnt from 2 calls (2 minutes of speech)"
+voice_case '{"model": "m", "seconds": 89, "meetings": 2, "sources": ["a", "b"], "vector": [1], "updated": "x"}' \
+  "Your voice: learnt from 2 calls (1 minute of speech)"
+if [ "$voice_ok" = 1 ]; then pass "doctor's voice line: minutes to the nearest, a half up, as Preferences says them (95 s and 90 s are 2 minutes, 89 s is 1)"
+else fail "doctor's voice line: minutes to the nearest, a half up, as Preferences says them (95 s and 90 s are 2 minutes, 89 s is 1):$voice_wrong"; fi
 # a voice print setup did not record is never learnt into, and doctor says so
 grep -vxF "$VOICE_FILE" "$INSTALLED" > "$HOME/installed.tmp"; mv "$HOME/installed.tmp" "$INSTALLED"
 printf '%s\n' '{"model": "m", "seconds": 75, "meetings": 2, "sources": ["a", "b"], "vector": [1], "updated": "x"}' > "$VOICE_FILE"
@@ -508,12 +518,41 @@ out="$(reset_cmd tools 2>&1)"; rc=$?
 if [ "$rc" -eq 0 ] && [ ! -e "$LOCK" ] && ! grep -qxF "$LOCK" "$INSTALLED" 2>/dev/null; then
   pass "reset_cmd tools removes the recorded lock through the record"
 else fail "reset_cmd tools removes the recorded lock through the record ($rc): $out"; fi
-fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; echo mine > "$LOCK"
+# A lock a writer made before this setup (voice.json recorded by an earlier one): recorded too, so
+# reset and uninstall never leave it behind.
+fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; record_install "$VOICE_FILE"; echo '{}' > "$VOICE_FILE"; : > "$LOCK"
+install_speech >/dev/null 2>&1
+recorded_there=0; installed_by_us "$LOCK" && recorded_there=1
+out="$(reset_cmd tools 2>&1)"; rc=$?
+if [ "$recorded_there" = 1 ] && [ "$rc" -eq 0 ] && [ ! -e "$LOCK" ] && ! grep -qxF "$LOCK" "$INSTALLED" 2>/dev/null; then
+  pass "setup records a lock already there as a plain file when voice.json is recorded, and reset removes it"
+else fail "setup records a lock already there as a plain file when voice.json is recorded, and reset removes it ($recorded_there, $rc): $out"; fi
+# The same with a voice.json setup records now, absent before.
+fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; : > "$LOCK"
+install_speech >/dev/null 2>&1
+if installed_by_us "$VOICE_FILE" && installed_by_us "$LOCK"; then pass "setup records a lock already there when it records voice.json now"
+else fail "setup records a lock already there when it records voice.json now: $(cat "$INSTALLED")"; fi
+# A voice.json of the user's own (there before setup, so never recorded): its lock is not claimed either.
+fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; echo '{}' > "$VOICE_FILE"; echo mine > "$LOCK"
 install_speech >/dev/null 2>&1
 out="$(confirm() { return 1; }; reset_cmd tools 2>&1)"
-if ! installed_by_us "$LOCK" && [ "$(cat "$LOCK")" = mine ] && printf '%s\n' "$out" | sed -n '/leave alone/,$p' | grep -qF "$LOCK"; then
-  pass "a lock file already there is not recorded, and reset lists it as left alone"
-else fail "a lock file already there is not recorded, and reset lists it as left alone: $out"; fi
+if ! installed_by_us "$VOICE_FILE" && ! installed_by_us "$LOCK" && [ "$(cat "$LOCK")" = mine ] \
+   && printf '%s\n' "$out" | sed -n '/leave alone/,$p' | grep -qF "$LOCK"; then
+  pass "a lock beside a voice.json setup did not record is not recorded, and reset lists it as left alone"
+else fail "a lock beside a voice.json setup did not record is not recorded, and reset lists it as left alone: $out"; fi
+# A link, or a folder, at the lock's path is never claimed, whatever the record says of voice.json.
+fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; record_install "$VOICE_FILE"; ln -s "$HOME/lock-elsewhere" "$LOCK"
+install_speech >/dev/null 2>&1
+link_recorded=0; installed_by_us "$LOCK" && link_recorded=1
+reset_cmd tools >/dev/null 2>&1
+link_kept=0; [ -L "$LOCK" ] && link_kept=1
+rm -f "$LOCK"; mkdir -p "$STATE_DIR"; record_install "$VOICE_FILE"; mkdir "$LOCK"
+install_speech >/dev/null 2>&1
+folder_recorded=0; installed_by_us "$LOCK" && folder_recorded=1
+if [ "$link_recorded" = 0 ] && [ "$link_kept" = 1 ] && [ "$folder_recorded" = 0 ] && [ -d "$LOCK" ] && [ ! -e "$HOME/lock-elsewhere" ]; then
+  pass "a link or a folder at the lock's path is never recorded, so reset never follows or removes it"
+else fail "a link or a folder at the lock's path is never recorded, so reset never follows or removes it ($link_recorded, $folder_recorded)"; fi
+rmdir "$LOCK"
 
 # --- the fakes: a usable speech helper, and mb-transcript ---
 fresh; rm -f "$LOCK"
@@ -526,6 +565,7 @@ case "$1" in
   check) [ ! -e "$HOME/check-fails" ] || { echo "mb-speech: a model file is the wrong size" >&2; exit 1; } ;;
   speakers)
     [ ! -e "$HOME/speakers-fail" ] || { echo "mb-speech: the diariser failed" >&2; exit 1; }
+    if [ -e "$HOME/speakers-slow" ]; then : > "$HOME/speaking"; sleep 30; fi
     if [ -f "$HOME/speakers.json" ]; then cp "$HOME/speakers.json" "$4"
     else printf '%s\n' '{"model": "m", "segments": [], "speakers": []}' > "$4"; fi ;;
 esac
@@ -717,6 +757,20 @@ out="$(script engines)"; rc=$?
 if [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = "parakeet ready" ] && [ "$(printf '%s\n' "$out" | sed -n 3p)" = "voice none" ]; then
   pass "meetingbox engines: runs to the end under set -e"
 else fail "meetingbox engines: runs to the end under set -e ($rc): $out"; fi
+
+# --- the app's limit: SIGTERM to voice add's whole process group, as ScriptEngineCommands sends it ---
+voice_reset; rm -f "$HOME/speaking"; touch "$HOME/speakers-slow"
+perl -e 'setpgrp(0, 0); exec @ARGV or die' env -i HOME="$HOME" PATH="$HOME/fakebin:/usr/bin:/bin" TMPDIR="$HOME/tmp" \
+  /bin/bash "$ROOT/meetingbox" voice add "$HOME/sample.caf" > "$HOME/term.out" 2>/dev/null &
+group=$!
+for _ in $(seq 1 250); do [ -e "$HOME/speaking" ] && break; sleep 0.02; done
+during="$(ls -A "$HOME/tmp")"
+kill -TERM -- "-$group" 2>/dev/null
+wait "$group"; rc=$?
+rm -f "$HOME/speakers-slow"
+if [ -e "$HOME/speaking" ] && [ -n "$during" ] && [ "$rc" -eq 143 ] && [ -z "$(ls -A "$HOME/tmp")" ] && [ ! -e "$HOME/transcript-calls.log" ]; then
+  pass "voice add: SIGTERM to its process group while mb-speech runs exits 143 and removes its temporary folder"
+else fail "voice add: SIGTERM to its process group while mb-speech runs exits 143 and removes its temporary folder ($rc, during: $during, after: $(ls -A "$HOME/tmp"))"; fi
 
 # --- the real mb-transcript --voice-sample, when tests/run.sh built it ---
 if [ -n "${MB_TEST_BIN:-}" ] && [ -x "$MB_TEST_BIN/mb-transcript" ]; then

@@ -56,10 +56,14 @@ final class AppModel: ObservableObject {
     let engine: EngineCommands
     private let sampler: SampleRecorder?
     private var enginesAsked = 0
-    /// The sample's folder while it records or is built, and which sample a late answer belongs to.
+    /// The sample's folder while it records or is built, which sample a late answer belongs to, and
+    /// where it stands: waiting for the sampler to capture, capturing, stopping (waiting for the
+    /// sampler to say the sample is final, before it is built), or being built.
     private var sampleFolder: URL?
     private var samplesAsked = 0
     private var sampleClock: DispatchSourceTimer?
+    private enum SampleStep { case none, waiting, capturing, stopping, building }
+    private var sampleStep = SampleStep.none
 
     /// Plays a system sound by name, through `play`.
     private let playSound: (String) -> Void
@@ -168,14 +172,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// At quit: the socket goes, and a voice sample being recorded stops and is deleted. A recorder
-    /// keeps running (it is its own process) and the next launch adopts it; the kernel releases
-    /// `app.lock` when the process ends. Never stop or signal the recorder here: Keep recording and
-    /// quit, and log out, end up here too.
+    /// At quit: the socket goes, and a voice sample being recorded is stopped and its folder deleted at
+    /// once, since the app may be gone before the sampler says it has stopped (a folder left anyway is
+    /// removed at the next launch). A recorder keeps running (it is its own process) and the next launch
+    /// adopts it; the kernel releases `app.lock` when the process ends. Never stop or signal the recorder
+    /// here: Keep recording and quit, and log out, end up here too.
     func shutDown() {
         server?.stop()
         server = nil
-        if case .recording = sample { endSample(.idle) }
+        let folder = sampleFolder
+        switch sampleStep {
+        case .waiting, .capturing:
+            endSample(.idle)
+        case .stopping:
+            sampleFolder = nil
+            sampleStep = .none
+            samplesAsked += 1
+            sample = .idle
+        case .none, .building:
+            return
+        }
+        if let folder = folder { SampleFolder.remove(folder) }
     }
 
     /// What the menu bar item and the floating button show now.
@@ -450,45 +467,87 @@ final class AppModel: ObservableObject {
         samplesAsked += 1
         let asked = samplesAsked
         sampleFolder = folder
+        sampleStep = .waiting
         sample = .recording(secondsLeft: SampleState.seconds)
         sampler.start(folder: folder, microphone: preferences.microphone) { [weak self] reason in
+            MainActor.assumeIsolated { self?.sampleStarted(asked, folder: folder, reason: reason) }
+        }
+    }
+
+    /// The sampler's word on a start: capturing (nil), or why it cannot. A word about a sample that has
+    /// already ended (Stop before it was capturing, a meeting, a quit) that it is capturing stops the
+    /// sampler again, unless a newer sample is under way, and that sample's folder goes once it has.
+    private func sampleStarted(_ asked: Int, folder: URL, reason: String?) {
+        guard asked == samplesAsked else {
+            if reason == nil, sampleStep == .none, let sampler = sampler {
+                sampler.stop { SampleFolder.remove(folder) }
+            } else {
+                SampleFolder.remove(folder)
+            }
+            return
+        }
+        guard sampleStep == .waiting else { return }
+        if let reason = reason {
+            endSample(.failed(reason))
+        } else {
+            sampleStep = .capturing
+            startSampleClock()
+        }
+    }
+
+    /// One second of the countdown, only while the sampler is capturing: the app's 1 s timer calls it
+    /// (tests call it directly). At 0 the sample is finished.
+    func tickSample() {
+        guard sampleStep == .capturing, case .recording(let left) = sample else { return }
+        if left > 1 {
+            sample = .recording(secondsLeft: left - 1)
+        } else {
+            sample = .recording(secondsLeft: 0)
+            finishSample()
+        }
+    }
+
+    /// Stop: a sample being captured ends early and is built from what was recorded. Before the sampler
+    /// is capturing (a first-time permission prompt still up) there is nothing to build: back to idle.
+    func stopSample() {
+        switch sampleStep {
+        case .waiting: endSample(.idle)
+        case .capturing: finishSample()
+        case .none, .stopping, .building: break
+        }
+    }
+
+    /// Done (or the sheet closing): back to idle once the sample has an outcome; a sample still being
+    /// recorded is cancelled and deleted. One stopping to be built, or being built, is left to finish.
+    func closeSample() {
+        switch sample {
+        case .done, .failed: sample = .idle
+        case .recording where sampleStep == .waiting || sampleStep == .capturing: endSample(.idle)
+        case .idle, .recording, .building: break
+        }
+    }
+
+    /// The sampler is asked to stop, and nothing waits for it. Once it says the sample is final, the
+    /// engine makes the print: `voice add <folder>/sample.caf`, with a 300 s limit. Once that answers,
+    /// the folder goes, the outcome is put into words and the status is read afresh.
+    private func finishSample() {
+        guard let folder = sampleFolder, let sampler = sampler else { return }
+        stopSampleClock()
+        sampleStep = .stopping
+        let asked = samplesAsked
+        sampler.stop { [weak self] in
             MainActor.assumeIsolated {
-                guard let self = self, asked == self.samplesAsked, case .recording = self.sample else { return }
-                if let reason = reason { self.endSample(.failed(reason)) } else { self.startSampleClock() }
+                guard let self = self, asked == self.samplesAsked, self.sampleStep == .stopping else {
+                    SampleFolder.remove(folder)
+                    return
+                }
+                self.buildSample(folder)
             }
         }
     }
 
-    /// One second of the countdown: the app's 1 s timer calls it (tests call it directly). At 0 the
-    /// sample is finished.
-    func tickSample() {
-        guard case .recording(let left) = sample else { return }
-        if left > 1 { sample = .recording(secondsLeft: left - 1) } else { finishSample() }
-    }
-
-    /// Stop: the sample ends early and is built from what was recorded.
-    func stopSample() {
-        guard case .recording = sample else { return }
-        finishSample()
-    }
-
-    /// Done (or the sheet closing): back to idle once the sample has an outcome; a sample still being
-    /// recorded is cancelled and deleted. One being built is left to finish.
-    func closeSample() {
-        switch sample {
-        case .done, .failed: sample = .idle
-        case .recording: endSample(.idle)
-        case .idle, .building: break
-        }
-    }
-
-    /// The sampler stops and the engine makes the print: `voice add <folder>/sample.caf`, with a 300 s
-    /// limit. Once it answers, the folder goes, the outcome is put into words and the status is read
-    /// afresh.
-    private func finishSample() {
-        guard let folder = sampleFolder else { return }
-        stopSampleClock()
-        sampler?.stop()
+    private func buildSample(_ folder: URL) {
+        sampleStep = .building
         sample = .building
         samplesAsked += 1
         let asked = samplesAsked
@@ -496,31 +555,35 @@ final class AppModel: ObservableObject {
         engine.run(["voice", "add", audio.path], stdin: nil, timeout: 300) { [weak self] status, output in
             MainActor.assumeIsolated {
                 SampleFolder.remove(folder)
-                guard let self = self else { return }
-                if self.sampleFolder == folder { self.sampleFolder = nil }
-                guard asked == self.samplesAsked, self.sample == .building else { return }
+                guard let self = self, asked == self.samplesAsked, self.sampleStep == .building else { return }
+                self.sampleFolder = nil
+                self.sampleStep = .none
                 self.sample = PreferencesPresentation.sampleOutcome(status: status, output: output)
                 self.refreshEngines()
             }
         }
     }
 
-    /// A recording is about to start (`ControlHandler.willStart`): a sample being recorded stops, its
-    /// folder is deleted and it fails, saying why.
+    /// A recording is about to start (`ControlHandler.willStart`, on the main queue just before the
+    /// recorder is launched): a sample being recorded fails, saying why, and the sampler is asked to
+    /// stop. Nothing waits for it, so the meeting starts at once; the folder goes once the sampler is done.
+    /// One already stopping to be built, or being built, has left the microphone and is left to finish.
     private func cancelSampleForMeeting() {
-        guard case .recording = sample else { return }
+        guard sampleStep == .waiting || sampleStep == .capturing else { return }
         endSample(.failed(PreferencesPresentation.sampleStoppedForMeeting))
     }
 
-    /// Ends a sample being recorded without building it: the clock and the sampler stop, the folder
-    /// goes, and any late word from the sampler is ignored.
+    /// Ends a sample being recorded without building it: the clock stops, the outcome is shown, any
+    /// later word about it is answered as a late one, and the sampler is asked to stop. Its folder goes
+    /// once the sampler says it has.
     private func endSample(_ outcome: SampleState) {
         stopSampleClock()
-        sampler?.stop()
-        if let folder = sampleFolder { SampleFolder.remove(folder) }
+        let folder = sampleFolder
         sampleFolder = nil
+        sampleStep = .none
         samplesAsked += 1
         sample = outcome
+        sampler?.stop { if let folder = folder { SampleFolder.remove(folder) } }
     }
 
     private func startSampleClock() {
