@@ -50,12 +50,19 @@ struct MeetingRecord {
     private var setFields: Set<Field> = []
     /// The counts as they were read.
     private var readPeople = People()
-    /// A `job` was there that this version cannot read.
+    /// A `job`, `jobTranscriber` or `jobTidy` was there that this version cannot read.
     private var unreadableJob = false
+    private var unreadableTranscriber = false
+    private var unreadableTidy = false
 
-    /// The record names a job this version does not know (a later version's kind, a mistyped word, not a
-    /// word at all). It must never run, as a process or as anything else. Setting `job` ends it.
-    var jobUnknown: Bool { unreadableJob && !setFields.contains(.job) }
+    /// The record names a job this version cannot run as written: a kind it does not know (a later
+    /// version's, a mistyped word, not a word at all), or a Transcribe again whose transcriber or tidying it
+    /// cannot read. It must never run, as a process or as anything else. Setting the field ends it.
+    var jobUnknown: Bool {
+        if unreadableJob && !setFields.contains(.job) { return true }
+        guard job == .transcribe else { return false }
+        return (unreadableTranscriber && !setFields.contains(.jobTranscriber)) || (unreadableTidy && !setFields.contains(.jobTidy))
+    }
 
     init(id: String = UUID().uuidString, title: String? = nil, started: Date = Date(), seconds: Int = 0,
          state: MeetingState) {
@@ -95,13 +102,20 @@ struct MeetingRecord {
         // A redo's own: only values in their words are taken; anything else reads as absent, and is kept
         // as it is in the file (see `apply`).
         self.job = (json["job"] as? String).flatMap(JobKind.init(rawValue:))
-        self.unreadableJob = json["job"] != nil && !(json["job"] is NSNull) && job == nil
         self.jobTranscriber = (json["jobTranscriber"] as? String).flatMap(Transcriber.init(rawValue:))
         self.jobTidy = MeetingRecord.flag(json["jobTidy"])
+        self.unreadableJob = MeetingRecord.present(json["job"]) && job == nil
+        self.unreadableTranscriber = MeetingRecord.present(json["jobTranscriber"]) && jobTranscriber == nil
+        self.unreadableTidy = MeetingRecord.present(json["jobTidy"]) && jobTidy == nil
         self.writer = MeetingRecord.writer(json["writer"])
         let people = json["people"] as? [String: Any]
         self.people = People(room: MeetingRecord.count(people?["room"]), call: MeetingRecord.count(people?["call"]))
         self.readPeople = self.people
+    }
+
+    /// A value is there: not absent, and not JSON null.
+    private static func present(_ value: Any?) -> Bool {
+        value != nil && !(value is NSNull)
     }
 
     /// true or false, as JSON writes them; nil for anything else (a number or a string included).

@@ -480,9 +480,12 @@ final class ProcessingQueue {
     /// The reason a redo gives when the engine said it was done but its files are not new.
     static let redoWroteNothing = "meetingbox finished but wrote nothing new"
 
-    /// A redo that did not finish and changed nothing (Copy, fixed).
+    /// A redo that did not finish and changed nothing (Copy, fixed). When the engine's reason says so
+    /// itself ("the meeting folder was moved, nothing was changed"), it is not said again.
     static func redoNothingChanged(_ reason: String) -> String {
-        "The redo did not finish: \(clause(reason)). Nothing was changed."
+        let said = clause(reason)
+        if said.lowercased().hasSuffix("nothing was changed") { return "The redo did not finish: \(said)." }
+        return "The redo did not finish: \(said). Nothing was changed."
     }
 
     /// A redo that left its swap part done, after its runs were spent (Copy, fixed).
@@ -513,8 +516,10 @@ final class ProcessingQueue {
         }
     }
 
-    /// The meeting being processed, or waited on.
-    private(set) var current: URL?
+    /// The meeting being processed, or waited on, where it was last found.
+    var current: URL? { holding?.dir }
+    /// That meeting, with what identifies it.
+    private var holding: Held?
     /// A job is running or waited on, or more are queued behind it.
     var hasWork: Bool { current != nil || !pending.isEmpty }
     /// The last stage in its progress file.
@@ -534,10 +539,39 @@ final class ProcessingQueue {
     private let settings: () -> RunSettings
     private var timer: DispatchSourceTimer?
 
-    private var pending: [URL] = []
-    /// The id in `meeting.json` of each meeting this queue holds, by its folder's path, so a folder moved
-    /// or renamed in Finder is found again (`locate`).
-    private var ids: [String: String] = [:]
+    /// A meeting this queue holds: its folder where it was last found; that folder's own identity, its
+    /// device and inode from `lstat` when it was queued (a rename or a move within the volume keeps them, a
+    /// Finder duplicate does not); its `meeting.json` id (a copied meeting.json has it too, so both must
+    /// match); and the kind its record named then.
+    private struct Held {
+        var dir: URL
+        let identity: FolderIdentity
+        let id: String
+        let kind: JobKind?
+
+        init?(_ dir: URL, _ record: MeetingRecord) {
+            guard let identity = FolderIdentity(dir) else { return nil }
+            self.dir = dir
+            self.identity = identity
+            self.id = record.id
+            self.kind = record.jobUnknown ? nil : record.job ?? .process
+        }
+    }
+
+    /// A folder's own device and inode, from `lstat`: a link is its own entry, never followed.
+    private struct FolderIdentity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+
+        init?(_ url: URL) {
+            var st = stat()
+            guard lstat(url.path, &st) == 0 else { return nil }
+            device = st.st_dev
+            inode = st.st_ino
+        }
+    }
+
+    private var pending: [Held] = []
     private enum Job {
         /// Our run of this kind, started at `started`. `token` ignores a late `done` from an earlier run.
         case running(started: Date, token: Int, kind: JobKind)
@@ -571,9 +605,9 @@ final class ProcessingQueue {
     func enqueue(_ folder: URL) {
         onTickQueue()
         let dir = ProcessingQueue.normal(folder)
-        guard !known(dir), let record = ProcessingQueue.read(dir), record.state == .queued || record.state == .processing else { return }
-        ids[dir.path] = record.id
-        pending.append(dir)
+        guard !known(dir), let record = ProcessingQueue.read(dir), record.state == .queued || record.state == .processing,
+              let entry = Held(dir, record) else { return }
+        pending.append(entry)
         onChange?()
         advance()
     }
@@ -686,10 +720,7 @@ final class ProcessingQueue {
         for meeting in store.scanEveryRoot().reversed() {
             guard let record = meeting.record, record.state == .queued || record.state == .processing else { continue }
             let dir = ProcessingQueue.normal(meeting.folder.url)
-            if !known(dir) {
-                ids[dir.path] = record.id
-                pending.append(dir)
-            }
+            if !known(dir), let entry = Held(dir, record) { pending.append(entry) }
         }
         onChange?()
         advance()
@@ -705,14 +736,12 @@ final class ProcessingQueue {
         case .running:
             pollProgress(dir)
         case .waiting:
-            guard let here = locate(dir) else {
-                // Nowhere to be found: not ours to settle any more.
-                forget(dir)
-                self.job = nil
-                advance()
+            guard let entry = holding else { return }
+            guard let here = locate(entry) else {
+                endNowhere(entry, kind: entry.kind)
                 return
             }
-            current = here
+            holding?.dir = here
             if ProcessingLock.owner(here, ps: ps, now: now()) == .gone {
                 settle(here)
                 advance()
@@ -726,21 +755,28 @@ final class ProcessingQueue {
         while job == nil {
             guard !pending.isEmpty else {
                 if current != nil || stage != nil {
-                    current = nil
+                    holding = nil
                     stage = nil
                     onChange?()
                 }
                 updateTimer()
                 return
             }
-            let queuedAt = pending.removeFirst()
+            let entry = pending.removeFirst()
             stage = nil
-            guard let dir = locate(queuedAt), let record = ProcessingQueue.read(dir) else {
-                forget(queuedAt)
-                current = nil
+            guard let dir = locate(entry) else {
+                // In no root any more: nothing is written anywhere, and the job ends as not done.
+                holding = nil
+                onFinished?(entry.dir, false, entry.kind)
+                onChange?()
                 continue
             }
-            current = dir
+            holding = entry
+            holding?.dir = dir
+            guard let record = ProcessingQueue.read(dir) else {
+                holding = nil
+                continue
+            }
             switch record.state {
             case .queued:
                 launch(dir, attempts: 1)
@@ -752,29 +788,43 @@ final class ProcessingQueue {
                     wait(dir)
                 }
             default:
-                forget(dir) // changed since it was queued: not ours to run
+                break // changed since it was queued: not ours to run
             }
-            if job == nil { current = nil }
+            if job == nil { holding = nil }
             onChange?()
         }
         updateTimer()
     }
 
-    /// Where a meeting this queue holds is now: its folder, while that still holds the meeting with the
-    /// id it had when it was queued; else, after it was moved or renamed in Finder, the folder in the roots
-    /// whose record has that id, found by one scan. Nil when it is nowhere to be found.
-    private func locate(_ dir: URL) -> URL? {
-        guard let id = ids[dir.path] else { return dir }
-        if ProcessingQueue.read(dir)?.id == id { return dir }
-        guard let found = store.scanEveryRoot().first(where: { $0.record?.id == id }) else { return nil }
-        let moved = ProcessingQueue.normal(found.folder.url)
-        ids[dir.path] = nil
-        ids[moved.path] = id
-        return moved
+    /// Where a meeting this queue holds is now: the folder it was last found in, while that is still its
+    /// folder (`holds`); else, after a rename or a move in Finder, the folder directly in one of the roots
+    /// that is. Only each folder's own entry is looked at (`lstat`), and a `meeting.json` is read only
+    /// where the folder itself matches. Nil when it is in no root.
+    private func locate(_ entry: Held) -> URL? {
+        if ProcessingQueue.holds(entry, at: entry.dir) { return entry.dir }
+        for root in store.roots {
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] where !name.hasPrefix(".") {
+                let dir = ProcessingQueue.normal(root.appendingPathComponent(name, isDirectory: true))
+                if ProcessingQueue.holds(entry, at: dir) { return dir }
+            }
+        }
+        return nil
     }
 
-    private func forget(_ dir: URL) {
-        ids[dir.path] = nil
+    /// The folder at `dir` is the entry's meeting only when both its own device and inode and the id in
+    /// its `meeting.json` are the entry's: never a Finder duplicate, a copied meeting.json, or another
+    /// meeting renamed onto the path.
+    private static func holds(_ entry: Held, at dir: URL) -> Bool {
+        FolderIdentity(dir) == entry.identity && read(dir)?.id == entry.id
+    }
+
+    /// The meeting is in no root any more (moved off the volume, out of the meetings folder, or to the
+    /// Trash): nothing is written anywhere, the old path included, since another meeting may be there
+    /// now. The job ends as not done; a relaunch's resume takes the meeting up if it comes back.
+    private func endNowhere(_ entry: Held, kind: JobKind?) {
+        job = nil
+        onFinished?(entry.dir, false, kind)
+        advance()
     }
 
     /// A `processing` meeting nobody holds, settled by the kind its record names, by the rule a run that
@@ -911,13 +961,17 @@ final class ProcessingQueue {
     }
 
     /// A run of ours ended: finished by `outcome`, where its meeting is now. A folder moved or renamed in
-    /// Finder while it ran is found by its id, and the status this run gave is used there, so nothing is
-    /// run twice (the engine's own `.process-result` went to the old path).
+    /// Finder while it ran is found again (`locate`), and the status this run gave is used there, so
+    /// nothing is run twice (the engine's own `.process-result` went to the old path). A meeting in no
+    /// root is finished nowhere (`endNowhere`).
     private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {
         guard case .running(let started, let t, let kind)? = job, t == mine,
-              let cur = current, cur.path == dir.path else { return }
-        let here = locate(dir) ?? dir
-        current = here
+              let entry = holding, entry.dir.path == dir.path else { return }
+        guard let here = locate(entry) else {
+            endNowhere(entry, kind: kind)
+            return
+        }
+        holding?.dir = here
         pollProgress(here)
         if status == ProcessingQueue.busyExit {
             // Refused: nothing ran, so this run is not counted. Wait for the holder, then settle.
@@ -948,7 +1002,6 @@ final class ProcessingQueue {
             $0.error = nil
             ProcessingQueue.clearJob(&$0)
         }
-        forget(dir)
         onFinished?(dir, true, kind)
     }
 
@@ -964,7 +1017,6 @@ final class ProcessingQueue {
             $0.error = reason
             ProcessingQueue.clearJob(&$0)
         }
-        forget(dir)
         onFinished?(dir, false, kind)
     }
 
@@ -992,8 +1044,12 @@ final class ProcessingQueue {
         onChange?()
     }
 
+    /// The queue holds this folder: it is the same folder (device and inode) as a meeting it holds, or,
+    /// where nothing is any more, the path one was last found at.
     private func known(_ dir: URL) -> Bool {
-        current?.path == dir.path || pending.contains { $0.path == dir.path }
+        let held = [holding].compactMap { $0 } + pending
+        if let identity = FolderIdentity(dir) { return held.contains { $0.identity == identity } }
+        return held.contains { $0.dir.path == dir.path }
     }
 
     /// The timer runs while a job is running or waited on.

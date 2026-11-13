@@ -117,6 +117,11 @@ final class LibraryModel: ObservableObject {
     var control: (@MainActor (MenuAction) -> Void)?
     /// Told when `select` or `show` changes which meeting is selected, and not otherwise.
     var onSelectionChange: (() -> Void)?
+    /// What tells whether a lock's owner is alive (`ProcessingLock.owner`), for a meeting's folder and for
+    /// a redo's check; tests give one that cannot run.
+    var ps = URL(fileURLWithPath: "/bin/ps")
+    /// Lists a meeting's transcripts, on the reader queue (`versions(in:)`); tests wrap it to see where it runs.
+    var listVersions: @Sendable (URL) -> [TranscriptVersion] = { LibraryModel.versions(in: $0) }
 
     private let reader = DispatchQueue(label: "meetingbox.library.read", qos: .userInitiated)
     private let searcher = DispatchQueue(label: "meetingbox.library.search", qos: .userInitiated)
@@ -223,13 +228,14 @@ final class LibraryModel: ObservableObject {
             return
         }
         let version = self.version
+        let (ps, list) = (self.ps, self.listVersions)
         reader.async { [weak self] in
             let dir = folder.url
             func read(_ url: URL) -> String? { try? String(contentsOf: url, encoding: .utf8) }
             // A chosen version is read only while it is a plain file, never through a link.
             let transcript = version.map { LibraryModel.isPlain($0, S_IFREG) ? read($0) : nil } ?? read(dir.appendingPathComponent("transcript.txt"))
             let loaded = Content(key: key, minutes: read(dir.appendingPathComponent("notes.md")).map(LibraryPresentation.minutes),
-                                 transcript: transcript, files: MeetingFiles.read(folder), versions: LibraryModel.versions(in: dir))
+                                 transcript: transcript, files: MeetingFiles.read(folder, ps: ps), versions: list(dir))
             Task { @MainActor in self?.loaded(loaded, token, version) }
         }
     }
@@ -244,7 +250,7 @@ final class LibraryModel: ObservableObject {
     /// in each folder in its `earlier/`. No link is followed, as the engine follows none there: `earlier`
     /// and each folder in it must be real folders, and every transcript a plain file. Call it off the main
     /// queue.
-    nonisolated private static func versions(in dir: URL) -> [TranscriptVersion] {
+    nonisolated static func versions(in dir: URL) -> [TranscriptVersion] {
         let fm = FileManager.default
         let files = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter {
             isPlain(dir.appendingPathComponent($0), S_IFREG)
@@ -443,7 +449,7 @@ final class LibraryModel: ObservableObject {
         if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) { return }
         redoToken += 1
         let token = redoToken
-        let ps = URL(fileURLWithPath: "/bin/ps")
+        let ps = self.ps
         reader.async { [weak self] in
             let recorded = LibraryPresentation.recordedState(draft.folder)
             let lock = ProcessingLock.owner(draft.folder, ps: ps, now: Date())
