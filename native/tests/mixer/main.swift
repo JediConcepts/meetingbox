@@ -461,6 +461,32 @@ func extractorCase(_ name: String) {
         let plain = stream(nil)
         check(!plain.isEmpty && unknown == plain,
               "\(name): the same samples as with no layout (\(unknown.count) and \(plain.count) frames)")
+    case "one extractor through changing formats, as fresh extractors give":
+        // Each buffer's stream differs from the one before, so the converter must be made anew each
+        // time. One kept across a change would read the new samples as the old stream's.
+        let mono = tone(44100)
+        let stereo = [mono, mono.map { $0 * -0.5 }]
+        let streams: [(String, [CMSampleBuffer?])] = [
+            ("mono, Float32 at 44.1 kHz, Int16 at 16 kHz, then Float32 at 44.1 kHz", [
+                pcmBuffer([mono], rate: 44100),
+                pcmBuffer([tone(16000)], rate: 16000, int16: true),
+                pcmBuffer([mono], rate: 44100),
+            ]),
+            ("stereo, Float32 at 44.1 kHz, interleaved, planar, then interleaved", [
+                pcmBuffer(stereo, rate: 44100, interleaved: true),
+                pcmBuffer(stereo, rate: 44100, interleaved: false),
+                pcmBuffer(stereo, rate: 44100, interleaved: true),
+            ]),
+        ]
+        for (label, buffers) in streams {
+            let one = SampleExtractor()
+            for (i, buffer) in buffers.enumerated() {
+                let kept = buffer.flatMap(one.samples(from:))
+                let fresh = extract(buffer, name)
+                check(kept != nil && kept == fresh,
+                      "\(name): \(label), buffer \(i + 1) (\(kept?.count ?? 0) and \(fresh?.count ?? 0) frames)")
+            }
+        }
     case "no channels":
         var asbd = pcmDescription(channels: 1, rate: 48000, int16: false, interleaved: false)
         asbd.mChannelsPerFrame = 0
@@ -485,6 +511,10 @@ func extractorCase(_ name: String) {
         // 4 GiB in two planes: AVAudioPCMBuffer's size arithmetic overflows and aborts.
         let asbd = pcmDescription(channels: 2, rate: 48000, int16: false, interleaved: false)
         unreadable(name, sampleBuffer(asbd, frames: 536_870_912, bytes: nil))
+    case "3 channels, Float32, planar, 357,913,942 frames":
+        // Each plane is under 2^31 bytes, but the three together reach 2^32, and AVAudioPCMBuffer aborts.
+        let asbd = pcmDescription(channels: 3, rate: 48000, int16: false, interleaved: false)
+        unreadable(name, sampleBuffer(asbd, frames: 357_913_942, bytes: nil))
     case "3 channels, big-endian Float32":
         // Only native-endian Float32 and Int16 are averaged.
         var asbd = pcmDescription(channels: 3, rate: 48000, int16: false, interleaved: true)
@@ -518,11 +548,13 @@ let extractorCases = [
     "stereo, Float32, interleaved, 44.1 kHz",
     "mono and left and right stereo, exactly as on 24e9ddc",
     "mono, Float32, 44.1 kHz, an Unknown layout, four buffers in a row",
+    "one extractor through changing formats, as fresh extractors give",
     "no channels",
     "AAC, not linear PCM",
     "PCM whose sizes do not add up",
     "PCM with no data behind it",
     "2 channels, Float32, planar, 536,870,912 frames",
+    "3 channels, Float32, planar, 357,913,942 frames",
     "3 channels, big-endian Float32",
     "3 channels, unsigned 16-bit",
     "stereo, big-endian Float32, a discrete layout",
