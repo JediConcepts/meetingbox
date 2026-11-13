@@ -45,15 +45,36 @@ final class AppModel: ObservableObject {
     /// Told once the session is idle again (Stop and quit).
     private var idleWaiters: [@MainActor () -> Void] = []
 
+    /// What `meetingbox engines` last said, and the voice line Preferences shows from it.
+    @Published private(set) var engineStatus = EngineStatus()
+    @Published private(set) var voiceStatus = ""
+    /// Why "Forget my voice" last failed, until it is chosen again.
+    @Published private(set) var voiceProblem: String?
+    /// The voice sample, as its sheet shows it.
+    @Published private(set) var sample: SampleState = .idle
+    /// The engine's commands other than jobs: `engines`, `voice add`, `voice forget`.
+    let engine: EngineCommands
+    private let sampler: SampleRecorder?
+    private var enginesAsked = 0
+    /// The sample's folder while it records or is built, and which sample a late answer belongs to.
+    private var sampleFolder: URL?
+    private var samplesAsked = 0
+    private var sampleClock: DispatchSourceTimer?
+
     /// Plays a system sound by name, through `play`.
     private let playSound: (String) -> Void
 
     /// The recorder, the processing runner, the free space and the sound player are the real ones
-    /// unless a test gives its own.
+    /// unless a test gives its own. Without an `engine` no engine command runs (each is answered that
+    /// meetingbox is not installed), and without a `sampler` there is no voice sample: only AppDelegate
+    /// passes the real ones.
     init(stateDir: URL, preferences: Preferences, recorder: RecorderControl = ChildRecorder(), runner: PipelineRunner? = nil,
          freeBytes: @escaping (URL) -> Int64? = { AppModel.freeBytes(near: $0) },
-         playSound: @escaping (String) -> Void = { NSSound(named: NSSound.Name($0))?.play() }) {
+         playSound: @escaping (String) -> Void = { NSSound(named: NSSound.Name($0))?.play() },
+         engine: EngineCommands = NoEngineCommands(), sampler: SampleRecorder? = nil) {
         self.playSound = playSound
+        self.engine = engine
+        self.sampler = sampler
         self.stateDir = stateDir
         self.preferences = preferences
         // The other folders recordings were started in are read from the setting each time they are looked in.
@@ -63,7 +84,9 @@ final class AppModel: ObservableObject {
         let session = Session(stateDir: stateDir, recorder: recorder, store: store, now: Date.init,
                               freeBytes: freeBytes)
         let script = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/meetingbox")
-        let queue = ProcessingQueue(store: store, runner: runner ?? ScriptRunner.fromBundle() ?? ScriptRunner(script: script))
+        // Each job reads the transcriber and tidying chosen here as it launches.
+        let queue = ProcessingQueue(store: store, runner: runner ?? ScriptRunner.fromBundle() ?? ScriptRunner(script: script),
+                                    settings: { [preferences] in preferences.runSettings })
         self.store = store
         self.session = session
         self.queue = queue
@@ -71,13 +94,18 @@ final class AppModel: ObservableObject {
         self.library = LibraryModel(store: store, session: session, queue: queue)
         // The window's Pause, Resume and Stop take the path the menu's do.
         library.control = { [weak self] action in self?.perform(action) }
+        // A meeting always wins: every start, by any route, first cancels a voice sample being recorded.
+        // The handler's queue is the session's tick queue, the main queue.
+        handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.cancelSampleForMeeting() } }
         // Settings from before (or written by hand) with neither the Dock icon nor the menu bar item.
         normaliseVisibility()
     }
 
-    /// In this order: take up a recording left by a crash (Task 4), pick up the processing queue
-    /// (Task 5), then answer on the socket. The caller already holds `app.lock`.
+    /// In this order: remove any voice sample folder a crash left, take up a recording left by a crash
+    /// (Task 4), pick up the processing queue (Task 5), then answer on the socket. The caller already
+    /// holds `app.lock`.
     func launch() {
+        SampleFolder.removeLeftovers(in: stateDir)
         let queue = self.queue
         session.onChange = { [weak self] phase in
             Task { @MainActor in
@@ -140,12 +168,14 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// At quit: the socket goes, and nothing else. A recorder keeps running (it is its own process)
-    /// and the next launch adopts it; the kernel releases `app.lock` when the process ends. Never
-    /// stop or signal the recorder here: Keep recording and quit, and log out, end up here too.
+    /// At quit: the socket goes, and a voice sample being recorded stops and is deleted. A recorder
+    /// keeps running (it is its own process) and the next launch adopts it; the kernel releases
+    /// `app.lock` when the process ends. Never stop or signal the recorder here: Keep recording and
+    /// quit, and log out, end up here too.
     func shutDown() {
         server?.stop()
         server = nil
+        if case .recording = sample { endSample(.idle) }
     }
 
     /// What the menu bar item and the floating button show now.
@@ -338,6 +368,173 @@ final class AppModel: ObservableObject {
     /// The window opens with no complaint left from last time.
     func clearFolderProblem() {
         if folderProblem != nil { folderProblem = nil }
+    }
+
+    /// The Preferences window is opening: no complaint left from last time, and the microphones and
+    /// the engine's status read afresh.
+    func preferencesOpened() {
+        clearFolderProblem()
+        refreshMicrophones()
+        refreshEngines()
+    }
+
+    // MARK: transcripts: the transcriber, tidying and the user's voice
+
+    /// Read when the next job launches.
+    func setTranscriber(_ transcriber: Transcriber) {
+        objectWillChange.send()
+        preferences.transcriber = transcriber
+    }
+
+    /// Read when the next job launches.
+    func setTidyLines(_ on: Bool) {
+        objectWillChange.send()
+        preferences.tidyLines = on
+    }
+
+    /// "Parakeet is not set up, …" while Parakeet is chosen and the engine says it cannot be used.
+    var parakeetNotSetUp: String? {
+        PreferencesPresentation.parakeetNotSetUp(transcriber: preferences.transcriber, engines: engineStatus)
+    }
+
+    /// Runs `engines` through the engine, with a 10 s limit, when Preferences opens and after any change
+    /// to the voice. An answer overtaken by a newer one is dropped.
+    func refreshEngines() {
+        enginesAsked += 1
+        let asked = enginesAsked
+        engine.run(["engines"], stdin: nil, timeout: 10) { [weak self] _, output in
+            MainActor.assumeIsolated {
+                guard let self = self, asked == self.enginesAsked else { return }
+                self.engineStatus = PreferencesPresentation.parseEngines(output)
+                self.voiceStatus = PreferencesPresentation.voiceLine(self.engineStatus.voice)
+            }
+        }
+    }
+
+    /// There is a voice print to forget.
+    var canForgetVoice: Bool {
+        if case .print = engineStatus.voice { return true }
+        return false
+    }
+
+    /// "Forget my voice": `voice forget` through the engine, then the status afresh. A refusal (another
+    /// writer held the print for too long) is shown in the engine's words.
+    func forgetVoice() {
+        voiceProblem = nil
+        engine.run(["voice", "forget"], stdin: nil, timeout: 60) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                if status != 0 { self.voiceProblem = PreferencesPresentation.engineProblem(status: status, output: output) }
+                self.refreshEngines()
+            }
+        }
+    }
+
+    /// "Record a voice sample…" is offered only while nothing records and no sample is under way.
+    var canRecordSample: Bool { sampler != nil && session.phase == .idle && sample == .idle }
+
+    /// Starts a voice sample: a private folder `<stateDir>/sample.XXXXXX`, and the sampler on the
+    /// Preferences microphone. Refused unless the session is idle, no sample is under way and a sampler
+    /// was given. When the engine has said Parakeet cannot be used, it fails at once with that, rather
+    /// than after 90 seconds of reading. The countdown starts once the sampler is capturing.
+    func recordSample() {
+        guard canRecordSample, let sampler = sampler else { return }
+        if case .unavailable = engineStatus.parakeet {
+            sample = .failed(PreferencesPresentation.sampleNeedsParakeet)
+            return
+        }
+        guard let folder = SampleFolder.make(in: stateDir) else {
+            sample = .failed(PreferencesPresentation.sampleNoFolder)
+            return
+        }
+        samplesAsked += 1
+        let asked = samplesAsked
+        sampleFolder = folder
+        sample = .recording(secondsLeft: SampleState.seconds)
+        sampler.start(folder: folder, microphone: preferences.microphone) { [weak self] reason in
+            MainActor.assumeIsolated {
+                guard let self = self, asked == self.samplesAsked, case .recording = self.sample else { return }
+                if let reason = reason { self.endSample(.failed(reason)) } else { self.startSampleClock() }
+            }
+        }
+    }
+
+    /// One second of the countdown: the app's 1 s timer calls it (tests call it directly). At 0 the
+    /// sample is finished.
+    func tickSample() {
+        guard case .recording(let left) = sample else { return }
+        if left > 1 { sample = .recording(secondsLeft: left - 1) } else { finishSample() }
+    }
+
+    /// Stop: the sample ends early and is built from what was recorded.
+    func stopSample() {
+        guard case .recording = sample else { return }
+        finishSample()
+    }
+
+    /// Done (or the sheet closing): back to idle once the sample has an outcome; a sample still being
+    /// recorded is cancelled and deleted. One being built is left to finish.
+    func closeSample() {
+        switch sample {
+        case .done, .failed: sample = .idle
+        case .recording: endSample(.idle)
+        case .idle, .building: break
+        }
+    }
+
+    /// The sampler stops and the engine makes the print: `voice add <folder>/sample.caf`, with a 300 s
+    /// limit. Once it answers, the folder goes, the outcome is put into words and the status is read
+    /// afresh.
+    private func finishSample() {
+        guard let folder = sampleFolder else { return }
+        stopSampleClock()
+        sampler?.stop()
+        sample = .building
+        samplesAsked += 1
+        let asked = samplesAsked
+        let audio = folder.appendingPathComponent(SampleFolder.audioName)
+        engine.run(["voice", "add", audio.path], stdin: nil, timeout: 300) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                SampleFolder.remove(folder)
+                guard let self = self else { return }
+                if self.sampleFolder == folder { self.sampleFolder = nil }
+                guard asked == self.samplesAsked, self.sample == .building else { return }
+                self.sample = PreferencesPresentation.sampleOutcome(status: status, output: output)
+                self.refreshEngines()
+            }
+        }
+    }
+
+    /// A recording is about to start (`ControlHandler.willStart`): a sample being recorded stops, its
+    /// folder is deleted and it fails, saying why.
+    private func cancelSampleForMeeting() {
+        guard case .recording = sample else { return }
+        endSample(.failed(PreferencesPresentation.sampleStoppedForMeeting))
+    }
+
+    /// Ends a sample being recorded without building it: the clock and the sampler stop, the folder
+    /// goes, and any late word from the sampler is ignored.
+    private func endSample(_ outcome: SampleState) {
+        stopSampleClock()
+        sampler?.stop()
+        if let folder = sampleFolder { SampleFolder.remove(folder) }
+        sampleFolder = nil
+        samplesAsked += 1
+        sample = outcome
+    }
+
+    private func startSampleClock() {
+        guard sampleClock == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in MainActor.assumeIsolated { self?.tickSample() } }
+        timer.resume()
+        sampleClock = timer
+    }
+
+    private func stopSampleClock() {
+        sampleClock?.cancel()
+        sampleClock = nil
     }
 
     /// The meetings folder. Taken only while nothing is recording, paused or finalising, only an

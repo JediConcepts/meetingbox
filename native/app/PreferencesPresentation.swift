@@ -227,3 +227,149 @@ enum PreferencesPresentation {
         return nil
     }
 }
+
+// MARK: - transcripts: the transcriber, tidying and the user's voice
+
+/// One line of `meetingbox engines` about something the engine needs: ready, unavailable with its
+/// reason, or not said (yet).
+enum EngineAvailability: Equatable {
+    case unknown
+    case ready
+    case unavailable(String)
+}
+
+/// The voice print as `engines` reports it: not said (yet), none, or its whole seconds, the meetings
+/// that made it, and whether it began from a recorded sample.
+enum VoiceState: Equatable {
+    case unknown
+    case none
+    case print(seconds: Int, meetings: Int, sample: Bool)
+}
+
+/// What `meetingbox engines` said. Everything is unknown until it answers.
+struct EngineStatus: Equatable {
+    var parakeet: EngineAvailability = .unknown
+    var apple: EngineAvailability = .unknown
+    var voice: VoiceState = .unknown
+    var outsideRuntime: EngineAvailability = .unknown
+}
+
+extension PreferencesPresentation {
+    static let transcriberNote = "Applies to the next meeting processed."
+    static let parakeetMissing = "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup."
+    static let tidyTitle = "Tidy transcript lines (drop 'um' and 'uh', keep short replies inline)"
+    static let voiceNotLearnt = "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+    static let recordSampleTitle = "Record a voice sample…"
+    static let forgetVoiceTitle = "Forget my voice"
+    static let sampleStopTitle = "Stop"
+    static let sampleDoneTitle = "Done"
+    static let sampleBuilding = "Finding your voice in the sample…"
+    static let sampleMicrophoneRefused = "meetingbox is not allowed to use the microphone. Allow it in System Settings, under Privacy & Security, Microphone."
+    static let sampleStoppedForMeeting = "Stopped because a meeting started recording."
+    static let sampleNeedsParakeet = "Parakeet is not set up, so a voice sample cannot be used. Run meetingbox setup."
+    static let sampleTookTooLong = "Finding your voice in the sample took too long, so it was not used."
+    static let sampleNoFolder = "The voice sample could not be recorded: meetingbox could not make a folder for it."
+    static let sampleNoMicrophone = "The voice sample could not be recorded: no microphone was found."
+
+    static func transcriberTitle(_ transcriber: Transcriber) -> String {
+        switch transcriber {
+        case .parakeet: return "Parakeet (more accurate)"
+        case .apple: return "Apple"
+        }
+    }
+
+    /// The Parakeet line, only when Parakeet is chosen and `engines` says it is unavailable.
+    static func parakeetNotSetUp(transcriber: Transcriber, engines: EngineStatus) -> String? {
+        guard transcriber == .parakeet, case .unavailable = engines.parakeet else { return nil }
+        return parakeetMissing
+    }
+
+    /// Reads `meetingbox engines`: the `parakeet`, `apple`, `voice` and `outside-runtime` lines. A line
+    /// it cannot read, or one that is not there, leaves what it would say unknown.
+    static func parseEngines(_ output: String) -> EngineStatus {
+        var status = EngineStatus()
+        for line in output.split(whereSeparator: \.isNewline) {
+            let words = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let name = words.first else { continue }
+            let rest = words.count > 1 ? words[1] : ""
+            switch name {
+            case "parakeet": status.parakeet = availability(rest) ?? status.parakeet
+            case "apple": status.apple = availability(rest) ?? status.apple
+            case "outside-runtime": status.outsideRuntime = availability(rest) ?? status.outsideRuntime
+            case "voice": status.voice = voice(rest) ?? status.voice
+            default: continue
+            }
+        }
+        return status
+    }
+
+    /// `ready`, or `unavailable <reason>`.
+    private static func availability(_ text: Substring) -> EngineAvailability? {
+        if text == "ready" { return .ready }
+        guard text.hasPrefix("unavailable") else { return nil }
+        return .unavailable(text.dropFirst("unavailable".count).trimmingCharacters(in: .whitespaces))
+    }
+
+    /// `none`, or `<seconds> <meetings> learnt|sample`.
+    private static func voice(_ text: Substring) -> VoiceState? {
+        if text == "none" { return VoiceState.none }
+        let parts = text.split(separator: " ")
+        guard parts.count == 3, let seconds = Int(parts[0]), seconds >= 0, let meetings = Int(parts[1]), meetings >= 1,
+              parts[2] == "learnt" || parts[2] == "sample" else { return nil }
+        return .print(seconds: seconds, meetings: meetings, sample: parts[2] == "sample")
+    }
+
+    /// Speech in whole minutes, to the nearest, with the singular.
+    private static func minutes(_ seconds: Int) -> String {
+        let m = Int((Double(seconds) / 60).rounded())
+        return m == 1 ? "1 minute" : "\(m) minutes"
+    }
+
+    private static func calls(_ n: Int) -> String { n == 1 ? "1 call" : "\(n) calls" }
+
+    /// The voice print in Preferences' words (spec 6.2). A sample counts as one of its meetings.
+    static func voiceStatus(seconds: Int, meetings: Int, sample: Bool) -> String {
+        guard sample else { return "Your voice: learnt from \(calls(meetings)) (\(minutes(seconds)) of speech)" }
+        if meetings <= 1 { return "Your voice: from a recorded sample (\(minutes(seconds)) of speech)" }
+        return "Your voice: from a recorded sample and \(calls(meetings - 1)) (\(minutes(seconds)) of speech)"
+    }
+
+    /// The voice line Preferences shows: nothing until the engine has said.
+    static func voiceLine(_ voice: VoiceState) -> String {
+        switch voice {
+        case .unknown: return ""
+        case .none: return voiceNotLearnt
+        case .print(let seconds, let meetings, let sample): return voiceStatus(seconds: seconds, meetings: meetings, sample: sample)
+        }
+    }
+
+    /// "Read aloud for 90 seconds. 0:42 left".
+    static func sampleCountdown(secondsLeft: Int) -> String {
+        let left = max(0, secondsLeft)
+        let seconds = left % 60
+        return "Read aloud for \(SampleState.seconds) seconds. \(left / 60):\(seconds < 10 ? "0" : "")\(seconds) left"
+    }
+
+    /// The first line with text in an engine command's output, or nil.
+    static func firstLine(_ output: String) -> String? {
+        output.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.first { !$0.isEmpty }
+    }
+
+    /// What `voice add` answered, in words: `sample <seconds>` is learnt; anything else fails with the
+    /// engine's own line (its refusals are already Preferences' words).
+    static func sampleOutcome(status: Int32, output: String) -> SampleState {
+        if status == ScriptEngineCommands.timedOut { return .failed(sampleTookTooLong) }
+        let line = firstLine(output)
+        if status == 0, let line = line, line.hasPrefix("sample "), let seconds = Int(line.dropFirst("sample ".count)), seconds >= 0 {
+            return .done("Your voice is learnt from this sample (\(minutes(seconds)) of speech).")
+        }
+        if status != 0, let line = line { return .failed(line) }
+        return .failed("The voice sample could not be used (exit \(status)).")
+    }
+
+    /// An engine command's answer as one line for the window: its own first line, or its status.
+    static func engineProblem(status: Int32, output: String) -> String {
+        if status == ScriptEngineCommands.timedOut { return "meetingbox did not answer in time." }
+        return firstLine(output) ?? "meetingbox could not do that (exit \(status))."
+    }
+}

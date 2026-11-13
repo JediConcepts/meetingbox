@@ -24,11 +24,10 @@ final class PreferencesWindow: NSObject {
         window.center()
     }
 
-    /// In front, with the microphones listed afresh (one may have been plugged in since) and no
-    /// complaint left over from last time.
+    /// In front, with the microphones and the engine's status read afresh (a microphone may have been
+    /// plugged in since, or setup run) and no complaint left over from last time.
     func show() {
-        model.clearFolderProblem()
-        model.refreshMicrophones()
+        model.preferencesOpened()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -87,6 +86,7 @@ struct PreferencesView: View {
                     Toggle("Open the minutes when they are ready", isOn: Binding(get: { app.preferences.openMinutes }, set: { app.setOpenMinutes($0) }))
                     Toggle("Play sounds", isOn: Binding(get: { app.preferences.sounds }, set: { app.setSounds($0) }))
                 }
+                TranscriptsSection(app: app)
                 Section {
                     Picker("Microphone:", selection: Binding(get: { microphone.selected }, set: { index in
                         if microphone.options.indices.contains(index) { app.setMicrophone(microphone.options[index].name) }
@@ -125,5 +125,81 @@ struct PreferencesView: View {
         }
         .padding(20)
         .frame(width: 480)
+        // The voice sample's sheet, shown while a sample is under way or has an outcome to read.
+        .sheet(isPresented: Binding(get: { app.sample != .idle }, set: { if !$0 { app.closeSample() } })) {
+            VoiceSampleSheet(app: app)
+        }
+    }
+}
+
+/// "Transcripts": the transcriber, tidying, and the user's voice, between the minutes toggles and the
+/// microphone. The words and the rules are `PreferencesPresentation`'s.
+struct TranscriptsSection: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        Section("Transcripts") {
+            Picker("Transcriber:", selection: Binding(get: { app.preferences.transcriber }, set: { app.setTranscriber($0) })) {
+                ForEach(Transcriber.allCases, id: \.self) { transcriber in
+                    Text(PreferencesPresentation.transcriberTitle(transcriber)).tag(transcriber)
+                }
+            }
+            Text(PreferencesPresentation.transcriberNote)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let missing = app.parakeetNotSetUp {
+                Text(missing)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Toggle(PreferencesPresentation.tidyTitle, isOn: Binding(get: { app.preferences.tidyLines }, set: { app.setTidyLines($0) }))
+            if !app.voiceStatus.isEmpty {
+                Text(app.voiceStatus)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Button(PreferencesPresentation.recordSampleTitle) { app.recordSample() }
+                    .disabled(!app.canRecordSample)
+                Button(PreferencesPresentation.forgetVoiceTitle) { app.forgetVoice() }
+                    .disabled(!app.canForgetVoice)
+            }
+            if let problem = app.voiceProblem {
+                Text(problem).foregroundStyle(.red)
+            }
+        }
+    }
+}
+
+/// The voice sample: the countdown and Stop while it records, a line while the engine builds the
+/// print, then the outcome and Done. It cannot be dismissed otherwise: Stop and Done are the way out.
+struct VoiceSampleSheet: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        VStack(spacing: 16) {
+            switch app.sample {
+            case .recording(let left):
+                Text(PreferencesPresentation.sampleCountdown(secondsLeft: left))
+                    .font(.title3)
+                    .monospacedDigit()
+                Button(PreferencesPresentation.sampleStopTitle) { app.stopSample() }
+                    .keyboardShortcut(.defaultAction)
+            case .building:
+                ProgressView()
+                Text(PreferencesPresentation.sampleBuilding)
+            case .done(let text), .failed(let text):
+                Text(text)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.center)
+                Button(PreferencesPresentation.sampleDoneTitle) { app.closeSample() }
+                    .keyboardShortcut(.defaultAction)
+            case .idle:
+                EmptyView()
+            }
+        }
+        .padding(24)
+        .frame(width: 380)
+        .interactiveDismissDisabled(true)
     }
 }

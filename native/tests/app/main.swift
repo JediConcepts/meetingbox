@@ -1,4 +1,4 @@
-// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift ../../app/RecordingMenu.swift ../../app/BuildInfo.swift
+// sources: ../../app/Preferences.swift ../../app/ControlServer.swift ../../app/MeetingFolder.swift ../../app/MeetingStore.swift ../../app/Session.swift ../../app/ChildRecorder.swift ../../recorder/RecordingOutput.swift ../../recorder/AudioMixer.swift ../../recorder/Finalise.swift ../../app/ProcessingQueue.swift ../../app/StatusPresentation.swift ../../app/StatusReducer.swift ../../app/LaunchMode.swift ../../app/LibraryPresentation.swift ../../app/LibraryModel.swift ../../app/PreferencesPresentation.swift ../../app/AppModel.swift ../../app/RecordingMenu.swift ../../app/BuildInfo.swift ../../app/VoiceSample.swift
 // Meeting folders, the library store, and the recording session. Everything runs in temporary folders.
 import AppKit
 import AVFoundation
@@ -1602,7 +1602,10 @@ do {
 /// Records each run; the test ends a run by calling `finish`.
 final class FakeRunner: PipelineRunner {
     struct Call {
-        let audio: URL
+        /// The job as the queue built it at launch: its kind, folder and the engine's arguments.
+        let job: PipelineJob
+        var audio: URL { job.folder.appendingPathComponent("audio.m4a") }
+        var arguments: [String] { job.arguments }
         let progress: URL
         let attempt: String
         let done: (Int32, String) -> Void
@@ -1613,10 +1616,10 @@ final class FakeRunner: PipelineRunner {
         let errorAtRun: String?
     }
     var calls: [Call] = []
-    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
-        let json = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: audio.deletingLastPathComponent()
+    func run(_ job: PipelineJob, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
+        let json = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: job.folder
             .appendingPathComponent("meeting.json")))) as? [String: Any]) ?? [:]
-        calls.append(Call(audio: audio, progress: progress, attempt: attempt, done: done,
+        calls.append(Call(job: job, progress: progress, attempt: attempt, done: done,
                           stateAtRun: json["state"] as? String, attemptsAtRun: (json["attempts"] as? NSNumber)?.intValue,
                           attemptAtRun: json["attempt"] as? String, errorAtRun: json["error"] as? String))
         return Int32(40000 + calls.count)
@@ -2082,12 +2085,15 @@ do {
     try! "an error from an earlier run\n".write(to: processLog, atomically: true, encoding: .utf8)
     let sem = DispatchSemaphore(value: 0)
     var got: (Int32, String)?
-    let pid = runner.run(audio: audio, progress: progress, attempt: "the-attempt") { s, l in got = (s, l); sem.signal() }
+    let job = PipelineJob(kind: .process, folder: dir, arguments: ScriptRunner.arguments(
+        kind: .process, folder: dir, transcriber: .parakeet, room: nil, call: nil, tidy: true, writer: nil))
+    let pid = runner.run(job, progress: progress, attempt: "the-attempt") { s, l in got = (s, l); sem.signal() }
     check(pid > 0, "ScriptRunner returns the worker's PID")
     check(sem.wait(timeout: .now() + 10) == .success, "ScriptRunner calls done")
     check(got?.0 == 3 && got?.1 == "the transcript came out empty", "ScriptRunner gives the exit status and the last stderr line")
     let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
-    check(text.contains("arg process\narg \(audio.path)\n"), "ScriptRunner runs <script> process <audio>")
+    check(text.contains("arg process\narg \(audio.path)\narg --parakeet\narg --tidy\narg --writer\narg apple\n"),
+          "ScriptRunner runs <script> with the job's arguments: process <audio> --parakeet --tidy --writer apple")
     check(text.contains("sounds=0\n") && text.contains("progress=\(progress.path)\n") && text.contains("attempt=the-attempt\n"),
           "ScriptRunner sets MB_SOUNDS=0, MB_PROGRESS_FILE and MB_ATTEMPT")
     check(text.contains("path=/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n"),
@@ -2103,14 +2109,15 @@ do {
     let quietScript = dir.appendingPathComponent("quiet")
     try! "#!/bin/bash\nexit 2\n".write(to: quietScript, atomically: true, encoding: .utf8)
     chmod(quietScript.path, 0o700)
-    _ = ScriptRunner(script: quietScript, home: home, environment: [:]).run(audio: audio, progress: progress, attempt: "q") { s, l in
+    let plainJob = PipelineJob(kind: .process, folder: dir, arguments: ["process", audio.path])
+    _ = ScriptRunner(script: quietScript, home: home, environment: [:]).run(plainJob, progress: progress, attempt: "q") { s, l in
         quiet = (s, l); sem3.signal() }
     check(sem3.wait(timeout: .now() + 10) == .success && quiet?.0 == 2 && quiet?.1 == "",
           "I2: the last line comes only from this run's part of the log")
     let missing = ScriptRunner(script: dir.appendingPathComponent("no-such-script"), home: home, environment: [:])
     var gone: (Int32, String)?
     let sem2 = DispatchSemaphore(value: 0)
-    _ = missing.run(audio: audio, progress: progress, attempt: "x") { s, l in gone = (s, l); sem2.signal() }
+    _ = missing.run(plainJob, progress: progress, attempt: "x") { s, l in gone = (s, l); sem2.signal() }
     check(sem2.wait(timeout: .now() + 5) == .success && gone?.0 == 127 && (gone?.1 ?? "").contains("could not start"),
           "ScriptRunner reports a script it cannot start")
 }
@@ -5073,6 +5080,479 @@ MainActor.assumeIsolated {
           "C2 app: Minutes ready on such a meeting opens it in the window")
     next.shutDown()
     try? fm.removeItem(at: state)
+}
+
+// MARK: - Transcriber, tidying and the user's voice (Stage 3, Task 6)
+
+/// Records each engine command; the test answers one by calling `answer`, on the main queue as the real
+/// one does. Never a process.
+final class FakeEngine: EngineCommands {
+    struct Call {
+        let arguments: [String]
+        let stdin: Data?
+        let timeout: TimeInterval
+        let done: (Int32, String) -> Void
+    }
+    var calls: [Call] = []
+    func run(_ arguments: [String], stdin: Data?, timeout: TimeInterval, done: @escaping (Int32, String) -> Void) {
+        calls.append(Call(arguments: arguments, stdin: stdin, timeout: timeout, done: done))
+    }
+    func answer(_ i: Int, _ status: Int32, _ output: String) { calls[i].done(status, output) }
+    func answerLast(_ status: Int32, _ output: String) { answer(calls.count - 1, status, output) }
+    func count(_ arguments: [String]) -> Int { calls.filter { $0.arguments == arguments }.count }
+}
+
+/// Records each sample; the test says when it is capturing, or why it cannot. It writes the
+/// sample.caf the real recorder would, so the folder has something in it.
+final class FakeSampler: SampleRecorder {
+    var starts: [(folder: URL, microphone: String?, started: (String?) -> Void)] = []
+    var stops = 0
+    func start(folder: URL, microphone: String?, started: @escaping (String?) -> Void) {
+        starts.append((folder, microphone, started))
+        try? Data("caf".utf8).write(to: folder.appendingPathComponent("sample.caf"))
+    }
+    func stop() { stops += 1 }
+}
+
+func lexists(_ url: URL) -> Bool { var s = stat(); return lstat(url.path, &s) == 0 }
+
+// Preferences: the transcriber and tidying, their defaults, persistence and the run settings.
+do {
+    let home = URL(fileURLWithPath: "/Users/someone", isDirectory: true)
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: home)
+    check(p.transcriber == .parakeet && p.tidyLines, "T6 Preferences: the transcriber is Parakeet and tidying is on, by default")
+    check(Transcriber.allCases == [.parakeet, .apple] && Transcriber.parakeet.rawValue == "parakeet" && Transcriber.apple.rawValue == "apple",
+          "T6 Transcriber: parakeet and apple, the words the engine reads")
+    check(p.runSettings == .defaults && RunSettings.defaults == RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: []),
+          "T6 Preferences: runSettings on an empty suite is RunSettings.defaults: Parakeet, tidy, Apple writes, nothing agreed")
+    p.transcriber = .apple
+    p.tidyLines = false
+    let q = Preferences(defaults: d, home: home)
+    check(q.transcriber == .apple && !q.tidyLines && d.string(forKey: "transcriber") == "apple" && (d.object(forKey: "tidyLines") as? Bool) == false,
+          "T6 Preferences: both persist, under the keys transcriber and tidyLines that the engine reads")
+    check(q.runSettings == RunSettings(transcriber: .apple, tidy: false, preferredWriter: .apple, agreed: []),
+          "T6 Preferences: runSettings follows them, with Apple writing and nothing agreed")
+    d.set("whisper", forKey: "transcriber")
+    let unknownText = q.transcriber
+    d.set(42, forKey: "transcriber")
+    check(unknownText == .parakeet && q.transcriber == .parakeet, "T6 Preferences: a transcriber it does not know reads as Parakeet")
+}
+
+// The arguments the app gives the engine, and the writer rule.
+do {
+    let dir = URL(fileURLWithPath: "/Users/someone/Meetings/2026-11-13_0900", isDirectory: true)
+    let audio = dir.appendingPathComponent("audio.m4a").path
+    func args(_ t: Transcriber, tidy: Bool, writer: OutsideWriter? = nil, room: Int? = nil, call: Int? = nil) -> [String] {
+        ScriptRunner.arguments(kind: .process, folder: dir, transcriber: t, room: room, call: call, tidy: tidy, writer: writer)
+    }
+    check(args(.parakeet, tidy: true) == ["process", audio, "--parakeet", "--tidy", "--writer", "apple"],
+          "T6 arguments: a process job is process <dir>/audio.m4a --parakeet --tidy --writer apple")
+    check(args(.apple, tidy: true) == ["process", audio, "--native", "--tidy", "--writer", "apple"], "T6 arguments: Apple's transcriber is --native")
+    check(args(.parakeet, tidy: false) == ["process", audio, "--parakeet", "--no-tidy", "--writer", "apple"], "T6 arguments: tidying off is --no-tidy")
+    check(args(.parakeet, tidy: true, room: 3, call: 2) == args(.parakeet, tidy: true), "T6 arguments: a process job takes no people counts")
+    let claude = OutsideWriter(kind: .claude, address: "https://api.anthropic.com", model: "claude-model")
+    check(args(.parakeet, tidy: true, writer: claude) == ["process", audio, "--parakeet", "--tidy", "--writer", "outside", "--kind", "claude",
+                                                          "--address", "https://api.anthropic.com", "--writer-model", "claude-model"],
+          "T6 arguments: an outside writer is --writer outside --kind --address --writer-model")
+    func same(_ a: (use: OutsideWriter?, setAside: OutsideWriter?), _ use: OutsideWriter?, _ setAside: OutsideWriter?) -> Bool {
+        a.use == use && a.setAside == setAside
+    }
+    let preferClaude = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .outside(claude),
+                                   agreed: [Source(kind: .claude, address: claude.address, agreed: true)])
+    var notAgreed = preferClaude
+    notAgreed.agreed = []
+    var otherKind = preferClaude
+    otherKind.agreed = [Source(kind: .standard, address: claude.address, agreed: true)]
+    var listedUnagreed = preferClaude
+    listedUnagreed.agreed = [Source(kind: .claude, address: claude.address, agreed: false)]
+    check(same(ScriptRunner.writer(meeting: nil, settings: .defaults), nil, nil), "T6 writer: no meeting writer and an Apple preference: Apple")
+    check(same(ScriptRunner.writer(meeting: nil, settings: preferClaude), claude, nil),
+          "T6 writer: the outside writer when agreed holds its kind and address")
+    check(same(ScriptRunner.writer(meeting: nil, settings: notAgreed), nil, claude), "T6 writer: set aside when agreed lacks it")
+    check(same(ScriptRunner.writer(meeting: nil, settings: otherKind), nil, claude), "T6 writer: set aside when agreed holds its address with another kind")
+    check(same(ScriptRunner.writer(meeting: nil, settings: listedUnagreed), nil, claude), "T6 writer: set aside when its source is listed but not agreed")
+    check(same(ScriptRunner.writer(meeting: .apple, settings: preferClaude), nil, nil), "T6 writer: a meeting's Apple wins over an outside preference")
+    let local = OutsideWriter(kind: .standard, address: "http://127.0.0.1:11434/v1", model: "llama")
+    let agreedLocal = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple,
+                                  agreed: [Source(kind: .standard, address: local.address, agreed: true)])
+    check(same(ScriptRunner.writer(meeting: .outside(local), settings: agreedLocal), local, nil)
+          && same(ScriptRunner.writer(meeting: .outside(local), settings: .defaults), nil, local),
+          "T6 writer: a meeting's own outside writer is used only when agreed, over an Apple preference")
+}
+
+// The queue builds each job's arguments at launch, from the settings of that moment, read once.
+do {
+    let r = QRig()
+    var current = RunSettings.defaults
+    var reads = 0
+    let q = ProcessingQueue(store: r.store, runner: r.runner, tickQueue: nil, settings: { reads += 1; return current })
+    let a = r.meeting("2026-11-13_0900", queued)
+    let b = r.meeting("2026-11-13_1000", queued)
+    let c = r.meeting("2026-11-13_1100", queued)
+    q.enqueue(a)
+    check(r.runner.calls.count == 1 && r.runner.calls[0].job.kind == .process && r.runner.calls[0].job.folder.path == a.path
+          && r.runner.calls[0].arguments == ["process", a.appendingPathComponent("audio.m4a").path, "--parakeet", "--tidy", "--writer", "apple"]
+          && reads == 1, "T6 queue: a process job launches with process <dir>/audio.m4a --parakeet --tidy --writer apple, the settings read once")
+    q.enqueue(b)
+    current = RunSettings(transcriber: .apple, tidy: false, preferredWriter: .apple, agreed: [])
+    check(reads == 1, "T6 queue: a job waiting in the queue has not read the settings yet")
+    r.runner.finish(0, 0)
+    check(r.runner.calls.count == 2 && r.runner.calls[1].arguments == ["process", b.appendingPathComponent("audio.m4a").path, "--native", "--no-tidy", "--writer", "apple"]
+          && reads == 2, "T6 queue: the next job launches with the settings changed while it waited: --native --no-tidy")
+    let llama = OutsideWriter(kind: .standard, address: "http://localhost:11434/v1", model: "llama3")
+    current = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .outside(llama), agreed: [])
+    q.enqueue(c)
+    r.runner.finish(1, 0)
+    let log = (try? String(contentsOf: c.appendingPathComponent(".process-log"), encoding: .utf8)) ?? ""
+    check(r.runner.calls.count == 3 && Array(r.runner.calls[2].arguments.suffix(2)) == ["--writer", "apple"]
+          && log == "The minutes writer llama3 at localhost was set aside because its source was removed, changed or not agreed. Apple's model writes the minutes.\n"
+          && mode(c.appendingPathComponent(".process-log")) == 0o600,
+          "T6 queue: a writer set aside at launch: Apple writes, and .process-log (0600) says why first (\(log))")
+    r.runner.finish(2, 0)
+}
+
+// The engine's commands outside the app: the environment, stdin, the limit and the output cap. These
+// call the static execute on scripts in the scratch folder; no test makes a ScriptEngineCommands.
+do {
+    let dir = freshRoot()
+    let base = ["PATH": "/usr/bin:/bin", "MB_DIR": "/elsewhere", "MB_ENGINE": "native", "HOME": "/Users/someone"]
+    let env = ScriptEngineCommands.environment(base, home: URL(fileURLWithPath: "/Users/someone"))
+    check(!env.keys.contains { $0.hasPrefix("MB_") } && env["PATH"] == "/Users/someone/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+          && env["HOME"] == "/Users/someone", "T6 engine commands: their environment has no MB_* setting, and PATH is led as the runner's is")
+    let script = dir.appendingPathComponent("engine")
+    try! """
+    #!/bin/bash
+    for a in "$@"; do echo "arg $a"; done
+    echo "stdin $(cat)"
+    env | grep '^MB_' | sed 's/^/env /'
+    exit 3
+    """.write(to: script, atomically: true, encoding: .utf8)
+    chmod(script.path, 0o700)
+    let (status, out) = ScriptEngineCommands.execute(script: script, arguments: ["key", "set", "--address", "http://x"], environment: env,
+                                                     stdin: Data("the-key\n".utf8), timeout: 10)
+    check(status == 3 && out.hasPrefix("arg key\narg set\narg --address\narg http://x\nstdin the-key\n") && !out.contains("env MB_"),
+          "T6 engine commands: the script gets its arguments, stdin from a pipe, no MB_* setting, and its status comes back (\(status), \(out))")
+    let quiet = dir.appendingPathComponent("quiet")
+    try! "#!/bin/bash\nread -r line || echo eof\n".write(to: quiet, atomically: true, encoding: .utf8)
+    chmod(quiet.path, 0o700)
+    let (quietStatus, quietOut) = ScriptEngineCommands.execute(script: quiet, arguments: [], environment: env, stdin: nil, timeout: 10)
+    check(quietStatus == 0 && quietOut == "eof\n", "T6 engine commands: with no stdin the script reads the end at once")
+    let loud = dir.appendingPathComponent("loud")
+    try! "#!/bin/bash\nhead -c 200000 /dev/zero | tr '\\0' a\n".write(to: loud, atomically: true, encoding: .utf8)
+    chmod(loud.path, 0o700)
+    let (loudStatus, loudOut) = ScriptEngineCommands.execute(script: loud, arguments: [], environment: env, stdin: nil, timeout: 10)
+    check(loudStatus == 0 && loudOut.utf8.count == 65_536 && loudOut.allSatisfy { $0 == "a" }, "T6 engine commands: at most 64 KB of stdout (\(loudOut.utf8.count))")
+    let slow = dir.appendingPathComponent("slow")
+    let childFile = dir.appendingPathComponent("child")
+    try! "#!/bin/bash\nsleep 30 &\necho $! > \"$1\"\nwait\n".write(to: slow, atomically: true, encoding: .utf8)
+    chmod(slow.path, 0o700)
+    let began = Date()
+    let (slowStatus, _) = ScriptEngineCommands.execute(script: slow, arguments: [childFile.path], environment: env, stdin: nil, timeout: 0.5)
+    let child = Int32((try? String(contentsOf: childFile, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+    var childGone = false
+    for _ in 0..<100 where !childGone { if child > 0 && kill(child, 0) != 0 { childGone = true } else { usleep(20_000) } }
+    check(slowStatus == 124 && Date().timeIntervalSince(began) < 8 && childGone,
+          "T6 engine commands: killed at the limit with status 124, the processes it started with it")
+    let none = NoEngineCommands()
+    var answer: (Int32, String)?
+    none.run(["engines"], stdin: nil, timeout: 10) { answer = ($0, $1) }
+    check(settle { answer != nil } && answer?.0 == 1 && answer?.1 == "meetingbox is not installed; run meetingbox setup",
+          "T6 engine commands: NoEngineCommands answers status 1 and says meetingbox is not installed, and runs nothing")
+}
+
+// What Preferences shows: the engine's lines, the voice status, the Parakeet line and the sample's words.
+do {
+    let ready = PreferencesPresentation.parseEngines("parakeet ready\napple ready\nvoice none\n")
+    check(ready == EngineStatus(parakeet: .ready, apple: .ready, voice: .none, outsideRuntime: .unknown),
+          "T6 parseEngines: parakeet ready, apple ready, voice none")
+    let missing = PreferencesPresentation.parseEngines(
+        "parakeet unavailable the speech helper is not installed\napple unavailable speech-analyzer is not installed\nvoice 391 1 learnt\noutside-runtime ready\n")
+    check(missing == EngineStatus(parakeet: .unavailable("the speech helper is not installed"), apple: .unavailable("speech-analyzer is not installed"),
+                                  voice: .print(seconds: 391, meetings: 1, sample: false), outsideRuntime: .ready),
+          "T6 parseEngines: unavailable with reasons, voice 391 1 learnt, and the outside-runtime line")
+    check(PreferencesPresentation.parseEngines("voice 75 1 sample").voice == .print(seconds: 75, meetings: 1, sample: true)
+          && PreferencesPresentation.parseEngines("voice 200 3 sample").voice == .print(seconds: 200, meetings: 3, sample: true),
+          "T6 parseEngines: voice 75 1 sample and voice 200 3 sample")
+    check(PreferencesPresentation.parseEngines("meetingbox is not installed; run meetingbox setup") == EngineStatus()
+          && PreferencesPresentation.parseEngines("voice lots 1 learnt\nparakeet maybe").voice == .unknown
+          && PreferencesPresentation.parseEngines("parakeet maybe").parakeet == .unknown,
+          "T6 parseEngines: lines it cannot read leave what they would say unknown")
+    let notLearnt = "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+    check(PreferencesPresentation.voiceLine(.none) == notLearnt && PreferencesPresentation.voiceLine(.unknown) == "",
+          "T6 voice status: none is not learnt yet, and nothing is said before the engine answers")
+    check(PreferencesPresentation.voiceStatus(seconds: 391, meetings: 1, sample: false) == "Your voice: learnt from 1 call (7 minutes of speech)",
+          "T6 voice status: 391 s from 1 call")
+    check(PreferencesPresentation.voiceStatus(seconds: 754, meetings: 3, sample: false) == "Your voice: learnt from 3 calls (13 minutes of speech)",
+          "T6 voice status: 754 s from 3 calls")
+    check(PreferencesPresentation.voiceStatus(seconds: 75, meetings: 1, sample: true) == "Your voice: from a recorded sample (1 minute of speech)",
+          "T6 voice status: 75 s from a sample")
+    check(PreferencesPresentation.voiceStatus(seconds: 200, meetings: 3, sample: true) == "Your voice: from a recorded sample and 2 calls (3 minutes of speech)",
+          "T6 voice status: 200 s from a sample and 2 calls")
+    check(PreferencesPresentation.voiceStatus(seconds: 130, meetings: 2, sample: true) == "Your voice: from a recorded sample and 1 call (2 minutes of speech)"
+          && PreferencesPresentation.voiceLine(.print(seconds: 391, meetings: 1, sample: false)) == "Your voice: learnt from 1 call (7 minutes of speech)",
+          "T6 voice status: a sample and 1 call, and voiceLine gives the same words")
+    let notSetUp = "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup."
+    let unavailable = EngineStatus(parakeet: .unavailable("x"), apple: .ready, voice: .none, outsideRuntime: .unknown)
+    check(PreferencesPresentation.parakeetNotSetUp(transcriber: .parakeet, engines: unavailable) == notSetUp
+          && PreferencesPresentation.parakeetNotSetUp(transcriber: .apple, engines: unavailable) == nil
+          && PreferencesPresentation.parakeetNotSetUp(transcriber: .parakeet, engines: ready) == nil
+          && PreferencesPresentation.parakeetNotSetUp(transcriber: .parakeet, engines: EngineStatus()) == nil,
+          "T6 Parakeet line: only when Parakeet is chosen and engines says it is unavailable")
+    check(PreferencesPresentation.transcriberTitle(.parakeet) == "Parakeet (more accurate)" && PreferencesPresentation.transcriberTitle(.apple) == "Apple"
+          && PreferencesPresentation.transcriberNote == "Applies to the next meeting processed."
+          && PreferencesPresentation.tidyTitle == "Tidy transcript lines (drop 'um' and 'uh', keep short replies inline)"
+          && PreferencesPresentation.recordSampleTitle == "Record a voice sample…" && PreferencesPresentation.forgetVoiceTitle == "Forget my voice"
+          && PreferencesPresentation.sampleStopTitle == "Stop" && PreferencesPresentation.sampleDoneTitle == "Done",
+          "T6 Preferences words: the transcriber, the note, tidying and the voice buttons, word for word")
+    check(PreferencesPresentation.sampleCountdown(secondsLeft: 42) == "Read aloud for 90 seconds. 0:42 left"
+          && PreferencesPresentation.sampleCountdown(secondsLeft: 90) == "Read aloud for 90 seconds. 1:30 left"
+          && PreferencesPresentation.sampleCountdown(secondsLeft: 5) == "Read aloud for 90 seconds. 0:05 left",
+          "T6 sample sheet: the countdown")
+    check(PreferencesPresentation.sampleOutcome(status: 0, output: "sample 75\n") == .done("Your voice is learnt from this sample (1 minute of speech).")
+          && PreferencesPresentation.sampleOutcome(status: 0, output: "sample 130\n") == .done("Your voice is learnt from this sample (2 minutes of speech)."),
+          "T6 sample outcome: sample <seconds> in words")
+    let twoVoices = "More than one voice was heard. Record again with only you speaking."
+    let noParakeet = "Parakeet is not set up, so a voice sample cannot be used. Run meetingbox setup."
+    check(PreferencesPresentation.sampleOutcome(status: 1, output: twoVoices + "\n") == .failed(twoVoices)
+          && PreferencesPresentation.sampleOutcome(status: 1, output: noParakeet + "\n") == .failed(noParakeet)
+          && PreferencesPresentation.sampleOutcome(status: 1, output: "meetingbox is not installed; run meetingbox setup") == .failed("meetingbox is not installed; run meetingbox setup"),
+          "T6 sample outcome: a refusal is the engine's own line")
+    check(PreferencesPresentation.sampleOutcome(status: 124, output: "") == .failed(PreferencesPresentation.sampleTookTooLong)
+          && PreferencesPresentation.sampleOutcome(status: 2, output: "\n") == .failed("The voice sample could not be used (exit 2).")
+          && PreferencesPresentation.sampleOutcome(status: 0, output: "") == .failed("The voice sample could not be used (exit 0)."),
+          "T6 sample outcome: the limit, and an answer with no line, are failures that say so")
+    check(PreferencesPresentation.sampleMicrophoneRefused
+          == "meetingbox is not allowed to use the microphone. Allow it in System Settings, under Privacy & Security, Microphone."
+          && PreferencesPresentation.sampleStoppedForMeeting == "Stopped because a meeting started recording."
+          && PreferencesPresentation.sampleNeedsParakeet == noParakeet, "T6 sample words: the microphone, a meeting starting, and Parakeet")
+}
+
+// AppModel: the settings, the engine's status, forgetting, and the voice sample.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    prefs.microphone = "USB Mic"
+    // What a crash may have left in the state folder, and what is not a sample folder.
+    let leftover = state.appendingPathComponent("sample.abc123", isDirectory: true)
+    try! fm.createDirectory(at: leftover, withIntermediateDirectories: true)
+    try! Data("caf".utf8).write(to: leftover.appendingPathComponent("sample.caf"))
+    let target = freshRoot()
+    try! Data("keep".utf8).write(to: target.appendingPathComponent("keep.txt"))
+    let link = state.appendingPathComponent("sample.lnk456")
+    try! fm.createSymbolicLink(at: link, withDestinationURL: target)
+    let samples = state.appendingPathComponent("samples", isDirectory: true)
+    try! fm.createDirectory(at: samples, withIntermediateDirectories: true)
+    let plainFile = state.appendingPathComponent("sample.fil789")
+    try! Data("x".utf8).write(to: plainFile)
+    let rec = FakeRecorder()
+    let runner = FakeRunner()
+    let engine = FakeEngine()
+    let sampler = FakeSampler()
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: runner, freeBytes: { _ in 50 * GB },
+                         engine: engine, sampler: sampler)
+    let waiting = make(root, "2026-11-13_0900", files: ["audio.m4a": "a"])
+    try! model.store.update(waiting) { $0.state = .queued }
+
+    var changes = 0
+    let watch = model.objectWillChange.sink { _ in changes += 1 }
+    model.setTranscriber(.apple)
+    check(changes == 1 && prefs.transcriber == .apple, "T6 app: setTranscriber writes the setting and tells the views")
+    model.setTidyLines(false)
+    check(changes == 2 && !prefs.tidyLines, "T6 app: setTidyLines writes the setting and tells the views")
+
+    model.launch()
+    check(!lexists(leftover) && lexists(link) && lexists(target.appendingPathComponent("keep.txt")) && lexists(samples) && lexists(plainFile),
+          "T6 launch: a leftover sample.abc123 folder is removed; a sample.* link, its target, a folder named samples and a file are not")
+    check(settle { runner.calls.count == 1 } && runner.calls[0].arguments
+          == ["process", waiting.appendingPathComponent("audio.m4a").path, "--native", "--no-tidy", "--writer", "apple"],
+          "T6 app: the queue launches with the transcriber and tidying chosen in Preferences (\(runner.calls.first?.arguments ?? []))")
+    check(engine.calls.isEmpty, "T6 app: no engine command runs before Preferences opens")
+
+    model.preferencesOpened()
+    check(engine.calls.count == 1 && engine.calls[0].arguments == ["engines"] && engine.calls[0].timeout == 10 && engine.calls[0].stdin == nil,
+          "T6 app: opening Preferences runs engines through the engine, with a 10 s limit")
+    engine.answer(0, 0, "parakeet unavailable the speech helper is not installed\napple ready\nvoice 391 1 learnt\n")
+    check(model.engineStatus.parakeet == .unavailable("the speech helper is not installed")
+          && model.voiceStatus == "Your voice: learnt from 1 call (7 minutes of speech)" && model.parakeetNotSetUp == nil,
+          "T6 app: the engine's answer is the status; with Apple chosen there is no Parakeet line")
+    model.setTranscriber(.parakeet)
+    check(model.parakeetNotSetUp == "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup.",
+          "T6 app: with Parakeet chosen and unavailable, the Parakeet line shows")
+    model.recordSample()
+    check(model.sample == .failed("Parakeet is not set up, so a voice sample cannot be used. Run meetingbox setup.") && sampler.starts.isEmpty,
+          "T6 sample: with Parakeet unavailable a sample is refused at once, before 90 seconds of reading")
+    model.closeSample()
+    model.refreshEngines()
+    model.refreshEngines()
+    engine.answer(2, 0, "parakeet ready\napple ready\nvoice none\n")
+    engine.answer(1, 0, "parakeet unavailable late\napple ready\nvoice 391 1 learnt\n")
+    check(model.engineStatus.parakeet == .ready && model.voiceStatus == "Not learnt yet: meetingbox learns it from your video calls, or record a sample"
+          && model.parakeetNotSetUp == nil, "T6 app: an engines answer overtaken by a newer one is dropped")
+
+    // Forget my voice
+    model.forgetVoice()
+    check(engine.calls.last?.arguments == ["voice", "forget"], "T6 forget: forgetVoice runs voice forget through the engine")
+    let enginesBeforeForget = engine.count(["engines"])
+    engine.answerLast(0, "")
+    check(engine.count(["engines"]) == enginesBeforeForget + 1 && model.voiceProblem == nil, "T6 forget: and then reads the engine status again")
+    engine.answerLast(0, "parakeet ready\napple ready\nvoice none\n")
+    model.forgetVoice()
+    engine.answerLast(1, "Your voice print is being saved right now, so it was not forgotten. Try again.\n")
+    check(model.voiceProblem == "Your voice print is being saved right now, so it was not forgotten. Try again.",
+          "T6 forget: a refusal is shown in the engine's words")
+    engine.answerLast(0, "parakeet ready\napple ready\nvoice none\n")
+
+    // The sample: recorded for 90 s, then built by the engine.
+    check(model.canRecordSample, "T6 sample: offered while nothing is recording")
+    model.recordSample()
+    let folder = sampler.starts.first?.folder ?? state
+    check(model.sample == .recording(secondsLeft: 90) && sampler.starts.count == 1 && folder.deletingLastPathComponent().path == state.path
+          && folder.lastPathComponent.hasPrefix("sample.") && folder.lastPathComponent.count == 13 && mode(folder) == 0o700
+          && sampler.starts.first?.microphone == "USB Mic" && !model.canRecordSample,
+          "T6 sample: recordSample makes <stateDir>/sample.XXXXXX (0700) and starts the sampler with the Preferences microphone")
+    model.recordSample()
+    check(sampler.starts.count == 1, "T6 sample: a second recordSample while one records starts nothing")
+    sampler.starts[0].started(nil)
+    for _ in 0..<89 { model.tickSample() }
+    check(model.sample == .recording(secondsLeft: 1) && sampler.stops == 0 && engine.count(["voice", "add", folder.appendingPathComponent("sample.caf").path]) == 0,
+          "T6 sample: 89 ticks leave one second, still recording")
+    model.tickSample()
+    check(model.sample == .building && sampler.stops == 1 && engine.calls.last?.arguments == ["voice", "add", folder.appendingPathComponent("sample.caf").path]
+          && engine.calls.last?.timeout == 300 && lexists(folder),
+          "T6 sample: the 90th tick ends the countdown: the sampler stops, building, voice add <stateDir>/sample.XXXXXX/sample.caf with a 300 s limit")
+    model.tickSample()
+    check(model.sample == .building, "T6 sample: ticks change nothing while building")
+    let enginesBeforeSample = engine.count(["engines"])
+    engine.answer(engine.calls.count - 1, 0, "sample 75\n")
+    check(model.sample == .done("Your voice is learnt from this sample (1 minute of speech).") && !lexists(folder)
+          && engine.count(["engines"]) == enginesBeforeSample + 1,
+          "T6 sample: once the engine answers, the folder is removed, the outcome is in words and the engine status is read again")
+    engine.answerLast(0, "parakeet ready\napple ready\nvoice 75 1 sample\n")
+    check(model.voiceStatus == "Your voice: from a recorded sample (1 minute of speech)", "T6 sample: and Preferences shows the voice from the sample")
+    model.closeSample()
+    check(model.sample == .idle, "T6 sample: Done closes it")
+
+    // Stop early, and a refusal.
+    model.recordSample()
+    let folder2 = sampler.starts[1].folder
+    sampler.starts[1].started(nil)
+    model.tickSample()
+    model.stopSample()
+    check(model.sample == .building && sampler.stops == 2 && engine.calls.last?.arguments == ["voice", "add", folder2.appendingPathComponent("sample.caf").path],
+          "T6 sample: Stop ends it early: the sampler stops and the engine builds what was recorded")
+    let tooShort = "Not enough speech: 12 seconds of the 60 needed. Record again and read for the whole 90 seconds."
+    engine.answerLast(1, tooShort + "\n")
+    check(model.sample == .failed(tooShort) && !lexists(folder2), "T6 sample: a refusal fails with the engine's line, and the folder is removed")
+    engine.answerLast(0, "parakeet ready\napple ready\nvoice none\n")
+    model.closeSample()
+
+    // The sampler cannot start.
+    let refused = "meetingbox is not allowed to use the microphone. Allow it in System Settings, under Privacy & Security, Microphone."
+    let voiceAdds = engine.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count
+    model.recordSample()
+    let folder3 = sampler.starts[2].folder
+    sampler.starts[2].started(refused)
+    check(model.sample == .failed(refused) && !lexists(folder3) && engine.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count == voiceAdds,
+          "T6 sample: started with a reason fails with that reason, removes the folder and builds nothing")
+    model.closeSample()
+
+    // A meeting wins: a socket start while sampling.
+    model.recordSample()
+    let folder4 = sampler.starts[3].folder
+    sampler.starts[3].started(nil)
+    model.tickSample()
+    let stopsBefore = sampler.stops
+    let reply = model.handler.reply(for: .start(mic: nil, dir: nil))
+    check(sampler.stops == stopsBefore + 1 && !lexists(folder4) && model.sample == .failed("Stopped because a meeting started recording.")
+          && reply.hasPrefix("ok recording") && rec.launches.count == 1
+          && engine.calls.filter { $0.arguments.starts(with: ["voice", "add"]) }.count == voiceAdds,
+          "T6 willStart: a socket start while sampling stops the sampler, removes its folder, fails the sample, and the recording starts (\(reply))")
+    sampler.starts[3].started(nil)
+    check(model.sample == .failed("Stopped because a meeting started recording."), "T6 willStart: a late word from the cancelled sampler changes nothing")
+    model.closeSample()
+
+    // Not while recording, paused or finalising.
+    model.recordSample()
+    check(model.sample == .idle && sampler.starts.count == 4 && !model.canRecordSample, "T6 sample: refused while recording")
+    model.perform(.pause)
+    check(settle { if case .paused = model.session.phase { return true }; return false }, "T6 sample: (the recording is paused)")
+    model.recordSample()
+    check(model.sample == .idle && sampler.starts.count == 4, "T6 sample: refused while paused")
+    let pid = rec.nextPid
+    model.perform(.stop)
+    check(settle { if case .finalising = model.session.phase { return true }; return false }, "T6 sample: (the recording is finalising)")
+    model.recordSample()
+    check(model.sample == .idle && sampler.starts.count == 4, "T6 sample: refused while finalising")
+    rec.exit(pid, 0, verifies: true)
+    check(settle { model.session.phase == .idle }, "T6 sample: (the recording is finished)")
+
+    // A toggle that becomes a start.
+    model.recordSample()
+    let folder5 = sampler.starts[4].folder
+    sampler.starts[4].started(nil)
+    let reply2 = model.handler.reply(for: .toggle(mic: nil, dir: nil))
+    check(sampler.stops == stopsBefore + 2 && !lexists(folder5) && model.sample == .failed("Stopped because a meeting started recording.")
+          && reply2.hasPrefix("ok recording") && rec.launches.count == 2,
+          "T6 willStart: a toggle that becomes a start does the same (\(reply2))")
+    model.closeSample()
+    let pid2 = rec.nextPid
+    model.perform(.stop)
+    _ = settle { if case .finalising = model.session.phase { return true }; return false }
+    rec.exit(pid2, 0, verifies: true)
+    check(settle { model.session.phase == .idle }, "T6 sample: (the second recording is finished)")
+
+    // A start while the sample is being built leaves it to finish: nothing is recording any more.
+    model.recordSample()
+    let folder6 = sampler.starts[5].folder
+    sampler.starts[5].started(nil)
+    model.stopSample()
+    let stopsBuilding = sampler.stops
+    _ = model.handler.reply(for: .start(mic: nil, dir: nil))
+    check(model.sample == .building && sampler.stops == stopsBuilding && lexists(folder6) && rec.launches.count == 3,
+          "T6 willStart: a start while the sample is being built records, and the build goes on")
+    engine.answerLast(0, "sample 61\n")
+    check(model.sample == .done("Your voice is learnt from this sample (1 minute of speech).") && !lexists(folder6),
+          "T6 sample: and finishes as before")
+    engine.answerLast(0, "parakeet ready\napple ready\nvoice 61 1 sample\n")
+    model.closeSample()
+    let pid3 = rec.nextPid
+    model.perform(.stop)
+    _ = settle { if case .finalising = model.session.phase { return true }; return false }
+    rec.exit(pid3, 0, verifies: true)
+    _ = settle { model.session.phase == .idle }
+
+    // Quitting during a sample stops it and removes its folder.
+    model.recordSample()
+    let folder7 = sampler.starts[6].folder
+    sampler.starts[6].started(nil)
+    let stopsBeforeQuit = sampler.stops
+    model.shutDown()
+    check(sampler.stops == stopsBeforeQuit + 1 && !lexists(folder7) && model.sample == .idle,
+          "T6 sample: quitting while a sample records stops it and removes its folder")
+    watch.cancel()
+
+    // Without a sampler there is no sample, and without an engine nothing runs.
+    let state2 = shortTemp()
+    let prefs2 = Preferences(defaults: testDefaults(), home: root)
+    prefs2.meetingsFolder = freshRoot()
+    prefs2.sounds = false
+    let plain = AppModel(stateDir: state2, preferences: prefs2, recorder: FakeRecorder(), runner: FakeRunner(), freeBytes: { _ in 50 * GB })
+    plain.launch()
+    plain.recordSample()
+    check(plain.sample == .idle && !plain.canRecordSample && names(state2).allSatisfy { !$0.hasPrefix("sample.") },
+          "T6 sample: refused when no sampler was given, making no folder")
+    check(plain.engine is NoEngineCommands, "T6 app: an AppModel built without an engine has NoEngineCommands, which starts no process")
+    plain.forgetVoice()
+    check(settle { plain.voiceProblem == "meetingbox is not installed; run meetingbox setup" } && plain.engineStatus == EngineStatus(),
+          "T6 app: and every engine command is answered that meetingbox is not installed")
+    plain.shutDown()
+    try? fm.removeItem(at: state)
+    try? fm.removeItem(at: state2)
 }
 
 try? fm.removeItem(at: scratch)

@@ -494,4 +494,276 @@ if [ "$rc" -eq 0 ] && [ -L "$DEPS" ] && [ "$(readlink "$DEPS")" = "$HOME/nowhere
   pass "reset_cmd tools leaves a dangling link at the dependency cache's path"
 else fail "reset_cmd tools leaves a dangling link at the dependency cache's path ($rc): $out"; fi
 
+# ======================================================== engines, voice add and voice forget (Task 6)
+
+LOCK="$VOICE_FILE.lock"
+# --- setup records the voice print's lock beside it, only if it is not there yet ---
+fresh; rm -f "$LOCK"
+install_speech >/dev/null 2>&1
+if [ "$VOICE_LOCK" = "$LOCK" ] && installed_by_us "$LOCK" && [ ! -e "$LOCK" ]; then
+  pass "setup records <voice.json>.lock, absent before"
+else fail "setup records <voice.json>.lock, absent before: $(cat "$INSTALLED")"; fi
+echo x > "$LOCK"; touch "$VOICE_FILE"
+out="$(reset_cmd tools 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$LOCK" ] && ! grep -qxF "$LOCK" "$INSTALLED" 2>/dev/null; then
+  pass "reset_cmd tools removes the recorded lock through the record"
+else fail "reset_cmd tools removes the recorded lock through the record ($rc): $out"; fi
+fresh; rm -f "$LOCK"; mkdir -p "$STATE_DIR"; echo mine > "$LOCK"
+install_speech >/dev/null 2>&1
+out="$(confirm() { return 1; }; reset_cmd tools 2>&1)"
+if ! installed_by_us "$LOCK" && [ "$(cat "$LOCK")" = mine ] && printf '%s\n' "$out" | sed -n '/leave alone/,$p' | grep -qF "$LOCK"; then
+  pass "a lock file already there is not recorded, and reset lists it as left alone"
+else fail "a lock file already there is not recorded, and reset lists it as left alone: $out"; fi
+
+# --- the fakes: a usable speech helper, and mb-transcript ---
+fresh; rm -f "$LOCK"
+mkdir -p "$SRC_DIR" "$SPEECH_MODELS" "$STATE_DIR" "$HOME/tmp"
+record_install "$VOICE_FILE"; record_install "$LOCK"   # as setup records them
+cat > "$SPEECH_BIN" <<'EOF'
+#!/bin/bash
+printf '%s|TMPDIR=%s\n' "$*" "${TMPDIR:-}" >> "$HOME/speech-calls.log"
+case "$1" in
+  check) [ ! -e "$HOME/check-fails" ] || { echo "mb-speech: a model file is the wrong size" >&2; exit 1; } ;;
+  speakers)
+    [ ! -e "$HOME/speakers-fail" ] || { echo "mb-speech: the diariser failed" >&2; exit 1; }
+    if [ -f "$HOME/speakers.json" ]; then cp "$HOME/speakers.json" "$4"
+    else printf '%s\n' '{"model": "m", "segments": [], "speakers": []}' > "$4"; fi ;;
+esac
+EOF
+chmod 700 "$SPEECH_BIN"
+FAKE_TRANSCRIPT="$HOME/fake-mb-transcript"
+cat > "$FAKE_TRANSCRIPT" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$HOME/transcript-calls.log"
+[ -f "$2" ] && cp "$2" "$HOME/speakers.seen"
+case "$(cat "$HOME/transcript-says" 2>/dev/null)" in
+  refused) echo "More than one voice was heard. Record again with only you speaking." >&2; exit 1 ;;
+  broken)  echo "mb-transcript: cannot write voice.json.tmp: Permission denied" >&2; exit 1 ;;
+  three)   echo "something else went wrong" >&2; exit 3 ;;
+  *)       echo "sample 75" ;;
+esac
+EOF
+chmod 700 "$FAKE_TRANSCRIPT"
+TRANSCRIPT_BIN="$FAKE_TRANSCRIPT"
+printf 'caf' > "$HOME/sample.caf"
+voice_reset() { rm -f "$HOME/speech-calls.log" "$HOME/transcript-calls.log" "$HOME/transcript-says" "$HOME/check-fails" \
+                      "$HOME/speakers-fail" "$HOME/speakers.seen" "$HOME/speakers.json"; clear_logs; }
+# voice add in a subshell, as the command runs it: TMPDIR a scratch folder, so what it leaves there shows.
+add_sample() { ( export TMPDIR="$HOME/tmp"; voice_add "${1:-$HOME/sample.caf}" ); }
+seen_tmp() { sed -n 's/^speakers .*|TMPDIR=//p' "$HOME/speech-calls.log" | head -n 1; }
+
+# --- parse_args: voice add <audio>, voice forget, engines ---
+got="$( (parse_args voice add /x/sample.caf; printf '%s|%s|%s' "$cmd" "$subcmd" "$argfile") 2>&1 )"
+got2="$( (parse_args voice forget; printf '%s|%s|%s' "$cmd" "$subcmd" "$argfile") 2>&1 )"
+got3="$( (parse_args engines; printf '%s|%s|%s' "$cmd" "$subcmd" "$argfile") 2>&1 )"
+got4="$( (parse_args process X --parakeet; printf '%s|%s|%s' "$cmd" "$subcmd" "$argfile") 2>&1 )"
+if [ "$got" = "voice|add|/x/sample.caf" ] && [ "$got2" = "voice|forget|" ] && [ "$got3" = "engines||" ] && [ "$got4" = "process||X" ]; then
+  pass "parse_args: voice add <audio>, voice forget and engines, and process as before"
+else fail "parse_args: voice add <audio>, voice forget and engines, and process as before: $got / $got2 / $got3 / $got4"; fi
+
+# --- voice add ---
+voice_reset
+out="$(add_sample)"; rc=$?
+T="$(seen_tmp)"
+speakers_call="$(grep '^speakers ' "$HOME/speech-calls.log")"
+if [ "$rc" -eq 0 ] && [ "$out" = "sample 75" ] \
+   && [ "$speakers_call" = "speakers $SPEECH_MODELS $T/sample.wav $T/sample.speakers.json|TMPDIR=$T" ] \
+   && grep -qxF "afconvert -f WAVE -d LEI16@16000 -c 1 $HOME/sample.caf $T/sample.wav" "$HOME/calls.log" \
+   && [ "$(cat "$HOME/transcript-calls.log")" = "--voice-sample $T/sample.speakers.json --voice $VOICE_FILE" ] \
+   && case "$T" in "$HOME/tmp/"?*) true ;; *) false ;; esac; then
+  pass "voice add: afconvert into a temporary folder, mb-speech speakers there with TMPDIR that folder, then mb-transcript --voice-sample; its line on stdout"
+else fail "voice add: afconvert into a temporary folder, mb-speech speakers there with TMPDIR that folder, then mb-transcript --voice-sample; its line on stdout ($rc): $out | $speakers_call | $(cat "$HOME/transcript-calls.log" "$HOME/calls.log")"; fi
+if ! grep -q -- '--count' "$HOME/speech-calls.log" && [ -s "$HOME/speakers.seen" ]; then
+  pass "voice add: mb-speech is never given --count"
+else fail "voice add: mb-speech is never given --count: $(cat "$HOME/speech-calls.log")"; fi
+if [ -n "$T" ] && [ ! -e "$T" ] && [ -z "$(ls -A "$HOME/tmp")" ]; then pass "voice add: leaves no temporary folder"
+else fail "voice add: leaves no temporary folder: $T $(ls -A "$HOME/tmp")"; fi
+
+voice_reset; echo refused > "$HOME/transcript-says"
+out="$(add_sample)"; rc=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "More than one voice was heard. Record again with only you speaking." ] && [ -z "$(ls -A "$HOME/tmp")" ]; then
+  pass "voice add: a refusal passes mb-transcript's one line and status through, and leaves no temporary folder"
+else fail "voice add: a refusal passes mb-transcript's one line and status through, and leaves no temporary folder ($rc): $out"; fi
+voice_reset; echo broken > "$HOME/transcript-says"
+out="$(add_sample)"; rc=$?
+voice_reset; echo three > "$HOME/transcript-says"
+out3="$(add_sample)"; rc3=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "cannot write voice.json.tmp: Permission denied" ] && [ "$rc3" -eq 3 ] && [ "$out3" = "something else went wrong" ]; then
+  pass "voice add: mb-transcript's own failures pass through, without its prefix, with its status"
+else fail "voice add: mb-transcript's own failures pass through, without its prefix, with its status ($rc, $rc3): $out / $out3"; fi
+
+voice_reset; touch "$HOME/speakers-fail"
+out="$(add_sample)"; rc=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "Your voice could not be found in the sample: the diariser failed" ] && [ ! -e "$HOME/transcript-calls.log" ] \
+   && [ -z "$(ls -A "$HOME/tmp")" ]; then
+  pass "voice add: when mb-speech fails, its reason in one line, nothing saved, no temporary folder"
+else fail "voice add: when mb-speech fails, its reason in one line, nothing saved, no temporary folder ($rc): $out"; fi
+voice_reset
+out="$(afconvert() { echo "afconvert $*" >> "$HOME/calls.log"; return 1; }; add_sample)"; rc=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "The recorded sample could not be read." ] && [ -z "$(ls -A "$HOME/tmp")" ]; then
+  pass "voice add: a sample afconvert cannot read is refused in one line"
+else fail "voice add: a sample afconvert cannot read is refused in one line ($rc): $out"; fi
+voice_reset
+out="$(add_sample "$HOME/no-such.caf")"; rc=$?
+if [ "$rc" -eq 1 ] && [ "$out" = "There is no sample at $HOME/no-such.caf." ] && ! grep -q '^speakers ' "$HOME/speech-calls.log"; then
+  pass "voice add: a sample that is not there is refused in one line"
+else fail "voice add: a sample that is not there is refused in one line ($rc): $out"; fi
+
+voice_reset; touch "$HOME/check-fails"
+out="$(add_sample)"; rc=$?
+mv "$SPEECH_BIN" "$SPEECH_BIN.away"
+out2="$(add_sample)"; rc2=$?
+mv "$SPEECH_BIN.away" "$SPEECH_BIN"
+if [ "$rc" -eq 1 ] && [ "$rc2" -eq 1 ] && [ "$out" = "Parakeet is not set up, so a voice sample cannot be used. Run meetingbox setup." ] \
+   && [ "$out2" = "$out" ] && ! grep -q '^speakers ' "$HOME/speech-calls.log" && [ ! -e "$HOME/transcript-calls.log" ]; then
+  pass "voice add: an unusable or missing speech helper is refused with the Parakeet line, and nothing runs"
+else fail "voice add: an unusable or missing speech helper is refused with the Parakeet line, and nothing runs ($rc, $rc2): $out / $out2"; fi
+voice_reset; forget_install "$VOICE_FILE"
+out="$(add_sample)"; rc=$?
+record_install "$VOICE_FILE"
+if [ "$rc" -eq 1 ] && [ "$out" = "$VOICE_FILE was not made by meetingbox, so a voice sample is not saved there." ] \
+   && ! grep -q '^speakers ' "$HOME/speech-calls.log" 2>/dev/null && [ ! -e "$HOME/transcript-calls.log" ]; then
+  pass "voice add: a voice print setup did not record is refused, and nothing runs"
+else fail "voice add: a voice print setup did not record is refused, and nothing runs ($rc): $out"; fi
+
+# --- voice forget ---
+hold_lock() {   # $1: seconds to hold <voice.json>.lock with flock, in the background; waits until it is held
+  rm -f "$HOME/held"
+  perl -e 'use Fcntl qw(:flock O_RDWR O_CREAT); sysopen(my $fh, $ARGV[0], O_RDWR|O_CREAT, 0600) or die; flock($fh, LOCK_EX) or die;
+           open(my $r, ">", $ARGV[1]) or die; close $r; select(undef, undef, undef, $ARGV[2]);' "$LOCK" "$HOME/held" "$1" &
+  HOLDER=$!
+  for _ in $(seq 1 200); do [ -e "$HOME/held" ] && break; sleep 0.02; done
+}
+now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }
+voice_reset; rm -f "$LOCK"
+echo '{"seconds": 75}' > "$VOICE_FILE"; echo stale > "$VOICE_FILE.tmp"
+out="$( (voice_forget) )"; rc=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$VOICE_FILE" ] && [ ! -e "$VOICE_FILE.tmp" ] && installed_by_us "$VOICE_FILE" \
+   && [ -f "$LOCK" ] && [ "$(mode "$LOCK")" = 600 ] && installed_by_us "$LOCK"; then
+  pass "voice forget: removes the recorded print and its voice.json.tmp, keeps the record line, and the lock file (0600) stays"
+else fail "voice forget: removes the recorded print and its voice.json.tmp, keeps the record line, and the lock file (0600) stays ($rc): $out"; fi
+out="$( (voice_forget) )"; rc=$?
+if [ "$rc" -eq 0 ]; then pass "voice forget: with no print to forget it succeeds"; else fail "voice forget: with no print to forget it succeeds ($rc): $out"; fi
+echo '{"seconds": 75}' > "$VOICE_FILE"
+forget_install "$VOICE_FILE"
+out="$( (voice_forget) )"; rc=$?
+record_install "$VOICE_FILE"
+if [ "$rc" -eq 1 ] && [ -e "$VOICE_FILE" ] && [ "$out" = "$VOICE_FILE was not made by meetingbox, so it is left alone." ]; then
+  pass "voice forget: refuses a voice print setup did not record, in one line"
+else fail "voice forget: refuses a voice print setup did not record, in one line ($rc): $out"; fi
+
+hold_lock 1.5
+start="$(now)"
+out="$( (VOICE_LOCK_WAIT=10; voice_forget) )"; rc=$?
+waited="$(perl -e "print $(now) - $start >= 1.0 ? 1 : 0")"
+wait "$HOLDER" 2>/dev/null
+if [ "$rc" -eq 0 ] && [ "$waited" = 1 ] && [ ! -e "$VOICE_FILE" ]; then
+  pass "voice forget: waits while another writer holds the lock, then forgets"
+else fail "voice forget: waits while another writer holds the lock, then forgets ($rc, waited $waited): $out"; fi
+echo '{"seconds": 75}' > "$VOICE_FILE"
+hold_lock 5
+out="$( (VOICE_LOCK_WAIT=1; voice_forget) )"; rc=$?
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+if [ "$rc" -eq 1 ] && [ -e "$VOICE_FILE" ] && [ "$out" = "Your voice print is being saved right now, so it was not forgotten. Try again." ]; then
+  pass "voice forget: when the lock is not free in time it refuses in one line and forgets nothing"
+else fail "voice forget: when the lock is not free in time it refuses in one line and forgets nothing ($rc): $out"; fi
+rm -f "$LOCK"; ln -s "$HOME/elsewhere" "$LOCK"
+out="$( (voice_forget) )"; rc=$?
+if [ "$rc" -eq 1 ] && [ -e "$VOICE_FILE" ] && [ ! -e "$HOME/elsewhere" ] && [ "$out" = "$LOCK is not a plain file, so your voice was not forgotten." ]; then
+  pass "voice forget: a link at the lock's path is never followed, and nothing is forgotten"
+else fail "voice forget: a link at the lock's path is never followed, and nothing is forgotten ($rc): $out"; fi
+rm -f "$LOCK"
+
+# --- engines ---
+engines_out() { ( have() { [ "$1" = speech-analyzer ] && [ -z "${NO_SA:-}" ]; }; engines_cmd ) 2>/dev/null; }
+voice_reset; rm -f "$VOICE_FILE"
+out="$(engines_out)"
+printf '%s\n' '{"model": "m", "seconds": 75.4, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' > "$VOICE_FILE"
+out2="$(engines_out)"
+if [ "$out" = "$(printf 'parakeet ready\napple ready\nvoice none')" ] && [ "$out2" = "$(printf 'parakeet ready\napple ready\nvoice 75 1 sample')" ] \
+   && ! grep -q '^curl' "$HOME/calls.log"; then
+  pass "engines: the parakeet, apple and voice lines, with no network call"
+else fail "engines: the parakeet, apple and voice lines, with no network call: $out / $out2 / $(cat "$HOME/calls.log")"; fi
+touch "$HOME/check-fails"
+out="$(NO_SA=1 engines_out)"
+rm -f "$HOME/check-fails"; mv "$SPEECH_BIN" "$SPEECH_BIN.away"
+out2="$(engines_out)"
+mv "$SPEECH_BIN.away" "$SPEECH_BIN"
+if [ "$out" = "$(printf 'parakeet unavailable a model file is the wrong size\napple unavailable speech-analyzer is not installed\nvoice 75 1 sample')" ] \
+   && [ "$(printf '%s\n' "$out2" | head -n 1)" = "parakeet unavailable the speech helper is not installed" ]; then
+  pass "engines: unavailable, each with its reason in one line"
+else fail "engines: unavailable, each with its reason in one line: $out / $out2"; fi
+
+# --- the commands as the app runs them: the whole script, under set -e ---
+mkdir -p "$HOME/fakebin"
+printf '#!/bin/bash\n: > "${!#}"\n' > "$HOME/fakebin/afconvert"; chmod 700 "$HOME/fakebin/afconvert"
+cp "$FAKE_TRANSCRIPT" "$SRC_DIR/mb-transcript"
+script() { env -i HOME="$HOME" PATH="$HOME/fakebin:/usr/bin:/bin" TMPDIR="$HOME/tmp" /bin/bash "$ROOT/meetingbox" "$@" 2>/dev/null; }
+voice_reset
+out="$(script voice add "$HOME/sample.caf")"; rc=$?
+echo refused > "$HOME/transcript-says"
+out2="$(script voice add "$HOME/sample.caf")"; rc2=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sample 75" ] && [ "$rc2" -eq 1 ] && [ "$out2" = "More than one voice was heard. Record again with only you speaking." ] \
+   && [ -z "$(ls -A "$HOME/tmp")" ]; then
+  pass "meetingbox voice add: one line on stdout and mb-transcript's status, as the app reads them"
+else fail "meetingbox voice add: one line on stdout and mb-transcript's status, as the app reads them ($rc, $rc2): $out / $out2"; fi
+echo '{"seconds": 75}' > "$VOICE_FILE"
+out="$(script voice forget)"; rc=$?
+out2="$(script voice)"; rc2=$?
+if [ "$rc" -eq 0 ] && [ ! -e "$VOICE_FILE" ] && [ "$rc2" -ne 0 ]; then
+  pass "meetingbox voice forget: forgets; meetingbox voice alone is a usage error"
+else fail "meetingbox voice forget: forgets; meetingbox voice alone is a usage error ($rc, $rc2): $out / $out2"; fi
+out="$(script engines)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = "parakeet ready" ] && [ "$(printf '%s\n' "$out" | sed -n 3p)" = "voice none" ]; then
+  pass "meetingbox engines: runs to the end under set -e"
+else fail "meetingbox engines: runs to the end under set -e ($rc): $out"; fi
+
+# --- the real mb-transcript --voice-sample, when tests/run.sh built it ---
+if [ -n "${MB_TEST_BIN:-}" ] && [ -x "$MB_TEST_BIN/mb-transcript" ]; then
+  REAL="$MB_TEST_BIN/mb-transcript"
+  one='{"model": "m@1", "segments": [{"speaker": "S1", "start": 0, "end": 75.4}], "speakers": [{"id": "S1", "seconds": 75.4, "median": 6, "vector": [3, 4, 0, 0]}]}'
+  two='{"model": "m@1", "segments": [], "speakers": [{"id": "S1", "seconds": 80, "median": 5, "vector": [1, 0, 0, 0]}, {"id": "S2", "seconds": 20, "median": 4, "vector": [0, 0, 1, 0]}]}'
+  printf '%s\n' "$one" > "$HOME/one.json"; printf '%s\n' "$two" > "$HOME/two.json"
+  printf '%s\n' '{"model": "m@1", "seconds": 391, "meetings": 3, "sources": ["a", "b", "c"], "sample": false, "refusals": 0, "refused": [], "vector": [0, 0, 1, 0], "updated": "x"}' > "$VOICE_FILE"
+  rm -f "$LOCK"
+  out="$("$REAL" --voice-sample "$HOME/one.json" --voice "$VOICE_FILE" 2>"$HOME/real.err")"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$out" = "sample 75" ] && [ ! -s "$HOME/real.err" ] && [ ! -e "$VOICE_FILE.tmp" ] && [ "$(mode "$VOICE_FILE")" = 600 ] \
+     && [ "$(jq -c '[.sample, .meetings, .sources, .seconds, .model]' "$VOICE_FILE")" = '[true,1,[],75.4,"m@1"]' ] \
+     && [ -f "$LOCK" ] && [ "$(mode "$LOCK")" = 600 ]; then
+    pass "mb-transcript --voice-sample: replaces a learnt print through voice.json.tmp, prints sample 75, under the lock"
+  else fail "mb-transcript --voice-sample: replaces a learnt print through voice.json.tmp, prints sample 75, under the lock ($rc): $out $(cat "$HOME/real.err" "$VOICE_FILE")"; fi
+  cp "$VOICE_FILE" "$HOME/voice.before"
+  out="$("$REAL" --voice-sample "$HOME/two.json" --voice "$VOICE_FILE" 2>"$HOME/real.err")"; rc=$?
+  if [ "$rc" -eq 1 ] && [ -z "$out" ] && [ "$(cat "$HOME/real.err")" = "More than one voice was heard. Record again with only you speaking." ] \
+     && cmp -s "$VOICE_FILE" "$HOME/voice.before"; then
+    pass "mb-transcript --voice-sample: a refusal is one stderr line, exit 1, and voice.json byte-identical"
+  else fail "mb-transcript --voice-sample: a refusal is one stderr line, exit 1, and voice.json byte-identical ($rc): $out / $(cat "$HOME/real.err")"; fi
+  "$REAL" --voice-sample "$HOME/one.json" --voice "$VOICE_FILE" --mic "$HOME/one.json" >/dev/null 2>&1; rc=$?
+  "$REAL" --voice-sample "$HOME/one.json" >/dev/null 2>&1; rc2=$?
+  if [ "$rc" -eq 1 ] && [ "$rc2" -eq 1 ] && cmp -s "$VOICE_FILE" "$HOME/voice.before"; then
+    pass "mb-transcript --voice-sample: with transcript arguments, or without --voice, it is a usage error and writes nothing"
+  else fail "mb-transcript --voice-sample: with transcript arguments, or without --voice, it is a usage error and writes nothing ($rc, $rc2)"; fi
+  voice_reset; printf '%s\n' "$one" > "$HOME/speakers.json"; rm -f "$VOICE_FILE"
+  out="$(TRANSCRIPT_BIN="$REAL"; add_sample)"; rc=$?
+  if [ "$rc" -eq 0 ] && [ "$out" = "sample 75" ] && [ "$(jq -r .sample "$VOICE_FILE")" = true ] && [ -z "$(ls -A "$HOME/tmp")" ]; then
+    pass "voice add with the real mb-transcript: the sample becomes the print"
+  else fail "voice add with the real mb-transcript: the sample becomes the print ($rc): $out"; fi
+else
+  echo "note: the real mb-transcript was not built (run tests/run.sh), so its --voice-sample checks were skipped"
+fi
+
+# --- the app's side: no test makes the real sampler or engine, and only AppDelegate passes them ---
+first="$(head -n 1 "$ROOT/native/tests/app/main.swift")"
+if ! grep -qE 'MicSampleRecorder *\(|ScriptEngineCommands *\(' "$ROOT/native/tests/app/main.swift" \
+   && printf '%s' "$first" | grep -qF '../../app/VoiceSample.swift' && ! printf '%s' "$first" | grep -qF 'MicSample.swift' \
+   && grep -qF 'engine: ScriptEngineCommands.fromBundle() ?? NoEngineCommands()' "$ROOT/native/app/AppDelegate.swift" \
+   && grep -qF 'sampler: MicSampleRecorder()' "$ROOT/native/app/AppDelegate.swift" \
+   && [ "$(grep -rlE 'MicSampleRecorder\(\)|ScriptEngineCommands\.fromBundle\(' "$ROOT/native/app" | xargs -n 1 basename | sort | tr '\n' ' ')" = "AppDelegate.swift " ]; then
+  pass "only AppDelegate makes MicSampleRecorder and ScriptEngineCommands; no app test does, and MicSample.swift is not in the tests' sources"
+else fail "only AppDelegate makes MicSampleRecorder and ScriptEngineCommands; no app test does, and MicSample.swift is not in the tests' sources"; fi
+if grep -qx 'import Foundation' "$ROOT/native/app/VoiceSample.swift" && ! grep -qE '^import (AVFoundation|AppKit|SwiftUI|CoreMedia)' "$ROOT/native/app/VoiceSample.swift" \
+   && grep -qx 'import AVFoundation' "$ROOT/native/app/MicSample.swift"; then
+  pass "VoiceSample.swift is Foundation only; MicSample.swift is the AVFoundation part"
+else fail "VoiceSample.swift is Foundation only; MicSample.swift is the AVFoundation part"; fi
+
 finish

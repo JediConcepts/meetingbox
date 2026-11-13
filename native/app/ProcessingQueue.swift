@@ -1,16 +1,67 @@
 import Darwin
 import Foundation
 
-/// Runs `meetingbox process` for one meeting. Returns the worker's PID (or -1 when it could not be
-/// started); `done` is called once, on any queue, with the exit status and the last stderr line.
-/// `attempt` names this run: the script writes it into `.process-result`.
-protocol PipelineRunner {
-    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32
+// MARK: - jobs, writers and the settings a run takes
+
+/// What a job runs. Task 8 adds the redo kinds.
+enum JobKind: String {
+    case process
 }
 
-/// The real runner: `<MBScriptPath> process <audio>` with `MB_PROGRESS_FILE`, `MB_ATTEMPT`,
+/// One run of the engine for one meeting: its kind, its folder, and the engine's arguments, built at
+/// launch (`ScriptRunner.arguments`).
+struct PipelineJob: Equatable {
+    let kind: JobKind
+    let folder: URL
+    let arguments: [String]
+}
+
+/// An outside source's kind: the Claude API, or a Standard (OpenAI-compatible) one.
+enum SourceKind: String, Codable {
+    case claude, standard
+}
+
+/// An outside model that may write the minutes.
+struct OutsideWriter: Equatable, Codable {
+    var kind: SourceKind
+    var address: String
+    var model: String
+}
+
+/// Who writes a meeting's minutes.
+enum MeetingWriter: Equatable {
+    case apple
+    case outside(OutsideWriter)
+}
+
+/// A source in Preferences, and whether the user agreed to send it transcripts.
+struct Source: Equatable, Codable {
+    var kind: SourceKind
+    var address: String
+    var agreed: Bool
+}
+
+/// What a job launched now runs with, read from Preferences at launch. `agreed` holds only sources
+/// that exist and are agreed.
+struct RunSettings: Equatable {
+    var transcriber: Transcriber
+    var tidy: Bool
+    var preferredWriter: MeetingWriter
+    var agreed: [Source]
+
+    static let defaults = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
+}
+
+/// Runs the engine for one job. Returns the worker's PID (or -1 when it could not be started); `done`
+/// is called once, on any queue, with the exit status and the last stderr line. `attempt` names this
+/// run: the script writes it into `.process-result`.
+protocol PipelineRunner {
+    func run(_ job: PipelineJob, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32
+}
+
+/// The real runner: `<MBScriptPath> <the job's arguments>` with `MB_PROGRESS_FILE`, `MB_ATTEMPT`,
 /// `MB_SOUNDS=0` and `MB_KEEP_AUDIO=1`, and `PATH` led by `~/.local/bin:/opt/homebrew/bin:/usr/local/bin`.
-/// The app's own `MB_*` variables are not passed on: settings travel explicitly, never through the
+/// The app's own `MB_*` variables are not passed on: settings travel as arguments, never through the
 /// environment. The script's stdout and stderr are `<dir>/.process-log` itself (0600, appended), not
 /// a pipe, so the run carries on if the app goes away; the last line is read back from that file.
 final class ScriptRunner: PipelineRunner {
@@ -31,10 +82,49 @@ final class ScriptRunner: PipelineRunner {
         return ScriptRunner(script: URL(fileURLWithPath: path))
     }
 
-    func run(audio: URL, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
+    /// The environment every engine command the app runs gets: the app's own, without any `MB_*`
+    /// setting, and with `PATH` led by `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`.
+    static func childEnvironment(_ environment: [String: String], home: URL) -> [String: String] {
         var env = environment.filter { !$0.key.hasPrefix("MB_") }
         let lead = ["\(home.path)/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"].joined(separator: ":")
         env["PATH"] = lead + ":" + (env["PATH"].flatMap { $0.isEmpty ? nil : $0 } ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        return env
+    }
+
+    /// The engine's arguments for a job (contracts, "App to engine arguments"):
+    /// `process <dir>/audio.m4a --parakeet|--native --tidy|--no-tidy <writer>`, where `<writer>` is
+    /// `--writer apple`, or `--writer outside --kind K --address A --writer-model M` for `writer`. A
+    /// process job takes no people counts.
+    static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, tidy: Bool,
+                          writer: OutsideWriter?) -> [String] {
+        let engine = transcriber == .parakeet ? "--parakeet" : "--native"
+        let lines = tidy ? "--tidy" : "--no-tidy"
+        let writes = writer.map { ["--writer", "outside", "--kind", $0.kind.rawValue, "--address", $0.address, "--writer-model", $0.model] }
+            ?? ["--writer", "apple"]
+        switch kind {
+        case .process:
+            return ["process", folder.appendingPathComponent("audio.m4a").path, engine, lines] + writes
+        }
+    }
+
+    /// The writer a job uses, chosen at launch: the meeting's own when it has one, else the preferred
+    /// one. An outside writer is used only when `settings.agreed` holds an agreed source of its kind at
+    /// its address; otherwise Apple's model writes and the outside one is `setAside`, for the log.
+    static func writer(meeting: MeetingWriter?, settings: RunSettings) -> (use: OutsideWriter?, setAside: OutsideWriter?) {
+        guard case .outside(let wanted) = meeting ?? settings.preferredWriter else { return (nil, nil) }
+        let agreed = settings.agreed.contains { $0.agreed && $0.kind == wanted.kind && $0.address == wanted.address }
+        return agreed ? (wanted, nil) : (nil, wanted)
+    }
+
+    /// The line `.process-log` gets when an outside writer is set aside at launch.
+    static func setAsideLine(_ writer: OutsideWriter) -> String {
+        let host = URL(string: writer.address)?.host ?? writer.address
+        return "The minutes writer \(writer.model) at \(host) was set aside because its source was removed, changed or not agreed. "
+            + "Apple's model writes the minutes."
+    }
+
+    func run(_ job: PipelineJob, progress: URL, attempt: String, done: @escaping (Int32, String) -> Void) -> Int32 {
+        var env = ScriptRunner.childEnvironment(environment, home: home)
         env["MB_PROGRESS_FILE"] = progress.path
         env["MB_ATTEMPT"] = attempt
         env["MB_SOUNDS"] = "0"
@@ -42,10 +132,10 @@ final class ScriptRunner: PipelineRunner {
 
         let process = Process()
         process.executableURL = script
-        process.arguments = ["process", audio.path]
+        process.arguments = job.arguments
         process.environment = env
         process.standardInput = FileHandle.nullDevice
-        let logURL = audio.deletingLastPathComponent().appendingPathComponent(ScriptRunner.logName)
+        let logURL = job.folder.appendingPathComponent(ScriptRunner.logName)
         let fd = open(logURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
         guard fd >= 0 else {
             let message = "could not start meetingbox: cannot write \(logURL.path)"
@@ -93,6 +183,185 @@ final class ScriptRunner: PipelineRunner {
         guard let line = text.split(whereSeparator: \.isNewline)
             .map({ $0.trimmingCharacters(in: .whitespaces) }).last(where: { !$0.isEmpty }) else { return "" }
         return line.hasPrefix("error ") ? String(line.dropFirst(6)).trimmingCharacters(in: .whitespaces) : line
+    }
+}
+
+// MARK: - the engine's other commands
+
+/// How the app runs an engine command that is not a job (`engines`, `voice add`, `voice forget`). `done`
+/// comes once, on the main queue, with the exit status and at most 64 KB of stdout. Injected into
+/// `AppModel`: only the app passes the real one, so a test can never reach the real engine.
+protocol EngineCommands {
+    func run(_ arguments: [String], stdin: Data?, timeout: TimeInterval, done: @escaping (Int32, String) -> Void)
+}
+
+/// What runs nothing: the default outside the app bundle, and the app's when its bundle names no script.
+struct NoEngineCommands: EngineCommands {
+    static let notInstalled = "meetingbox is not installed; run meetingbox setup"
+
+    func run(_ arguments: [String], stdin: Data?, timeout: TimeInterval, done: @escaping (Int32, String) -> Void) {
+        DispatchQueue.main.async { done(1, NoEngineCommands.notInstalled) }
+    }
+}
+
+/// The real engine commands: the bundle's `MBScriptPath` script, never `~/.local/bin/meetingbox`, run
+/// off the main queue with the runner's environment (no `MB_*` setting), anything secret on stdin
+/// through a pipe and never in the arguments, stderr discarded. At the limit the script and everything
+/// it started (its own process group) are sent SIGTERM, then SIGKILL 5 s later, and the status is 124.
+struct ScriptEngineCommands: EngineCommands {
+    static let timedOut: Int32 = 124
+    static let outputLimit = 65_536
+    let script: URL
+    private let environment: [String: String]
+
+    init(script: URL, home: URL = FileManager.default.homeDirectoryForCurrentUser,
+         environment: [String: String] = ProcessInfo.processInfo.environment) {
+        self.script = script
+        self.environment = ScriptEngineCommands.environment(environment, home: home)
+    }
+
+    /// The script named by `MBScriptPath` in the app's Info.plist; nil outside the app bundle.
+    static func fromBundle(_ bundle: Bundle = .main) -> ScriptEngineCommands? {
+        guard let path = bundle.object(forInfoDictionaryKey: "MBScriptPath") as? String, !path.isEmpty else { return nil }
+        return ScriptEngineCommands(script: URL(fileURLWithPath: path))
+    }
+
+    /// The environment the commands run with: the runner's.
+    static func environment(_ environment: [String: String], home: URL) -> [String: String] {
+        ScriptRunner.childEnvironment(environment, home: home)
+    }
+
+    func run(_ arguments: [String], stdin: Data?, timeout: TimeInterval, done: @escaping (Int32, String) -> Void) {
+        let (script, environment) = (self.script, self.environment)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let (status, output) = ScriptEngineCommands.execute(script: script, arguments: arguments, environment: environment,
+                                                                stdin: stdin, timeout: timeout)
+            DispatchQueue.main.async { done(status, output) }
+        }
+    }
+
+    /// Runs `script` with `arguments` and waits for it: call off the main queue. Its stdin is a pipe
+    /// holding `stdin` (empty when nil); its stdout is read to the end, keeping the first 64 KB; its
+    /// stderr goes nowhere. It runs in a process group of its own, so the limit ends what it started too.
+    static func execute(script: URL, arguments: [String], environment: [String: String], stdin: Data?,
+                        timeout: TimeInterval) -> (Int32, String) {
+        var input: [Int32] = [-1, -1], output: [Int32] = [-1, -1]
+        guard pipe(&input) == 0 else { return (127, "could not start meetingbox: no pipe") }
+        guard pipe(&output) == 0 else { close(input[0]); close(input[1]); return (127, "could not start meetingbox: no pipe") }
+        _ = fcntl(input[1], F_SETNOSIGPIPE, 1) // a script that never reads its stdin must not end the app
+
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_adddup2(&actions, input[0], 0)
+        posix_spawn_file_actions_adddup2(&actions, output[1], 1)
+        posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0)
+        var attributes: posix_spawnattr_t?
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        // Its own process group; only 0, 1 and 2 inherited; signals as a fresh process has them.
+        posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF
+                                                    | POSIX_SPAWN_SETSIGMASK))
+        posix_spawnattr_setpgroup(&attributes, 0)
+        var defaults = sigset_t(), none = sigset_t()
+        sigemptyset(&defaults)
+        for signal in [SIGPIPE, SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGCHLD, SIGALRM, SIGUSR1, SIGUSR2] { sigaddset(&defaults, signal) }
+        sigemptyset(&none)
+        posix_spawnattr_setsigdefault(&attributes, &defaults)
+        posix_spawnattr_setsigmask(&attributes, &none)
+
+        let argv = ([script.path] + arguments).map { strdup($0) } + [nil]
+        let envp = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { (argv + envp).forEach { free($0) } }
+        var pid: pid_t = 0
+        let spawned = posix_spawn(&pid, script.path, &actions, &attributes, argv, envp)
+        close(input[0])
+        close(output[1])
+        guard spawned == 0 else {
+            close(input[1])
+            close(output[0])
+            return (127, "could not start meetingbox: \(String(cString: strerror(spawned)))")
+        }
+
+        // The limit: TERM to the group, then KILL 5 s later, only while the script has not been reaped.
+        let watch = Watchdog(group: pid)
+        let watchdog = DispatchWorkItem { watch.fire() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + max(0, timeout), execute: watchdog)
+
+        // stdin on its own thread, so a script that writes before it reads cannot deadlock with us.
+        let feeder = DispatchGroup()
+        let writeEnd = input[1]
+        DispatchQueue.global().async(group: feeder) {
+            if let data = stdin {
+                data.withUnsafeBytes { raw in
+                    var offset = 0
+                    while offset < raw.count {
+                        let n = write(writeEnd, raw.baseAddress! + offset, raw.count - offset)
+                        if n > 0 { offset += n } else if n < 0 && errno == EINTR { continue } else { break }
+                    }
+                }
+            }
+            close(writeEnd)
+        }
+
+        var kept = Data()
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while true {
+            let n = read(output[0], &buffer, buffer.count)
+            if n > 0 {
+                if kept.count < outputLimit { kept.append(contentsOf: buffer[0..<min(n, outputLimit - kept.count)]) }
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                break
+            }
+        }
+        close(output[0])
+        feeder.wait()
+
+        // Seen to have exited first (WNOWAIT), so the watchdog can never signal a group whose leader's
+        // PID has been reused; then reaped.
+        var info = siginfo_t()
+        while waitid(P_PID, id_t(pid), &info, WEXITED | WNOWAIT) != 0 && errno == EINTR {}
+        let timedOut = watch.reap()
+        watchdog.cancel()
+        var status: Int32 = 0
+        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+        let text = String(decoding: kept, as: UTF8.self)
+        if timedOut { return (ScriptEngineCommands.timedOut, text) }
+        let signal = status & 0x7f
+        return (signal == 0 ? (status >> 8) & 0xff : 128 + signal, text)
+    }
+
+    /// Ends a process group at the limit: SIGTERM, then SIGKILL 5 s later, never once it has been reaped.
+    private final class Watchdog: @unchecked Sendable {
+        private let lock = NSLock()
+        private let group: pid_t
+        private var reaped = false
+        private var fired = false
+
+        init(group: pid_t) { self.group = group }
+
+        func fire() {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !reaped else { return }
+            fired = true
+            kill(-group, SIGTERM)
+            DispatchQueue.global().asyncAfter(deadline: .now() + 5) { [self] in
+                lock.lock()
+                defer { lock.unlock() }
+                if !reaped { kill(-group, SIGKILL) }
+            }
+        }
+
+        /// The script has exited and is about to be reaped: whether the limit was reached first.
+        func reap() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            reaped = true
+            return fired
+        }
     }
 }
 
@@ -209,6 +478,8 @@ final class ProcessingQueue {
     private let now: () -> Date
     private let ps: URL
     private let tickQueue: DispatchQueue?
+    /// Read once at each launch, so a job runs with the settings of the moment it starts.
+    private let settings: () -> RunSettings
     private var timer: DispatchSourceTimer?
 
     private var pending: [URL] = []
@@ -223,13 +494,16 @@ final class ProcessingQueue {
 
     /// `tickQueue` runs the 1 s timer and receives the runner's `done`; nil means no timer and
     /// `done` handled where it is called (tests call `tick()`). `ps` is injectable, as in ChildRecorder.
+    /// `settings` gives what a job launched now runs with (the app's Preferences).
     init(store: MeetingStore, runner: PipelineRunner, now: @escaping () -> Date = Date.init,
-         ps: URL = URL(fileURLWithPath: "/bin/ps"), tickQueue: DispatchQueue? = .main) {
+         ps: URL = URL(fileURLWithPath: "/bin/ps"), tickQueue: DispatchQueue? = .main,
+         settings: @escaping () -> RunSettings = { .defaults }) {
         self.store = store
         self.runner = runner
         self.now = now
         self.ps = ps
         self.tickQueue = tickQueue
+        self.settings = settings
     }
 
     deinit { timer?.cancel() }
@@ -400,9 +674,25 @@ final class ProcessingQueue {
         let mine = token
         let started = now()
         job = .running(started: started, token: mine)
-        _ = runner.run(audio: dir.appendingPathComponent("audio.m4a"), progress: progress, attempt: attempt) { [weak self] status, line in
+        // The settings of this moment, read once; an outside writer that cannot be used is said first.
+        let settings = self.settings()
+        let writer = ScriptRunner.writer(meeting: nil, settings: settings)
+        if let aside = writer.setAside { ProcessingQueue.appendLog(dir, ScriptRunner.setAsideLine(aside)) }
+        let arguments = ScriptRunner.arguments(kind: .process, folder: dir, transcriber: settings.transcriber, room: nil, call: nil,
+                                               tidy: settings.tidy, writer: writer.use)
+        _ = runner.run(PipelineJob(kind: .process, folder: dir, arguments: arguments), progress: progress, attempt: attempt) { [weak self] status, line in
             self?.onQueue { self?.ended(mine, dir, status, line) }
         }
+    }
+
+    /// One line added to `<dir>/.process-log` (0600), where the run's own lines follow.
+    private static func appendLog(_ dir: URL, _ line: String) {
+        let fd = open(dir.appendingPathComponent(ScriptRunner.logName).path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        fchmod(fd, 0o600)
+        let data = Data((line + "\n").utf8)
+        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     }
 
     private func ended(_ mine: Int, _ dir: URL, _ status: Int32, _ line: String) {

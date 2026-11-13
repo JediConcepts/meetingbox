@@ -5,6 +5,12 @@ enum FloatingMode: String, CaseIterable {
     case always, whileRecording, never
 }
 
+/// Which transcriber processing starts with. The raw values are what the engine reads from the
+/// `transcriber` key when no flag says otherwise.
+enum Transcriber: String, CaseIterable {
+    case parakeet, apple
+}
+
 /// The app's settings, with their defaults, over a given `UserDefaults` (the app's own suite,
 /// `com.jediconcepts.meetingbox`; tests give one in a temporary folder). Never read from `MB_*`
 /// variables: the command's `--mic` and `--dir` travel inside each request instead.
@@ -37,6 +43,8 @@ final class Preferences {
         static let microphone = "microphone"
         static let floatingX = "floatingX"
         static let floatingY = "floatingY"
+        static let transcriber = "transcriber"
+        static let tidyLines = "tidyLines"
     }
 
     private func bool(_ key: String, _ fallback: Bool) -> Bool {
@@ -123,6 +131,25 @@ final class Preferences {
                 defaults.removeObject(forKey: Key.floatingY)
             }
         }
+    }
+
+    /// The transcriber the next meeting processed starts with: Parakeet unless Apple's was chosen. Text
+    /// it does not know reads as Parakeet.
+    var transcriber: Transcriber {
+        get { defaults.string(forKey: Key.transcriber).flatMap(Transcriber.init(rawValue:)) ?? .parakeet }
+        set { defaults.set(newValue.rawValue, forKey: Key.transcriber) }
+    }
+
+    /// Tidy transcript lines (spec 6.3), on by default.
+    var tidyLines: Bool {
+        get { bool(Key.tidyLines, true) }
+        set { defaults.set(newValue, forKey: Key.tidyLines) }
+    }
+
+    /// What a job launched now runs with: the transcriber and tidying chosen here, Apple writing the
+    /// minutes, and no outside source agreed (Task 11 fills the writer fields).
+    var runSettings: RunSettings {
+        RunSettings(transcriber: transcriber, tidy: tidyLines, preferredWriter: .apple, agreed: [])
     }
 
     /// Recorded time as the timer shows it: `mm:ss` under an hour, then `h:mm:ss`.

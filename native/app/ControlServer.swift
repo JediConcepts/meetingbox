@@ -79,6 +79,10 @@ final class ControlHandler {
     /// A start or toggle was refused because the last recording is still being saved (for the
     /// failure sound).
     var onRefused: (() -> Void)?
+    /// Called on `queue` just before a recording starts, by any route (New meeting, the menus, the
+    /// floating button, the socket's `start`, or a `toggle` that becomes one): the one place a voice
+    /// sample in progress is cancelled, so a meeting always wins the microphone.
+    var willStart: (() -> Void)?
     /// Every request on the socket, once, with its final reply (the line the client reads, after the
     /// start wait), as the request it became: a toggle as the start or the stop it was handled as. So
     /// a start that fails from the hotkey or the command is shown as one from the menus is. Never
@@ -247,6 +251,7 @@ final class ControlHandler {
         } else {
             root = preferences.meetingsFolder
         }
+        willStart?()
         do {
             let started = try session.start(root: root, mic: mic ?? preferences.microphone)
             if dir != nil { preferences.addOtherRoot(root) }

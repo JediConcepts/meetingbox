@@ -5,6 +5,10 @@
 // starts at every change of label and every word is kept. With --learn (first processing only), a call
 // may add to the voice print in --voice.
 // Warnings go to stderr with an "mb-transcript: " prefix; the meeting's log lines go there without one.
+//
+// mb-transcript --voice-sample F --voice V
+// makes the voice print V from a recorded sample's speakers file F, replacing any print, and prints
+// `sample <seconds>`. A refusal is one line on stderr, in Preferences' words, and exit 1, writing nothing.
 import Foundation
 
 func fail(_ message: String) -> Never {
@@ -15,7 +19,8 @@ func warn(_ message: String) { FileHandle.standardError.write(Data("mb-transcrip
 func log(_ line: String) { FileHandle.standardError.write(Data("\(line)\n".utf8)) }
 
 let usage = "usage: mb-transcript --mic FILE --call FILE [--mic-speakers FILE] [--call-speakers FILE] [--mic-count N] "
-    + "[--call-count N] [--voice FILE] [--learn ID] [--plain]"
+    + "[--call-count N] [--voice FILE] [--learn ID] [--plain], or mb-transcript --voice-sample FILE --voice FILE"
+var samplePath: String?
 var micPath: String?
 var callPath: String?
 var micSpeakersPath: String?
@@ -45,7 +50,25 @@ while !args.isEmpty {
     case "--voice": voicePath = value()
     case "--learn": learnID = value()
     case "--plain": plain = true
+    case "--voice-sample": samplePath = value()
     default: fail(usage)
+    }
+}
+
+// A recorded sample: nothing else is read, and only the print is written.
+if let samplePath = samplePath {
+    guard let voicePath = voicePath, micPath == nil, callPath == nil, micSpeakersPath == nil, callSpeakersPath == nil,
+          micCount == nil, callCount == nil, learnID == nil, !plain else { fail(usage) }
+    switch saveSample(speakers: FileManager.default.contents(atPath: samplePath), from: samplePath,
+                      voice: URL(fileURLWithPath: voicePath), now: Date()) {
+    case .saved(let seconds):
+        print("sample \(seconds)")
+        exit(0)
+    case .refused(let line):
+        log(line)
+        exit(1)
+    case .failed(let reason):
+        fail(reason)
     }
 }
 

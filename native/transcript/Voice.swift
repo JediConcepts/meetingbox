@@ -179,13 +179,39 @@ private func failure(_ what: String) -> TranscriptError {
     TranscriptError(description: "\(what): \(String(cString: strerror(errno)))")
 }
 
-/// Writes the print to `url` only if the file there is as it was when read (`readState`, nil for none),
-/// so "Forget my voice" or a new sample during processing holds. It is written to the fixed name
-/// `voice.json.tmp` beside it (0600), checked once more, and renamed into place. Returns false, writing
-/// nothing, when the file changed or vanished.
-func savePrintIfUnchanged(_ print: VoicePrint, at url: URL, readState: FileState?) throws -> Bool {
-    guard fileState(at: url) == readState else { return false }
-    let data = try encodePrint(print)
+/// How long a writer waits for the voice print's lock, as the engine's `voice forget` does.
+let voiceLockWait: TimeInterval = 30
+
+/// Runs `body` holding the lock every writer of the voice print takes (spec 6.2, "How it is stored"):
+/// flock(LOCK_EX) on `<voice.json>.lock` beside it, which the engine's `voice forget` takes with BSD
+/// lockf (the same lock: lockf opens with O_EXLOCK, which is flock's). The lock file is 0600, made if
+/// missing, never a link and never removed by a writer. Only a save or a discard is held under it, never
+/// a whole transcript run. Throws when the lock is not free within `wait` seconds.
+func withVoiceLock<T>(_ voice: URL, wait: TimeInterval = voiceLockWait, _ body: () throws -> T) throws -> T {
+    let path = voice.path + ".lock"
+    // O_NONBLOCK so that something other than a plain file there (a FIFO) cannot hold up the open.
+    let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0o600)
+    guard fd >= 0 else { throw failure("cannot open \(path)") }
+    defer { close(fd) } // closing it releases the lock
+    var info = stat()
+    guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+        throw TranscriptError(description: "\(path) is not a plain file")
+    }
+    if info.st_mode & 0o777 != 0o600 { _ = fchmod(fd, 0o600) }
+    let giveUp = Date().addingTimeInterval(wait)
+    while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+        guard errno == EWOULDBLOCK || errno == EINTR else { throw failure("cannot lock \(path)") }
+        guard Date() < giveUp else {
+            throw TranscriptError(description: "your voice print is being changed by another process (\(path) is held)")
+        }
+        usleep(20_000)
+    }
+    return try body()
+}
+
+/// Writes `data` to `url` through the fixed name `voice.json.tmp` beside it (0600), and renames it into
+/// place if `stillWanted` says so once it is written. Returns false, writing nothing, when it does not.
+private func writeThroughTmp(_ data: Data, to url: URL, stillWanted: () -> Bool) throws -> Bool {
     let tmp = url.path + ".tmp"
     if unlink(tmp) != 0 && errno != ENOENT { throw failure("cannot replace \(tmp)") }
     let fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
@@ -202,14 +228,115 @@ func savePrintIfUnchanged(_ print: VoicePrint, at url: URL, readState: FileState
     written = written && fsync(fd) == 0
     close(fd)
     guard written else { let error = failure("cannot write \(tmp)"); unlink(tmp); throw error }
-    guard fileState(at: url) == readState else { unlink(tmp); return false }
+    guard stillWanted() else { unlink(tmp); return false }
     guard rename(tmp, url.path) == 0 else { let error = failure("cannot rename \(tmp)"); unlink(tmp); throw error }
     return true
 }
 
-/// Removes the print only if it is as it was when read. Returns false, removing nothing, otherwise.
-func discardPrintIfUnchanged(at url: URL, readState: FileState?) throws -> Bool {
-    guard let state = readState, fileState(at: url) == state else { return false }
-    guard unlink(url.path) == 0 else { throw failure("cannot remove \(url.path)") }
-    return true
+/// Writes the print to `url` only if the file there is as it was when read (`readState`, nil for none),
+/// so "Forget my voice" or a new sample during processing holds. The check, the write through
+/// `voice.json.tmp` and the rename are made under the voice print's lock, so nothing can change the file
+/// between them. Returns false, writing nothing, when the file changed or vanished; throws when the lock
+/// is not free within `lockWait`.
+func savePrintIfUnchanged(_ print: VoicePrint, at url: URL, readState: FileState?, lockWait: TimeInterval = voiceLockWait) throws -> Bool {
+    let data = try encodePrint(print)
+    return try withVoiceLock(url, wait: lockWait) {
+        guard fileState(at: url) == readState else { return false }
+        return try writeThroughTmp(data, to: url) { fileState(at: url) == readState }
+    }
+}
+
+/// Removes the print only if it is as it was when read, under the lock. Returns false, removing nothing,
+/// otherwise.
+func discardPrintIfUnchanged(at url: URL, readState: FileState?, lockWait: TimeInterval = voiceLockWait) throws -> Bool {
+    try withVoiceLock(url, wait: lockWait) {
+        guard let state = readState, fileState(at: url) == state else { return false }
+        guard unlink(url.path) == 0 else { throw failure("cannot remove \(url.path)") }
+        return true
+    }
+}
+
+/// Writes the print whatever is there now (a recorded sample replaces any print), through
+/// `voice.json.tmp`, under the lock.
+func savePrint(_ print: VoicePrint, at url: URL, lockWait: TimeInterval = voiceLockWait) throws {
+    let data = try encodePrint(print)
+    _ = try withVoiceLock(url, wait: lockWait) { try writeThroughTmp(data, to: url) { true } }
+}
+
+// MARK: - the voice print from a recorded sample
+
+/// Why a sample does not make a print.
+enum SampleRefusal: Error, Equatable {
+    /// Under 60 s of the user's voice: the whole seconds there were.
+    case tooShort(Int)
+    case moreThanOneVoice
+}
+
+/// The print from a recorded sample's speakers (spec 6.2, "Building the print"). The speaker with the
+/// most speech is the user. Another speaker whose cosine with it is 0.60 or more is the same voice split
+/// in two, and is added in; failing that, one with under 5% of all the speakers' seconds, or a median
+/// segment under 2.5 s, is ignored and not added; any other means more than one voice. A sample with a
+/// second voice is refused for that before its length, since recording for longer would not cure it.
+/// Under 60 s of the user's voice (whole seconds, rounded down) is too short, and no speakers at all is 0.
+/// The print counts as one meeting, from no call, and is usable on its own.
+func sampleToPrint(_ speakers: [SpeakerInfo], model: String, now: Date) -> Result<VoicePrint, SampleRefusal> {
+    guard let user = speakers.max(by: { $0.seconds < $1.seconds }) else { return .failure(.tooShort(0)) }
+    let total = speakers.reduce(0) { $0 + $1.seconds }
+    var voice = [user]
+    for other in speakers where other.id != user.id {
+        if atLeast(cosine(other.vector, user.vector), Rule.printMatch) {
+            voice.append(other)
+        } else if other.seconds / total < Rule.smallShare || other.median < Rule.shortMedian {
+            continue
+        } else {
+            return .failure(.moreThanOneVoice)
+        }
+    }
+    let seconds = voice.reduce(0) { $0 + $1.seconds }
+    guard atLeast(seconds, Rule.usableSeconds) else { return .failure(.tooShort(Int(seconds.rounded(.down)))) }
+    // each vector at length 1, weighted by its talk, as learning from calls does
+    var vector = [Double](repeating: 0, count: user.vector.count)
+    for speaker in voice {
+        for (k, x) in scaledToOne(speaker.vector).enumerated() { vector[k] += x * speaker.seconds / seconds }
+    }
+    return .success(VoicePrint(model: model, seconds: seconds, meetings: 1, sources: [], sample: true, refusals: 0, refused: [],
+                               vector: vector, updated: stamp(now)))
+}
+
+/// A refusal in the words Preferences shows (spec, "Copy, fixed").
+func sampleRefusalLine(_ refusal: SampleRefusal) -> String {
+    switch refusal {
+    case .tooShort(let n):
+        return "Not enough speech: \(n) \(n == 1 ? "second" : "seconds") of the 60 needed. Record again and read for the whole 90 seconds."
+    case .moreThanOneVoice:
+        return "More than one voice was heard. Record again with only you speaking."
+    }
+}
+
+/// What `mb-transcript --voice-sample F --voice V` comes to: the print saved, with its whole seconds
+/// (printed as `sample <seconds>`); refused, with the one line to print; or failed, with why.
+enum SampleOutcome: Equatable {
+    case saved(seconds: Int)
+    case refused(String)
+    case failed(String)
+}
+
+/// Builds the print from the speakers file's contents (`speakers`, nil when it could not be read; `from`
+/// names it) and writes it to `voice`, replacing any print without comparing with it. A refusal or a
+/// failure writes nothing.
+func saveSample(speakers data: Data?, from path: String, voice url: URL, now: Date, lockWait: TimeInterval = voiceLockWait) -> SampleOutcome {
+    guard let data = data else { return .failed("cannot read \(path)") }
+    let loaded: (model: String, segments: [Segment], speakers: [SpeakerInfo])
+    do { loaded = try loadSpeakers(data) } catch { return .failed("cannot read \(path): \(error)") }
+    switch sampleToPrint(loaded.speakers, model: loaded.model, now: now) {
+    case .failure(let refusal):
+        return .refused(sampleRefusalLine(refusal))
+    case .success(let print):
+        do {
+            try savePrint(print, at: url, lockWait: lockWait)
+        } catch {
+            return .failed("could not save your voice print: \(error)")
+        }
+        return .saved(seconds: Int(print.seconds.rounded(.down)))
+    }
 }

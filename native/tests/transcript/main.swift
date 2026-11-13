@@ -1086,5 +1086,236 @@ check((try? discardPrintIfUnchanged(at: voiceURL, readState: readSixth)) == true
       "discardPrintIfUnchanged: an unchanged print is removed")
 try? FileManager.default.removeItem(at: folder)
 
+// ======================================================================= the voice sample (6.2)
+// "Record a voice sample…": the speakers in the sample, found without a count, become the print.
+
+func fromSample(_ speakers: [SpeakerInfo]) -> Result<VoicePrint, SampleRefusal> { sampleToPrint(speakers, model: model, now: now) }
+if case .success(let p) = fromSample([sp("S1", seconds: 75, median: 6, vector: [3, 4, 0, 0])]) {
+    check(p.model == model && p.seconds == 75 && p.meetings == 1 && p.sources == [] && p.sample && p.refusals == 0 && p.refused == []
+          && close(p.vector, [0.6, 0.8, 0, 0]) && p.updated == stamp && usablePrint(p, model: model) == p,
+          "sampleToPrint: 75 s of one voice is a usable print: meetings 1, no sources, sample true, its vector scaled to length 1 (\(p))")
+} else { check(false, "sampleToPrint: 75 s of one voice is a usable print: meetings 1, no sources, sample true, its vector scaled to length 1") }
+check(fromSample([sp("S1", seconds: 40, median: 6, vector: e1)]) == .failure(.tooShort(40)), "sampleToPrint: 40 s gives tooShort(40)")
+check(fromSample([]) == .failure(.tooShort(0)), "sampleToPrint: no speakers gives tooShort(0)")
+check(fromSample([sp("S1", seconds: 59.6, median: 6, vector: e1)]) == .failure(.tooShort(59)),
+      "sampleToPrint: the seconds a refusal gives are whole seconds, rounded down (59.6 s is 59, not the 60 needed)")
+if case .success(let p) = fromSample([sp("S1", seconds: 60, median: 6, vector: e1)]) {
+    check(p.seconds == 60, "sampleToPrint: exactly 60 s is enough")
+} else { check(false, "sampleToPrint: exactly 60 s is enough") }
+check(fromSample([sp("S1", seconds: 80, median: 5, vector: e1), sp("S2", seconds: 20, median: 4, vector: at(0.3))]) == .failure(.moreThanOneVoice),
+      "sampleToPrint: a second speaker with 20% of the talk, a 4 s median and a cosine of 0.3 gives moreThanOneVoice")
+if case .success(let p) = fromSample([sp("S1", seconds: 92, median: 5, vector: e1), sp("S2", seconds: 8, median: 3, vector: at(0.7))]) {
+    let unit = at(0.7)
+    check(p.seconds == 100 && close(p.vector, zip(e1, unit).map { ($0 * 92 + $1 * 8) / 100 }) && p.meetings == 1 && p.sample,
+          "sampleToPrint: one voice split 92% and 8% at a cosine of 0.7 is accepted, with the seconds of both, talk-weighted (\(p.vector))")
+} else { check(false, "sampleToPrint: one voice split 92% and 8% at a cosine of 0.7 is accepted, with the seconds of both, talk-weighted") }
+if case .success(let p) = fromSample([sp("S1", seconds: 96, median: 5, vector: [5, 0, 0, 0]), sp("S2", seconds: 4, median: 3, vector: at(0.2))]) {
+    check(p.seconds == 96 && close(p.vector, e1), "sampleToPrint: a 4% speaker at a cosine of 0.2 is ignored, and the print is the main speaker's vector alone, unit-scaled")
+} else { check(false, "sampleToPrint: a 4% speaker at a cosine of 0.2 is ignored, and the print is the main speaker's vector alone, unit-scaled") }
+if case .success(let p) = fromSample([sp("S1", seconds: 90, median: 5, vector: e1), sp("S2", seconds: 10, median: 1.9, vector: e3)]) {
+    check(p.seconds == 90 && close(p.vector, e1), "sampleToPrint: a 10% speaker with a 1.9 s median is ignored and not added")
+} else { check(false, "sampleToPrint: a 10% speaker with a 1.9 s median is ignored and not added") }
+// The edges and the order of the rules.
+check(fromSample([sp("S1", seconds: 95, median: 5, vector: e1), sp("S2", seconds: 5, median: 2.5, vector: e3)]) == .failure(.moreThanOneVoice),
+      "sampleToPrint: exactly 5% of the talk with exactly a 2.5 s median is not small: another voice")
+if case .success(let p) = fromSample([sp("S1", seconds: 97, median: 5, vector: e1), sp("S2", seconds: 3, median: 1, vector: at(0.65))]) {
+    check(p.seconds == 100, "sampleToPrint: the same voice is added in even when it is small: the cosine rule comes first")
+} else { check(false, "sampleToPrint: the same voice is added in even when it is small: the cosine rule comes first") }
+if case .success(let p) = fromSample([sp("S1", seconds: 50, median: 5, vector: e1), sp("S2", seconds: 15, median: 4, vector: at(0.65))]) {
+    check(p.seconds == 65, "sampleToPrint: the same voice split in two counts towards the 60 s")
+} else { check(false, "sampleToPrint: the same voice split in two counts towards the 60 s") }
+check(fromSample([sp("S1", seconds: 40, median: 5, vector: e1), sp("S2", seconds: 20, median: 4, vector: e3)]) == .failure(.moreThanOneVoice),
+      "sampleToPrint: a short sample with a second voice is refused for the second voice, which recording longer would not cure")
+if case .success(let p) = fromSample([sp("S2", seconds: 10, median: 1, vector: e3), sp("S1", seconds: 70, median: 5, vector: e2)]) {
+    check(p.seconds == 70 && close(p.vector, e2), "sampleToPrint: the user is the speaker with the most speech, wherever it is listed")
+} else { check(false, "sampleToPrint: the user is the speaker with the most speech, wherever it is listed") }
+check(sampleRefusalLine(.tooShort(40)) == "Not enough speech: 40 seconds of the 60 needed. Record again and read for the whole 90 seconds."
+      && sampleRefusalLine(.moreThanOneVoice) == "More than one voice was heard. Record again with only you speaking.",
+      "sampleRefusalLine: the two refusals, word for word")
+check(sampleRefusalLine(.tooShort(1)) == "Not enough speech: 1 second of the 60 needed. Record again and read for the whole 90 seconds.",
+      "sampleRefusalLine: 1 second, singular")
+
+// --- mb-transcript --voice-sample F --voice V (saveSample is what main.swift runs) ---
+let sampleFolder = FileManager.default.temporaryDirectory.appendingPathComponent("mb-sample-\(UUID().uuidString)")
+try? FileManager.default.createDirectory(at: sampleFolder, withIntermediateDirectories: true)
+let sampleVoice = sampleFolder.appendingPathComponent("voice.json"), sampleTmp = sampleFolder.appendingPathComponent("voice.json.tmp")
+func speakersFile(_ speakers: [(String, Double, Double, [Double])]) -> Data {
+    let list = speakers.map { "{\"id\": \"\($0.0)\", \"seconds\": \($0.1), \"median\": \($0.2), \"vector\": \($0.3)}" }.joined(separator: ", ")
+    let segments = speakers.map { "{\"speaker\": \"\($0.0)\", \"start\": 0, \"end\": \($0.1)}" }.joined(separator: ", ")
+    return Data("{\"model\": \"\(model)\", \"segments\": [\(segments)], \"speakers\": [\(list)]}".utf8)
+}
+let oneVoice = speakersFile([("S1", 75.4, 6, [3, 4, 0, 0])])
+let learnt = vp(seconds: 391, meetings: 3, sources: ["m-a", "m-b", "m-c"], vector: e3)
+try? encodePrint(learnt).write(to: sampleVoice)
+let saved = saveSample(speakers: oneVoice, from: "sample.speakers.json", voice: sampleVoice, now: now)
+let savedPrint = try? decodePrint(contents(sampleVoice) ?? Data())
+check(saved == .saved(seconds: 75) && savedPrint?.sample == true && savedPrint?.meetings == 1 && savedPrint?.sources == []
+      && savedPrint?.seconds == 75.4 && close(savedPrint?.vector ?? [], [0.6, 0.8, 0, 0]) && savedPrint?.model == model,
+      "saveSample: replaces a learnt print, without comparing, and answers sample 75 (\(saved))")
+check(mode(sampleVoice) == 0o600 && !FileManager.default.fileExists(atPath: sampleTmp.path),
+      "saveSample: voice.json is 0600 and no voice.json.tmp is left")
+try? FileManager.default.createDirectory(at: sampleTmp, withIntermediateDirectories: true)
+let blockedBefore = contents(sampleVoice)
+if case .failed = saveSample(speakers: speakersFile([("S1", 80, 6, [0, 0, 1, 0])]), from: "x", voice: sampleVoice, now: now) {
+    check(contents(sampleVoice) == blockedBefore, "saveSample: it writes through voice.json.tmp, so when that cannot be made voice.json is left as it was")
+} else { check(false, "saveSample: it writes through voice.json.tmp, so when that cannot be made voice.json is left as it was") }
+try? FileManager.default.removeItem(at: sampleTmp)
+let refusedBefore = contents(sampleVoice)
+let refusedShort = saveSample(speakers: speakersFile([("S1", 40.7, 6, [1, 0, 0, 0])]), from: "x", voice: sampleVoice, now: now)
+let refusedTwo = saveSample(speakers: speakersFile([("S1", 80, 5, [1, 0, 0, 0]), ("S2", 20, 4, [0, 0, 1, 0])]), from: "x", voice: sampleVoice, now: now)
+check(refusedShort == .refused("Not enough speech: 40 seconds of the 60 needed. Record again and read for the whole 90 seconds.")
+      && refusedTwo == .refused("More than one voice was heard. Record again with only you speaking.")
+      && contents(sampleVoice) == refusedBefore && !FileManager.default.fileExists(atPath: sampleTmp.path),
+      "saveSample: a refusal gives its one line and leaves voice.json byte-identical")
+let noSpeakers = saveSample(speakers: Data("{\"model\": \"\(model)\", \"segments\": [], \"speakers\": []}".utf8), from: "x", voice: sampleVoice, now: now)
+check(noSpeakers == .refused("Not enough speech: 0 seconds of the 60 needed. Record again and read for the whole 90 seconds."),
+      "saveSample: a sample with no speech found is too short")
+if case .failed = saveSample(speakers: nil, from: "gone.json", voice: sampleVoice, now: now),
+   case .failed = saveSample(speakers: Data("garbage".utf8), from: "bad.json", voice: sampleVoice, now: now) {
+    check(contents(sampleVoice) == refusedBefore, "saveSample: a missing or unreadable speakers file fails and changes nothing")
+} else { check(false, "saveSample: a missing or unreadable speakers file fails and changes nothing") }
+try? FileManager.default.removeItem(at: sampleFolder)
+
+// --- one lock for every writer of the voice print ---
+// <voice.json>.lock: mb-transcript takes flock(LOCK_EX) on it around each save and discard, and the
+// engine's `voice forget` takes the same lock with BSD lockf. Never held across a whole run.
+let lockFolder = FileManager.default.temporaryDirectory.appendingPathComponent("mb-lock-\(UUID().uuidString)")
+try? FileManager.default.createDirectory(at: lockFolder, withIntermediateDirectories: true)
+let lVoice = lockFolder.appendingPathComponent("voice.json"), lTmp = lockFolder.appendingPathComponent("voice.json.tmp")
+let lLock = lockFolder.appendingPathComponent("voice.json.lock")
+func exists(_ url: URL) -> Bool { var s = stat(); return lstat(url.path, &s) == 0 }
+func regular(_ url: URL) -> Bool { var s = stat(); return lstat(url.path, &s) == 0 && (s.st_mode & S_IFMT) == S_IFREG }
+/// Holds the lock as another writer does: its own open file, flock'd.
+func holdLock() -> Int32 {
+    let fd = open(lLock.path, O_RDWR | O_CREAT, 0o600)
+    flock(fd, LOCK_EX)
+    return fd
+}
+func release(_ fd: Int32) { flock(fd, LOCK_UN); close(fd) }
+/// Runs a tool and gives its exit status.
+func tool(_ path: String, _ arguments: [String]) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = arguments
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return -1 }
+    p.waitUntilExit()
+    return p.terminationStatus
+}
+/// Runs `work` on another thread; `wait` gives what it returned, or nil if it has not finished in time.
+final class Background<T> {
+    private let done = DispatchSemaphore(value: 0)
+    private var value: T?
+    init(_ work: @escaping () -> T) {
+        DispatchQueue.global().async { self.value = work(); self.done.signal() }
+    }
+    func wait(_ seconds: Double) -> T? { done.wait(timeout: .now() + seconds) == .success ? value : nil }
+}
+func printAt(_ url: URL) -> VoicePrint? { try? decodePrint(contents(url) ?? Data()) }
+
+try? encodePrint(usable).write(to: lVoice)
+check((try? savePrintIfUnchanged(newPrint, at: lVoice, readState: fileState(at: lVoice))) == true && regular(lLock) && mode(lLock) == 0o600,
+      "lock: a save makes <voice.json>.lock beside the print, a plain file, 0600, and leaves it there")
+
+// A held lock makes a second save wait, and it then checks and writes under the lock.
+var held = holdLock()
+let waitingSave = Background { (try? savePrintIfUnchanged(usable, at: lVoice, readState: fileState(at: lVoice), lockWait: 10)) ?? false }
+check(waitingSave.wait(0.4) == nil && printAt(lVoice) == newPrint, "lock: a save waits while another writer holds the lock, writing nothing")
+release(held)
+check(waitingSave.wait(10) == true && printAt(lVoice) == usable, "lock: and saves once the lock is free")
+
+// Or it times out, writing nothing; so does a discard and a sample save.
+held = holdLock()
+let heldBefore = contents(lVoice)
+var timedOut = false
+do { _ = try savePrintIfUnchanged(newPrint, at: lVoice, readState: fileState(at: lVoice), lockWait: 0.3) } catch { timedOut = true }
+check(timedOut && contents(lVoice) == heldBefore && !exists(lTmp), "lock: a save that cannot get the lock in time fails and writes nothing")
+var discardTimedOut = false
+do { _ = try discardPrintIfUnchanged(at: lVoice, readState: fileState(at: lVoice), lockWait: 0.3) } catch { discardTimedOut = true }
+check(discardTimedOut && contents(lVoice) == heldBefore, "lock: a discard waits for the lock too, and removes nothing when it times out")
+var sampleTimedOut = false
+do { try savePrint(newPrint, at: lVoice, lockWait: 0.3) } catch { sampleTimedOut = true }
+let busySample = saveSample(speakers: oneVoice, from: "x", voice: lVoice, now: now, lockWait: 0.3)
+if case .failed = busySample {
+    check(sampleTimedOut && contents(lVoice) == heldBefore && !exists(lTmp),
+          "lock: a sample save (--voice-sample) waits for the lock too, and fails with voice.json byte-identical when it times out")
+} else { check(false, "lock: a sample save (--voice-sample) waits for the lock too, and fails with voice.json byte-identical when it times out") }
+release(held)
+
+// A learn whose read was made before a forget saves nothing. The forget is the engine's: lockf, then rm.
+let readBeforeForget = fileState(at: lVoice)
+check(tool("/usr/bin/lockf", ["-s", "-k", "-t", "5", lLock.path, "/bin/rm", "-f", "--", lVoice.path]) == 0
+      && (try? savePrintIfUnchanged(newPrint, at: lVoice, readState: readBeforeForget)) == false && !exists(lVoice) && regular(lLock),
+      "lock: a learn whose read was made before a forget writes nothing, and the print stays forgotten")
+// Interleaved: the forget holds the lock when the learn comes to save; the learn waits, then checks.
+try? encodePrint(usable).write(to: lVoice)
+let readMid = fileState(at: lVoice)
+held = holdLock()
+let learnDuringForget = Background { (try? savePrintIfUnchanged(newPrint, at: lVoice, readState: readMid, lockWait: 10)) ?? true }
+usleep(300_000)
+unlink(lVoice.path) // the forget's rm, under its lock
+release(held)
+check(learnDuringForget.wait(10) == false && !exists(lVoice), "lock: a learn that comes to save during a forget waits for it, then writes nothing")
+
+// Two writers never rename each other's voice.json.tmp: many saves at once, every one whole.
+try? encodePrint(usable).write(to: lVoice)
+let errorsLock = NSLock()
+var writerErrors: [String] = []
+var written: Set<String> = []
+DispatchQueue.concurrentPerform(iterations: 8) { i in
+    for k in 0..<40 {
+        let p = vp(seconds: Double(100 + i), sources: ["w\(i)-\(k)"])
+        do {
+            if k % 2 == 0 {
+                try savePrint(p, at: lVoice)
+                errorsLock.lock(); written.insert("w\(i)-\(k)"); errorsLock.unlock()
+            } else if try savePrintIfUnchanged(p, at: lVoice, readState: fileState(at: lVoice)) {
+                errorsLock.lock(); written.insert("w\(i)-\(k)"); errorsLock.unlock()
+            }
+        } catch {
+            errorsLock.lock(); writerErrors.append("\(error)"); errorsLock.unlock()
+        }
+    }
+}
+let lastWritten = printAt(lVoice)
+check(writerErrors.isEmpty && lastWritten.map { written.contains($0.sources.first ?? "") } == true && !exists(lTmp),
+      "lock: 320 saves from 8 writers at once: none fails, voice.json is one whole print one of them wrote, no voice.json.tmp left (\(writerErrors.prefix(3)))")
+
+// Two processes: lockf (BSD, O_EXLOCK) and this process's flock are the same lock.
+held = holdLock()
+let lockfStart = Date()
+let lockfBusy = tool("/usr/bin/lockf", ["-s", "-k", "-t", "1", lLock.path, "/usr/bin/true"])
+check(lockfBusy == 75 && Date().timeIntervalSince(lockfStart) >= 0.9,
+      "lock, two processes: while this process holds the flock, lockf waits and times out with EX_TEMPFAIL (\(lockfBusy))")
+release(held)
+check(tool("/usr/bin/lockf", ["-s", "-k", "-t", "1", lLock.path, "/usr/bin/true"]) == 0, "lock, two processes: and lockf takes it once it is free")
+let lockfReady = lockFolder.appendingPathComponent("ready")
+let holder = Process()
+holder.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+holder.arguments = ["-k", lLock.path, "/bin/sh", "-c", "touch \"$0\"; sleep 2", lockfReady.path]
+try? holder.run()
+var readyWait = 0
+while !exists(lockfReady) && readyWait < 200 { usleep(20_000); readyWait += 1 }
+let beforeLockf = contents(lVoice)
+var blockedByLockf = false
+do { try savePrint(newPrint, at: lVoice, lockWait: 0.3) } catch { blockedByLockf = true }
+check(exists(lockfReady) && blockedByLockf && contents(lVoice) == beforeLockf,
+      "lock, two processes: while lockf holds the lock, a save here waits and times out, writing nothing")
+let afterLockf = Background { () -> Bool in (try? savePrint(newPrint, at: lVoice, lockWait: 10)) != nil }
+holder.waitUntilExit()
+check(afterLockf.wait(10) == true && printAt(lVoice) == newPrint && regular(lLock),
+      "lock, two processes: the save goes ahead once lockf is done, and lockf -k left the lock file")
+
+// A link at the lock's path is never followed.
+let elsewhere = lockFolder.appendingPathComponent("elsewhere")
+unlink(lLock.path)
+symlink(elsewhere.path, lLock.path)
+let beforeLink = contents(lVoice)
+var linkRefused = false
+do { try savePrint(usable, at: lVoice, lockWait: 0.3) } catch { linkRefused = true }
+check(linkRefused && !exists(elsewhere) && contents(lVoice) == beforeLink, "lock: a link at the lock's path is not followed: the save fails and changes nothing")
+try? FileManager.default.removeItem(at: lockFolder)
+
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

@@ -93,6 +93,10 @@ SPEECH_MODELS="$SRC_DIR/models"
 # builds of the same pinned version reuse it.
 SPEECH_DEPS="$SRC_DIR/swiftpm-cache"
 VOICE_FILE="$STATE_DIR/voice.json"
+# The one lock every writer of the voice print takes (mb-transcript with flock, `voice forget` with
+# lockf, which is the same lock), and how long a writer waits for it. Kept: never removed by a writer.
+VOICE_LOCK="$VOICE_FILE.lock"
+VOICE_LOCK_WAIT=30
 # The app is signed with a certificate setup makes in the login keychain. macOS
 # ties the permissions to that certificate, so they survive a rebuild.
 SIGN_NAME="meetingbox local signing"
@@ -753,6 +757,7 @@ install_speech() {
   # Recorded only if it is not there yet: a folder of the user's own is never claimed.
   if cache="$(speech_cache)" && [ ! -e "$cache" ] && [ ! -L "$cache" ]; then record_install "$cache"; fi
   if [ ! -e "$VOICE_FILE" ] && [ ! -L "$VOICE_FILE" ]; then record_install "$VOICE_FILE"; fi
+  if [ ! -e "$VOICE_LOCK" ] && [ ! -L "$VOICE_LOCK" ]; then record_install "$VOICE_LOCK"; fi
 
   if [ -e "$SPEECH_MODELS" ] || [ -L "$SPEECH_MODELS" ]; then
     installed_by_us "$SPEECH_MODELS" || { claim_path "$SPEECH_MODELS"; speech_step_failed "the models folder is not meetingbox's"; return 1; }
@@ -1392,6 +1397,91 @@ voice_words() {
   elif [ "$meetings" -le 1 ]; then printf 'Your voice: from a recorded sample (%s of speech)' "$minutes"
   else printf 'Your voice: from a recorded sample and %s (%s of speech)' "$calls" "$minutes"
   fi
+}
+
+# ------------------------------------------------- the app's engine commands
+#
+# What the app runs through its engine commands (EngineCommands in the app): `engines`, `voice add` and
+# `voice forget`. The app reads only stdout, so each answers there; each starts with umask 077, as
+# process does.
+
+voice_says() { printf '%s\n' "$1"; }
+
+# Which transcribers can be used, and the voice print, one line each: `parakeet ready` or `parakeet
+# unavailable <reason>`, `apple ready` or `apple unavailable <reason>`, and `voice none` or `voice
+# <seconds> <meetings> learnt|sample`. Nothing reaches the network.
+engines_cmd() {
+  local reason=""
+  umask 077
+  if speech_usable; then
+    echo "parakeet ready"
+  elif [ ! -x "$SPEECH_BIN" ]; then
+    echo "parakeet unavailable the speech helper is not installed"
+  else
+    reason="$("$SPEECH_BIN" check "$SPEECH_MODELS" 2>&1 >/dev/null | head -n 1 | tr -d '[:cntrl:]')" || true
+    reason="${reason#mb-speech: }"
+    echo "parakeet unavailable ${reason:-its models did not pass their check}"
+  fi
+  if have speech-analyzer; then echo "apple ready"; else echo "apple unavailable speech-analyzer is not installed"; fi
+  printf 'voice %s\n' "$(voice_line)"
+}
+
+# `voice add <audio>` (spec 6.2, "Record a voice sample…"): the speakers in the app's sample.caf, found
+# without a count, become the voice print, replacing any. The WAV and the speakers file (it holds voice
+# vectors) live only in a private temporary folder, removed before it answers. The answer is one line:
+# mb-transcript's `sample <seconds>`, or why the sample was refused; the status is mb-transcript's.
+voice_add() {
+  local audio="$1" base tmp speakers line rc=0
+  umask 077
+  if ! speech_usable; then voice_says "Parakeet is not set up, so a voice sample cannot be used. Run meetingbox setup."; return 1; fi
+  if ! installed_by_us "$VOICE_FILE"; then voice_says "$VOICE_FILE was not made by meetingbox, so a voice sample is not saved there."; return 1; fi
+  if [ ! -x "$TRANSCRIPT_BIN" ]; then voice_says "mb-transcript is not installed. Run meetingbox setup."; return 1; fi
+  if [ ! -f "$audio" ]; then voice_says "There is no sample at $audio."; return 1; fi
+  # an explicit template: macOS's mktemp -d on its own ignores TMPDIR
+  base="${TMPDIR:-/tmp}"
+  tmp="$(mktemp -d "${base%/}/meetingbox-voice.XXXXXX")" \
+    || { voice_says "The voice sample could not be used: no temporary folder could be made."; return 1; }
+  trap 'rm -rf -- "$tmp"; exit 129' HUP
+  trap 'rm -rf -- "$tmp"; exit 130' INT
+  trap 'rm -rf -- "$tmp"; exit 143' TERM
+  # afconvert into the folder, then mb-speech there with TMPDIR that folder, and no count
+  speakers="$tmp/sample.speakers.json"
+  speech_run "$tmp" "$audio" speakers "$speakers" || rc=$?
+  case "$rc" in
+    0)
+      "$TRANSCRIPT_BIN" --voice-sample "$speakers" --voice "$VOICE_FILE" > "$tmp/answer" 2> "$tmp/reason" || rc=$?
+      if [ "$rc" -eq 0 ]; then line="$(grep -m 1 . "$tmp/answer")" || line=""
+      else line="$(grep -m 1 . "$tmp/reason")" || line=""; line="${line#mb-transcript: }"; fi
+      [ -n "$line" ] || line="mb-transcript stopped without giving a reason (exit $rc)" ;;
+    2) line="The recorded sample could not be read."; rc=1 ;;
+    *) line="Your voice could not be found in the sample: $SPEECH_REASON"; rc=1 ;;
+  esac
+  rm -rf -- "$tmp"
+  trap - HUP INT TERM
+  voice_says "$line"
+  return "$rc"
+}
+
+# `voice forget` ("Forget my voice"): removes the voice print and its voice.json.tmp under the voice
+# print's lock, the one mb-transcript takes to save, so a save in progress finishes first, and a learn
+# that read the print before finds it gone and writes nothing. The record line stays, so the voice can
+# be learnt again. A lock still held after VOICE_LOCK_WAIT seconds is refused, forgetting nothing.
+voice_forget() {
+  local rc=0
+  umask 077
+  if ! installed_by_us "$VOICE_FILE"; then voice_says "$VOICE_FILE was not made by meetingbox, so it is left alone."; return 1; fi
+  # lockf would follow a link there: the lock is only ever a plain file
+  if [ -L "$VOICE_LOCK" ] || { [ -e "$VOICE_LOCK" ] && [ ! -f "$VOICE_LOCK" ]; }; then
+    voice_says "$VOICE_LOCK is not a plain file, so your voice was not forgotten."
+    return 1
+  fi
+  /usr/bin/lockf -s -k -t "$VOICE_LOCK_WAIT" "$VOICE_LOCK" rm -f -- "$VOICE_FILE" "$VOICE_FILE.tmp" || rc=$?
+  case "$rc" in
+    0)  ok "your voice print is forgotten"; return 0 ;;
+    75) voice_says "Your voice print is being saved right now, so it was not forgotten. Try again." ;;
+    *)  voice_says "Your voice could not be forgotten (exit $rc)." ;;
+  esac
+  return 1
 }
 
 doctor() {
@@ -2436,7 +2526,7 @@ reset_cmd() {
     left=""
     for p in "$APP_DIR" "$TRANSCRIPT_BIN" "$SRC_DIR/meetingbox" "$SRC_DIR/audio-capture" "$SRC_DIR/speech-analyzer-cli" \
              "$SA_APP" "$SA_LINK" "$WHISPER_FILE" "$SPEECH_BIN" "$SPEECH_MODELS" "$HOME/Library/Caches/mb-speech" \
-             "$VOICE_FILE"; do
+             "$VOICE_FILE" "$VOICE_LOCK"; do
       if { [ -e "$p" ] || [ -L "$p" ]; } && ! installed_by_us "$p"; then left="$left$p
 "; fi
     done
@@ -2565,6 +2655,9 @@ meetingbox: record, transcribe and summarise a meeting entirely on device.
   meetingbox process <audio|txt>   run an existing file through the pipeline
   meetingbox recover <folder>      finish a recording that was interrupted
   meetingbox doctor                what is installed and what is not
+  meetingbox engines               which transcribers are ready, and your voice print
+  meetingbox voice add <audio>     learn your voice from a recording of you alone
+  meetingbox voice forget          forget your voice
   meetingbox mics                  microphones the recorder can see
   meetingbox reset                 clear a stuck recording, ask for permissions again
   meetingbox reset --tools         also remove what setup built, to start setup afresh
@@ -2588,10 +2681,11 @@ Output lands in ~/Meetings/<date>_<time>/
 USAGE
 }
 
-# The command line: the command, its file, and the settings. A function above main, so the tests
-# can call it.
+# The command line: the command, its file, and the settings. `voice` takes a word of its own first
+# (add or forget). A function above main, so the tests can call it.
 parse_args() {
   cmd=""
+  subcmd=""
   argfile=""
   RESET_TOOLS=0
   while [ $# -gt 0 ]; do
@@ -2617,7 +2711,10 @@ parse_args() {
       -v|--version) print_version; exit 0 ;;
       -h|--help) usage; exit 0 ;;
       -*) die "unknown option: $1" ;;
-      *)  if [ -z "$cmd" ]; then cmd="$1"; else argfile="$1"; fi; shift ;;
+      *)  if [ -z "$cmd" ]; then cmd="$1"
+          elif [ "$cmd" = voice ] && [ -z "$subcmd" ]; then subcmd="$1"
+          else argfile="$1"; fi
+          shift ;;
     esac
   done
 }
@@ -2642,6 +2739,14 @@ case "${cmd:-toggle}" in
            recover_cmd "$argfile" ;;
   setup)   setup ;;
   doctor|check) doctor ;;
+  engines) engines_cmd ;;
+  voice)
+    case "$subcmd" in
+      add)    [ -n "$argfile" ] || die "usage: meetingbox voice add <audio>"
+              voice_add "$argfile" ;;
+      forget) voice_forget ;;
+      *)      die "usage: meetingbox voice add <audio> | meetingbox voice forget" ;;
+    esac ;;
   mics|devices)
     recorder_ready || die "the recorder is not installed. Run: meetingbox setup"
     "$APP_BIN" --record -l ;;
