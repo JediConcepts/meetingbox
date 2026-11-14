@@ -1730,6 +1730,11 @@ let deadPid: Int32 = {
 }()
 let me = getpid()
 
+/// A count kept by a closure the code under test calls.
+final class Tally {
+    var count = 0
+}
+
 final class QRig {
     let root = freshRoot()
     let store: MeetingStore
@@ -1741,14 +1746,18 @@ final class QRig {
     /// The reason each job `finished` reports gives, in the same order (nil: the record's own error).
     var reasons: [String?] = []
     var changes = 0
+    /// How many times the store's roots were read: once for each scan or search of them (none while the queue
+    /// finds a meeting in the folder it was last found in).
+    let rootReads = Tally()
 
     init() {
-        store = MeetingStore(root: root.appendingPathComponent("Meetings"))
+        let reads = rootReads
+        store = MeetingStore(root: root.appendingPathComponent("Meetings"), otherRoots: { reads.count += 1; return [] })
         try! fm.createDirectory(at: store.root, withIntermediateDirectories: true)
     }
     @discardableResult
-    func make(settings: @escaping () -> RunSettings = { .defaults }) -> ProcessingQueue {
-        queue = ProcessingQueue(store: store, runner: runner, tickQueue: nil, settings: settings)
+    func make(settings: @escaping () -> RunSettings = { .defaults }, ps: URL = URL(fileURLWithPath: "/bin/ps")) -> ProcessingQueue {
+        queue = ProcessingQueue(store: store, runner: runner, ps: ps, tickQueue: nil, settings: settings)
         queue.onFinished = { [unowned self] dir, ok, kind, reason in
             self.finished.append((dir.lastPathComponent, ok))
             self.kinds.append(kind)
@@ -7488,6 +7497,91 @@ do {
     check(r.runner.calls.count == 1 && !q.hasWork && r.finished.last.map { $0 == (a.lastPathComponent, false) } == true
           && r.reasons.last == lostReason,
           "R4 reason: a waiting job whose meeting is in no root ends with the lost-folder reason (\(r.reasons.last.flatMap { $0 } ?? "nil"))")
+}
+
+// MARK: - Redo in the window, round 5
+
+// At a relaunch the run the last instance left going is waited for before anything else starts, whatever the
+// dates (R4RR-1). A meeting left processing whose lock is live, or whose owner ps cannot tell, comes before one
+// left processing whose lock is gone (a crash leftover, here older), and both before the meeting queued. Once the
+// live run settles, the leftover runs again once, as its kind, and then the queued one, one at a time. The same
+// holds with the dates swapped.
+for (kind, unknown, swapped) in [(JobKind.process, false, false), (JobKind.process, true, false), (JobKind.minutes, false, false),
+                                 (JobKind.transcribe, false, false), (JobKind.process, false, true)] {
+    let r = QRig()
+    func left(_ name: String, _ change: @escaping (inout MeetingRecord) -> Void) -> URL {
+        if kind == .process { return r.meeting(name, files: ["audio.m4a": "a"], change) }
+        return t8Done(r, name) {
+            $0.writer = .apple
+            $0.job = kind
+            if kind == .transcribe { $0.jobTranscriber = .apple; $0.jobTidy = false }
+            change(&$0)
+        }
+    }
+    let (liveName, deadName) = swapped ? ("2026-11-01_0900", "2026-11-13_0900") : ("2026-11-13_0900", "2026-11-01_0900")
+    let dead = left(deadName) { $0.state = .processing; $0.attempts = 1; $0.attempt = "att-old" } // no lock, no result
+    let waiting = left("2026-11-05_0900") { $0.state = .queued }
+    let live = left(liveName) { $0.state = .processing; $0.attempts = 1; $0.attempt = "att-new" }
+    r.lock(live, owner: "\(me) \(lstartOf(me))") // the last instance's engine, still at work
+    let q = r.make(ps: URL(fileURLWithPath: unknown ? "/no-such-ps" : "/bin/ps"))
+    q.resume()
+    let label = "\(kind), the live lock \(unknown ? "unknown to ps" : "alive"), the leftover \(swapped ? "newer" : "older")"
+    check(r.runner.calls.isEmpty && q.stage == "waiting for another meetingbox"
+          && q.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(live),
+          "R5 relaunch: no run while a meeting left processing holds a live lock; the queue waits on it (\(label); runs \(r.runner.folders))")
+    // The live run ends on its own: what its kind writes, our attempt's result, and its lock gone.
+    if kind == .minutes {
+        try! "new minutes\n".write(to: live.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+    } else {
+        r.outputs(live, at: Date())
+    }
+    r.result(live, attempt: "att-new", status: 0, started: Date().addingTimeInterval(-60))
+    r.unlock(live)
+    q.tick()
+    check(r.state(live) == "done" && r.runner.calls.count == 1 && r.runner.calls[0].job.kind == kind && r.runner.calls[0].attemptsAtRun == 2
+          && LibraryPresentation.key(r.runner.calls[0].job.folder) == LibraryPresentation.key(dead),
+          "R5 relaunch: once it settles Done, the leftover runs again, as its kind, at attempts 2 (\(label))")
+    if kind == .minutes { r.runner.finishNotes(0, 0) } else { r.runner.finish(0, 0) }
+    check(r.state(dead) == "done" && r.runner.calls.count == 2 && r.runner.calls[1].job.kind == kind
+          && LibraryPresentation.key(r.runner.calls[1].job.folder) == LibraryPresentation.key(waiting),
+          "R5 relaunch: then the queued one runs (\(label))")
+    if kind == .minutes { r.runner.finishNotes(1, 0) } else { r.runner.finish(1, 0) }
+    check(r.state(waiting) == "done" && r.runner.calls.count == 2 && !q.hasWork, "R5 relaunch: and each runs once (\(label))")
+}
+
+// The running tick (R4RR-2): while the folder it was last found in is still the job's meeting, a tick with nothing
+// new searches no root and tells onChange nothing. A lost run that comes back with no new stage written is current
+// again and onChange is told once, whether it is back at the same path or under another name; later ticks with
+// nothing new tell it nothing.
+for samePath in [true, false] {
+    let r = QRig()
+    let q = r.make()
+    let a = t8Done(r, "2026-11-13_0900") { $0.writer = .apple }
+    _ = q.redo(a, kind: .transcribe, options: JobOptions(transcriber: .apple, tidy: false, writer: .apple))
+    try! "transcribing\n".write(to: r.runner.calls[0].progress, atomically: false, encoding: .utf8)
+    q.tick()
+    let label = samePath ? "to the same path" : "under another name in the root"
+    var (told, reads) = (r.changes, r.rootReads.count)
+    q.tick()
+    q.tick()
+    check(q.stage == "transcribing" && r.changes == told && r.rootReads.count == reads,
+          "R5 tick: while its folder is in place, a tick with nothing new searches no root and tells onChange nothing (\(label); \(r.rootReads.count - reads) searches, \(r.changes - told) changes)")
+    let away = freshRoot().appendingPathComponent("2026-11-13_0900", isDirectory: true)
+    _ = Darwin.rename(a.path, away.path)
+    reads = r.rootReads.count
+    q.tick()
+    check(q.current == nil && r.rootReads.count > reads, "R5 tick: once it is gone, the roots are searched (\(label))")
+    let back = samePath ? a : r.store.root.appendingPathComponent("2026-11-13 0900 Weekly", isDirectory: true)
+    _ = Darwin.rename(away.path, back.path) // its progress file unchanged: no new stage
+    told = r.changes
+    q.tick()
+    check(q.current.map { LibraryPresentation.key($0) } == LibraryPresentation.key(back) && q.stage == "transcribing" && r.changes == told + 1,
+          "R5 back: a lost run that comes back with no new stage is current again, and onChange is told once (\(label); \(r.changes - told) changes)")
+    (told, reads) = (r.changes, r.rootReads.count)
+    q.tick()
+    q.tick()
+    check(r.changes == told && r.rootReads.count == reads,
+          "R5 back: later ticks with nothing new search no root and tell onChange nothing (\(label); \(r.rootReads.count - reads) searches, \(r.changes - told) changes)")
 }
 
 try? fm.removeItem(at: scratch)

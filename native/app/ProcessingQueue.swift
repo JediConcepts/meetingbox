@@ -459,10 +459,11 @@ struct ProcessResult: Equatable {
 /// The durable processing queue. Its state lives in each meeting's `meeting.json` (`queued`,
 /// `processing`, `attempts`, `attempt`, and a redo's `job` and its options), so a crash loses nothing:
 /// `resume()` picks up every `queued` and `processing` meeting, and never touches `unprocessed` or
-/// `done` ones. One job runs at a time, as the kind its record names, in the order asked; at launch,
-/// the meetings found `processing` come first and then those found `queued`, each oldest first, since
-/// a run the last instance left going may still be at work. A job found `processing` after a quit or a
-/// crash is settled from its lock and `.process-result`: a live owner is waited for; our attempt's
+/// `done` ones. One job runs at a time, as the kind its record names, in the order asked. At launch the
+/// order is, each group oldest first: the meetings found `processing` whose lock is live or whose owner
+/// cannot be told (a run the last instance left going may still be at work), then those found
+/// `processing` whose lock is gone, then those found `queued`. A job found `processing` after a quit or
+/// a crash is settled from its lock and `.process-result`: a live owner is waited for; our attempt's
 /// success is done; anything that stopped part way is run again as the same kind, at most three runs in
 /// all.
 /// Call it from one queue (the main queue in the app); a 1 s timer there follows the progress file
@@ -722,18 +723,26 @@ final class ProcessingQueue {
         record.jobTidy = nil
     }
 
-    /// Picks up every meeting left `processing`, then every one left `queued`, each oldest first, in the
-    /// meetings folder and in every other folder a recording was started in (`MeetingStore.roots`). A run
-    /// the last instance started goes on after it quits, holding its lock, so it is waited for before
-    /// anything else starts. Safe to call again.
+    /// Picks up every meeting left `processing` or `queued`, in the meetings folder and in every other
+    /// folder a recording was started in (`MeetingStore.roots`), in this order, each group oldest first:
+    /// those `processing` whose lock is live or whose owner ps cannot tell, then those `processing` whose
+    /// lock is gone, then those `queued`. A run the last instance started goes on after it quits, holding
+    /// its lock, so at launch it is waited for before anything else starts, whatever the dates. Safe to
+    /// call again: what a later call finds goes behind what is already pending.
     func resume() {
         onTickQueue()
-        let found = store.scanEveryRoot().reversed().compactMap { meeting in
-            meeting.record.map { (ProcessingQueue.normal(meeting.folder.url), $0) }
+        let found = store.scanEveryRoot().reversed().compactMap { meeting -> (dir: URL, record: MeetingRecord, group: Int)? in
+            guard let record = meeting.record else { return nil }
+            let dir = ProcessingQueue.normal(meeting.folder.url)
+            switch record.state {
+            case .processing: return (dir, record, ProcessingLock.owner(dir, ps: ps, now: now()) == .gone ? 1 : 0)
+            case .queued: return (dir, record, 2)
+            default: return nil
+            }
         }
-        for state in [MeetingState.processing, .queued] {
-            for (dir, record) in found where record.state == state {
-                if !known(dir), let entry = Held(dir, record) { pending.append(entry) }
+        for group in 0...2 {
+            for meeting in found where meeting.group == group {
+                if !known(meeting.dir), let entry = Held(meeting.dir, meeting.record) { pending.append(entry) }
             }
         }
         onChange?()
