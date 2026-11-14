@@ -8391,12 +8391,36 @@ MainActor.assumeIsolated {
     _ = settle { phaseIs("finalising") }
     rec.exit(third.pid, 0, verifies: true)
     check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 adopt at once: (the recording is saved)")
+
+    // The same with the recorder found paused (T9R2-RR-1): adopted as .paused, the backstop still makes way,
+    // so nothing plays or samples into a recording the user can then resume.
+    app.recordSample()
+    sampler.starts.last?.started(nil)
+    player.toggle(fileB)
+    check(player.state == .playing(fileB) && app.sampling, "T9 adopt at once, paused: (playing, with a sample under way)")
+    log = []
+    audio.onStop = { log.append("player") }
+    sampler.onStop = { log.append("sampler") }
+    let fourth = leftRunning("2026-11-14_0930", paused: true)
+    app.adopt()
+    check(app.session.phase == .paused(fourth.dir) && !app.session.unconfirmed, "T9 adopt at once, paused: (adopted straight away, paused)")
+    check(settle { player.state == .idle } && log == ["player", "sampler"] && app.sample == .failed("Stopped because a meeting started recording."),
+          "T9 adopt at once, paused: an adopted paused recording stops playback, then cancels the sample (\(log))")
+    check(app.topBar.player?.toggle == off("Play"), "T9 adopt at once, paused: and Play is disabled while it is paused")
+    audio.onStop = nil
+    sampler.onStop = nil
+    app.closeSample()
+    app.perform(.stop)
+    _ = settle { phaseIs("finalising") }
+    rec.exit(fourth.pid, 0, verifies: true)
+    check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 adopt at once, paused: (the recording is saved)")
     app.shutDown()
     try? fm.removeItem(at: state)
 }
 
-// R2-1 by the real route: the meetings folder changes, while a meeting plays, to one where a recorder that
-// recording.dir names is running and ps cannot tell. Playback stops at once.
+// R2-1 by the real route: the meetings folder changes, while a meeting plays and a sample is under way, to one
+// where a recorder that recording.dir names is running and ps cannot tell. Playback stops at once, then the
+// sample is cancelled. A change to a folder with no recording in it leaves playback alone.
 MainActor.assumeIsolated {
     let state = shortTemp()
     let root = freshRoot()
@@ -8406,9 +8430,10 @@ MainActor.assumeIsolated {
     prefs.openMinutes = false
     let rec = FakeRecorder()
     let audio = FakeAudio()
+    let sampler = FakeSampler()
     let player = Player(audio: audio, tickQueue: nil, loadQueue: nil)
     let app = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
-                       engine: FakeEngine(), sampler: FakeSampler(), player: player)
+                       engine: FakeEngine(), sampler: sampler, player: player)
     let b = make(root, "2026-11-11_0900", files: ["audio.m4a": "b"])
     try! app.store.update(b) { $0.state = .done; $0.seconds = 754 }
     let fileB = b.appendingPathComponent("audio.m4a")
@@ -8416,6 +8441,23 @@ MainActor.assumeIsolated {
     app.library.reload()
     app.library.select(LibraryPresentation.key(b))
     check(settle { app.library.shownContent?.files.audio != nil }, "T9 folder change: (meeting B selected)")
+    @MainActor func playsB() -> Bool { if case .playing(let u) = player.state { return isAt(u, fileB) }; return false }
+    var log: [String] = []
+    audio.onStop = { log.append("player") }
+    sampler.onStop = { log.append("sampler") }
+
+    // A folder with no meeting being recorded in it (T9R2-RR-3): the meeting playing carries on.
+    let quiet = freshRoot()
+    let done = make(quiet, "2026-11-10_0900", files: ["audio.m4a": "q"])
+    try! app.store.update(done) { $0.state = .done; $0.seconds = 60 }
+    app.togglePlayer()
+    check(playsB(), "T9 folder change, no recorder: (playing B)")
+    app.setMeetingsFolder(quiet)
+    check(settle { isAt(prefs.meetingsFolder, quiet) } && app.folderProblem == nil && !app.session.unconfirmed,
+          "T9 folder change, no recorder: (the folder is taken)")
+    check(playsB() && log == [], "T9 folder change, no recorder: a meeting playing carries on (\(log))")
+
+    // A folder where a recorder is running and ps cannot tell.
     let elsewhere = freshRoot()
     let live = Session.folderURL(elsewhere.appendingPathComponent("2026-11-14_0700").path)
     try! fm.createDirectory(at: live, withIntermediateDirectories: true)
@@ -8426,16 +8468,21 @@ MainActor.assumeIsolated {
     rec.running[live.path] = pid
     rec.alive.insert(pid)
     rec.findUnknown = true
-    app.togglePlayer()
-    check({ if case .playing(let u) = player.state { return isAt(u, fileB) }; return false }(), "T9 folder change: (playing B)")
-    var log: [String] = []
-    audio.onStop = { log.append("player") }
+    // A sample under way and B playing: the app never lets both happen at once, but the player itself knows
+    // nothing of samples, so this shows what the move stops and in what order.
+    app.recordSample()
+    sampler.starts.last?.started(nil)
+    player.toggle(fileB)
+    check(playsB() && app.sampling, "T9 folder change: (playing B, with a sample under way)")
+    log = []
     app.setMeetingsFolder(elsewhere)
     check(settle { app.session.unconfirmed } && app.folderProblem == nil && isAt(prefs.meetingsFolder, elsewhere),
           "T9 folder change: (the folder is taken, and its recorder is unconfirmed)")
-    check(player.state == .idle && log == ["player"],
-          "T9 folder change: a meeting playing stops as soon as the new folder leaves a recorder unconfirmed (\(log))")
+    check(player.state == .idle && log == ["player", "sampler"] && app.sample == .failed("Stopped because a meeting started recording."),
+          "T9 folder change: as soon as the new folder leaves a recorder unconfirmed, playback stops, then the sample is cancelled (\(log))")
     audio.onStop = nil
+    sampler.onStop = nil
+    app.closeSample()
     rec.findUnknown = false
     check(settle { app.session.phase == .recording(live) }, "T9 folder change: (the tick adopts the recorder)")
     app.perform(.stop)
