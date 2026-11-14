@@ -102,8 +102,8 @@ final class LibraryModel: ObservableObject {
     @Published private(set) var version: URL?
     /// The listed entry `version` was chosen from, so the picker can still name it once it has gone.
     private var chosen: TranscriptVersion?
-    /// Why the last action did nothing (Play audio without QuickTime Player), until the next action or
-    /// another meeting is chosen.
+    /// Why the last action did nothing (Open in QuickTime Player when it is not installed), until the next
+    /// action or another meeting is chosen.
     @Published private(set) var problem: String?
     /// A meeting the window was asked to show (`show`) that is not in the meetings folder: one recorded
     /// in a folder of its own. It is read with each scan while it is selected, and never listed.

@@ -57,7 +57,7 @@ enum LibraryAction: CaseIterable, Hashable {
         case .stop: return "Stop"
         case .rename: return "Rename…"
         case .showInFinder: return "Show in Finder"
-        case .playAudio: return "Play audio"
+        case .playAudio: return "Open in QuickTime Player"
         case .process: return "Process"
         case .redoMinutes: return "Redo minutes…"
         case .transcribeAgain: return "Transcribe again…"
@@ -244,15 +244,15 @@ enum LibraryPresentation {
         files.runnable && (meeting.state == .unprocessed || meeting.state == .failed)
     }
 
-    /// The meeting the session is on offers what the recording can be asked to do; any other offers
-    /// Rename and Show in Finder, Play audio when there is audio, Process when `canProcess`, and the two
-    /// redos when nothing has a claim on it. Redo minutes is for a done or failed meeting with a
+    /// The meeting the session is on offers what the recording can be asked to do; any other offers Rename
+    /// and Show in Finder, Open in QuickTime Player when there is audio, Process when `canProcess`, and the
+    /// two redos when nothing has a claim on it. Redo minutes is for a done or failed meeting with a
     /// transcript; Transcribe again for a done meeting the queue can run. A claim is the session, the
     /// queue's live job (`processing`), a busy state in its record (`isBusy`, as for a rename), or a lock
-    /// another process may hold (`files.lockHeld`). Nothing is played while a recording runs or is
-    /// paused: the recorder takes in the Mac's own sound, so the meeting played would be recorded into
-    /// this one. A redo is offered meanwhile, since it may run while another meeting records. Reads only
-    /// its arguments: never the disk, and never `ps`.
+    /// another process may hold (`files.lockHeld`). Nothing is played while a recording runs or is paused:
+    /// the recorder takes in the Mac's own sound, so the meeting played would be recorded into this one. A
+    /// redo is offered meanwhile, since it may run while another meeting records. Reads only its arguments:
+    /// never the disk, and never `ps`.
     static func actions(for meeting: Meeting, phase: Session.Phase, files: MeetingFiles, processing: URL?) -> [LibraryAction] {
         let capturing: Bool
         switch phase {
@@ -277,7 +277,7 @@ enum LibraryPresentation {
         return list
     }
 
-    /// Play audio opens the recording in QuickTime Player, by its bundle identifier, and never in the
+    /// Open in QuickTime Player opens the recording there, by its bundle identifier, and never in the
     /// `.m4a` default application: that is often Music, which adds the file to its library and may
     /// upload it. Without QuickTime Player nothing is opened, and the window says why.
     static let quickTimePlayer = "com.apple.QuickTimePlayerX"

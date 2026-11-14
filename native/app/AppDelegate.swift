@@ -28,9 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.lock = lock
 
-        // The real engine commands and microphone sampler: passed only here, never by a test.
+        // The real engine commands, microphone sampler and player: passed only here, never by a test.
         let model = AppModel(stateDir: stateDir, preferences: Preferences(defaults: Preferences.appDefaults()),
-                             engine: ScriptEngineCommands.fromBundle() ?? NoEngineCommands(), sampler: MicSampleRecorder())
+                             engine: ScriptEngineCommands.fromBundle() ?? NoEngineCommands(), sampler: MicSampleRecorder(),
+                             player: Player(audio: SystemAudio(), tickQueue: .main))
         model.onOpenLibrary = { [weak self] in self?.showLibrary() }
         model.onOpenPreferences = { [weak self] in self?.showPreferences() }
         model.onVisibilityChange = { [weak self] in self?.applyVisibility() }

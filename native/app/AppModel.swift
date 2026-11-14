@@ -67,16 +67,21 @@ final class AppModel: ObservableObject {
 
     /// Plays a system sound by name, through `play`.
     private let playSound: (String) -> Void
+    /// The top bar's player of the selected meeting's audio (Player.swift). Only the bar's player view
+    /// observes it; this model does not pass its changes on.
+    let player: Player
 
     /// The recorder, the processing runner, the free space and the sound player are the real ones
     /// unless a test gives its own. Without an `engine` no engine command runs (each is answered that
-    /// meetingbox is not installed), and without a `sampler` there is no voice sample: only AppDelegate
-    /// passes the real ones.
+    /// meetingbox is not installed), without a `sampler` there is no voice sample, and without a `player`
+    /// nothing plays (every file is refused): only AppDelegate passes the real ones.
     init(stateDir: URL, preferences: Preferences, recorder: RecorderControl = ChildRecorder(), runner: PipelineRunner? = nil,
          freeBytes: @escaping (URL) -> Int64? = { AppModel.freeBytes(near: $0) },
          playSound: @escaping (String) -> Void = { NSSound(named: NSSound.Name($0))?.play() },
-         engine: EngineCommands = NoEngineCommands(), sampler: SampleRecorder? = nil) {
+         engine: EngineCommands = NoEngineCommands(), sampler: SampleRecorder? = nil,
+         player: Player = Player(audio: NoAudio(), tickQueue: nil)) {
         self.playSound = playSound
+        self.player = player
         self.engine = engine
         self.sampler = sampler
         self.stateDir = stateDir
@@ -101,9 +106,9 @@ final class AppModel: ObservableObject {
         // The window's Pause, Resume and Stop take the path the menu's do.
         library.control = { [weak self] action in self?.perform(action) }
         library.onSelectionChange = { [weak self] in self?.selectionChanged() }
-        // A meeting always wins: every start, by any route, first cancels a voice sample being recorded.
-        // The handler's queue is the session's tick queue, the main queue.
-        handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.cancelSampleForMeeting() } }
+        // A meeting always wins: every start, by any route, first stops playback and then cancels a voice
+        // sample being recorded. The handler's queue is the session's tick queue, the main queue.
+        handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.recordingWillStart() } }
         // Settings from before (or written by hand) with neither the Dock icon nor the menu bar item.
         normaliseVisibility()
     }
@@ -232,8 +237,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// The window chose another meeting. Nothing follows the selection yet; the player will stop here.
-    private func selectionChanged() {}
+    /// The window chose another meeting: the player, which plays the selected meeting, stops.
+    private func selectionChanged() {
+        player.stop()
+    }
 
     /// Brings the meetingbox window forward, on that meeting's minutes when one is given.
     func showLibrary(on dir: URL? = nil) {
@@ -461,7 +468,8 @@ final class AppModel: ObservableObject {
     /// Starts a voice sample: a private folder `<stateDir>/sample.XXXXXX`, and the sampler on the
     /// Preferences microphone. Refused unless the session is idle, no sample is under way and a sampler
     /// was given. When the engine has said Parakeet cannot be used, it fails at once with that, rather
-    /// than after 90 seconds of reading. The countdown starts once the sampler is capturing.
+    /// than after 90 seconds of reading. Playback stops before the sampler starts, so the microphone does
+    /// not take in a meeting being played. The countdown starts once the sampler is capturing.
     func recordSample() {
         guard canRecordSample, let sampler = sampler else { return }
         if case .unavailable = engineStatus.parakeet {
@@ -477,6 +485,7 @@ final class AppModel: ObservableObject {
         sampleFolder = folder
         sampleStep = .waiting
         sample = .recording(secondsLeft: SampleState.seconds)
+        player.stop()
         sampler.start(folder: folder, microphone: preferences.microphone) { [weak self] reason in
             MainActor.assumeIsolated { self?.sampleStarted(asked, folder: folder, reason: reason) }
         }
@@ -576,8 +585,15 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// A recording is about to start (`ControlHandler.willStart`, on the main queue just before the
-    /// recorder is launched): a sample not yet being built fails, saying why. One being recorded has its
+    /// A recording is about to start, by any route (`ControlHandler.willStart`, on the main queue just
+    /// before the recorder is launched): playback stops first, since the recorder takes in the Mac's own
+    /// sound, and then a voice sample under way is cancelled.
+    private func recordingWillStart() {
+        player.stop()
+        cancelSampleForMeeting()
+    }
+
+    /// A meeting is starting: a sample not yet being built fails, saying why. One being recorded has its
     /// sampler asked to stop; one already stopping keeps the stop it has, and is not built once that is
     /// done. Nothing waits for the sampler, so the meeting starts at once; the folder goes once the
     /// sampler is done. One being built has left the microphone and is left to finish.
@@ -691,6 +707,44 @@ final class AppModel: ObservableObject {
     func newMeeting() {
         guard canStartNewMeeting else { return }
         perform(.start)
+    }
+
+    // MARK: the window's top bar: the recording's controls and the player
+
+    /// A voice sample holds the microphone: from its start until the sampler has stopped (`sample` stays
+    /// `.recording` while it stops). Nothing plays meanwhile.
+    var sampling: Bool {
+        if case .recording = sample { return true }
+        return false
+    }
+
+    /// What the top bar shows (TopBarPresentation.swift). The phase is the session's own, read on its tick
+    /// queue (this one), so Play is refused from the moment a recording starts; the length is the file the
+    /// player holds, else the selected meeting's recorded length. Its Pause, Resume and Stop are the menu
+    /// bar's actions, which the bar hands to `perform`.
+    var topBar: TopBar {
+        let meeting = library.selectedMeeting
+        return TopBarPresentation.bar(phase: session.phase, seconds: status.seconds, sampling: sampling, player: player.state,
+                                      selected: meeting?.folder.url, audio: library.shownContent?.files.audio, position: player.position,
+                                      duration: TopBarPresentation.length(loaded: player.duration, recorded: meeting?.record?.seconds ?? 0))
+    }
+
+    /// Play or Pause, only while the bar offers it: never while a recording runs or is paused, or while
+    /// a voice sample records.
+    func togglePlayer() {
+        guard let playback = topBar.player, playback.toggle.enabled else { return }
+        player.toggle(playback.file)
+    }
+
+    /// Stop: back to the start.
+    func stopPlayer() {
+        player.stop()
+    }
+
+    /// The slider, while the player holds a file.
+    func seekPlayer(to seconds: Double) {
+        guard topBar.player?.canSeek == true else { return }
+        player.seek(to: seconds)
     }
 
     // MARK: quitting

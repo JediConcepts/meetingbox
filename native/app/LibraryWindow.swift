@@ -64,6 +64,9 @@ struct LibraryView: View {
         .frame(minWidth: 720, minHeight: 420)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
+                TopBarControls(app: app, player: app.player, library: model)
+            }
+            ToolbarItem(placement: .primaryAction) {
                 NewMeetingButton(app: app)
             }
         }
@@ -73,9 +76,61 @@ struct LibraryView: View {
     }
 }
 
+/// The top bar beside New meeting (spec 6.6), as `AppModel.topBar` (TopBarPresentation) has it: while a
+/// recording runs or is paused, its time, Pause or Resume, and Stop, the menu bar's own actions through
+/// `AppModel.perform`, whichever meeting is selected; and the selected meeting's player: Play or Pause,
+/// Stop, a slider and the position, or why it cannot be played. Only this view follows the player, so
+/// the rest of the window is not redrawn every second while a meeting plays.
+struct TopBarControls: View {
+    @ObservedObject var app: AppModel
+    @ObservedObject var player: Player
+    @ObservedObject var library: LibraryModel
+
+    var body: some View {
+        let bar = app.topBar
+        HStack(spacing: 10) {
+            if let recording = bar.recording {
+                Text(recording.timer)
+                    .monospacedDigit()
+                    .foregroundStyle(.red)
+                Button(recording.toggle.title) { app.perform(recording.toggleAction) }
+                    .disabled(!recording.toggle.enabled)
+                Button(recording.stop.title) { app.perform(recording.stopAction) }
+                    .disabled(!recording.stop.enabled)
+            }
+            if let playback = bar.player {
+                Button {
+                    app.togglePlayer()
+                } label: {
+                    Label(playback.toggle.title, systemImage: playback.playing ? "pause.fill" : "play.fill")
+                }
+                .labelStyle(.iconOnly)
+                .help(playback.toggle.title)
+                .disabled(!playback.toggle.enabled)
+                Button {
+                    app.stopPlayer()
+                } label: {
+                    Label(playback.stop.title, systemImage: "stop.fill")
+                }
+                .labelStyle(.iconOnly)
+                .help(playback.stop.title)
+                .disabled(!playback.stop.enabled)
+                Slider(value: Binding(get: { playback.value }, set: { app.seekPlayer(to: $0) }), in: 0...playback.length)
+                    .frame(width: 160)
+                    .disabled(!playback.canSeek)
+                Text(playback.problem ?? playback.position)
+                    .monospacedDigit()
+                    .foregroundStyle(playback.problem == nil ? Color.secondary : Color.orange)
+                    .lineLimit(1)
+            }
+        }
+    }
+}
+
 /// New meeting, at the top of the window: the menus' Start recording, through `AppModel.newMeeting`,
-/// enabled only while nothing is recording (the selected recording's own controls cover Pause and
-/// Stop). Only this view follows the app's changes, so the rest of the window is not redrawn every second.
+/// enabled only while nothing is recording (the top bar's recording controls cover Pause and Stop).
+/// Only this view and the top bar follow the app's changes, so the rest of the window is not redrawn
+/// every second.
 struct NewMeetingButton: View {
     @ObservedObject var app: AppModel
 
