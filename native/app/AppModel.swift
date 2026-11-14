@@ -108,7 +108,7 @@ final class AppModel: ObservableObject {
         library.onSelectionChange = { [weak self] in self?.selectionChanged() }
         // A meeting always wins: every start, by any route, first stops playback and then cancels a voice
         // sample being recorded. The handler's queue is the session's tick queue, the main queue.
-        handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.recordingWillStart() } }
+        handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.makeWayForRecording() } }
         // Settings from before (or written by hand) with neither the Dock icon nor the menu bar item.
         normaliseVisibility()
     }
@@ -121,6 +121,12 @@ final class AppModel: ObservableObject {
         let queue = self.queue
         session.onChange = { [weak self] phase in
             Task { @MainActor in
+                // A recording or a pause by any route, one adopted after a relaunch included (it never goes
+                // through willStart): nothing plays into it and no sample goes on. Nothing to do after a start.
+                switch phase {
+                case .recording, .paused: self?.makeWayForRecording()
+                case .idle, .finalising: break
+                }
                 self?.apply(.phase(phase))
                 self?.syncClock()
                 self?.tellIdleWaiters()
@@ -462,8 +468,9 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// "Record a voice sample…" is offered only while nothing records and no sample is under way.
-    var canRecordSample: Bool { sampler != nil && session.phase == .idle && sample == .idle }
+    /// "Record a voice sample…" is offered only while nothing records, no recorder left running is waiting
+    /// to be confirmed, and no sample is under way.
+    var canRecordSample: Bool { sampler != nil && session.phase == .idle && !session.unconfirmed && sample == .idle }
 
     /// Starts a voice sample: a private folder `<stateDir>/sample.XXXXXX`, and the sampler on the
     /// Preferences microphone. Refused unless the session is idle, no sample is under way and a sampler
@@ -586,9 +593,10 @@ final class AppModel: ObservableObject {
     }
 
     /// A recording is about to start, by any route (`ControlHandler.willStart`, on the main queue just
-    /// before the recorder is launched): playback stops first, since the recorder takes in the Mac's own
-    /// sound, and then a voice sample under way is cancelled.
-    private func recordingWillStart() {
+    /// before the recorder is launched), or one has begun without a start (adopted on the tick): playback
+    /// stops first, since the recorder takes in the Mac's own sound, and then a voice sample under way is
+    /// cancelled. Doing it again changes nothing.
+    private func makeWayForRecording() {
         player.stop()
         cancelSampleForMeeting()
     }
@@ -719,21 +727,25 @@ final class AppModel: ObservableObject {
     }
 
     /// What the top bar shows (TopBarPresentation.swift). The phase is the session's own, read on its tick
-    /// queue (this one), so Play is refused from the moment a recording starts; the length is the file the
-    /// player holds, else the selected meeting's recorded length. Its Pause, Resume and Stop are the menu
-    /// bar's actions, which the bar hands to `perform`.
+    /// queue (this one), so Play is refused from the moment a recording starts; a recorder left running
+    /// and not confirmed yet counts as taking the sound in, as a sample does. A meeting is `selected` once
+    /// its folder is read and its recording finished, so missing audio is said only there. The length is
+    /// the file the player holds, else the selected meeting's recorded length. Its Pause, Resume and Stop
+    /// are the menu bar's actions, which the bar hands to `perform`.
     var topBar: TopBar {
         let meeting = library.selectedMeeting
-        return TopBarPresentation.bar(phase: session.phase, seconds: status.seconds, sampling: sampling, player: player.state,
-                                      selected: meeting?.folder.url, audio: library.shownContent?.files.audio, position: player.position,
+        let files = library.shownContent?.files
+        return TopBarPresentation.bar(phase: session.phase, seconds: status.seconds, sampling: sampling || session.unconfirmed,
+                                      player: player.state, selected: TopBarPresentation.selected(meeting?.folder.url, files: files),
+                                      audio: files?.audio, position: player.position,
                                       duration: TopBarPresentation.length(loaded: player.duration, recorded: meeting?.record?.seconds ?? 0))
     }
 
-    /// Play or Pause, only while the bar offers it: never while a recording runs or is paused, or while
-    /// a voice sample records.
+    /// Play or Pause, only while the bar offers it: never while a recording runs, is paused or is being
+    /// saved, while a recorder left running is unconfirmed, or while a voice sample records.
     func togglePlayer() {
-        guard let playback = topBar.player, playback.toggle.enabled else { return }
-        player.toggle(playback.file)
+        guard let playback = topBar.player, playback.toggle.enabled, let file = playback.file else { return }
+        player.toggle(file)
     }
 
     /// Stop: back to the start.

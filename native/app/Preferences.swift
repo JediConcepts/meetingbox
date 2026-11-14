@@ -155,10 +155,11 @@ final class Preferences {
     /// Recorded time as the timer shows it: `mm:ss` under an hour, then `h:mm:ss`.
     func formatTimer(_ seconds: Int) -> String { Preferences.timerText(seconds) }
 
-    static func timerText(_ seconds: Int) -> String {
+    /// `padMinutes` false gives `m:ss` under an hour (`0:42`), as the player's position reads.
+    static func timerText(_ seconds: Int, padMinutes: Bool = true) -> String {
         let s = max(0, seconds)
         let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60)
         let two = { (n: Int) in n < 10 ? "0\(n)" : "\(n)" }
-        return h > 0 ? "\(h):\(two(m)):\(two(sec))" : "\(two(m)):\(two(sec))"
+        return h > 0 ? "\(h):\(two(m)):\(two(sec))" : "\(padMinutes ? two(m) : "\(m)"):\(two(sec))"
     }
 }

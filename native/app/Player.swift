@@ -2,11 +2,13 @@ import AVFoundation
 
 // The top bar's player (spec 6.6): plays the selected meeting's audio inside the app. `Player` is the
 // model the bar's player view observes; `AudioPlaying` is what makes the sound, `AVAudioPlayer` in the app
-// (`SystemAudio`) and a fake in the tests, so no test ever plays anything.
+// (`SystemAudio`) and a fake in the tests, so no test ever plays anything. What the bar shows, and
+// `PlayerState`, are in TopBarPresentation.swift.
 
 /// What plays one file. `load` throws when the file cannot be played (missing, unreadable, not audio);
-/// `position` is in seconds from the start, and `duration` is 0 with nothing loaded. Used on one queue,
-/// the player's.
+/// `position` is in seconds from the start, and `duration` is 0 with nothing loaded. `load` runs on the
+/// player's load queue, and nothing else is called while it runs; everything else is called on the
+/// player's tick queue.
 protocol AudioPlaying: AnyObject {
     func load(_ url: URL) throws
     func play()
@@ -16,20 +18,19 @@ protocol AudioPlaying: AnyObject {
     var duration: Double { get }
 }
 
-/// Where the player stands, as the bar shows it.
-enum PlayerState: Equatable {
-    case idle
-    case playing(URL)
-    case paused(URL)
-    /// Why the last file asked for cannot be played, in the bar's words.
-    case failed(String)
-}
-
 /// Play, Pause, Stop (back to the start) and the slider, over an `AudioPlaying`. Call it on its tick
-/// queue (the main queue in the app). With a tick queue, playing runs one repeating 1 s timer that calls
-/// `tick`, and pause, stop, a failure and the end of the file cancel it; with none (the tests) there is no
-/// timer and `tick` is called directly. Only a change is published, and only the top bar's player view
-/// observes this, so nothing else in the window is redrawn while a meeting plays.
+/// queue (the main queue in the app).
+///
+/// - Loading: only a regular file is loaded (never a link, a FIFO, a folder or a device), and the load
+///   runs on the load queue, so a slow or stuck file never blocks the tick queue. Until it comes back the
+///   state stays as it was. A stop, or Play on another file, before then means the late load plays nothing
+///   and changes nothing. With no load queue (the tests) it loads in line.
+/// - Ticking: with a tick queue, playing runs one repeating 1 s timer that calls `tick`, and pause, stop,
+///   a failure and the end of the file cancel it; with none (the tests) there is no timer and `tick` is
+///   called directly.
+///
+/// Only a change is published, and only the top bar's player view observes this, so nothing else in the
+/// window is redrawn while a meeting plays.
 final class Player: ObservableObject {
     @Published private(set) var state: PlayerState = .idle
     /// Seconds from the start, as the last tick, seek or pause found it.
@@ -40,11 +41,22 @@ final class Player: ObservableObject {
     /// What makes the sound (read only here, so a test can see an app model built without one plays nothing).
     let audio: AudioPlaying
     private let tickQueue: DispatchQueue?
+    private let loadQueue: DispatchQueue?
     private var timer: DispatchSourceTimer?
+    /// Moved on by every Play of a new file and every stop: a load that comes back to an older one is late.
+    private var token = 0
+    /// Loads not come back yet. While any is under way nothing else touches `audio`.
+    private var loading = 0
+    /// The file the latest load is for, until it comes back or is overtaken, so Play pressed again waits for it.
+    private var loadingFile: URL?
+    /// `audio` may have a file loaded: from a load that worked until `audio.stop()`.
+    private var loaded = false
 
-    init(audio: AudioPlaying, tickQueue: DispatchQueue?) {
+    init(audio: AudioPlaying, tickQueue: DispatchQueue?,
+         loadQueue: DispatchQueue? = DispatchQueue(label: "meetingbox.player.load", qos: .userInitiated)) {
         self.audio = audio
         self.tickQueue = tickQueue
+        self.loadQueue = loadQueue
     }
 
     deinit { timer?.cancel() }
@@ -52,8 +64,15 @@ final class Player: ObservableObject {
     /// The 1 s timer is running.
     var ticking: Bool { timer != nil }
 
+    /// A regular file, by lstat, so a link is never followed: the only kind the player loads. A FIFO would
+    /// block the open until something writes to it.
+    static func isPlainFile(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+    }
+
     /// Play or Pause: the file the player holds pauses or carries on; any other file is loaded and
-    /// played from the start, or fails, saying so.
+    /// played from the start, or fails, saying so. Play on the file already loading waits for it.
     func toggle(_ url: URL) {
         switch state {
         case .playing(let held) where held == url:
@@ -66,16 +85,18 @@ final class Player: ObservableObject {
             set(state: .playing(url))
             startTimer()
         default:
+            guard loadingFile != url else { return }
             begin(url)
         }
     }
 
-    /// Stop: back to the start, holding nothing. Also what a recording, a voice sample and another
-    /// meeting being chosen do first.
+    /// Stop: back to the start, holding nothing, and a load still under way plays nothing. Also what a
+    /// recording, a voice sample and another meeting being chosen do first.
     func stop() {
+        token += 1
+        loadingFile = nil
         stopTimer()
-        audio.stop()
-        audio.position = 0
+        letGo()
         duration = 0
         set(position: 0)
         set(state: .idle)
@@ -103,23 +124,78 @@ final class Player: ObservableObject {
         set(position: within(now))
     }
 
+    /// The file held stops first; the new one is checked and loaded off the tick queue.
     private func begin(_ url: URL) {
-        stopTimer()
-        audio.stop()
-        do {
-            try audio.load(url)
-        } catch {
+        switch state {
+        case .playing, .paused: stop()
+        case .idle, .failed: break
+        }
+        token += 1
+        let asked = token
+        loadingFile = url
+        loading += 1
+        let audio = self.audio
+        let load = { () -> Double? in
+            guard Player.isPlainFile(url) else { return nil }
+            do { try audio.load(url) } catch { return nil }
+            return audio.duration
+        }
+        guard let queue = loadQueue else {
+            came(back: load(), for: url, asked: asked)
+            return
+        }
+        let answer = tickQueue ?? .main
+        queue.async { [weak self] in
+            let length = load()
+            answer.async { self?.came(back: length, for: url, asked: asked) }
+        }
+    }
+
+    /// A load has come back with the file's length, or nil when it cannot be played.
+    private func came(back length: Double?, for url: URL, asked: Int) {
+        loading -= 1
+        if length != nil { loaded = true }
+        guard asked == token else {
+            // Overtaken: nothing plays and nothing changes. What it loaded goes once no other load is under way.
+            if !holding { letGo() }
+            return
+        }
+        loadingFile = nil
+        guard let length = length else {
+            letGo()
             duration = 0
             set(position: 0)
             set(state: .failed(TopBarPresentation.cannotPlay))
             return
         }
-        duration = audio.duration
+        duration = length
         audio.position = 0
         set(position: 0)
         audio.play()
+        // A play that did not start reads as already at the end, from the start: it cannot be played.
+        if duration > 0, audio.position >= duration {
+            letGo()
+            duration = 0
+            set(state: .failed(TopBarPresentation.cannotPlay))
+            return
+        }
         set(state: .playing(url))
         startTimer()
+    }
+
+    private var holding: Bool {
+        switch state {
+        case .playing, .paused: return true
+        case .idle, .failed: return false
+        }
+    }
+
+    /// `audio` lets go of what it has loaded, unless a load is still under way on the load queue.
+    private func letGo() {
+        guard loaded, loading == 0 else { return }
+        audio.stop()
+        audio.position = 0
+        loaded = false
     }
 
     private func within(_ seconds: Double) -> Double {
@@ -149,8 +225,9 @@ final class Player: ObservableObject {
     }
 }
 
-/// `AudioPlaying` over `AVAudioPlayer`, on the main queue: the app's only player of a meeting's
-/// recording. Passed only by AppDelegate, never by a test.
+/// `AudioPlaying` over `AVAudioPlayer`: the app's only player of a meeting's recording. `load` runs on the
+/// player's load queue and the rest on the main queue, never at the same time. Passed only by
+/// AppDelegate, never by a test.
 final class SystemAudio: AudioPlaying {
     private var player: AVAudioPlayer?
     /// Asked to play and not paused or stopped since. `AVAudioPlayer` stops by itself at the end of the

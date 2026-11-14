@@ -2,7 +2,17 @@ import Foundation
 
 // The window's top bar (spec 6.6): the recording's controls while one is under way, and a simple player
 // for the selected meeting's audio. Which buttons show, which can be pressed, and their words, worked out
-// from the arguments alone. Foundation only, so the native tests compile it; LibraryWindow draws it.
+// from the arguments alone. Foundation only, so the native tests compile it; LibraryWindow draws it, and
+// Player.swift is the part that plays.
+
+/// Where the player stands, as the bar shows it.
+enum PlayerState: Equatable {
+    case idle
+    case playing(URL)
+    case paused(URL)
+    /// Why the last file asked for cannot be played, in the bar's words.
+    case failed(String)
+}
 
 /// What the top bar shows now.
 struct TopBar: Equatable {
@@ -24,8 +34,9 @@ struct TopBar: Equatable {
 
     /// The player: Play or Pause, Stop (back to the start), the position and a slider to move it.
     struct Playback: Equatable {
-        /// What Play, Pause and Stop act on: the file the player holds, else the selected meeting's audio.
-        let file: URL
+        /// What Play, Pause and Stop act on: the file the player holds, else the selected meeting's audio;
+        /// nil for a meeting with no audio, which says why instead.
+        let file: URL?
         let playing: Bool
         let toggle: Control
         let stop: Control
@@ -50,15 +61,18 @@ enum TopBarPresentation {
     static let stop = "Stop"
     static let cannotPlay = "This recording cannot be played"
 
-    /// The bar for the session's `phase` and recorded `seconds`, whether a voice sample is being recorded,
-    /// the player's state and position, the selected meeting's folder and audio, and the length to show.
+    /// The bar for the session's `phase` and recorded `seconds`, whether the microphone or the Mac's sound
+    /// may be being taken by something other than a recording (`sampling`: a voice sample, or a recorder
+    /// not confirmed yet), the player's state and position, the selected meeting (`selected`, as
+    /// `selected(_:files:)` gives it) and its audio, and the length to show.
     ///
     /// - The recording's controls show while a recording runs or is paused, whatever is selected.
-    /// - The player shows for the selected meeting's audio, or for the file the player holds, so what
-    ///   plays can always be paused and stopped.
-    /// - Play is offered only while nothing records and no sample is taken: the recorder takes in the
-    ///   Mac's own sound, and a sample the room's, so a meeting played then would be recorded too. It is
-    ///   offered while the last recording is only being saved.
+    /// - The player shows for the file the player holds, so what plays can always be paused and stopped;
+    ///   else for the selected meeting's audio; else, for a finished meeting other than the one being
+    ///   recorded or saved, with Play disabled and "This recording cannot be played".
+    /// - Play is offered only while the session is idle and nothing else takes the sound in: the recorder
+    ///   takes in the Mac's own sound until it has stopped, and a sample the room's, so a meeting played
+    ///   then would be recorded too.
     static func bar(phase: Session.Phase, seconds: Int, sampling: Bool, player: PlayerState, selected: URL?, audio: URL?,
                     position: Double, duration: Double) -> TopBar {
         let recording: TopBar.Recording?
@@ -77,13 +91,19 @@ enum TopBarPresentation {
         case .paused(let url): (held, playing) = (url, false)
         case .idle, .failed: (held, playing) = (nil, false)
         }
-        guard let file = held ?? (selected == nil ? nil : audio) else { return TopBar(recording: recording, player: nil) }
-        let canPlay = recording == nil && !sampling
+        let file = held ?? audio
+        if file == nil {
+            // No audio: said only for a finished meeting the session is not on.
+            guard let selected = selected, !(phase.folder.map { LibraryPresentation.samePlace($0, selected) } ?? false) else {
+                return TopBar(recording: recording, player: nil)
+            }
+        }
+        let canPlay = phase == .idle && !sampling && file != nil
         let length = max(duration, 0)
         // Nothing loaded is at the start; a position outside the file is shown within it.
         let at = held == nil ? 0 : max(position, 0)
         let shown = length > 0 ? min(at, length) : at
-        var problem: String? = nil
+        var problem: String? = file == nil ? cannotPlay : nil
         if case .failed(let why) = player { problem = why }
         let playback = TopBar.Playback(
             file: file, playing: playing,
@@ -99,12 +119,17 @@ enum TopBarPresentation {
                          stop: TopBar.Control(title: MenuAction.stop.title, enabled: true), stopAction: .stop)
     }
 
+    /// The `selected` the bar is given: the selected meeting's folder once its files have been read and its
+    /// recording is finished; nil while they are being read, for an unfinished recording, and with nothing
+    /// selected. So missing audio is said only where audio belongs.
+    static func selected(_ folder: URL?, files: MeetingFiles?) -> URL? {
+        guard let files = files, !files.unfinished else { return nil }
+        return folder
+    }
+
     /// `0:00`, `12:34`, `1:05:00`: whole seconds, rounded down.
     static func time(_ seconds: Double) -> String {
-        let s = seconds.isFinite ? max(0, Int(seconds)) : 0
-        let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60)
-        let two = { (n: Int) in n < 10 ? "0\(n)" : "\(n)" }
-        return h > 0 ? "\(h):\(two(m)):\(two(sec))" : "\(m):\(two(sec))"
+        Preferences.timerText(seconds.isFinite && seconds > 0 ? Int(min(seconds, 1e9)) : 0, padMinutes: false)
     }
 
     /// The length the bar shows: the file the player holds, once loaded, else the meeting's recorded length.

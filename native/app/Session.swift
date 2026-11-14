@@ -198,6 +198,11 @@ final class Session {
 
     deinit { timer?.cancel() }
 
+    /// Idle, but a recorder may still be recording: `find` could not tell at the last adopt, and the tick
+    /// tries again. Read only; nothing about recording depends on it. The app offers no playback and no
+    /// voice sample meanwhile, since a recorder left running takes in the Mac's sound and the microphone.
+    var unconfirmed: Bool { phase == .idle && needsAdopt }
+
     var health: Health {
         healthLock.lock()
         defer { healthLock.unlock() }

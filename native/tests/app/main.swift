@@ -7589,30 +7589,97 @@ for samePath in [true, false] {
 // MARK: - Recording controls and a simple player in the window's top bar (Stage 3, Task 9)
 
 /// Stands in for AVAudioPlayer, and never makes a sound. `load` fails, as AVAudioPlayer does, for a file
-/// that is not there or cannot be read; the position is the test's to move, as time would while playing.
+/// that cannot be read; the position is the test's to move, as time would while playing. `load` runs on
+/// the player's load queue, so what it records is behind a lock. With `gate` it waits, as a slow disk
+/// would, for at most 3 s, so a load wrongly made on the main queue holds a test up but never hangs it.
 final class FakeAudio: AudioPlaying {
-    var calls: [String] = []
-    var loads: [URL] = []
+    private let lock = NSLock()
+    private var said: [String] = []
+    private var opened: [URL] = []
+    var calls: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return said
+    }
+    var loads: [URL] {
+        lock.lock()
+        defer { lock.unlock() }
+        return opened
+    }
+    /// A load is running on the load queue; a call made meanwhile is noted as made during a load.
+    private var inLoad = false
+    private func note(_ call: String, opening url: URL? = nil) {
+        lock.lock()
+        if let url = url { opened.append(url) } else { said.append(inLoad ? call + " during a load" : call) }
+        lock.unlock()
+    }
+    private func loading(_ on: Bool) {
+        lock.lock()
+        inLoad = on
+        lock.unlock()
+    }
+    var isLoading: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inLoad
+    }
     /// The length a file that loads has.
     var length: Double = 3900
-    var position: Double = 0
+    private var held: DispatchSemaphore?
+    var gate: DispatchSemaphore? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return held
+        }
+        set {
+            lock.lock()
+            held = newValue
+            lock.unlock()
+        }
+    }
+    /// A play that does not start (no output device, say): SystemAudio then reads its position as the end.
+    var playFails = false
+    private var at: Double = 0
+    /// How many times the position was read: once a tick while playing.
+    private(set) var positionReads = 0
+    var position: Double {
+        get {
+            positionReads += 1
+            return at
+        }
+        set { at = newValue }
+    }
     private(set) var duration: Double = 0
     /// Told at each stop, as it is asked for.
     var onStop: (() -> Void)?
     func load(_ url: URL) throws {
-        calls.append("load")
+        let wait = gate // read before it says it is loading, so a test may swap gates once it is
+        note("load")
+        loading(true)
+        defer { loading(false) }
+        _ = wait?.wait(timeout: .now() + 3)
         duration = 0
         guard FileManager.default.isReadableFile(atPath: url.path) else { throw FakeError(text: "cannot open \(url.path)") }
-        loads.append(url)
+        note("", opening: url)
         duration = length
-        position = 0
+        at = 0
     }
-    func play() { calls.append("play") }
-    func pause() { calls.append("pause") }
+    func play() {
+        note("play")
+        if playFails { at = duration }
+    }
+    func pause() { note("pause") }
     func stop() {
-        calls.append("stop")
+        note("stop")
         onStop?()
     }
+    func count(_ call: String) -> Int { calls.filter { $0 == call }.count }
+}
+
+/// Set from a closure the main queue runs later.
+final class Flag {
+    var on = false
 }
 
 let on = { (title: String) in TopBar.Control(title: title, enabled: true) }
@@ -7656,16 +7723,34 @@ do {
     check(paused?.playing == false && paused?.toggle == on("Play") && paused?.stop == on("Stop") && paused?.position == "12:34 / 1:05:00"
           && paused?.canSeek == true, "T9 bar: paused: Play again, Stop, and the slider")
     check(bar(at: 754).player?.position == "0:00 / 1:05:00" && bar(at: 754).player?.value == 0, "T9 bar: with nothing loaded the position is the start")
-    check(bar(selected: nil).player == nil && bar(audio: nil).player == nil && bar(selected: nil, audio: nil).player == nil,
-          "T9 bar: no player without a selected meeting that has audio")
 
-    // Play is unavailable while recording, paused or sampling; offered while the last recording is only being saved.
+    // A selected meeting with no audio says why (F1), unless it is the one being recorded or saved, or its
+    // recording is unfinished (the app then passes no `selected`).
+    let none = bar(audio: nil).player
+    check(none?.file == nil && none?.toggle == off("Play") && none?.stop == off("Stop") && none?.problem == "This recording cannot be played"
+          && none?.canSeek == false,
+          "T9 bar: a finished meeting with no audio shows the player with Play disabled and This recording cannot be played (\(String(describing: none)))")
+    check(bar(.recording(other), audio: nil).player?.problem == "This recording cannot be played",
+          "T9 bar: and says so while another meeting records")
+    check(bar(.recording(here), audio: nil).player == nil && bar(.paused(here), audio: nil).player == nil
+          && bar(.finalising(here), audio: nil).player == nil,
+          "T9 bar: the meeting being recorded, paused or saved shows nothing about audio it does not have yet")
+    check(bar(selected: nil, audio: nil).player == nil, "T9 bar: nothing selected (or a meeting unread or unfinished): no player")
+    check(bar(selected: nil).player?.file == file && bar(selected: nil).player?.problem == nil,
+          "T9 bar: audio there is offered, whatever else the meeting is (an unfinished one with a part-saved audio.m4a)")
+    let folder = here
+    check(TopBarPresentation.selected(folder, files: nil) == nil && TopBarPresentation.selected(nil, files: MeetingFiles()) == nil
+          && TopBarPresentation.selected(folder, files: MeetingFiles(unfinished: true)) == nil
+          && TopBarPresentation.selected(folder, files: MeetingFiles()) == folder,
+          "T9 selected: a meeting counts once its folder has been read and its recording is finished")
+
+    // Play is offered only while the session is idle and no sample records: not while recording, paused or saving.
     check(bar(.recording(other)).player?.toggle == off("Play") && bar(.recording(here)).player?.toggle == off("Play"),
           "T9 bar: Play is disabled while recording")
     check(bar(.paused(other)).player?.toggle == off("Play"), "T9 bar: and while paused")
     check(bar(sampling: true).player?.toggle == off("Play") && bar(sampling: true, player: .paused(file)).player?.toggle == off("Play"),
           "T9 bar: and while a voice sample records")
-    check(bar(.finalising(other)).player?.toggle == on("Play"), "T9 bar: and offered while the last recording is only being saved")
+    check(bar(.finalising(other)).player?.toggle == off("Play"), "T9 bar: and while the last recording is being saved (it may still be capturing)")
     // What the player holds is what Play, Pause and Stop act on, and it can always be paused and stopped.
     let held = bar(player: .playing(otherFile)).player
     check(held?.file == otherFile && held?.toggle == on("Pause") && held?.stop == on("Stop"),
@@ -7683,8 +7768,11 @@ do {
     check(TopBarPresentation.cannotPlay == "This recording cannot be played", "T9 words: This recording cannot be played")
 
     // Times, and lengths.
-    let times = [0, 0.9, 59.99, 60, 754, 3599, 3600, 3900, 36000].map(TopBarPresentation.time)
-    check(times == ["0:00", "0:00", "0:59", "1:00", "12:34", "59:59", "1:00:00", "1:05:00", "10:00:00"], "T9 bar: times as 12:34 and 1:05:00 (\(times))")
+    let times = [0, 0.9, 59.99, 60, 754, 3599, 3600, 3900, 36000, .nan, -5].map(TopBarPresentation.time)
+    check(times == ["0:00", "0:00", "0:59", "1:00", "12:34", "59:59", "1:00:00", "1:05:00", "10:00:00", "0:00", "0:00"],
+          "T9 bar: times as 12:34 and 1:05:00 (\(times))")
+    check(Preferences.timerText(754) == "12:34" && Preferences.timerText(5) == "00:05" && Preferences.timerText(3900) == "1:05:00",
+          "T9 bar: the menu bar's timer is as it was")
     check(bar(of: 0).player?.position == "0:00" && bar(of: 0).player?.length == 1, "T9 bar: with no known length, the position alone, and the slider keeps a range")
     check(bar(player: .playing(file), at: 5000).player?.position == "1:05:00 / 1:05:00" && bar(player: .playing(file), at: -3).player?.value == 0,
           "T9 bar: a position outside the file is shown within it")
@@ -7693,11 +7781,35 @@ do {
           "T9 length: the loaded file's length, else the meeting's recorded length")
 }
 
-// The player over a fake, with no tick queue: Play and Pause, Stop, the slider, ticks, the end of the file, failure.
+// Only a regular file is ever loaded: never a link, a FIFO (which would block the open), a folder or a device.
+do {
+    let dir = make(freshRoot(), "2026-11-14_0930", files: ["audio.m4a": "a"])
+    let plain = dir.appendingPathComponent("audio.m4a")
+    let link = dir.appendingPathComponent("link.m4a")
+    try! fm.createSymbolicLink(at: link, withDestinationURL: plain)
+    let fifo = dir.appendingPathComponent("fifo.m4a")
+    check(mkfifo(fifo.path, 0o600) == 0, "T9 plain file: (a FIFO is made)")
+    let folder = dir.appendingPathComponent("folder.m4a", isDirectory: true)
+    try! fm.createDirectory(at: folder, withIntermediateDirectories: true)
+    check(Player.isPlainFile(plain) && !Player.isPlainFile(link) && !Player.isPlainFile(fifo) && !Player.isPlainFile(folder)
+          && !Player.isPlainFile(URL(fileURLWithPath: "/dev/null")) && !Player.isPlainFile(dir.appendingPathComponent("gone.m4a")),
+          "T9 plain file: a regular file is one; a link, a FIFO, a folder, a device and nothing at all are not")
+    let fake = FakeAudio()
+    let player = Player(audio: fake, tickQueue: nil, loadQueue: nil)
+    for (name, url) in [("a link", link), ("a FIFO", fifo), ("a folder", folder), ("a device", URL(fileURLWithPath: "/dev/null"))] {
+        player.toggle(url)
+        check(player.state == .failed("This recording cannot be played") && fake.count("load") == 0 && fake.count("play") == 0,
+              "T9 plain file: Play on \(name) fails, saying This recording cannot be played, and nothing is opened (\(fake.calls))")
+        player.stop()
+    }
+}
+
+// The player over a fake, with no tick queue and loading in line: Play and Pause, Stop, the slider, ticks,
+// the end of the file, failure.
 do {
     let fake = FakeAudio()
-    let player = Player(audio: fake, tickQueue: nil)
-    let dir = make(freshRoot(), "2026-11-14_0900", files: ["audio.m4a": "a", "other.m4a": "o"])
+    let player = Player(audio: fake, tickQueue: nil, loadQueue: nil)
+    let dir = make(freshRoot(), "2026-11-14_0900", files: ["audio.m4a": "a", "other.m4a": "o", "locked.m4a": "l"])
     let file = dir.appendingPathComponent("audio.m4a")
     let otherFile = dir.appendingPathComponent("other.m4a")
     check(player.state == .idle && player.position == 0 && player.duration == 0 && !player.ticking && fake.calls.isEmpty,
@@ -7749,31 +7861,54 @@ do {
     check(player.state == .idle && player.position == 0 && fake.position == 0 && fake.calls.last == "stop",
           "T9 player: at the end of the file it stops, back at the start")
 
-    // Another file, and one that cannot be played.
+    // Another file, and ones that cannot be played.
     player.toggle(file)
     player.toggle(otherFile)
     check(player.state == .playing(otherFile) && fake.loads.suffix(1) == [otherFile], "T9 player: Play on another file plays that one")
     let loadsBefore = fake.loads.count
     player.toggle(dir.appendingPathComponent("gone.m4a"))
-    check(player.state == .failed("This recording cannot be played") && fake.calls.last == "load" && fake.loads.count == loadsBefore
+    check(player.state == .failed("This recording cannot be played") && fake.calls.last == "stop" && fake.loads.count == loadsBefore
           && player.position == 0 && player.duration == 0,
-          "T9 player: a file that cannot be loaded fails, saying This recording cannot be played, and nothing plays")
+          "T9 player: a missing file fails, saying This recording cannot be played: the file held is let go and nothing else is opened (\(fake.calls.suffix(3)))")
     player.seek(to: 10)
     player.tick()
     check(player.position == 0 && player.state == .failed("This recording cannot be played"), "T9 player: nothing moves once it has failed")
+    let locked = dir.appendingPathComponent("locked.m4a")
+    chmod(locked.path, 0)
+    player.toggle(locked)
+    check(player.state == .failed("This recording cannot be played") && fake.calls.last == "load" && fake.loads.count == loadsBefore,
+          "T9 player: an unreadable file is tried and fails the same way")
+    chmod(locked.path, 0o644)
     player.stop()
     check(player.state == .idle, "T9 player: Stop clears a failure")
     told = 0
     let quiet = player.objectWillChange.sink { _ in told += 1 }
     player.stop()
-    check(told == 0, "T9 player: Stop with nothing loaded publishes nothing")
+    check(told == 0 && fake.calls.last == "load", "T9 player: Stop with nothing loaded publishes nothing and touches nothing")
     quiet.cancel()
+
+    // A play that does not start (T9-ADV-5): it says so, rather than seeming to reach the end a tick later.
+    fake.playFails = true
+    player.toggle(file)
+    check(player.state == .failed("This recording cannot be played") && fake.calls.suffix(2) == ["play", "stop"] && !player.ticking
+          && player.duration == 0,
+          "T9 player: a play that does not start fails, saying This recording cannot be played, and lets the file go (\(fake.calls.suffix(3)))")
+    fake.playFails = false
+    // Carrying on from the very end is a real end, not a failure.
+    player.toggle(file)
+    player.seek(to: 3900)
+    player.toggle(file)
+    check(player.state == .paused(file) && player.position == 3900, "T9 player: (paused at the end)")
+    player.toggle(file)
+    check(player.state == .playing(file), "T9 player: Play at the very end carries on, and is not taken for a failure")
+    player.tick()
+    check(player.state == .idle && player.position == 0, "T9 player: and the next tick is the end of the file")
 }
 
-// The timer: with a tick queue, one 1 s timer exists only while playing.
+// The timer: with a tick queue, one 1 s timer exists only while playing, really cancelled, and never keeping the player alive.
 MainActor.assumeIsolated {
     let fake = FakeAudio()
-    let player = Player(audio: fake, tickQueue: .main)
+    let player = Player(audio: fake, tickQueue: .main, loadQueue: nil)
     let dir = make(freshRoot(), "2026-11-14_1000", files: ["audio.m4a": "a", "other.m4a": "o"])
     let file = dir.appendingPathComponent("audio.m4a")
     check(!player.ticking, "T9 timer: none before Play")
@@ -7799,9 +7934,29 @@ MainActor.assumeIsolated {
     player.toggle(file)
     player.toggle(dir.appendingPathComponent("gone.m4a"))
     check(!player.ticking && player.state == .failed("This recording cannot be played"), "T9 timer: a failure cancels it")
-    fake.position = 2
+
+    // Each Pause, Stop and failure cancels its timer, not only forgets it (Q1): after Play, Pause, Play, Pause,
+    // Play, one timer ticks, about twice in 2.5 s, not several times as fast.
+    for _ in 0..<5 { player.toggle(file) }
+    check(player.state == .playing(file), "T9 timer: (playing again after Play, Pause, Play, Pause, Play)")
+    var reads = fake.positionReads
+    _ = settle({ false }, timeout: 2.5)
+    reads = fake.positionReads - reads
+    check((1...3).contains(reads), "T9 timer: only one timer ticks, once a second, so every earlier one was cancelled (\(reads) ticks in 2.5 s)")
+    player.stop()
+
+    // A player let go while playing is freed, and its timer never ticks again: the timer holds it weakly.
+    weak var gone: Player?
+    let lone = FakeAudio()
+    do {
+        let held = Player(audio: lone, tickQueue: .main, loadQueue: nil)
+        held.toggle(file)
+        gone = held
+    }
+    let readsBefore = lone.positionReads
     _ = settle({ false }, timeout: 1.5)
-    check(player.position == 0, "T9 timer: and nothing ticks once it is cancelled")
+    check(gone == nil && lone.positionReads == readsBefore,
+          "T9 timer: a Player let go while playing is freed, and no tick comes after (\(lone.positionReads - readsBefore) ticks)")
 }
 
 // The real player refuses what cannot be played, without playing anything; without one, nothing plays at all.
@@ -7821,7 +7976,7 @@ MainActor.assumeIsolated {
     prefs.meetingsFolder = freshRoot()
     let plain = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: FakeRunner(), freeBytes: { _ in 50 * GB })
     plain.player.toggle(dir.appendingPathComponent("audio.m4a"))
-    check(plain.player.audio is NoAudio && plain.player.state == .failed("This recording cannot be played") && !plain.player.ticking,
+    check(plain.player.audio is NoAudio && settle { plain.player.state == .failed("This recording cannot be played") } && !plain.player.ticking,
           "T9 app: an AppModel built without a player has NoAudio and plays nothing (only AppDelegate passes the real one)")
     try? fm.removeItem(at: state)
 }
@@ -7839,7 +7994,7 @@ MainActor.assumeIsolated {
     let engine = FakeEngine()
     let sampler = FakeSampler()
     let audio = FakeAudio()
-    let player = Player(audio: audio, tickQueue: nil)
+    let player = Player(audio: audio, tickQueue: nil, loadQueue: nil)
     let app = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
                        engine: engine, sampler: sampler, player: player)
     let a = make(root, "2026-11-12_0900", files: ["audio.m4a": "a", "notes.md": "the minutes"])
@@ -7852,6 +8007,11 @@ MainActor.assumeIsolated {
     @MainActor func choose(_ dir: URL) -> Bool {
         app.library.select(LibraryPresentation.key(dir))
         return settle { isAt(app.library.shownContent?.files.audio?.deletingLastPathComponent(), dir) }
+    }
+    /// Selects a meeting and waits until its folder has been read, audio or none.
+    @MainActor func read(_ dir: URL) -> Bool {
+        app.library.select(LibraryPresentation.key(dir))
+        return settle { app.library.shownContent?.key == LibraryPresentation.key(dir) }
     }
     @MainActor func plays(_ f: URL) -> Bool { if case .playing(let u) = player.state { return isAt(u, f) }; return false }
     @MainActor func holdsPaused(_ f: URL) -> Bool { if case .paused(let u) = player.state { return isAt(u, f) }; return false }
@@ -7904,11 +8064,16 @@ MainActor.assumeIsolated {
     check(player.state == .idle && bar.player?.position == "0:00 / 1:05:00" && audio.position == 0 && bar.player?.stop == off("Stop")
           && bar.player?.toggle == on("Play"), "T9 app: Stop returns the position to 0")
 
-    // Choosing another meeting stops playback (LibraryModel.onSelectionChange); showing the same one does not.
+    // Choosing another meeting stops playback (LibraryModel.onSelectionChange), playing or paused; showing the same one does not.
     app.togglePlayer()
     check(plays(fileA) && choose(b) && player.state == .idle && audio.calls.last == "stop",
           "T9 app: choosing another meeting stops playback")
     check(app.topBar.player?.position == "0:00 / 12:34" && isAt(app.topBar.player?.file, fileB), "T9 app: and the bar is that meeting's")
+    app.togglePlayer()
+    app.togglePlayer()
+    check(holdsPaused(fileB) && choose(a) && player.state == .idle && audio.calls.last == "stop" && isAt(app.topBar.player?.file, fileA),
+          "T9 app: choosing another meeting while one is paused stops it too, so Play is the new meeting's")
+    check(choose(b), "T9 app: (meeting B again)")
     app.togglePlayer()
     app.library.show(b)
     check(plays(fileB), "T9 app: showing the meeting already selected leaves it playing")
@@ -7994,6 +8159,7 @@ MainActor.assumeIsolated {
         }
         // While it records: the timer, Pause and Stop, whichever meeting is selected; the menu bar's own actions.
         check(settle { phaseIs("recording") }, "T9 recording: (recording)")
+        check(log == ["player", "sampler", "launch, nothing held"], "T9 recording: once the views have heard, nothing more is stopped (\(log))")
         var r = app.topBar.recording
         check(r?.timer == Preferences.timerText(app.status.seconds) && r?.toggle == on("Pause") && r?.toggleAction == .pause
               && r?.stop == on("Stop") && r?.stopAction == .stop,
@@ -8004,11 +8170,10 @@ MainActor.assumeIsolated {
         app.togglePlayer()
         check(player.state == .idle && audio.loads.count == loadsBefore + 1, "T9 recording: and Play does nothing")
         let live = rec.launches.last?.dir ?? a
-        app.library.select(LibraryPresentation.key(live))
-        let onLive = app.topBar.recording
+        check(read(live) && app.topBar.recording == r && app.topBar.player == nil,
+              "T9 recording: with the recording itself selected, the same controls and no player (it has no audio yet, and says nothing)")
         app.library.select(nil)
-        check(onLive == r && app.topBar.recording == r && app.topBar.player == nil,
-              "T9 recording: the same controls with the recording itself selected, and with nothing selected")
+        check(app.topBar.recording == r && app.topBar.player == nil, "T9 recording: and with nothing selected")
         check(choose(a), "T9 recording: (meeting A selected again)")
         app.perform(r?.toggleAction ?? .info)
         check(settle { phaseIs("paused") } && app.session.phase == .paused(live), "T9 recording: the bar's Pause, through perform, pauses the recording")
@@ -8024,9 +8189,13 @@ MainActor.assumeIsolated {
         let pid = rec.nextPid
         app.perform(app.topBar.recording?.stopAction ?? .info)
         check(settle { phaseIs("finalising") }, "T9 recording: the bar's Stop, through perform, stops it")
-        check(app.topBar.recording == nil && app.topBar.player?.toggle == on("Play"), "T9 finalising: no recording controls, and Play is offered again")
+        check(app.topBar.recording == nil && app.topBar.player?.toggle == off("Play"),
+              "T9 finalising: no recording controls, and Play waits until the recording is saved")
+        app.togglePlayer()
+        check(player.state == .idle && audio.loads.count == loadsBefore + 1, "T9 finalising: and Play does nothing")
         rec.exit(pid, 0, verifies: true)
-        check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 \(route): (the recording is finished)")
+        check(settle { phaseIs("idle") && app.session.phase == .idle } && app.topBar.player?.toggle == on("Play"),
+              "T9 \(route): once it is saved, Play is offered again")
     }
 
     // A paused player, with no sample: the start still stops it first.
@@ -8042,11 +8211,18 @@ MainActor.assumeIsolated {
     sampler.onStop = nil
     rec.onLaunch = nil
 
-    // A missing or unreadable audio file.
+    // A missing or unreadable audio file says why.
     let c = make(root, "2026-11-10_0900", files: ["audio.m4a": "c"])
     try! app.store.update(c) { $0.state = .done; $0.seconds = 60 }
     let d = make(root, "2026-11-09_0900", files: ["audio.m4a": "d"])
     try! app.store.update(d) { $0.state = .done; $0.seconds = 60 }
+    let e = make(root, "2026-11-08_0900", files: ["notes.md": "minutes, and no recording"])
+    try! app.store.update(e) { $0.state = .done; $0.seconds = 60 }
+    let u = make(root, "2026-11-07_0900", files: ["mic.caf": "working"])
+    try! app.store.update(u) { $0.state = .failed; $0.seconds = 60 }
+    let f = make(root, "2026-11-06_0900")
+    check(mkfifo(f.appendingPathComponent("audio.m4a").path, 0o600) == 0, "T9 app: (meeting F's audio.m4a is a FIFO)")
+    try! app.store.update(f) { $0.state = .done; $0.seconds = 60 }
     app.library.reload()
     check(choose(c), "T9 app: (meeting C selected)")
     try! fm.removeItem(at: c.appendingPathComponent("audio.m4a"))
@@ -8054,13 +8230,275 @@ MainActor.assumeIsolated {
     bar = app.topBar
     check(player.state == cannotPlay && bar.player?.problem == "This recording cannot be played" && bar.player?.toggle == on("Play")
           && bar.player?.stop == off("Stop") && !audio.calls.suffix(1).contains("play"),
-          "T9 app: a missing audio file shows This recording cannot be played, and nothing plays")
+          "T9 app: audio that has gone since the folder was read shows This recording cannot be played, and nothing plays")
     check(choose(d) && player.state == .idle && app.topBar.player?.problem == nil, "T9 app: choosing another meeting clears it")
     chmod(d.appendingPathComponent("audio.m4a").path, 0)
     app.togglePlayer()
     check(player.state == cannotPlay && app.topBar.player?.problem == "This recording cannot be played", "T9 app: so does an unreadable one")
     chmod(d.appendingPathComponent("audio.m4a").path, 0o644)
+    let loadsBeforeE = audio.count("load")
+    check(read(e), "T9 app: (meeting E, finished with no audio, selected)")
+    bar = app.topBar
+    check(bar.player?.file == nil && bar.player?.problem == "This recording cannot be played" && bar.player?.toggle == off("Play")
+          && bar.player?.stop == off("Stop"),
+          "T9 app: a finished meeting with no audio at all shows the player with Play disabled and This recording cannot be played (F1)")
+    app.togglePlayer()
+    check(player.state == .idle && audio.count("load") == loadsBeforeE, "T9 app: and Play does nothing there")
+    check(read(c) && app.topBar.player?.file == nil && app.topBar.player?.problem == "This recording cannot be played",
+          "T9 app: so does C once its folder is read again without its audio")
+    check(read(u) && app.library.shownContent?.files.unfinished == true && app.topBar.player == nil,
+          "T9 app: an unfinished recording shows nothing about audio it does not have yet")
+    check(choose(f), "T9 app: (meeting F selected)")
+    let started = Date()
+    app.togglePlayer()
+    check(Date().timeIntervalSince(started) < 0.5 && player.state == cannotPlay && audio.count("load") == loadsBeforeE,
+          "T9 app: a FIFO audio.m4a fails at once, saying so, and is never opened (an open would block)")
 
+    app.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// A recorder left running by a crash or a relaunch (T9-ADV-1, T9-ADV-2): while it is unconfirmed nothing is
+// offered; once it is adopted on the tick, playback stops and a sample is cancelled, in that order; and Play
+// waits until the recording is saved, even while its stop has not reached the recorder.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    let rec = FakeRecorder()
+    let engine = FakeEngine()
+    let sampler = FakeSampler()
+    let audio = FakeAudio()
+    let player = Player(audio: audio, tickQueue: nil, loadQueue: nil)
+    let app = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                       engine: engine, sampler: sampler, player: player)
+    let b = make(root, "2026-11-11_0900", files: ["audio.m4a": "b"])
+    try! app.store.update(b) { $0.state = .done; $0.seconds = 754 }
+    let fileB = b.appendingPathComponent("audio.m4a")
+    /// A recorder still running in a meeting folder that recording.dir names, as a relaunch finds it.
+    @MainActor func leftRunning(_ name: String, paused: Bool) -> (dir: URL, pid: Int32) {
+        let dir = Session.folderURL(root.appendingPathComponent(name).path)
+        try! fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try! app.store.update(dir) { $0.state = .recording; $0.started = Date().addingTimeInterval(-600) }
+        try! fm.createDirectory(at: state, withIntermediateDirectories: true)
+        try! Data(dir.path.utf8).write(to: state.appendingPathComponent("recording.dir"))
+        if paused { try! Data().write(to: state.appendingPathComponent("paused")) }
+        rec.nextPid += 1
+        rec.running[dir.path] = rec.nextPid
+        rec.alive.insert(rec.nextPid)
+        return (dir, rec.nextPid)
+    }
+    @MainActor func phaseIs(_ wanted: String) -> Bool {
+        switch (wanted, app.status.phase) {
+        case ("recording", .recording), ("paused", .paused), ("finalising", .finalising), ("idle", .idle): return true
+        default: return false
+        }
+    }
+
+    // At launch ps cannot tell whether the recorder is alive: nothing is offered.
+    let first = leftRunning("2026-11-14_0800", paused: false)
+    rec.findUnknown = true
+    app.launch()
+    app.library.reload()
+    app.library.select(LibraryPresentation.key(b))
+    check(settle { app.library.shownContent?.files.audio != nil }, "T9 adopt: (meeting B selected)")
+    check(app.session.phase == .idle && app.session.unconfirmed, "T9 adopt: (a recorder is left unconfirmed: the session is idle)")
+    check(app.topBar.player?.toggle == off("Play") && !app.canRecordSample,
+          "T9 adopt: while a recorder is unconfirmed, neither Play nor a voice sample is offered")
+    app.togglePlayer()
+    app.recordSample()
+    check(player.state == .idle && audio.count("load") == 0 && sampler.starts.isEmpty && app.sample == .idle,
+          "T9 adopt: and Play and Record a voice sample do nothing")
+    _ = settle({ false }, timeout: 1.5)
+    check(app.session.phase == .idle && app.session.unconfirmed && app.topBar.player?.toggle == off("Play"),
+          "T9 adopt: still nothing while the tick cannot tell")
+    rec.findUnknown = false
+    check(settle { phaseIs("recording") } && app.session.phase == .recording(first.dir) && !app.session.unconfirmed,
+          "T9 adopt: once ps can tell, the tick adopts the recording")
+    check(app.topBar.recording != nil && app.topBar.player?.toggle == off("Play"), "T9 adopt: and Play is disabled while it records")
+
+    // Its Stop cannot reach the recorder yet (ps cannot confirm the pid): finalising, still capturing, Play still disabled.
+    rec.findUnknown = true
+    app.perform(.stop)
+    check(settle { phaseIs("finalising") } && rec.sent(SIGINT) == 0 && rec.alive.contains(first.pid),
+          "T9 finalising: (stopping, with the stop not yet sent to the recorder)")
+    check(app.topBar.recording == nil && app.topBar.player?.toggle == off("Play"),
+          "T9 finalising: Play is not offered while the stop has not reached the recorder")
+    app.togglePlayer()
+    check(player.state == .idle && audio.count("load") == 0, "T9 finalising: and Play does nothing")
+    rec.findUnknown = false
+    check(settle { rec.sent(SIGINT) == 1 }, "T9 finalising: (the stop reaches the recorder once ps can confirm it)")
+    rec.exit(first.pid, 0, verifies: true)
+    check(settle { phaseIs("idle") && app.session.phase == .idle } && app.topBar.player?.toggle == on("Play"),
+          "T9 finalising: once it is saved, Play is offered again")
+
+    // A recorder adopted later, on the tick (the meetings folder changed, say), while the player plays and a sample
+    // is under way: playback stops, then the sample is cancelled, as willStart does for a start.
+    app.recordSample()
+    sampler.starts.last?.started(nil)
+    player.toggle(fileB)
+    check(player.state == .playing(fileB) && app.sampling, "T9 adopt later: (playing, with a sample under way)")
+    var log: [String] = []
+    audio.onStop = { log.append("player") }
+    sampler.onStop = { log.append("sampler") }
+    let second = leftRunning("2026-11-14_0830", paused: true)
+    rec.findUnknown = true
+    app.session.adopt()
+    check(app.session.phase == .idle && app.session.unconfirmed && !app.canRecordSample, "T9 adopt later: (the recorder is unconfirmed)")
+    rec.findUnknown = false
+    check(settle { phaseIs("paused") } && app.session.phase == .paused(second.dir), "T9 adopt later: (the tick adopts it, paused)")
+    check(settle { player.state == .idle } && log == ["player", "sampler"] && app.sample == .failed("Stopped because a meeting started recording."),
+          "T9 adopt later: an adopted recording stops playback, then cancels the sample (\(log))")
+    check(app.topBar.player?.toggle == off("Play"), "T9 adopt later: and Play is disabled while it is paused")
+    audio.onStop = nil
+    sampler.onStop = nil
+    app.closeSample()
+    app.perform(.stop)
+    _ = settle { phaseIs("finalising") }
+    rec.exit(second.pid, 0, verifies: true)
+    check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 adopt later: (the recording is saved)")
+    app.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// Play loads the file off the main queue (T9-ADV-3): the main queue stays free while it loads, and a stop,
+// another meeting, a voice sample or a recording that comes first means the late load plays nothing.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    let rec = FakeRecorder()
+    let engine = FakeEngine()
+    let sampler = FakeSampler()
+    let slow = FakeAudio()
+    let player = Player(audio: slow, tickQueue: nil, loadQueue: DispatchQueue(label: "meetingbox.test.player.load"))
+    let app = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                       engine: engine, sampler: sampler, player: player)
+    let a = make(root, "2026-11-12_0900", files: ["audio.m4a": "a"])
+    try! app.store.update(a) { $0.state = .done; $0.seconds = 3900 }
+    let b = make(root, "2026-11-11_0900", files: ["audio.m4a": "b"])
+    try! app.store.update(b) { $0.state = .done; $0.seconds = 754 }
+    let f = make(root, "2026-11-10_0900")
+    check(mkfifo(f.appendingPathComponent("audio.m4a").path, 0o600) == 0, "T9 load: (meeting F's audio.m4a is a FIFO)")
+    try! app.store.update(f) { $0.state = .done; $0.seconds = 60 }
+    let fileA = a.appendingPathComponent("audio.m4a")
+    app.launch()
+    app.library.reload()
+    @MainActor func choose(_ dir: URL) -> Bool {
+        app.library.select(LibraryPresentation.key(dir))
+        return settle { isAt(app.library.shownContent?.files.audio?.deletingLastPathComponent(), dir) }
+    }
+    @MainActor func plays(_ f: URL) -> Bool { if case .playing(let u) = player.state { return isAt(u, f) }; return false }
+
+    check(choose(a), "T9 load: (meeting A selected)")
+    app.togglePlayer()
+    check(player.state == .idle, "T9 load: Play leaves the player as it was until the file has loaded")
+    check(settle { plays(fileA) } && slow.count("play") == 1, "T9 load: then it plays")
+    app.stopPlayer()
+
+    /// Play with the load held up until `release`: togglePlayer returns at once and the main queue stays free.
+    @MainActor func heldPlay(_ label: String) -> DispatchSemaphore {
+        let gate = DispatchSemaphore(value: 0)
+        slow.gate = gate
+        let t0 = Date()
+        app.togglePlayer()
+        let took = Date().timeIntervalSince(t0)
+        let ran = Flag()
+        DispatchQueue.main.async { ran.on = true }
+        check(took < 0.5 && settle({ ran.on }, timeout: 1) && player.state == .idle,
+              "T9 load \(label): togglePlayer returns at once and the main queue stays free while the file loads (\(took) s)")
+        return gate
+    }
+    /// Lets the held load come back and gives its answer time to reach the main queue.
+    @MainActor func release(_ gate: DispatchSemaphore) {
+        slow.gate = nil
+        gate.signal()
+        _ = settle({ false }, timeout: 0.5)
+    }
+
+    // A recording started before the load comes back is never played into.
+    var plays0 = slow.count("play")
+    var gate = heldPlay("then a recording")
+    let reply = app.handler.reply(for: .start(mic: nil, dir: nil))
+    check(reply.hasPrefix("ok recording") && rec.launches.count == 1, "T9 load: (a recording starts while the file loads)")
+    release(gate)
+    check(slow.count("play") == plays0 && player.state == .idle && slow.calls.last == "stop",
+          "T9 load: a recording started before the load came back is never played into: nothing plays, and what was loaded is let go (\(slow.calls.suffix(3)))")
+    let pid = rec.nextPid
+    app.perform(.stop)
+    _ = settle { if case .finalising = app.status.phase { return true }; return false }
+    rec.exit(pid, 0, verifies: true)
+    check(settle { app.session.phase == .idle && app.status.phase == .idle }, "T9 load: (the recording is saved)")
+
+    // Stop, another meeting, and a voice sample, each before the load comes back.
+    plays0 = slow.count("play")
+    gate = heldPlay("then Stop")
+    app.stopPlayer()
+    release(gate)
+    check(slow.count("play") == plays0 && player.state == .idle, "T9 load: a Stop before the load came back: nothing plays")
+    gate = heldPlay("then another meeting")
+    check(choose(b), "T9 load: (meeting B chosen while A loads)")
+    release(gate)
+    check(slow.count("play") == plays0 && player.state == .idle, "T9 load: another meeting chosen before the load came back: nothing plays")
+    check(choose(a), "T9 load: (meeting A again)")
+    gate = heldPlay("then a voice sample")
+    app.recordSample()
+    release(gate)
+    check(slow.count("play") == plays0 && player.state == .idle && app.sampling,
+          "T9 load: a voice sample started before the load came back: nothing plays")
+    app.closeSample()
+
+    // Nothing touches the audio while a load is under way: a late load that comes back while a newer one is
+    // still loading leaves the audio alone, and the newer one plays.
+    let firstGate = DispatchSemaphore(value: 0), secondGate = DispatchSemaphore(value: 0)
+    let loadsBeforeBoth = slow.count("load")
+    slow.gate = firstGate
+    app.togglePlayer()
+    let firstIn = Date().addingTimeInterval(3)
+    while !slow.isLoading && Date() < firstIn { usleep(1000) }
+    app.stopPlayer()
+    slow.gate = secondGate
+    app.togglePlayer()
+    firstGate.signal()
+    // The main queue is held (no run loop) until the newer load is inside load, so the late answer, queued on
+    // the main queue meanwhile, is handled while it runs.
+    let holdUntil = Date().addingTimeInterval(3)
+    while !(slow.count("load") == loadsBeforeBoth + 2 && slow.isLoading) && Date() < holdUntil { usleep(1000) }
+    check(slow.count("load") == loadsBeforeBoth + 2 && slow.isLoading, "T9 load: (the newer load is under way, the late answer waiting)")
+    _ = settle({ false }, timeout: 0.5)
+    check(!slow.calls.contains { $0.hasSuffix("during a load") } && player.state == .idle,
+          "T9 load: a late load coming back while a newer one loads touches nothing (\(slow.calls.suffix(4)))")
+    slow.gate = nil
+    secondGate.signal()
+    check(settle { plays(fileA) }, "T9 load: and the newer one plays")
+    app.stopPlayer()
+
+    // Play again while the same file loads does not load it twice.
+    let loads0 = slow.count("load")
+    gate = heldPlay("pressed twice")
+    app.togglePlayer()
+    release(gate)
+    check(plays(fileA) && slow.count("load") == loads0 + 1, "T9 load: Play pressed again while the file loads loads it once, and it plays")
+    app.stopPlayer()
+
+    // A FIFO is refused before anything opens it, so the load queue is never stuck.
+    let loads1 = slow.count("load")
+    check(choose(f), "T9 load: (meeting F selected)")
+    let t0 = Date()
+    app.togglePlayer()
+    check(Date().timeIntervalSince(t0) < 0.5 && settle({ player.state == .failed("This recording cannot be played") }, timeout: 2)
+          && slow.count("load") == loads1,
+          "T9 load: a FIFO audio.m4a fails at once, and togglePlayer returns at once")
+    check(choose(a), "T9 load: (meeting A again)")
+    app.togglePlayer()
+    check(settle { plays(fileA) }, "T9 load: and the next Play still plays")
+    app.stopPlayer()
     app.shutDown()
     try? fm.removeItem(at: state)
 }
