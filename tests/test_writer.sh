@@ -746,17 +746,32 @@ check "every block that expands the key runs only allowed builtins, names no com
 [ -z "$rule_bad$abs_paths" ] || printf '%s\n' "$rule_bad" "$abs_paths"
 
 # --- the lines that handle the key, pinned ---
-# This list is deliberate. It is every line of meetingbox that spells a variable holding the key (key,
-# got and STORED_KEY: typed by the user or read from the keychain), as an expansion or an assignment;
-# every line naming key_ok, the one function handed the key as an argument, or stored_key, which hands
-# it back in STORED_KEY; every security call that can print a key (find-generic-password, dump-keychain);
-# and every line that uses eval, ${! or declare -p, bash's ways of reaching a variable without spelling
-# it (none of them near the key today). Each is compared as text, less its leading space, so a change
-# to how meetingbox handles the key must change this list, where a reviewer sees it; the awk rule above
-# is then the second line of defence. read_swap's key is a word of a .swap line, not the key, but a
-# text search cannot tell them apart, so its lines are pinned with the rest.
+# This list is deliberate. It is every line of meetingbox that spells a variable holding the key
+# (KEY_VARS: key, got and STORED_KEY, typed by the user or read from the keychain), as an expansion, an
+# assignment or a declaration; every line naming key_ok, the one function handed the key as an
+# argument, or stored_key, which hands it back in STORED_KEY; every security call that can print a key
+# (find-generic-password, dump-keychain); every line that uses eval or ${!; every set, declare, typeset,
+# local, readonly or export that prints variables (no name after it, or -p in an option word); and
+# every trap, set -T, functrace and extdebug, which can see a variable without spelling it (none of
+# them near the key today). Each is compared as text, less its leading space, so a change to how
+# meetingbox handles the key must change this list, where a reviewer sees it; the awk rule above is
+# then the second line of defence. Three things a change must keep in step: a new variable that holds
+# the key must be added to KEY_VARS, or the lines that use it are not pinned (the awk rule still
+# follows the copy); a second function handed the key, on its arguments or its input, needs a body pin
+# of its own like key_ok's and run_limited's below, as only its call lines are pinned here; and the
+# receiver on a pinned line's continuation line (the "| run_limited" after a send's printf) is checked
+# by the awk rule, not the pin. read_swap's key is a word of a .swap line, not the key, but a text
+# search cannot tell them apart, so its lines are pinned with the rest.
+KEY_VARS='key|got|STORED_KEY'
+CMD_START='(^[[:space:]]*|[;|&({!][[:space:]]*|(then|do|else)[[:space:]]+)'   # where a command word can start
+DUMPERS='set|declare|typeset|local|readonly|export'
 key_lines() {
-  grep -E '\$\{?(key|got|STORED_KEY)([^A-Za-z0-9_]|$)|(^|[[:space:]])(key|got|STORED_KEY)\+?=|(^|[^A-Za-z0-9_])(key_ok|stored_key|eval)([^A-Za-z0-9_]|$)|(declare|typeset) +-[A-Za-z]*p|find-generic-password|dump-keychain|\$\{!' "$1" \
+  grep -E -e '\$\{?('"$KEY_VARS"')([^A-Za-z0-9_]|$)' -e '(^|[[:space:]])('"$KEY_VARS"')\+?=' \
+          -e '(^|[^A-Za-z0-9_])(key_ok|stored_key|eval)([^A-Za-z0-9_]|$)' -e 'find-generic-password|dump-keychain|\$\{!' \
+          -e "$CMD_START($DUMPERS)([[:space:]]+-[A-Za-z]+)*[[:space:]]*([;|&)}><#]|\$)" \
+          -e "$CMD_START($DUMPERS)[^#]*[[:space:]]-[A-Za-z]*p" \
+          -e "${CMD_START}trap([[:space:]]|\$)|set[[:space:]]+-[A-Za-z]*T|functrace|extdebug" \
+          -e "$CMD_START($DUMPERS)[^#]*[[:space:]]($KEY_VARS)([^A-Za-z0-9_]|\$)" "$1" \
     | sed 's/^[[:space:]]*//'
 }
 cat > "$HOME/key-lines" <<'LINES'
@@ -766,6 +781,7 @@ printf -v piece '%x' "${!i}"
 key_ok() {
 security find-generic-password -s "$KEY_SERVICE" -a "$1" ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} >/dev/null 2>&1 || status=$?
 stored_key() {
+local got status
 STORED_KEY=""
 got="$(security find-generic-password -s "$KEY_SERVICE" -a "$1" -w ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} 2>/dev/null; printf '.%s' "$?")"
 status="${got##*.}"
@@ -773,6 +789,8 @@ got="${got%.*}"
 got="${got%$'\n'}"   # security ends what it prints with one newline of its own
 key_ok "$got" || return 2
 STORED_KEY="$got"
+local sub="$1" address="$OUTSIDE_ADDRESS" key had=0 status=0 stored=0
+set)
 key="$(LC_ALL=C tr '\000' ' '; printf x)"
 key="${key%x}"
 key="${key%$'\n'}"
@@ -781,20 +799,36 @@ printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"%s\n' "$KEY_SERVICE" "$ad
 if stored_key "$address" && [ "$STORED_KEY" = "$key" ]; then stored=1; fi
 STORED_KEY=""
 [ -n "$b" ] && eval "$("$b" shellenv)"
+trap 'rm -rf -- "$tmp"; exit 130' INT
+trap 'rm -rf -- "$tmp"; exit 143' TERM
+trap - INT TERM
 local reason="" key="" request answer status had_key=0
 status=0; stored_key "$OUTSIDE_ADDRESS" || status=$?
 0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
 answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
 key=""
+trap 'rm -rf -- "$tmp"; exit 129' HUP
+trap 'rm -rf -- "$tmp"; exit 130' INT
+trap 'rm -rf -- "$tmp"; exit 143' TERM
+trap - HUP INT TERM
 local host node key="" had_key=0 status=0 rc work limit chars finish tokens counted schema type request answer
 stored_key "$address" || status=$?
 0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
 if ! outside_runtime; then key=""; outside_note "$host" 0 "outside models are not set up"; return 1; fi
 answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
 key=""
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap '' INT TERM
+trap - INT TERM
+trap 'end_processing $?' EXIT
+trap - EXIT HUP INT TERM
+local line key value n=0 ended=0
 key="${line%% *}"; value="${line#* }"
 case "$n:$key" in
 if [ "$key" = move ]; then SWAP_MOVES="$SWAP_MOVES $value"; else SWAP_DISPLACES="$SWAP_DISPLACES $value"; fi ;;
+trap '' INT TERM HUP
 LINES
 key_lines "$ROOT/meetingbox" > "$HOME/key-lines.now"
 lines_diff="$(diff "$HOME/key-lines" "$HOME/key-lines.now")"
@@ -812,6 +846,42 @@ fn_diff="$(sed -n '/^key_ok() {$/,/^}$/p' "$ROOT/meetingbox" | sed 's/^[[:space:
 check "key_ok, the one function handed the key as an argument, is word for word the pinned text, and is defined once" \
   eval '[ -z "$fn_diff" ] && [ "$(grep -cE "(^|[^A-Za-z0-9_])key_ok *\(\)|^function +key_ok" "$ROOT/meetingbox")" = 1 ]'
 [ -z "$fn_diff" ] || printf '%s\n' "$fn_diff"
+# run_limited whole too: both sends pipe the request, the key first, into it. Every function a pinned
+# line calls is defined once, by whichever form it is written, and no function takes the name of a
+# builtin or command those lines run (printf, security, tr, run_limited's kill, sleep and wait, and the
+# rest of SHADOW): one would see the key.
+cat > "$HOME/run-limited" <<'FN'
+run_limited() {
+local limit="$1" pid start grace rc=0 fired=0
+shift
+"$@" <&0 &
+pid=$!
+start=$SECONDS
+while kill -0 "$pid" 2>/dev/null; do
+if [ $((SECONDS - start)) -ge "$limit" ]; then
+fired=1
+kill -TERM "$pid" 2>/dev/null || true
+grace=$SECONDS
+while kill -0 "$pid" 2>/dev/null && [ $((SECONDS - grace)) -lt 5 ]; do sleep 0.2; done
+kill -KILL "$pid" 2>/dev/null || true
+break
+fi
+sleep 0.2
+done
+wait "$pid" 2>/dev/null || rc=$?
+[ "$fired" = 0 ] || return 124
+return "$rc"
+}
+FN
+rl_diff="$(sed -n '/^run_limited() {$/,/^}$/p' "$ROOT/meetingbox" | sed 's/^[[:space:]]*//' | diff "$HOME/run-limited" -)"
+defined() { grep -cE "^[[:space:]]*(function[[:space:]]+)?($1)[[:space:]]*\(\)|^[[:space:]]*function[[:space:]]+($1)([[:space:]{]|\$)" "$ROOT/meetingbox"; }
+once=""
+for f in key_ok run_limited stored_key outside_note outside_runtime; do [ "$(defined "$f")" = 1 ] || once="$once [$f defined $(defined "$f") times]"; done
+SHADOW='printf|echo|read|builtin|command|test|eval|exec|security|tr|env|jq|cat|kill|sleep|wait|shift|return|true|set|declare|typeset|local|readonly|export|trap'
+shadowed="$(grep -nE "^[[:space:]]*(function[[:space:]]+)?($SHADOW)[[:space:]]*\(\)|^[[:space:]]*function[[:space:]]+($SHADOW)([[:space:]{]|\$)" "$ROOT/meetingbox")"
+check "run_limited, handed the key on its input, is word for word the pinned text; it, key_ok, stored_key, outside_note and outside_runtime are defined once; and no function takes the name of a builtin or command a key line runs" \
+  eval '[ -z "$rl_diff" ] && [ -z "$once" ] && [ -z "$shadowed" ]'
+[ -z "$rl_diff$once$shadowed" ] || printf '%s\n' "$rl_diff" "$once" "$shadowed"
 
 # --- a runtime that is not set up is never sent to ---
 not_set_up() {   # $1: name; expects the not-sent note, and no complete call
@@ -1608,20 +1678,38 @@ check "with BASE_DIR on another disk, HOME and the folders above it are still re
 # off, the Data volume's own path, NFD against NFC, a relative BASE_DIR, and a BASE_DIR that is a link.
 # Each line is refused with the warning and kept, every meeting's audio is still there, and the plain
 # recorded paths (MINUTES_DIR, NODE_FILE and a folder of setup's) are removed. SPELL_DATA names the
-# Data volume, SPELL_CWD the folder reset runs from, and SPELL_APP what the app's Preferences name.
-NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'
+# Data volume, SPELL_CWD the folder reset runs from, and SPELL_APP and SPELL_ROOTS what the app's
+# Preferences name: its meetings folder, and the other folders it was told to record into.
+NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'; OTHER=$'R\xc3\xa9unions d\x27\xc3\xa9quipe'
+# The app's Preferences as a test names them: defaults read answers SPELL_APP for meetingsFolder, and
+# defaults export gives a property list with SPELL_ROOTS (one path a line) as otherRoots.
+fake_defaults() {
+  case "$1" in
+    read) [ -n "${SPELL_APP:-}" ] && printf '%s\n' "$SPELL_APP" ;;
+    export)
+      printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>'
+      if [ -n "${SPELL_ROOTS:-}" ]; then
+        printf '<key>otherRoots</key><array>'
+        printf '%s\n' "$SPELL_ROOTS" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/.*/<string>&<\/string>/'
+        printf '</array>'
+      fi
+      printf '</dict></plist>\n' ;;
+    *) return 1 ;;
+  esac
+}
 spellings_case() {   # $1: name; $2: BASE_DIR as reset sees it (from $HOME); $3: the real meetings folder; then the lines
   local name="$1" base="$2" real="$3" level p
   shift 3
   for level in tools all; do
     fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
-    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
+    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub" \
+           "$HOME/$OTHER" "$HOME/Calls"
     mkdir -p "$real/m1" "$SRC_DIR/plain" "${SPELL_CWD:-$HOME}"; printf 'aac' > "$real/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
     case "$name" in "a BASE_DIR that is a link"*) ln -s "$HOME/elsewhere/Real" "$HOME/MeetingsLink" ;; esac
     ln -s "$real" "$SRC_DIR/link"
     printf '%s\n' "$@" "$SRC_DIR/plain" >> "$INSTALLED"
     out="$( (cd "${SPELL_CWD:-$HOME}"; BASE_DIR="$base"; DATA_VOLUME="${SPELL_DATA:-$DATA_VOLUME}"; rm() { safe_rm "$@"; }
-             defaults() { [ -n "${SPELL_APP:-}" ] && printf '%s\n' "$SPELL_APP"; }
+             defaults() { fake_defaults "$@"; }
              refuse_while_busy() { return 0; }; adopt_own_app() { :; }
              quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }
              brew() { return 1; }; reset_cmd "$level") 2>&1 )"
@@ -1655,36 +1743,57 @@ SPELL_CWD="$HOME/sub" spellings_case "MB_DIR with a ~/ left unexpanded, naming a
   "$HOME/Docs/Mtgs/m1" "$HOME/Docs/Mtgs" "$HOME/Docs"
 SPELL_CWD="$HOME/sub" spellings_case "a relative BASE_DIR, reset run from another folder" "Meetings" "$HOME/Meetings" \
   "$HOME/Meetings/m1" "$HOME/Meetings"
-rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
+# And the folders the app was told to record into with --dir or MB_DIR, which it keeps as otherRoots:
+# read as a property list, so a name with a space, a quote and an accent comes through whole; and a
+# relative MB_DIR=Calls recorded from $HOME, reset from elsewhere, once the app remembers ~/Calls.
+SPELL_ROOTS="$HOME/$OTHER" spellings_case "a folder in the app's otherRoots, with a space, a quote and an accent" "$HOME/m" "$HOME/$OTHER" \
+  "$HOME/$OTHER/m1" "$HOME/$OTHER"
+SPELL_CWD="$HOME/sub" SPELL_ROOTS="$HOME/Calls" spellings_case "MB_DIR=Calls, reset run from another folder, with ~/Calls in the app's otherRoots" \
+  "Calls" "$HOME/Calls" "$HOME/Calls/m1" "$HOME/Calls"
+rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub" \
+       "$HOME/$OTHER" "$HOME/Calls"
 : > "$INSTALLED"
 
 # A line through a link into a meeting folder, or a meeting's own volfs name (/.vol/<device>/<inode>),
-# spells no meetings folder above it: the guard follows the physical path too. Each line is refused
-# with the warning and kept, every meeting's files stay, and the plain recorded path goes.
+# spells no meetings folder above it: the guard follows the physical path too, and refuses every volfs
+# name outright (cd -P follows one only for a folder, so a meeting file's own would reach rm). A link
+# inside the app's meetings folder to a meeting kept elsewhere is refused by the spelt chain of folders,
+# and a folder that cannot be entered refuses its line. Each line is refused with the warning and kept,
+# every meeting's files stay, and the plain recorded path goes.
+volfs() { printf '/.vol/%s/%s' "$(/usr/bin/stat -f %d "$1")" "$(/usr/bin/stat -f %i "$1")"; }
 for level in tools all; do
   fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
-  rm -rf "$HOME/m" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink"
-  mkdir -p "$HOME/m/m1" "$HOME/m/m2" "$HOME/m/m3/earlier" "$HOME/m/m4/sub/more" "$SRC_DIR/plain"
-  printf 'aac' > "$HOME/m/m1/audio.m4a"; printf 'aac' > "$HOME/m/m2/audio.m4a"; printf 'old' > "$HOME/m/m3/earlier/notes.md"
-  printf 'aac' > "$HOME/m/m4/sub/more/deep.m4a"; : > "$SRC_DIR/plain/keep"
+  chmod 700 "$SRC_DIR/locked" 2>/dev/null
+  rm -rf "$HOME/m" "$HOME/ext" "$HOME/Documents" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink" "$SRC_DIR/locked"
+  mkdir -p "$HOME/m/m1" "$HOME/m/m2" "$HOME/m/m3/earlier" "$HOME/m/m4/sub/more" "$HOME/ext/Meetings/x1" "$HOME/Documents/AppMeetings" \
+           "$SRC_DIR/locked/inner" "$SRC_DIR/plain"
+  printf 'aac' > "$HOME/m/m1/audio.m4a"; printf '{"state": "done"}' > "$HOME/m/m1/meeting.json"; printf 'aac' > "$HOME/m/m2/audio.m4a"
+  printf 'old' > "$HOME/m/m3/earlier/notes.md"; printf 'aac' > "$HOME/m/m4/sub/more/deep.m4a"; printf 'aac' > "$HOME/ext/Meetings/x1/audio.m4a"
+  : > "$SRC_DIR/plain/keep"
   ln -s "$HOME/m" "$SRC_DIR/link"; ln -s "$HOME/m/m1" "$SRC_DIR/mlink"; ln -s "$HOME/m/m3/earlier" "$SRC_DIR/elink"
-  vol="/.vol/$(/usr/bin/stat -f %d "$HOME/m/m2")/$(/usr/bin/stat -f %i "$HOME/m/m2")"
-  physical=("$SRC_DIR/mlink/audio.m4a" "$SRC_DIR/elink/notes.md" "$vol" "$vol/audio.m4a" "$SRC_DIR/link/m4/sub/more/deep.m4a")
+  ln -s "$HOME/ext/Meetings/x1" "$HOME/Documents/AppMeetings/x1"
+  chmod 600 "$SRC_DIR/locked"
+  vol="$(volfs "$HOME/m/m2")"
+  physical=("$SRC_DIR/mlink/audio.m4a" "$SRC_DIR/elink/notes.md" "$vol" "$vol/audio.m4a" "$SRC_DIR/link/m4/sub/more/deep.m4a"
+            "$(volfs "$HOME/m/m1/audio.m4a")" "$(volfs "$HOME/m/m1/meeting.json")" "$HOME/Documents/AppMeetings/x1/audio.m4a" "$SRC_DIR/locked/inner")
   printf '%s\n' "${physical[@]}" "$SRC_DIR/plain" >> "$INSTALLED"
-  out="$( (BASE_DIR="$HOME/m"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
+  out="$( (BASE_DIR="$HOME/m"; SPELL_APP="$HOME/Documents/AppMeetings"; rm() { safe_rm "$@"; }; defaults() { fake_defaults "$@"; }
+           refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
            reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
            reset_cmd "$level") 2>&1 )"
+  chmod 700 "$SRC_DIR/locked"
   missing=""
   for p in "${physical[@]}"; do
     grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
     printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
   done
-  check "reset_cmd $level refuses, with a warning, a line through a link into a meeting folder or into a meeting's earlier/, a meeting's volfs name and a file under it, and a file three folders down a meeting through a link, keeps each line, keeps every meeting's files, and removes the plain path" \
-    eval '[ -z "$missing" ] && [ -f "$HOME/m/m1/audio.m4a" ] && [ -f "$HOME/m/m2/audio.m4a" ] && [ -f "$HOME/m/m3/earlier/notes.md" ]
-          && [ -f "$HOME/m/m4/sub/more/deep.m4a" ] && [ ! -e "$SRC_DIR/plain" ] && ! installed_by_us "$SRC_DIR/plain" && [ ! -e "$HOME/rm-refused" ]'
+  check "reset_cmd $level refuses, with a warning, a line through a link into a meeting folder or into a meeting's earlier/, a meeting's volfs name, a file under it and a meeting file's own volfs name, a file three folders down a meeting through a link, a link in the app's folder to a meeting kept elsewhere, and a line through a folder that cannot be entered; keeps each line and every meeting's file, and removes the plain path" \
+    eval '[ -z "$missing" ] && [ -f "$HOME/m/m1/audio.m4a" ] && [ -f "$HOME/m/m1/meeting.json" ] && [ -f "$HOME/m/m2/audio.m4a" ]
+          && [ -f "$HOME/m/m3/earlier/notes.md" ] && [ -f "$HOME/m/m4/sub/more/deep.m4a" ] && [ -f "$HOME/ext/Meetings/x1/audio.m4a" ]
+          && [ -d "$SRC_DIR/locked/inner" ] && [ ! -e "$SRC_DIR/plain" ] && ! installed_by_us "$SRC_DIR/plain" && [ ! -e "$HOME/rm-refused" ]'
   [ -z "$missing" ] || printf '%s\n' "$missing"
 done
-rm -rf "$HOME/m" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink"; : > "$INSTALLED"
+rm -rf "$HOME/m" "$HOME/ext" "$HOME/Documents" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink" "$SRC_DIR/locked"; : > "$INSTALLED"
 
 # The guard asks the system's stat (GUARD_STAT), so a stat earlier on the PATH, whether GNU's (whose
 # -f takes no format, so it fails) or a planted one answering identities that never match, cannot

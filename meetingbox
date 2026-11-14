@@ -289,9 +289,10 @@ remove_installed() {
 # (so never a meeting folder), nor HOME or above it. First by spelling, case ignored as the Mac's disk
 # ignores it; then by folder (device and inode), so no other spelling of the same folder passes: a
 # link, /private, the Data volume's own path, another Unicode form. The folders above the line are
-# taken as spelt and again on its physical path (cd -P, which resolves links and /.vol names), so a
-# link into a meeting folder, or a meeting's volfs name, shows the meetings folder above it. A relative
-# BASE_DIR is taken from the current folder. A path or folder that cannot be examined is refused.
+# taken as spelt and again on its physical path (cd -P, which resolves links), so a link into a meeting
+# folder shows the meetings folder above it. A volfs name (/.vol/<device>/<inode>) is refused outright:
+# cd -P follows it only for a folder, and meetingbox never writes one. A relative BASE_DIR is taken
+# from the current folder. A path or folder that cannot be examined is refused.
 removable() {
   local p="$1" base home="${HOME%/}" nocase=0 ok=0 a rest real ids n=0 id first=""
   case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
@@ -307,6 +308,7 @@ removable() {
       case "$home/" in "$p"/*) ;; *) ok=1 ;; esac ;;
     esac ;;
   esac
+  case "$p" in /.vol|/.vol/*) ok=0 ;; esac
   [ "$nocase" = 1 ] || shopt -u nocasematch
   [ "$ok" = 1 ] || return 1
   [ "$GUARD_FIXED" = 1 ] || guard_folders || return 1
@@ -336,9 +338,10 @@ removable() {
 }
 
 # The folders removable protects, by device and inode. GUARD_BASE holds the meetings folders that are
-# there: BASE_DIR; MB_DIR with a ~/ left unexpanded, as the app expands it; the app's own folder, from
-# its Preferences; and ~/Meetings. GUARD_ABOVE holds those, HOME, and every folder above them, above
-# their spelt paths, their physical paths (cd -P), and those on the Data volume (/System/Volumes/Data).
+# there: BASE_DIR; MB_DIR with a ~/ left unexpanded, as the app expands it; the app's own folder and
+# the others it was told to record into, from its Preferences; and ~/Meetings. GUARD_ABOVE holds those,
+# HOME, and every folder above them, above their spelt paths, their physical paths (cd -P), and those
+# on the Data volume (/System/Volumes/Data).
 # BASE_DIR and HOME are protected whether they are there or not (the folders above them are); one of
 # the other meetings folders that is not there protects nothing. False when a folder there cannot be
 # examined. reset works them out once (GUARD_FIXED); otherwise each call does. The guard asks the
@@ -350,7 +353,7 @@ guard_folders() {
   local base f d real list="" ids meetings
   case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
   GUARD_BASE=" "; GUARD_ABOVE=" "
-  meetings="$base"$'\n'"$HOME/Meetings"$'\n'"$(app_meetings_folder)"
+  meetings="$base"$'\n'"$HOME/Meetings"$'\n'"$(app_meetings_folder)"$'\n'"$(app_other_roots)"
   case "$BASE_DIR" in "~"|"~/"*) meetings="$meetings"$'\n'"$HOME${BASE_DIR#\~}" ;; esac
   while IFS= read -r f; do
     f="${f%/}"
@@ -565,6 +568,15 @@ app_meetings_folder() {
 "*) return 0 ;;
     /*) printf '%s' "$d" ;;
   esac
+}
+
+# The other folders the app was told to record into, with --dir or MB_DIR, which it keeps in its
+# Preferences as otherRoots: one full path a line. The domain is read as a property list (defaults
+# read's own notation would not keep spaces, quotes and other alphabets whole); a missing key or domain
+# gives nothing, and is not an error.
+app_other_roots() {
+  defaults export "$APP_ID" - 2>/dev/null | plutil -extract otherRoots json -o - - 2>/dev/null \
+    | jq -r '.[]? | strings | select(startswith("/") and (contains("\n") | not))' 2>/dev/null || true
 }
 
 # A recording is being made or saved: a recorder or a recovery is running, a session is open
