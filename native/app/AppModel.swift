@@ -180,7 +180,7 @@ final class AppModel: ObservableObject {
         // `show` from the socket (a second launch, or the command): the window.
         handler.onShow = { [weak self] in Task { @MainActor in self?.showLibrary() } }
 
-        session.adopt()
+        adopt()
         queue.resume()
         do {
             let server = try ControlServer(socket: stateDir.appendingPathComponent("control.sock"), handler: handler)
@@ -697,7 +697,16 @@ final class AppModel: ObservableObject {
         // skips what the queue already holds, and adopt does nothing unless the session is idle (it is:
         // checked above, on this queue) and skips recoveries already running.
         queue.resume()
+        adopt()
+    }
+
+    /// Takes up a recording left running (`Session.adopt`), at launch and after the meetings folder changes.
+    /// One found running changes the phase, and the backstop in `session.onChange` makes way for it. One
+    /// that ps cannot confirm changes no phase but may be recording, so what plays stops and a sample under
+    /// way is cancelled now, the same way. Nothing is played or sampled until it is confirmed or gone.
+    func adopt() {
         session.adopt()
+        if session.unconfirmed { makeWayForRecording() }
     }
 
     // MARK: recording entries (the Dock menu, the main menu's Recording menu, New meeting)

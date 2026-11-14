@@ -7596,6 +7596,13 @@ final class FakeAudio: AudioPlaying {
     private let lock = NSLock()
     private var said: [String] = []
     private var opened: [URL] = []
+    private var threads: [Bool] = []
+    /// For each load, whether it ran on the main thread.
+    var loadedOnMain: [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return threads
+    }
     var calls: [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -7655,6 +7662,9 @@ final class FakeAudio: AudioPlaying {
     var onStop: (() -> Void)?
     func load(_ url: URL) throws {
         let wait = gate // read before it says it is loading, so a test may swap gates once it is
+        lock.lock()
+        threads.append(Thread.isMainThread)
+        lock.unlock()
         note("load")
         loading(true)
         defer { loading(false) }
@@ -8335,8 +8345,8 @@ MainActor.assumeIsolated {
     check(settle { phaseIs("idle") && app.session.phase == .idle } && app.topBar.player?.toggle == on("Play"),
           "T9 finalising: once it is saved, Play is offered again")
 
-    // A recorder adopted later, on the tick (the meetings folder changed, say), while the player plays and a sample
-    // is under way: playback stops, then the sample is cancelled, as willStart does for a start.
+    // A recorder left unconfirmed later (the meetings folder changed while ps cannot tell, say), while the player
+    // plays and a sample is under way: at once, playback stops, then the sample is cancelled (R2-1).
     app.recordSample()
     sampler.starts.last?.started(nil)
     player.toggle(fileB)
@@ -8346,22 +8356,116 @@ MainActor.assumeIsolated {
     sampler.onStop = { log.append("sampler") }
     let second = leftRunning("2026-11-14_0830", paused: true)
     rec.findUnknown = true
-    app.session.adopt()
+    app.adopt()
     check(app.session.phase == .idle && app.session.unconfirmed && !app.canRecordSample, "T9 adopt later: (the recorder is unconfirmed)")
+    check(player.state == .idle && app.sample == .failed("Stopped because a meeting started recording.") && log == ["player", "sampler"],
+          "T9 adopt later: straight after the adopt that leaves a recorder unconfirmed, playback stops, then the sample is cancelled (\(log))")
+    check(app.topBar.player?.toggle == off("Play"), "T9 adopt later: and Play is not offered")
     rec.findUnknown = false
     check(settle { phaseIs("paused") } && app.session.phase == .paused(second.dir), "T9 adopt later: (the tick adopts it, paused)")
-    check(settle { player.state == .idle } && log == ["player", "sampler"] && app.sample == .failed("Stopped because a meeting started recording."),
-          "T9 adopt later: an adopted recording stops playback, then cancels the sample (\(log))")
-    check(app.topBar.player?.toggle == off("Play"), "T9 adopt later: and Play is disabled while it is paused")
-    audio.onStop = nil
-    sampler.onStop = nil
+    check(log == ["player", "sampler"] && app.topBar.player?.toggle == off("Play"),
+          "T9 adopt later: once adopted nothing more is stopped, and Play is disabled while it is paused (\(log))")
     app.closeSample()
     app.perform(.stop)
     _ = settle { phaseIs("finalising") }
     rec.exit(second.pid, 0, verifies: true)
     check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 adopt later: (the recording is saved)")
+
+    // A recorder found running at once (ps can tell): the phase changes, and the backstop stops playback, then
+    // cancels the sample, as willStart does for a start.
+    app.recordSample()
+    sampler.starts.last?.started(nil)
+    player.toggle(fileB)
+    check(player.state == .playing(fileB) && app.sampling, "T9 adopt at once: (playing, with a sample under way)")
+    log = []
+    let third = leftRunning("2026-11-14_0900", paused: false)
+    app.adopt()
+    check(app.session.phase == .recording(third.dir) && !app.session.unconfirmed, "T9 adopt at once: (adopted straight away)")
+    check(settle { player.state == .idle } && log == ["player", "sampler"] && app.sample == .failed("Stopped because a meeting started recording."),
+          "T9 adopt at once: an adopted recording stops playback, then cancels the sample (\(log))")
+    check(app.topBar.player?.toggle == off("Play"), "T9 adopt at once: and Play is disabled while it records")
+    audio.onStop = nil
+    sampler.onStop = nil
+    app.closeSample()
+    app.perform(.stop)
+    _ = settle { phaseIs("finalising") }
+    rec.exit(third.pid, 0, verifies: true)
+    check(settle { phaseIs("idle") && app.session.phase == .idle }, "T9 adopt at once: (the recording is saved)")
     app.shutDown()
     try? fm.removeItem(at: state)
+}
+
+// R2-1 by the real route: the meetings folder changes, while a meeting plays, to one where a recorder that
+// recording.dir names is running and ps cannot tell. Playback stops at once.
+MainActor.assumeIsolated {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    prefs.meetingsFolder = root
+    prefs.sounds = false
+    prefs.openMinutes = false
+    let rec = FakeRecorder()
+    let audio = FakeAudio()
+    let player = Player(audio: audio, tickQueue: nil, loadQueue: nil)
+    let app = AppModel(stateDir: state, preferences: prefs, recorder: rec, runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                       engine: FakeEngine(), sampler: FakeSampler(), player: player)
+    let b = make(root, "2026-11-11_0900", files: ["audio.m4a": "b"])
+    try! app.store.update(b) { $0.state = .done; $0.seconds = 754 }
+    let fileB = b.appendingPathComponent("audio.m4a")
+    app.launch()
+    app.library.reload()
+    app.library.select(LibraryPresentation.key(b))
+    check(settle { app.library.shownContent?.files.audio != nil }, "T9 folder change: (meeting B selected)")
+    let elsewhere = freshRoot()
+    let live = Session.folderURL(elsewhere.appendingPathComponent("2026-11-14_0700").path)
+    try! fm.createDirectory(at: live, withIntermediateDirectories: true)
+    try! app.store.update(live) { $0.state = .recording; $0.started = Date().addingTimeInterval(-600) }
+    try! Data(live.path.utf8).write(to: state.appendingPathComponent("recording.dir"))
+    rec.nextPid += 1
+    let pid = rec.nextPid
+    rec.running[live.path] = pid
+    rec.alive.insert(pid)
+    rec.findUnknown = true
+    app.togglePlayer()
+    check({ if case .playing(let u) = player.state { return isAt(u, fileB) }; return false }(), "T9 folder change: (playing B)")
+    var log: [String] = []
+    audio.onStop = { log.append("player") }
+    app.setMeetingsFolder(elsewhere)
+    check(settle { app.session.unconfirmed } && app.folderProblem == nil && isAt(prefs.meetingsFolder, elsewhere),
+          "T9 folder change: (the folder is taken, and its recorder is unconfirmed)")
+    check(player.state == .idle && log == ["player"],
+          "T9 folder change: a meeting playing stops as soon as the new folder leaves a recorder unconfirmed (\(log))")
+    audio.onStop = nil
+    rec.findUnknown = false
+    check(settle { app.session.phase == .recording(live) }, "T9 folder change: (the tick adopts the recorder)")
+    app.perform(.stop)
+    _ = settle { if case .finalising = app.status.phase { return true }; return false }
+    rec.exit(pid, 0, verifies: true)
+    check(settle { app.session.phase == .idle && app.status.phase == .idle }, "T9 folder change: (the recording is saved)")
+    app.shutDown()
+    try? fm.removeItem(at: state)
+}
+
+// R2-2: the player's own default load queue, the one the app uses, is a background queue: Play returns at
+// once while the load is held, and the load runs off the main thread.
+MainActor.assumeIsolated {
+    let fake = FakeAudio()
+    let player = Player(audio: fake, tickQueue: .main)
+    let file = make(freshRoot(), "2026-11-14_1200", files: ["audio.m4a": "a"]).appendingPathComponent("audio.m4a")
+    let gate = DispatchSemaphore(value: 0)
+    fake.gate = gate
+    let t0 = Date()
+    player.toggle(file)
+    let took = Date().timeIntervalSince(t0)
+    let ran = Flag()
+    DispatchQueue.main.async { ran.on = true }
+    check(took < 0.5 && settle({ ran.on }, timeout: 1) && player.state == .idle,
+          "T9 default load queue: Play returns at once while the load is held, and the main queue stays free (\(took) s)")
+    fake.gate = nil
+    gate.signal()
+    check(settle { player.state == .playing(file) } && fake.loadedOnMain == [false],
+          "T9 default load queue: the load ran off the main thread, then it plays (\(fake.loadedOnMain))")
+    player.stop()
 }
 
 // Play loads the file off the main queue (T9-ADV-3): the main queue stays free while it loads, and a stop,

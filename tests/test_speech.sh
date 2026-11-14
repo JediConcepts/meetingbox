@@ -826,7 +826,7 @@ if [ "$(grep -c '^import ' "$ROOT/native/app/TopBarPresentation.swift")" = 1 ] &
   pass "TopBarPresentation.swift (with PlayerState) is Foundation only; Player.swift is the AVFoundation part"
 else fail "TopBarPresentation.swift (with PlayerState) is Foundation only; Player.swift is the AVFoundation part"; fi
 if [ "$(grep -rlE 'SystemAudio *\(' "$ROOT/native/app" | xargs -n 1 basename | sort | tr '\n' ' ')" = "AppDelegate.swift " ] \
-   && grep -qF 'player: Player(audio: SystemAudio(), tickQueue: .main' "$ROOT/native/app/AppDelegate.swift" \
+   && grep -qF 'player: Player(audio: SystemAudio(), tickQueue: .main))' "$ROOT/native/app/AppDelegate.swift" \
    && [ "$(grep -cE 'SystemAudio *\(' "$ROOT/native/tests/app/main.swift")" = 1 ] \
    && ! grep -qE 'Player\(audio: *SystemAudio' "$ROOT/native/tests/app/main.swift"; then
   pass "only AppDelegate gives a Player the real SystemAudio; the app test makes one only to see it refuse files"
