@@ -103,7 +103,7 @@ reset_run() {
   : > "$HOME/calls.log"
   rm -f "$HOME/node.log" "$HOME"/node.stdin.* "$HOME"/node-* "$HOME/fm-brief.in" "$HOME/security-stdin.log" "$KEYSTORE" \
         "$HOME/security-recorded.log" "$HOME/scan-found" "$HOME/shims.log"
-  rm -rf "$HOME/graveyard"
+  rm -rf "$HOME/graveyard" "$HOME/shims.d"
   HAVE_FM=1; unset STORED_RAW MB_WRITER_LIMIT MB_KEYCHAIN AUDIO_SECONDS FIND_STATUS DELETE_STATUS
 }
 # The complete call's own lines in node.log: its argv, then its environment.
@@ -286,12 +286,14 @@ check "a keyless run's writer.mjs stderr (here the transcript) is discarded too"
 
 # --- leaks seen through files and real command lines ---
 # A shim for every external command the outside path and key set run, first on the engine's PATH: each
-# logs its argv and its environment to shims.log, then runs the real one, and rm first copies what it
-# removes into graveyard/, so a file that held the key for a moment is still seen. mktemp also logs
-# each path it made ("made: <path>"). The shimmed runs have TMPDIR inside the scratch home. While the
-# fake node runs it looks through every file under the scratch home (the meeting, its stage and work
-# folders, the temporary folder, the shims' log, the graveyard) for the key or 16 characters of it, and
-# the suite looks again after.
+# logs its argv and its environment to a record of its own under shims.d/ (bash's printf writes a long
+# record in pieces, so shims running at once, the watchdog's sleep beside writer.mjs say, would mix
+# lines in one shared log), then runs the real one, and rm first copies what it removes into
+# graveyard/, so a file that held the key for a moment is still seen. mktemp also logs each path it
+# made ("made: <path>"). shimmed gathers the records into shims.log after the run. The shimmed runs
+# have TMPDIR inside the scratch home. While the fake node runs it looks through every file under the
+# scratch home (the meeting, its stage and work folders, the temporary folder, the shims' records, the
+# graveyard) for the key or 16 characters of it, and the suite looks again after.
 SHIMMED="jq cat tail head cp mv rm mkdir mktemp chmod env sed awk grep date stat tr cut printf shasum basename dirname
          sort realpath sleep wc ls find touch ln rmdir paste uniq tee xargs"
 mkdir -p "$HOME/shims" "$HOME/tmp"; : > "$HOME/shims/.real"
@@ -299,15 +301,15 @@ cat > "$HOME/shims/.shim" <<EOF
 #!/bin/bash
 h="$HOME"; name="\${0##*/}"
 real="\$(/usr/bin/awk -v n="\$name" '\$1 == n { print \$2; exit }' "\$h/shims/.real")"
-# one record, written whole, so shims running at once (the watchdog's sleep, say) never mix lines
 rec="argv: \$name"; for a in "\$@"; do rec="\$rec \$a"; done
 rec="\$rec
 env: \$(/usr/bin/env | /usr/bin/tr '\n' ' ')
 "
-printf '%s' "\$rec" >> "\$h/shims.log"
+log="\$(/usr/bin/mktemp "\$h/shims.d/r.XXXXXX")" || exit 1
+printf '%s' "\$rec" > "\$log"
 if [ "\$name" = mktemp ]; then
   made="\$("\$real" "\$@")" || exit \$?
-  case "\$made" in /*) printf 'made: %s\n' "\$made" ;; *) printf 'made: %s/%s\n' "\$PWD" "\$made" ;; esac >> "\$h/shims.log"
+  case "\$made" in /*) printf 'made: %s\n' "\$made" ;; *) printf 'made: %s/%s\n' "\$PWD" "\$made" ;; esac >> "\$log"
   printf '%s\n' "\$made"
   exit 0
 fi
@@ -326,12 +328,23 @@ for name in $SHIMMED; do
   printf '%s %s\n' "$name" "$real" >> "$HOME/shims/.real"
   ln -s .shim "$HOME/shims/$name"
 done
-shimmed() { ( export PATH="$HOME/shims:$PATH" TMPDIR="$HOME/tmp"; set -euo pipefail; "$@" ); }
+shimmed() {
+  local status=0
+  rm -rf "$HOME/shims.d"; mkdir "$HOME/shims.d"
+  ( export PATH="$HOME/shims:$PATH" TMPDIR="$HOME/tmp"; set -euo pipefail; "$@" ) || status=$?
+  cat "$HOME"/shims.d/r.* > "$HOME/shims.log" 2>/dev/null
+  return "$status"
+}
 HOME_P="$(cd "$HOME" && pwd -P)"   # the scratch home as the shims' working folder may name it
-# The shims ran, the fake node's scan ran (when asked) and found nothing, nothing is found now, and
-# every path mktemp made is inside the scratch home, where the scans look.
+# The shims ran, and every record is whole (as many lines start with "argv: " as there are records and
+# occurrences of it); the fake node's scan ran (when asked) and found nothing; nothing is found now;
+# and every path mktemp made is inside the scratch home, where the scans look.
 leak_free() {
-  [ -s "$HOME/shims.log" ] && { [ ! -e "$HOME/node-scan" ] || [ -e "$HOME/scan-found" ]; } && [ ! -s "$HOME/scan-found" ] \
+  local records
+  records="$(grep -c '^argv: ' "$HOME/shims.log" 2>/dev/null)"
+  [ -s "$HOME/shims.log" ] && [ "${records:-0}" -gt 0 ] && [ "$records" = "$(grep -o 'argv: ' "$HOME/shims.log" | wc -l | tr -d ' ')" ] \
+    && [ "$records" = "$(ls "$HOME/shims.d" | wc -l | tr -d ' ')" ] \
+    && { [ ! -e "$HOME/node-scan" ] || [ -e "$HOME/scan-found" ]; } && [ ! -s "$HOME/scan-found" ] \
     && [ -z "$(key_scan "$KEY")" ] && ! sed -n 's/^made: //p' "$HOME/shims.log" | grep -v "^$HOME/" | grep -qv "^$HOME_P/"
 }
 reset_run; meeting k1; fake_node; ok_reply; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"
@@ -731,6 +744,74 @@ abs_paths="$(grep -nE '(^|[^A-Za-z0-9_.-])/(usr/)?(local/)?bin/(printf|echo|test
 check "every block that expands the key runs only allowed builtins, names no command through a variable or a path, has no << or <<<, and writes nowhere but /dev/null, nor does anything around it; and meetingbox names no /bin printf, echo or test" \
   eval '[ "$(printf "%s\n" "$rule_out" | grep -c "^key ")" -ge 12 ] && [ -z "$rule_bad" ] && [ -z "$abs_paths" ]'
 [ -z "$rule_bad$abs_paths" ] || printf '%s\n' "$rule_bad" "$abs_paths"
+
+# --- the lines that handle the key, pinned ---
+# This list is deliberate. It is every line of meetingbox that spells a variable holding the key (key,
+# got and STORED_KEY: typed by the user or read from the keychain), as an expansion or an assignment;
+# every line naming key_ok, the one function handed the key as an argument, or stored_key, which hands
+# it back in STORED_KEY; every security call that can print a key (find-generic-password, dump-keychain);
+# and every line that uses eval, ${! or declare -p, bash's ways of reaching a variable without spelling
+# it (none of them near the key today). Each is compared as text, less its leading space, so a change
+# to how meetingbox handles the key must change this list, where a reviewer sees it; the awk rule above
+# is then the second line of defence. read_swap's key is a word of a .swap line, not the key, but a
+# text search cannot tell them apart, so its lines are pinned with the rest.
+key_lines() {
+  grep -E '\$\{?(key|got|STORED_KEY)([^A-Za-z0-9_]|$)|(^|[[:space:]])(key|got|STORED_KEY)\+?=|(^|[^A-Za-z0-9_])(key_ok|stored_key|eval)([^A-Za-z0-9_]|$)|(declare|typeset) +-[A-Za-z]*p|find-generic-password|dump-keychain|\$\{!' "$1" \
+    | sed 's/^[[:space:]]*//'
+}
+cat > "$HOME/key-lines" <<'LINES'
+if [ "${!i}" = 0 ]; then
+j=$i; while [ "$j" -le 8 ] && [ "${!j}" = 0 ]; do j=$((j + 1)); done
+printf -v piece '%x' "${!i}"
+key_ok() {
+security find-generic-password -s "$KEY_SERVICE" -a "$1" ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} >/dev/null 2>&1 || status=$?
+stored_key() {
+STORED_KEY=""
+got="$(security find-generic-password -s "$KEY_SERVICE" -a "$1" -w ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} 2>/dev/null; printf '.%s' "$?")"
+status="${got##*.}"
+got="${got%.*}"
+got="${got%$'\n'}"   # security ends what it prints with one newline of its own
+key_ok "$got" || return 2
+STORED_KEY="$got"
+key="$(LC_ALL=C tr '\000' ' '; printf x)"
+key="${key%x}"
+key="${key%$'\n'}"
+if ! key_ok "$key"; then
+printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"%s\n' "$KEY_SERVICE" "$address" "$key" "${MB_KEYCHAIN:+ \"$MB_KEYCHAIN\"}" \
+if stored_key "$address" && [ "$STORED_KEY" = "$key" ]; then stored=1; fi
+STORED_KEY=""
+[ -n "$b" ] && eval "$("$b" shellenv)"
+local reason="" key="" request answer status had_key=0
+status=0; stored_key "$OUTSIDE_ADDRESS" || status=$?
+0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
+answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
+key=""
+local host node key="" had_key=0 status=0 rc work limit chars finish tokens counted schema type request answer
+stored_key "$address" || status=$?
+0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
+if ! outside_runtime; then key=""; outside_note "$host" 0 "outside models are not set up"; return 1; fi
+answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
+key=""
+key="${line%% *}"; value="${line#* }"
+case "$n:$key" in
+if [ "$key" = move ]; then SWAP_MOVES="$SWAP_MOVES $value"; else SWAP_DISPLACES="$SWAP_DISPLACES $value"; fi ;;
+LINES
+key_lines "$ROOT/meetingbox" > "$HOME/key-lines.now"
+lines_diff="$(diff "$HOME/key-lines" "$HOME/key-lines.now")"
+check "the lines of meetingbox that handle the key are exactly the pinned ones: none added, removed or changed" \
+  eval '[ -z "$lines_diff" ]'
+[ -z "$lines_diff" ] || printf '%s\n' "$lines_diff"
+# And key_ok whole, the one function handed the key as an argument, by whichever form it is written.
+cat > "$HOME/key-ok" <<'FN'
+key_ok() {
+[ -n "$1" ] && [ "${#1}" -le 4096 ] || return 1
+case "$1" in *[!$KEY_CHARS]*) return 1 ;; esac
+}
+FN
+fn_diff="$(sed -n '/^key_ok() {$/,/^}$/p' "$ROOT/meetingbox" | sed 's/^[[:space:]]*//' | diff "$HOME/key-ok" -)"
+check "key_ok, the one function handed the key as an argument, is word for word the pinned text, and is defined once" \
+  eval '[ -z "$fn_diff" ] && [ "$(grep -cE "(^|[^A-Za-z0-9_])key_ok *\(\)|^function +key_ok" "$ROOT/meetingbox")" = 1 ]'
+[ -z "$fn_diff" ] || printf '%s\n' "$fn_diff"
 
 # --- a runtime that is not set up is never sent to ---
 not_set_up() {   # $1: name; expects the not-sent note, and no complete call
@@ -1503,9 +1584,12 @@ for level in tools all; do
 done
 rm -rf "$HOME/Documents" "$HOME/Meetings2"
 # With BASE_DIR on another disk, nothing but the HOME rule stands between rm and HOME or a folder
-# above it.
-fresh_setup; rm -f "$HOME/rm-refused"
-above=("$HOME" "${HOME%/*}" "${HOME%/*/*}")
+# above it, by any spelling (the Data volume's, /private added or taken off); nor is there a
+# ~/Meetings whose folders would cover it.
+case "$HOME" in /private/*) other_home="${HOME#/private}" ;; *) other_home="/private$HOME" ;; esac
+DATA_HOME="/System/Volumes/Data$SCRATCH"
+fresh_setup; rm -f "$HOME/rm-refused"; rm -rf "$HOME/Meetings"
+above=("$HOME" "${HOME%/*}" "${HOME%/*/*}" "$DATA_HOME" "$other_home")
 printf '%s\n' "${above[@]}" >> "$INSTALLED"
 out="$( (BASE_DIR="/Volumes/meetingbox-elsewhere/Meetings"; rm() { safe_rm "$@"; }
          for p in "${above[@]}"; do remove_installed "$p"; done) 2>&1 )"
@@ -1514,29 +1598,30 @@ for p in "${above[@]}"; do
   grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
   printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
 done
-check "with BASE_DIR on another disk, HOME and the folders above it are still refused, with a warning, and their lines kept" \
+check "with BASE_DIR on another disk, HOME and the folders above it are still refused, by every spelling, with a warning, and their lines kept" \
   eval '[ -z "$missing" ] && [ -d "$HOME/.meetingbox" ] && [ ! -e "$HOME/rm-refused" ]'
+[ -z "$missing" ] || printf '%s\n' "$missing"
 : > "$INSTALLED"
 
 # The guard compares folders, by device and inode, not spellings. For each way of naming BASE_DIR, a
 # meeting in it, HOME or a folder above them by another spelling: a link, /private added or taken
 # off, the Data volume's own path, NFD against NFC, a relative BASE_DIR, and a BASE_DIR that is a link.
 # Each line is refused with the warning and kept, every meeting's audio is still there, and the plain
-# recorded paths (MINUTES_DIR, NODE_FILE and a folder of setup's) are removed.
-case "$HOME" in /private/*) other_home="${HOME#/private}" ;; *) other_home="/private$HOME" ;; esac
-DATA_HOME="/System/Volumes/Data$SCRATCH"
+# recorded paths (MINUTES_DIR, NODE_FILE and a folder of setup's) are removed. SPELL_DATA names the
+# Data volume, SPELL_CWD the folder reset runs from, and SPELL_APP what the app's Preferences name.
 NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'
 spellings_case() {   # $1: name; $2: BASE_DIR as reset sees it (from $HOME); $3: the real meetings folder; then the lines
   local name="$1" base="$2" real="$3" level p
   shift 3
   for level in tools all; do
     fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
-    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink"
-    mkdir -p "$real/m1" "$SRC_DIR/plain"; printf 'aac' > "$real/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
+    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
+    mkdir -p "$real/m1" "$SRC_DIR/plain" "${SPELL_CWD:-$HOME}"; printf 'aac' > "$real/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
     case "$name" in "a BASE_DIR that is a link"*) ln -s "$HOME/elsewhere/Real" "$HOME/MeetingsLink" ;; esac
     ln -s "$real" "$SRC_DIR/link"
     printf '%s\n' "$@" "$SRC_DIR/plain" >> "$INSTALLED"
-    out="$( (cd "$HOME"; BASE_DIR="$base"; DATA_VOLUME="${SPELL_DATA:-$DATA_VOLUME}"; rm() { safe_rm "$@"; }
+    out="$( (cd "${SPELL_CWD:-$HOME}"; BASE_DIR="$base"; DATA_VOLUME="${SPELL_DATA:-$DATA_VOLUME}"; rm() { safe_rm "$@"; }
+             defaults() { [ -n "${SPELL_APP:-}" ] && printf '%s\n' "$SPELL_APP"; }
              refuse_while_busy() { return 0; }; adopt_own_app() { :; }
              quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }
              brew() { return 1; }; reset_cmd "$level") 2>&1 )"
@@ -1560,26 +1645,121 @@ spellings_case "a BASE_DIR that is a link" "$HOME/MeetingsLink" "$HOME/elsewhere
 # again with no Data volume (another disk, an older macOS), so only the physical path names its parent
 SPELL_DATA="$HOME/no-data-volume" spellings_case "a BASE_DIR that is a link, with no Data volume" "$HOME/MeetingsLink" \
   "$HOME/elsewhere/Real" "$HOME/elsewhere/Real" "$HOME/elsewhere/Real/m1" "$HOME/elsewhere"
-rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink"; : > "$INSTALLED"
+# The other folders meetingbox records meetings in are protected too, equal, under and above: the app's
+# own, from its Preferences; MB_DIR with a ~/ left unexpanded, which the app expands to $HOME/; and
+# ~/Meetings always, as a relative BASE_DIR names it from $HOME while reset may run from elsewhere.
+SPELL_APP="$HOME/Documents/AppMeetings" spellings_case "the app's own meetings folder" "$HOME/m" "$HOME/Documents/AppMeetings" \
+  "$HOME/Documents/AppMeetings/m1" "$HOME/Documents/AppMeetings" "$HOME/Documents"
+SPELL_CWD="$HOME/sub" spellings_case "MB_DIR with a ~/ left unexpanded" '~/Meetings' "$HOME/Meetings" "$HOME/Meetings/m1" "$HOME/Meetings"
+SPELL_CWD="$HOME/sub" spellings_case "MB_DIR with a ~/ left unexpanded, naming another folder" '~/Docs/Mtgs' "$HOME/Docs/Mtgs" \
+  "$HOME/Docs/Mtgs/m1" "$HOME/Docs/Mtgs" "$HOME/Docs"
+SPELL_CWD="$HOME/sub" spellings_case "a relative BASE_DIR, reset run from another folder" "Meetings" "$HOME/Meetings" \
+  "$HOME/Meetings/m1" "$HOME/Meetings"
+rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
+: > "$INSTALLED"
+
+# A line through a link into a meeting folder, or a meeting's own volfs name (/.vol/<device>/<inode>),
+# spells no meetings folder above it: the guard follows the physical path too. Each line is refused
+# with the warning and kept, every meeting's files stay, and the plain recorded path goes.
+for level in tools all; do
+  fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
+  rm -rf "$HOME/m" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink"
+  mkdir -p "$HOME/m/m1" "$HOME/m/m2" "$HOME/m/m3/earlier" "$HOME/m/m4/sub/more" "$SRC_DIR/plain"
+  printf 'aac' > "$HOME/m/m1/audio.m4a"; printf 'aac' > "$HOME/m/m2/audio.m4a"; printf 'old' > "$HOME/m/m3/earlier/notes.md"
+  printf 'aac' > "$HOME/m/m4/sub/more/deep.m4a"; : > "$SRC_DIR/plain/keep"
+  ln -s "$HOME/m" "$SRC_DIR/link"; ln -s "$HOME/m/m1" "$SRC_DIR/mlink"; ln -s "$HOME/m/m3/earlier" "$SRC_DIR/elink"
+  vol="/.vol/$(/usr/bin/stat -f %d "$HOME/m/m2")/$(/usr/bin/stat -f %i "$HOME/m/m2")"
+  physical=("$SRC_DIR/mlink/audio.m4a" "$SRC_DIR/elink/notes.md" "$vol" "$vol/audio.m4a" "$SRC_DIR/link/m4/sub/more/deep.m4a")
+  printf '%s\n' "${physical[@]}" "$SRC_DIR/plain" >> "$INSTALLED"
+  out="$( (BASE_DIR="$HOME/m"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
+           reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
+           reset_cmd "$level") 2>&1 )"
+  missing=""
+  for p in "${physical[@]}"; do
+    grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
+    printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
+  done
+  check "reset_cmd $level refuses, with a warning, a line through a link into a meeting folder or into a meeting's earlier/, a meeting's volfs name and a file under it, and a file three folders down a meeting through a link, keeps each line, keeps every meeting's files, and removes the plain path" \
+    eval '[ -z "$missing" ] && [ -f "$HOME/m/m1/audio.m4a" ] && [ -f "$HOME/m/m2/audio.m4a" ] && [ -f "$HOME/m/m3/earlier/notes.md" ]
+          && [ -f "$HOME/m/m4/sub/more/deep.m4a" ] && [ ! -e "$SRC_DIR/plain" ] && ! installed_by_us "$SRC_DIR/plain" && [ ! -e "$HOME/rm-refused" ]'
+  [ -z "$missing" ] || printf '%s\n' "$missing"
+done
+rm -rf "$HOME/m" "$SRC_DIR/link" "$SRC_DIR/mlink" "$SRC_DIR/elink"; : > "$INSTALLED"
+
+# The guard asks the system's stat (GUARD_STAT), so a stat earlier on the PATH, whether GNU's (whose
+# -f takes no format, so it fails) or a planted one answering identities that never match, cannot
+# change what it decides: a meeting line only the identities refuse (through a link) is refused and a
+# plain one removed either way.
+mkdir -p "$HOME/statbin"
+cat > "$HOME/statbin/never-matches" <<'EOF'
+#!/bin/bash
+n=0; for a in "$@"; do case "$a" in -*|%*) ;; *) n=$((n + 1)); echo "0:$$.$n" ;; esac; done
+EOF
+cat > "$HOME/statbin/gnu-style" <<'EOF'
+#!/bin/bash
+for a in "$@"; do case "$a" in %*) exit 1 ;; esac; done   # GNU's -f takes no format: %d:%i is a missing file
+exec /usr/bin/stat "$@"
+EOF
+cat > "$HOME/statbin/fails-on-plain3" <<'EOF'
+#!/bin/bash
+case "$*" in *plain3*) exit 1 ;; esac
+exec /usr/bin/stat "$@"
+EOF
+cat > "$HOME/statbin/fails-on-root" <<'EOF'
+#!/bin/bash
+case " $* " in *" / "*) exit 1 ;; esac
+exec /usr/bin/stat "$@"
+EOF
+chmod 755 "$HOME/statbin"/*
+for planted in never-matches gnu-style; do
+  fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"; rm -rf "$HOME/m" "$HOME/onpath" "$SRC_DIR/link"
+  mkdir -p "$HOME/m/m1" "$SRC_DIR/plain" "$HOME/onpath"; printf 'aac' > "$HOME/m/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
+  ln -s "$HOME/m" "$SRC_DIR/link"; cp "$HOME/statbin/$planted" "$HOME/onpath/stat"
+  printf '%s\n' "$SRC_DIR/link/m1" "$SRC_DIR/plain" >> "$INSTALLED"
+  want="refusing to remove '$SRC_DIR/link/m1'"
+  out="$( (PATH="$HOME/onpath:$PATH"; BASE_DIR="$HOME/m"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }; adopt_own_app() { :; }
+           quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }
+           brew() { return 1; }; reset_cmd tools) 2>&1 )"
+  check "reset_cmd tools with a stat first on the PATH ($planted): the meeting line through a link is refused with the warning and kept, its audio stays, and the plain path goes" \
+    eval 'printf "%s" "$out" | grep -qF "$want" && grep -qxF "$SRC_DIR/link/m1" "$INSTALLED" && [ -f "$HOME/m/m1/audio.m4a" ]
+          && [ ! -e "$SRC_DIR/plain" ] && [ ! -e "$MINUTES_DIR" ] && [ ! -e "$HOME/rm-refused" ]'
+done
+rm -rf "$HOME/m" "$HOME/onpath" "$SRC_DIR/link"; : > "$INSTALLED"
 # Fail safe: when the path, or a folder the guard protects, cannot be examined (stat fails), the line is
 # refused and kept.
 fresh_setup; rm -f "$HOME/rm-refused"; mkdir -p "$SRC_DIR/plain3"; record_install "$SRC_DIR/plain3"
 want="refusing to remove '$SRC_DIR/plain3'"
-# (functions of their own: bash 3.2 cannot parse a case statement inside $( ))
-stat_fails_on_plain3() { case "$*" in *plain3*) return 1 ;; esac; command stat "$@"; }
-stat_fails_on_root() { case " $* " in *" / "*) return 1 ;; esac; command stat "$@"; }
-out1="$( (stat() { stat_fails_on_plain3 "$@"; }; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc1=$?
-out2="$( (stat() { stat_fails_on_root "$@"; }; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc2=$?
+out1="$( (GUARD_STAT="$HOME/statbin/fails-on-plain3"; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc1=$?
+out2="$( (GUARD_STAT="$HOME/statbin/fails-on-root"; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc2=$?
 check "when stat fails on the path, or on the folders the guard protects, the line is refused with the warning and kept" \
   eval '[ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ] && printf "%s" "$out1" | grep -qF "$want" && printf "%s" "$out2" | grep -qF "$want"
         && [ -d "$SRC_DIR/plain3" ] && installed_by_us "$SRC_DIR/plain3" && [ ! -e "$HOME/rm-refused" ]'
 out3="$( (rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"
 check "with stat working, the same plain line is removed" eval '[ ! -e "$SRC_DIR/plain3" ] && ! installed_by_us "$SRC_DIR/plain3"'
 : > "$INSTALLED"
+# And through reset itself: when the guard's folders cannot be worked out (here the stat of /, which
+# only guard_folders asks for, fails), every line is refused, the plain one too, and nothing is removed.
+fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"; rm -rf "$HOME/m" "$SRC_DIR/link"
+mkdir -p "$HOME/m/m1" "$SRC_DIR/plain"; printf 'aac' > "$HOME/m/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"; ln -s "$HOME/m" "$SRC_DIR/link"
+unguarded=("$SRC_DIR/link/m1" "$DATA_HOME" "$SRC_DIR/plain" "$MINUTES_DIR" "$NODE_FILE")
+printf '%s\n' "$SRC_DIR/link/m1" "$DATA_HOME" "$SRC_DIR/plain" >> "$INSTALLED"
+out="$( (GUARD_STAT="$HOME/statbin/fails-on-root"; BASE_DIR="$HOME/m"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }
+         adopt_own_app() { :; }; quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }
+         remove_signing_identity() { :; }; brew() { return 1; }; reset_cmd tools) 2>&1 )"
+missing=""
+for p in "${unguarded[@]}"; do
+  grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
+  printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
+done
+check "reset_cmd tools when guard_folders fails: every line is refused with the warning and kept, the plain ones too, and nothing is removed" \
+  eval '[ -z "$missing" ] && [ -f "$HOME/m/m1/audio.m4a" ] && [ -f "$SRC_DIR/plain/keep" ] && [ -e "$MINUTES_DIR" ] && [ -e "$NODE_FILE" ]
+        && [ ! -e "$HOME/rm-refused" ]'
+[ -z "$missing" ] || printf '%s\n' "$missing"
+rm -rf "$HOME/m" "$SRC_DIR/link"; : > "$INSTALLED"
 
 # The leftover sweep takes only the names mktemp makes: .minutes. or .minutes-old. and six letters or
 # digits.
-fresh_setup; reset_run
+fresh_setup; reset_run; rm -f "$HOME/rm-refused"
 sweep="$SRC_DIR/.minutes.Ab3dE9 $SRC_DIR/.minutes-old.Zz09aa $SRC_DIR/.minutes.ab/cde $SRC_DIR/.minutes.a.b.cd $SRC_DIR/.minutes-old.a/b/cd"
 for p in $sweep; do mkdir -p "$p"; : > "$p/keep"; record_install "$p"; done
 ( rm() { safe_rm "$@"; }; remove_minutes_leftovers ) > /dev/null 2>&1

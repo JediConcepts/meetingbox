@@ -285,13 +285,15 @@ remove_installed() {
 }
 
 # A record line remove_installed may hand to rm: absolute, with no empty, . or .. part and no final /,
-# and neither BASE_DIR, nor in it or above it (so never a meeting folder), nor HOME or above it. First
-# by spelling, case ignored as the Mac's disk ignores it; then by folder (device and inode), so no
-# other spelling of the same folder passes: a link, /private, the Data volume's own path, another
-# Unicode form. A relative BASE_DIR is taken from the current folder. A path or folder that cannot be
-# examined is refused.
+# and neither a meetings folder (BASE_DIR and the others guard_folders names), nor in one or above it
+# (so never a meeting folder), nor HOME or above it. First by spelling, case ignored as the Mac's disk
+# ignores it; then by folder (device and inode), so no other spelling of the same folder passes: a
+# link, /private, the Data volume's own path, another Unicode form. The folders above the line are
+# taken as spelt and again on its physical path (cd -P, which resolves links and /.vol names), so a
+# link into a meeting folder, or a meeting's volfs name, shows the meetings folder above it. A relative
+# BASE_DIR is taken from the current folder. A path or folder that cannot be examined is refused.
 removable() {
-  local p="$1" base home="${HOME%/}" nocase=0 ok=0 a ids n=0 id first=""
+  local p="$1" base home="${HOME%/}" nocase=0 ok=0 a rest real ids n=0 id first=""
   case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
   case "$p" in
     /*/|*//*|*/./*|*/.|*/../*|*/..) return 1 ;;
@@ -308,51 +310,74 @@ removable() {
   [ "$nocase" = 1 ] || shopt -u nocasematch
   [ "$ok" = 1 ] || return 1
   [ "$GUARD_FIXED" = 1 ] || guard_folders || return 1
-  # the path and every folder above it that is there, in one stat
+  # the path and every folder above it that is there, as spelt, in one stat
   set --
   if [ -e "$p" ]; then set -- "$p"; first=1; fi
   a="${p%/*}"
   while [ -n "$a" ]; do [ ! -e "$a" ] || set -- "$@" "$a"; a="${a%/*}"; done   # p is absolute
+  # and again on its physical path: a folder's is where cd -P lands; anything else takes the nearest
+  # folder above it that is there, physically, with the rest of the path put back
+  a="$p"; rest=""
+  while [ ! -d "$a" ] && [ -n "$a" ]; do rest="${a##*/}${rest:+/$rest}"; a="${a%/*}"; done
+  real="$(cd -P -- "${a:-/}" 2>/dev/null && pwd -P)" || return 1
+  a="${real%/}${rest:+/$rest}"
+  while [ -n "$a" ]; do [ ! -e "$a" ] || set -- "$@" "$a"; a="${a%/*}"; done
   [ "$#" -gt 0 ] || return 0
-  ids="$(stat -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
+  ids="$("$GUARD_STAT" -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
   while IFS= read -r id; do
     n=$((n + 1))
     [ -n "$id" ] || return 1
-    # inside BASE_DIR, or BASE_DIR itself
-    [ "$id" != "$GUARD_BASE" ] || return 1
-    # the path itself is BASE_DIR, HOME or a folder above either
+    # inside a meetings folder, or one itself
+    case "$GUARD_BASE" in *" $id "*) return 1 ;; esac
+    # the path itself is a meetings folder, HOME or a folder above either
     if [ "$n" = 1 ] && [ -n "$first" ]; then case "$GUARD_ABOVE" in *" $id "*) return 1 ;; esac; fi
   done <<< "$ids"
   [ "$n" = "$#" ]
 }
 
-# The folders removable protects, by device and inode: GUARD_BASE is BASE_DIR's (empty when it is not
-# there), and GUARD_ABOVE holds BASE_DIR's, HOME's and every folder's above them, above their spelt
-# paths, their physical paths (cd -P), and those on the Data volume (/System/Volumes/Data). False when
-# a folder there cannot be examined. reset works them out once (GUARD_FIXED); otherwise each call does.
+# The folders removable protects, by device and inode. GUARD_BASE holds the meetings folders that are
+# there: BASE_DIR; MB_DIR with a ~/ left unexpanded, as the app expands it; the app's own folder, from
+# its Preferences; and ~/Meetings. GUARD_ABOVE holds those, HOME, and every folder above them, above
+# their spelt paths, their physical paths (cd -P), and those on the Data volume (/System/Volumes/Data).
+# BASE_DIR and HOME are protected whether they are there or not (the folders above them are); one of
+# the other meetings folders that is not there protects nothing. False when a folder there cannot be
+# examined. reset works them out once (GUARD_FIXED); otherwise each call does. The guard asks the
+# system's stat, so one earlier on the PATH (GNU's, whose -f takes no format) cannot decide for it.
 GUARD_FIXED=0; GUARD_BASE=""; GUARD_ABOVE=""
 DATA_VOLUME="/System/Volumes/Data"   # macOS's Data volume, which gives the same folders a second path
+GUARD_STAT="/usr/bin/stat"           # the system's stat: the guard never takes one from the PATH
 guard_folders() {
-  local base f d real list="" ids
+  local base f d real list="" ids meetings
   case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
-  GUARD_BASE=""; GUARD_ABOVE=" "
-  for f in "$base" "${HOME%/}"; do
+  GUARD_BASE=" "; GUARD_ABOVE=" "
+  meetings="$base"$'\n'"$HOME/Meetings"$'\n'"$(app_meetings_folder)"
+  case "$BASE_DIR" in "~"|"~/"*) meetings="$meetings"$'\n'"$HOME${BASE_DIR#\~}" ;; esac
+  while IFS= read -r f; do
+    f="${f%/}"
+    [ -n "$f" ] || continue
+    [ "$f" = "$base" ] || [ "$f" = "${HOME%/}" ] || [ -e "$f" ] || continue
     # the folder as spelt, then the nearest folder of it that is there, physically, and on the Data volume
     d="$f"; list="$list$f"$'\n'
     while [ ! -d "$d" ] && [ -n "$d" ]; do case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac; done
     real="$(cd -P -- "${d:-/}" 2>/dev/null && pwd -P)" || return 1
     list="$list$real"$'\n'
     if [ -d "$DATA_VOLUME$real" ]; then list="$list$DATA_VOLUME$real"$'\n'; fi
-  done
+  done <<< "$meetings"$'\n'"${HOME%/}"
   set --
   while IFS= read -r f; do
     while [ -n "$f" ]; do [ ! -e "$f" ] || set -- "$@" "$f"; case "$f" in */*) f="${f%/*}" ;; *) f="" ;; esac; done
   done <<< "$list"
   set -- "$@" /
-  ids="$(stat -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
+  ids="$("$GUARD_STAT" -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
   [ "$(printf '%s\n' "$ids" | grep -c .)" = "$#" ] || return 1
   GUARD_ABOVE=" $(printf '%s' "$ids" | tr '\n' ' ') "
-  if [ -e "$base" ]; then GUARD_BASE="$(stat -L -f %d:%i -- "$base" 2>/dev/null)" || return 1; fi
+  # the meetings folders that are there
+  set --
+  while IFS= read -r f; do f="${f%/}"; [ -z "$f" ] || [ ! -e "$f" ] || set -- "$@" "$f"; done <<< "$meetings"
+  [ "$#" -gt 0 ] || return 0
+  ids="$("$GUARD_STAT" -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$ids" | grep -c .)" = "$#" ] || return 1
+  GUARD_BASE=" $(printf '%s' "$ids" | tr '\n' ' ') "
   return 0
 }
 
