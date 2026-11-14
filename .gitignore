@@ -19,3 +19,6 @@ Models/
 
 # macOS
 .DS_Store
+
+# outside minutes: the router npm installs; setup and tests/run.sh install it elsewhere
+minutes/node_modules/

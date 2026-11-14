@@ -1,0 +1,13 @@
+{
+  "name": "meetingbox-minutes",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sends one meeting's transcript to the outside model the user chose, through the AI Execution Router.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ai-execution-router": "1.1.1"
+  }
+}

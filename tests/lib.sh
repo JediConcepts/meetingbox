@@ -51,3 +51,48 @@ swift()     { echo "swift $*" >> "$HOME/calls.log"; return 1; }
 afconvert() { echo "afconvert $*" >> "$HOME/calls.log"; : > "${!#}"; }
 # Parakeet counts as set up, so a setup() test sees no Parakeet step unless its suite says otherwise.
 speech_ready() { return 0; }
+# Node is never run by name: the engine runs the recorded one with env -i and its absolute path, which
+# this stub cannot see, so a suite that may reach outside minutes also calls fake_node.
+node() { echo "node $*" >> "$HOME/calls.log"; return 1; }
+# Outside models count as set up, and their setup step does nothing, so a setup() test never finds a
+# real Node, runs npm or offers Homebrew unless its suite says otherwise (test_writer.sh does).
+minutes_ready()   { return 0; }
+install_minutes() { echo "install_minutes" >> "$HOME/calls.log"; return 0; }
+
+# A fake Node in the scratch home, recorded in NODE_FILE as setup records the real one, beside a
+# placeholder MINUTES_DIR/writer.mjs. It runs with an empty environment, so every path in it is
+# absolute. Each call appends "argv: ..." and "env: ..." lines to $HOME/node.log; "Never calls Node"
+# means that file does not exist. What it reads on stdin goes to $HOME/node.stdin.<command>. It answers:
+#   --version             $HOME/node-version, else v22.22.2
+#   <writer.mjs> version  {"router": "1.1.1"}, or $HOME/node-router-version's text
+#   <writer.mjs> list     $HOME/node-list, else {"models": []}
+#   <writer.mjs> complete $HOME/node-reply, else minutes in Markdown
+# with the status in $HOME/node-status (default 0). $HOME/node-sleep makes complete sleep that many
+# seconds first (exec, so a TERM reaches the sleep), and $HOME/node-stderr-stdin makes it copy its
+# stdin to stderr, the key included.
+fake_node() {
+  local f="$HOME/fake-node/node"
+  mkdir -p "$HOME/fake-node" "$STATE_DIR" "$MINUTES_DIR"
+  cat > "$f" <<EOF
+#!/bin/bash
+h="$HOME"
+{ printf 'argv:'; printf ' %s' "\$@"; printf '\n'; printf 'env:'; /usr/bin/env | /usr/bin/tr '\n' ' '; printf '\n'; } >> "\$h/node.log"
+case "\$1" in --version) /bin/cat "\$h/node-version" 2>/dev/null || echo v22.22.2; exit 0 ;; esac
+cmd="\${2:-}"
+case "\$cmd" in list|complete) /bin/cat > "\$h/node.stdin.\$cmd" ;; esac
+[ ! -e "\$h/node-stderr-stdin" ] || /bin/cat "\$h/node.stdin.\$cmd" >&2
+case "\$cmd" in
+  version) if [ -e "\$h/node-router-version" ]; then /bin/cat "\$h/node-router-version"; else echo '{"router": "1.1.1"}'; fi ;;
+  list) if [ -e "\$h/node-list" ]; then /bin/cat "\$h/node-list"; else echo '{"models": []}'; fi ;;
+  complete)
+    [ ! -e "\$h/node-sleep" ] || exec /bin/sleep "\$(/bin/cat "\$h/node-sleep")"
+    if [ -e "\$h/node-reply" ]; then /bin/cat "\$h/node-reply"
+    else printf '%s\n' '{"text": "## Summary\\nThe plan was agreed.\\n\\n## Decisions\\nNone\\n", "finishReason": "stop", "inputTokens": 0, "tokenSource": "unreported"}'; fi ;;
+esac
+exit "\$(/bin/cat "\$h/node-status" 2>/dev/null || echo 0)"
+EOF
+  chmod 755 "$f"
+  printf '%s\n' "$f" > "$NODE_FILE"
+  record_install "$NODE_FILE"
+  [ -e "$MINUTES_DIR/writer.mjs" ] || : > "$MINUTES_DIR/writer.mjs"
+}

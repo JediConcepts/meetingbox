@@ -1,0 +1,110 @@
+# The address rule (spec section 5), one case a line, read by the bash, node and Swift tests alike.
+#   allow <address>    the engine, writer.mjs and the app all accept it
+#   refuse <address>   all three refuse it, before it reaches security, node or the install record
+# The address is the rest of the line after the first space, as written, except four escapes:
+# \n a newline, \r a carriage return, \t a tab, \\ one backslash. Lines starting with # and empty
+# lines are not cases. An address of more than 2048 characters is refused; the suites test that.
+allow https://api.anthropic.com
+allow https://api.anthropic.com/
+allow https://openrouter.ai/api/v1
+allow https://my-gateway.example.co.uk:8443/openai/v1
+allow https://h.example/v1
+allow https://a.example:1/x
+allow https://a.example:65535/x
+allow https://localhost:8443/v1
+allow https://bridge
+allow https://xn--bcher-kva.example/v1
+allow https://127.0.0.1.evil.example/v1
+allow https://example.com/path/with-dash_and.dot~tilde/
+allow https://example.com/v1/%7Euser
+allow https://example.com/v1/../../x
+allow https://example.com/a;b=c,d!$&()*+:e
+allow https://[2001:db8::1]/v1
+allow https://[::1]/v1
+allow https://[2001:db8:0:0:0:0:0:1]:8443
+allow http://127.0.0.1
+allow http://127.0.0.1:11434/v1
+allow http://127.0.0.1:11434/v1/
+allow http://localhost:1234/v1
+allow http://localhost
+allow http://[::1]:8080/v1
+allow http://[::1]
+# the scheme: lower-case https:// or http:// only
+refuse HTTPS://api.anthropic.com
+refuse Https://api.anthropic.com
+refuse ftp://example.com
+refuse https:/example.com
+refuse https//example.com
+refuse example.com
+refuse //example.com
+refuse https://
+refuse http://
+refuse https:///v1
+refuse  https://api.anthropic.com
+# http for the three local hosts only, exactly
+refuse http://example.com
+refuse http://127.0.0.1.evil.example
+refuse http://127.0.0.1.evil.example:11434/v1
+refuse http://localhost.evil.example
+refuse http://127.0.0.2:11434
+refuse http://0.0.0.0:11434
+refuse http://192.168.1.10:1234/v1
+refuse http://[::2]:80
+refuse http://[0:0:0:0:0:0:0:1]:80
+refuse http://LOCALHOST:11434
+refuse http://Localhost
+# https for a DNS name (lower case) or a bracketed IPv6 literal, never an IPv4 literal
+refuse https://1.2.3.4/v1
+refuse https://127.0.0.1:8443
+refuse https://API.anthropic.com
+refuse https://-example.com
+refuse https://example-.com
+refuse https://example..com
+refuse https://.example.com
+refuse https://example.com.
+refuse https://exa_mple.com
+refuse https://exämple.com
+refuse https://exa mple.com
+refuse https://[::1
+refuse https://[::1]x/v1
+refuse https://[fe80::1%25en0]/v1
+refuse https://[:::1]/
+refuse https://[1:2:3:4:5:6:7:8:9]/
+refuse https://[1:2:3:4:5:6:7]/
+refuse https://[12345::1]/
+refuse https://[::g]/
+refuse https://[::FFFF]/
+refuse https://[1::2::3]/
+refuse https://[::1.2.3.4]/
+# the port: 1 to 65535, digits only, no leading zero
+refuse https://example.com:0
+refuse https://example.com:65536
+refuse https://example.com:
+refuse https://example.com:080
+refuse https://example.com:8a
+refuse https://example.com:-1
+refuse https://example.com:443:443
+# no user information, query, fragment, space, quote, backslash or control character
+refuse https://user@example.com
+refuse https://user:pass@example.com/v1
+refuse https://example.com@evil.example
+refuse https://example.com/v1@x
+refuse https://example.com/v1?x=1
+refuse https://example.com/v1?
+refuse https://example.com/v1#frag
+refuse https://example.com/a b
+refuse https://example.com/a"b
+refuse https://example.com/a'b
+refuse https://example.com/a`b
+refuse https://example.com/a\\b
+refuse https://example.com\\@evil.example
+refuse https://h.example/v1\n/tmp/x
+refuse https://h.example\n
+refuse https://h.example/v1\r
+refuse https://h.example/v1\t
+refuse https://example.com/<script>
+refuse https://example.com/a{b}
+refuse https://example.com/a|b
+refuse https://example.com/a^b
+refuse https://example.com/a[b]
+refuse https://example.com/é

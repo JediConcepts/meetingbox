@@ -720,16 +720,16 @@ voice_reset; rm -f "$VOICE_FILE"
 out="$(engines_out)"
 printf '%s\n' '{"model": "m", "seconds": 75.4, "meetings": 1, "sources": [], "sample": true, "refusals": 0, "vector": [1], "updated": "x"}' > "$VOICE_FILE"
 out2="$(engines_out)"
-if [ "$out" = "$(printf 'parakeet ready\napple ready\nvoice none')" ] && [ "$out2" = "$(printf 'parakeet ready\napple ready\nvoice 75 1 sample')" ] \
+if [ "$out" = "$(printf 'parakeet ready\napple ready\nvoice none\noutside-runtime unavailable outside models are not set up')" ] && [ "$out2" = "$(printf 'parakeet ready\napple ready\nvoice 75 1 sample\noutside-runtime unavailable outside models are not set up')" ] \
    && ! grep -q '^curl' "$HOME/calls.log"; then
-  pass "engines: the parakeet, apple and voice lines, with no network call"
-else fail "engines: the parakeet, apple and voice lines, with no network call: $out / $out2 / $(cat "$HOME/calls.log")"; fi
+  pass "engines: the parakeet, apple, voice and outside-runtime lines, with no network call"
+else fail "engines: the parakeet, apple, voice and outside-runtime lines, with no network call: $out / $out2 / $(cat "$HOME/calls.log")"; fi
 touch "$HOME/check-fails"
 out="$(NO_SA=1 engines_out)"
 rm -f "$HOME/check-fails"; mv "$SPEECH_BIN" "$SPEECH_BIN.away"
 out2="$(engines_out)"
 mv "$SPEECH_BIN.away" "$SPEECH_BIN"
-if [ "$out" = "$(printf 'parakeet unavailable a model file is the wrong size\napple unavailable speech-analyzer is not installed\nvoice 75 1 sample')" ] \
+if [ "$out" = "$(printf 'parakeet unavailable a model file is the wrong size\napple unavailable speech-analyzer is not installed\nvoice 75 1 sample\noutside-runtime unavailable outside models are not set up')" ] \
    && [ "$(printf '%s\n' "$out2" | head -n 1)" = "parakeet unavailable the speech helper is not installed" ]; then
   pass "engines: unavailable, each with its reason in one line"
 else fail "engines: unavailable, each with its reason in one line: $out / $out2"; fi
