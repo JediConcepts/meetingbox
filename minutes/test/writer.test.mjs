@@ -8,6 +8,8 @@ import { readFileSync, existsSync, mkdtempSync, copyFileSync, mkdirSync, writeFi
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { createServer as createTlsServer } from "node:https";
+import { constants as cryptoConstants } from "node:crypto";
+import dc from "node:diagnostics_channel";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -103,6 +105,18 @@ function fetchFailed(cause) {
   return err;
 }
 function coded(code, message = code) { return Object.assign(new Error(message), { code }); }
+// Node's own fetch publishes connectError when it could not make a connection, and connected when it
+// made one. A stubbed fetch publishes them itself, in the same shape.
+const CHANNELS = { connected: dc.channel("undici:client:connected"), connectError: dc.channel("undici:client:connectError") };
+function publish(name, error) {
+  const connectParams = { host: "127.0.0.1:11434", hostname: "127.0.0.1", protocol: "http:", port: "11434", servername: null };
+  CHANNELS[name].publish(error ? { connectParams, connector: () => {}, error } : { connectParams, connector: () => {}, socket: null });
+}
+// A connection refused the way Node's own fetch reports it: connectError published, then the rejection.
+function refused(cause) {
+  publish("connectError", cause);
+  return fetchFailed(cause);
+}
 
 const MINUTES = "## Summary\nThe plan was agreed.\n\n## Decisions\n- Ship in March\n\n## Actions\nNone\n\n## Open questions\nNone\n";
 
@@ -364,23 +378,59 @@ test("a connection reset after the request went counts as sent", async () => {
   assert.equal(e.type, "other");
 });
 
-test("ECONNREFUSED gives connect, not sent", async () => {
+test("a real source that reads the whole body and then destroys the socket: sent", async () => {
+  let got = "";
+  const s = await server((rq) => { rq.on("data", (d) => { got += d; }); rq.on("end", () => rq.socket.destroy()); });
+  try {
+    const r = await run("complete", req({ address: `${s.url}/v1`, key: KEY }));
+    assert.deepEqual([r.output.error.type, r.output.error.sent], ["other", true]);
+    assert.ok(got.includes(SECRET), "the server read the transcript");
+  } finally { await s.close(); }
+});
+
+test("ECONNREFUSED on a real closed port gives connect, not sent, for complete and for list", async () => {
   const s = await server(() => {});
   const port = s.port;
   await s.close();
   const r = await run("complete", req({ address: `http://127.0.0.1:${port}/v1` }));
   assert.equal(r.code, 0);
   assert.deepEqual([r.output.error.type, r.output.error.sent], ["connect", false]);
+  const l = await run("list", { kind: "standard", address: `http://127.0.0.1:${port}/v1` });
+  assert.equal(l.output.error.type, "connect");
 });
 
-test("every connect-stage code, on the cause or in an AggregateError, gives connect, not sent", async () => {
+test("every connect-stage code, on the cause or in an AggregateError, with connectError published, gives connect, not sent", async () => {
   for (const code of ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT"]) {
-    let e = await errorOf(() => { throw fetchFailed(coded(code)); });
+    let e = await errorOf(() => { throw refused(coded(code)); });
     assert.deepEqual([e.type, e.sent], ["connect", false], code);
     const agg = Object.assign(new AggregateError([coded(code), coded(code)], code), { code });
-    e = await errorOf(() => { throw fetchFailed(agg); });
+    e = await errorOf(() => { throw refused(agg); });
     assert.deepEqual([e.type, e.sent], ["connect", false], `${code} in an AggregateError`);
   }
+});
+
+test("a connect-stage code with no connectError published counts as sent: the code alone is no evidence", async () => {
+  for (const code of ["ECONNREFUSED", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT"]) {
+    const e = await errorOf(() => { throw fetchFailed(coded(code)); });
+    assert.deepEqual([e.type, e.sent], ["other", true], code);
+  }
+  useFetch(() => { throw fetchFailed(coded("ECONNREFUSED")); });
+  const l = await run("list", { kind: "standard", address: STANDARD });
+  assert.equal(l.output.error.type, "other");
+  // connectError published, and a rejection with no connect-stage code: sent
+  const e = await errorOf(() => { publish("connectError", coded("ECONNREFUSED")); throw fetchFailed(coded("ECONNRESET")); });
+  assert.deepEqual([e.type, e.sent], ["other", true]);
+});
+
+test("connected published, then a CERT_HAS_EXPIRED cause (a renegotiation after the request): sent", async () => {
+  let e = await errorOf(() => { publish("connected"); throw fetchFailed(coded("CERT_HAS_EXPIRED", "certificate has expired")); });
+  assert.deepEqual([e.type, e.sent], ["other", true]);
+  // a connection made, and a connectError besides: still sent
+  e = await errorOf(() => { publish("connected"); throw refused(coded("ECONNREFUSED")); });
+  assert.deepEqual([e.type, e.sent], ["other", true]);
+  // connected, then the router gives up on its own
+  e = await errorOf((c) => { publish("connected"); return waitForAbort(c); }, { timeoutMs: 50 });
+  assert.deepEqual([e.type, e.sent], ["timeout", true]);
 });
 
 test("an error thrown before any fetch (no baseUrl) is not sent", async () => {
@@ -419,6 +469,83 @@ test("finishReason length, max_tokens and model_context_window_exceeded pass thr
   r = await run("complete", req({ kind: "claude", address: CLAUDE, key: KEY }));
   assert.equal(r.output.finishReason, "model_context_window_exceeded");
   assert.equal(r.output.text, MINUTES);
+});
+
+test("finishReason is passed on only from the known set, and null otherwise", async () => {
+  for (const finish of ["stop", "length", "tool_calls", "content_filter"]) {
+    useFetch(() => standardReply(MINUTES, { finish }));
+    assert.equal((await run("complete", req())).output.finishReason, finish);
+  }
+  for (const stop of ["end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal", "model_context_window_exceeded"]) {
+    useFetch(() => claudeReply(MINUTES, { stop }));
+    assert.equal((await run("complete", req({ kind: "claude", address: CLAUDE, key: KEY }))).output.finishReason, stop);
+  }
+  for (const finish of ["weird", "STOP", "length ", ""]) {
+    useFetch(() => standardReply(MINUTES, { finish }));
+    assert.equal((await run("complete", req())).output.finishReason, null, JSON.stringify(finish));
+  }
+});
+
+test("a key the source puts in finish_reason or stop_reason, or as a usage count, never reaches the output", async () => {
+  useFetch(() => standardReply(MINUTES, { finish: KEY }));
+  let r = await run("complete", req({ key: KEY }));
+  assert.equal(r.output.finishReason, null);
+  assert.ok(!JSON.stringify(r.output).includes(KEY), JSON.stringify(r.output));
+  useFetch(() => claudeReply(MINUTES, { stop: KEY }));
+  r = await run("complete", req({ kind: "claude", address: CLAUDE, key: KEY }));
+  assert.equal(r.output.finishReason, null);
+  assert.ok(!JSON.stringify(r.output).includes(KEY), JSON.stringify(r.output));
+  useFetch(() => standardReply(MINUTES, { usage: { prompt_tokens: KEY, completion_tokens: KEY } }));
+  r = await run("complete", req({ key: KEY }));
+  assert.equal(r.output.inputTokens, null);
+  assert.ok(!JSON.stringify(r.output).includes(KEY), JSON.stringify(r.output));
+  useFetch(() => claudeReply(MINUTES, { input: KEY, output: KEY }));
+  r = await run("complete", req({ kind: "claude", address: CLAUDE, key: KEY }));
+  assert.equal(r.output.inputTokens, null);
+  assert.ok(!JSON.stringify(r.output).includes(KEY), JSON.stringify(r.output));
+});
+
+test("inputTokens is passed on only as a non-negative safe integer, and tokenSource only as one of writer.mjs's own", async () => {
+  for (const [given, want] of [[0, 0], [4321, 4321], [-1, null], [1.5, null], [2 ** 53, null], ["4321", null], [null, null], [KEY, null]]) {
+    const out = await send(req({ key: KEY }), async () => ({ text: MINUTES, finishReason: "stop", promptTokens: given, tokenSource: "reported" }));
+    assert.equal(out.inputTokens, want, JSON.stringify(given));
+  }
+  for (const given of [KEY, "REPORTED", "", 7, null, undefined]) {
+    const out = await send(req({ key: KEY }), async () => ({ text: MINUTES, finishReason: KEY, promptTokens: 12, tokenSource: given }));
+    assert.ok(["reported", "partial", "unreported"].includes(out.tokenSource), JSON.stringify(out));
+    assert.ok(!JSON.stringify(out).includes(KEY), JSON.stringify(out));
+  }
+  for (const given of ["reported", "partial", "unreported"]) {
+    const out = await send(req(), async () => ({ text: MINUTES, finishReason: "stop", promptTokens: 12, tokenSource: given }));
+    assert.equal(out.tokenSource, given);
+  }
+});
+
+test("on the command line, a key in finish_reason or the usage counts never reaches stdout", async () => {
+  for (const kind of ["standard", "claude"]) {
+    const s = await server((rq, rs) => {
+      rq.resume();
+      rq.on("end", () => {
+        rs.writeHead(200, { "content-type": "text/event-stream" });
+        const events = kind === "standard"
+          ? [{ choices: [{ delta: { content: "## Summary\nfine" }, finish_reason: KEY }] }, { choices: [], usage: { prompt_tokens: KEY, completion_tokens: 3 } }, "[DONE]"]
+          : [{ type: "message_start", message: { id: "m", usage: { input_tokens: KEY } } },
+            { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+            { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "## Summary\nfine" } },
+            { type: "content_block_stop", index: 0 }, { type: "message_delta", delta: { stop_reason: KEY }, usage: { output_tokens: 3 } },
+            { type: "message_stop" }];
+        rs.end(events.map((e) => `data: ${typeof e === "string" ? e : JSON.stringify(e)}\n\n`).join(""));
+      });
+    });
+    try {
+      const r = await cli(["complete"], JSON.stringify(req({ kind, address: kind === "standard" ? `${s.url}/v1` : s.url, key: KEY })));
+      assert.equal(r.code, 0, kind);
+      const out = JSON.parse(r.out);
+      assert.equal(out.text, "## Summary\nfine", kind);
+      assert.deepEqual([out.finishReason, out.inputTokens], [null, null], kind);
+      clean(r);
+    } finally { await s.close(); }
+  }
 });
 
 // --- the address rule -----------------------------------------------------------------------------
@@ -661,7 +788,7 @@ test("list errors: a 401 is refused, a closed port is connect, a body that is no
   useFetch(() => json(401, { error: { message: "nope" } }));
   let r = await run("list", { kind: "standard", address: STANDARD, key: KEY });
   assert.equal(r.output.error.type, "refused");
-  useFetch(() => { throw fetchFailed(coded("ECONNREFUSED")); });
+  useFetch(() => { throw refused(coded("ECONNREFUSED")); });
   r = await run("list", { kind: "standard", address: STANDARD });
   assert.equal(r.output.error.type, "connect");
   useFetch(() => new Response("<html></html>", { status: 200, headers: { "content-type": "text/html" } }));
@@ -717,8 +844,8 @@ test("a port fetch refuses (6000, 10080) is answered at once: connect, not sent,
   for (const p of ["", "80", "443", "11434", "1234", "8443"]) assert.ok(!BAD_PORTS.has(p), p);
 });
 
-// Node's documented X509 certificate error codes, less OUT_OF_MEM, and the altname check: all of them
-// fail the handshake, before any request is written.
+// Node's documented X509 certificate error codes, less OUT_OF_MEM, and the altname check. In the first
+// handshake they come before any request is written; in a renegotiation they can come after it.
 const CERT_CODES = ["UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
   "UNABLE_TO_DECRYPT_CRL_SIGNATURE", "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY", "CERT_SIGNATURE_FAILURE", "CRL_SIGNATURE_FAILURE",
   "CERT_NOT_YET_VALID", "CERT_HAS_EXPIRED", "CRL_NOT_YET_VALID", "CRL_HAS_EXPIRED", "ERROR_IN_CERT_NOT_BEFORE_FIELD",
@@ -727,9 +854,9 @@ const CERT_CODES = ["UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO
   "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "CERT_CHAIN_TOO_LONG", "CERT_REVOKED", "INVALID_CA", "PATH_LENGTH_EXCEEDED",
   "INVALID_PURPOSE", "CERT_UNTRUSTED", "CERT_REJECTED", "HOSTNAME_MISMATCH", "ERR_TLS_CERT_ALTNAME_INVALID"];
 
-test("a certificate the handshake refuses is not sent; other TLS failures are", async () => {
+test("a certificate the first handshake refuses (connectError published) is not sent; other TLS failures are", async () => {
   for (const code of CERT_CODES) {
-    const e = await errorOf(() => { throw fetchFailed(coded(code)); });
+    const e = await errorOf(() => { throw refused(coded(code)); });
     assert.deepEqual([e.type, e.sent], ["connect", false], code);
   }
   for (const code of ["ERR_SSL_PACKET_LENGTH_TOO_LONG", "ERR_SSL_WRONG_VERSION_NUMBER", "OUT_OF_MEM", "ECONNRESET"]) {
@@ -810,4 +937,131 @@ test("hosts that are numbers to the URL parser are refused: 0x forms, and a trai
   }
   for (const address of ["https://a.0xg", "https://0xg.example", "https://00x1.example"]) assert.notEqual(addressHost(address), null, address);
   assert.equal(calls.length, 0);
+});
+
+// --- round 2 --------------------------------------------------------------------------------------
+
+// openssl ca's date form (UTCTime): YYMMDDHHMMSSZ.
+function utcTime(ms) { return `${new Date(ms).toISOString().replace(/[-:T]/g, "").slice(2, 14)}Z`; }
+
+test("a TLS 1.2 source that renegotiates after reading the body, once its certificate has expired, counts as sent",
+  { skip: haveOpenssl ? false : "no openssl to make a certificate", timeout: 20_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "writer-renegotiate-"));
+    const at = (name) => join(dir, name);
+    const openssl = (...args) => assert.equal(spawnSync("openssl", args, { cwd: dir, stdio: "ignore" }).status, 0, args.join(" "));
+    let s;
+    try {
+      writeFileSync(at("ca.cnf"), [
+        "[ req ]", "distinguished_name = dn", "prompt = no", "[ dn ]", "CN = meetingbox test CA",
+        "[ ca_ext ]", "basicConstraints = critical,CA:true", "keyUsage = critical,keyCertSign,cRLSign", "subjectKeyIdentifier = hash",
+        "[ ca ]", "default_ca = test_ca",
+        "[ test_ca ]", `database = ${at("index.txt")}`, `new_certs_dir = ${dir}`, `serial = ${at("serial")}`,
+        `certificate = ${at("ca.pem")}`, `private_key = ${at("ca.key")}`, "default_md = sha256", "policy = any",
+        "x509_extensions = leaf_ext", "unique_subject = no", "copy_extensions = none",
+        "[ any ]", "commonName = supplied",
+        "[ leaf_ext ]", "basicConstraints = CA:false", "keyUsage = critical,digitalSignature,keyEncipherment",
+        "extendedKeyUsage = serverAuth", "subjectAltName = DNS:localhost,IP:127.0.0.1", "",
+      ].join("\n"));
+      writeFileSync(at("index.txt"), "");
+      writeFileSync(at("serial"), "01\n");
+      openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", at("ca.key"), "-out", at("ca.pem"), "-days", "2",
+        "-config", at("ca.cnf"), "-extensions", "ca_ext");
+      openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", at("leaf.key"), "-out", at("leaf.csr"), "-subj", "/CN=localhost",
+        "-config", at("ca.cnf"));
+      // valid from a minute ago until 8 seconds from now (to the second): time for the writer to start
+      // and make its first handshake, even on a busy Mac
+      const notAfter = Math.floor(Date.now() / 1000) * 1000 + 8000;
+      openssl("ca", "-batch", "-notext", "-config", at("ca.cnf"), "-startdate", utcTime(Date.now() - 60_000), "-enddate", utcTime(notAfter),
+        "-in", at("leaf.csr"), "-out", at("leaf.pem"));
+      const log = [];
+      s = createTlsServer({
+        key: readFileSync(at("leaf.key")), cert: readFileSync(at("leaf.pem")),
+        minVersion: "TLSv1.2", maxVersion: "TLSv1.2", secureOptions: cryptoConstants.SSL_OP_NO_TICKET,
+      }, (rq) => {
+        let body = "";
+        rq.on("data", (d) => { body += d; });
+        rq.on("end", () => {
+          log.push(`body read, transcript ${body.includes(SECRET)}, key ${rq.headers.authorization === `Bearer ${KEY}`}`);
+          // once the certificate has expired, a full handshake again (no tickets, so no resumption)
+          setTimeout(() => rq.socket.renegotiate({ rejectUnauthorized: false }, () => log.push("renegotiated")),
+            Math.max(0, notAfter - Date.now() + 1500));
+        });
+      });
+      await new Promise((resolve) => s.listen(0, "127.0.0.1", resolve));
+      const r = await cli(["complete"], JSON.stringify(req({ address: `https://localhost:${s.address().port}/v1`, key: KEY, timeoutMs: 60_000 })),
+        { env: { NODE_EXTRA_CA_CERTS: at("ca.pem") } });
+      assert.equal(log[0], "body read, transcript true, key true", JSON.stringify(log));
+      assert.equal(r.code, 0);
+      const out = JSON.parse(r.out);
+      assert.deepEqual([out.error?.type, out.error?.sent], ["other", true], r.out);
+      clean(r);
+    } finally {
+      if (s) await new Promise((resolve) => { s.closeAllConnections?.(); s.close(() => resolve()); });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+test("a key under 8 characters is not scrubbed: ollama stays in the text, and ids holding it are kept", async () => {
+  useFetch(() => json(200, { data: [{ id: "llama3:8b" }, { id: "ollama/llama3:8b" }, { id: "ollama" }] }));
+  let r = await run("list", { kind: "standard", address: STANDARD, key: "ollama" });
+  assert.deepEqual(r.output, { models: ["llama3:8b", "ollama/llama3:8b", "ollama"] });
+  useFetch(() => standardReply("## Summary\nWe set up ollama on the Mac.\n"));
+  r = await run("complete", req({ key: "ollama" }));
+  assert.equal(r.output.text, "## Summary\nWe set up ollama on the Mac.\n");
+  for (const key of ["abcdefg", "x"]) {
+    useFetch(() => standardReply(`## Summary\nsay ${key} twice: ${key}\n`));
+    r = await run("complete", req({ key }));
+    assert.equal(r.output.text, `## Summary\nsay ${key} twice: ${key}\n`, key);
+  }
+  // 8 characters or more: scrubbed as before
+  for (const key of ["abcdefgh", "ollama-placeholder"]) {
+    useFetch(() => json(200, { data: [{ id: "m1" }, { id: `x-${key}` }, { id: "m2" }] }));
+    r = await run("list", { kind: "standard", address: STANDARD, key });
+    assert.deepEqual(r.output, { models: ["m1", "m2"] }, key);
+    useFetch(() => standardReply(`## Summary\nsay ${key} twice: ${key}\n`));
+    r = await run("complete", req({ key }));
+    assert.equal(r.output.text, "## Summary\nsay [key] twice: [key]\n", key);
+  }
+});
+
+test("an address the URL parser refuses (xn--a) gives exit 2 and no fetch, for complete and for list", async () => {
+  useFetch(() => standardReply(MINUTES));
+  for (const address of ["https://xn--a/v1", "https://xn--a.example/v1"]) {
+    assert.notEqual(addressHost(address), null, `the rule accepts ${address}`);
+    assert.throws(() => new URL(address), TypeError, address);
+    for (const kind of ["standard", "claude"]) {
+      assert.equal((await run("complete", req({ kind, address, key: KEY }))).code, 2, `${kind} complete ${address}`);
+      assert.equal((await run("list", { kind, address, key: KEY })).code, 2, `${kind} list ${address}`);
+    }
+    for (const [command, input] of [["complete", req({ address, key: KEY })], ["list", { kind: "standard", address, key: KEY }]]) {
+      const r = await cli([command], JSON.stringify(input));
+      assert.deepEqual([r.code, r.out, r.err], [2, "", "bad input\n"], `${command} ${address}`);
+    }
+  }
+  assert.equal(calls.length, 0);
+});
+
+// The Fetch standard's bad ports (fetch.spec.whatwg.org, "port blocking"), less 0, which the address
+// rule refuses anyway.
+const FETCH_BAD_PORTS = ["1", "7", "9", "11", "13", "15", "17", "19", "20", "21", "22", "23", "25", "37", "42", "43", "53", "69",
+  "77", "79", "87", "95", "101", "102", "103", "104", "109", "110", "111", "113", "115", "117", "119", "123", "135", "137", "139",
+  "143", "161", "179", "389", "427", "465", "512", "513", "514", "515", "526", "530", "531", "532", "540", "548", "554", "556",
+  "563", "587", "601", "636", "989", "990", "993", "995", "1719", "1720", "1723", "2049", "3659", "4045", "4190", "5060", "5061",
+  "6000", "6566", "6665", "6666", "6667", "6668", "6669", "6679", "6697", "10080"];
+
+test("BAD_PORTS is the Fetch standard's list, and the real fetch refuses every one of them before connecting", async () => {
+  assert.deepEqual([...BAD_PORTS].sort(), [...FETCH_BAD_PORTS].sort());
+  const seen = [];
+  const before = (message) => { seen.push(message?.connectParams?.port); };
+  dc.subscribe("undici:client:beforeConnect", before);
+  try {
+    for (const port of BAD_PORTS) {
+      const err = await realFetch(`http://127.0.0.1:${port}/`).then(() => null, (e) => e);
+      assert.ok(err, `port ${port} was fetched`);
+      assert.equal(err.cause?.message, "bad port", `port ${port}`);
+    }
+  } finally {
+    dc.unsubscribe("undici:client:beforeConnect", before);
+  }
+  assert.deepEqual(seen, []);
 });

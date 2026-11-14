@@ -8,22 +8,31 @@
 //             ->  {"text", "finishReason", "inputTokens", "tokenSource"}
 //              or {"error": {"type", "message", "sent"}}
 //
-// It exits 0 even when the request failed; 2 means bad input (an address the rule refuses included),
-// with the one line "bad input" on stderr; 3 means the router could not be loaded, so nothing was
-// sent, with the one line "writer failed". Anything else it did not expect prints "writer failed" and
-// exits 1. The key, the transcript and the source's reply never reach stdout (but for the reply's text
-// on success, with any copy of the key in it replaced by [key]), stderr or a file, and nothing is read
-// from the environment.
+// It exits 0 even when the request failed; 2 means bad input (an address the rule or the URL parser
+// refuses included), with the one line "bad input" on stderr; 3 means the router could not be loaded,
+// so nothing was sent, with the one line "writer failed". Anything else it did not expect prints
+// "writer failed" and exits 1. The key, the transcript and the source's reply never reach stdout (but
+// for the reply's text on success, with any copy of a key of 8 or more characters in it replaced by
+// [key], and a finish reason and token count only as values it knows), stderr or a file, and nothing
+// is read from the environment.
 
+import dc from "node:diagnostics_channel";
 import { realpathSync, writeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const KEY_RULE = /^[A-Za-z0-9._~+/=-]{1,4096}$/;
 const MODEL_RULE = /^[A-Za-z0-9._:/+@-]{1,200}$/;
-// A fetch that rejected with one of these, on its cause or in an AggregateError, wrote no request: it
-// never connected, or its TLS handshake refused the certificate (Node's documented X509 codes, less
-// OUT_OF_MEM, and the altname check), which happens before any request is written.
+// Node's own fetch publishes these for each connection it tries: connected once one is made (for https,
+// once its first handshake is done), connectError when one could not be. A bad port, which fetch
+// refuses before connecting, publishes neither.
+const CONNECTED = "undici:client:connected";
+const CONNECT_ERROR = "undici:client:connectError";
+// The codes of a failure to connect, on a rejection's cause or in an AggregateError: refused, no such
+// host, no route, a connect timeout, or a certificate the handshake refused (Node's documented X509
+// codes, less OUT_OF_MEM, and the altname check). A code alone proves nothing: over TLS 1.2 a source can
+// renegotiate after the request was written, and a certificate that has expired by then fails with
+// CERT_HAS_EXPIRED. So a code counts only beside the channels' evidence (see sentBy).
 const CONNECT_CODES = new Set([
   "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT",
   "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO_DECRYPT_CERT_SIGNATURE", "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
@@ -43,6 +52,14 @@ export const BAD_PORTS = new Set(["1", "7", "9", "11", "13", "15", "17", "19", "
   "135", "137", "139", "143", "161", "179", "389", "427", "465", "512", "513", "514", "515", "526", "530", "531", "532",
   "540", "548", "554", "556", "563", "587", "601", "636", "989", "990", "993", "995", "1719", "1720", "1723", "2049",
   "3659", "4045", "4190", "5060", "5061", "6000", "6566", "6665", "6666", "6667", "6668", "6669", "6679", "6697", "10080"]);
+// The finish reasons the two wire formats name. Any other value is the source's own text, which could be
+// anything, the key included, so it is passed on as null.
+const FINISH_REASONS = new Set(["stop", "length", "max_tokens", "end_turn", "stop_sequence", "tool_use", "tool_calls",
+  "function_call", "content_filter", "model_context_window_exceeded", "pause_turn", "refusal"]);
+const TOKEN_SOURCES = new Set(["reported", "partial", "unreported"]);
+// A key shorter than this (a placeholder such as "ollama") is not looked for in what the source sends
+// back: it would turn ordinary words into [key] and drop ordinary model ids.
+const SCRUB_MIN = 8;
 // The list's own limit, over every page; a test may shorten it.
 export const limits = { listMs: 10_000 };
 const LIST_PAGES = 10;
@@ -149,7 +166,8 @@ function checkSource(input) {
   if (!isObject(input)) return null;
   const { kind, address, key } = input;
   if (kind !== "claude" && kind !== "standard") return null;
-  if (addressHost(address) === null) return null;
+  // An address the rule accepts and the URL parser refuses (a label such as xn--a) is refused too.
+  if (addressHost(address) === null || !URL.canParse(address)) return null;
   if (key !== undefined && (typeof key !== "string" || !KEY_RULE.test(key))) return null;
   return { kind, address, key };
 }
@@ -184,16 +202,21 @@ function connectStage(err) {
 }
 function timedOut(err) { return codesOf(err).some((c) => TIMEOUT_CODES.has(c)); }
 
-// Runs WORK with globalThis.fetch, whatever it is now, wrapped: every call passes redirect: "error",
-// and the record says whether any call passed on reached the source, which is all "sent" means. It
-// is false only when no call was passed on, or every one rejected with a connect-stage code.
+// Runs WORK with globalThis.fetch, whatever it is now, wrapped so that every call passes redirect:
+// "error", and with a record of what happened, from the calls and from Node's own channels. "Not sent"
+// needs evidence that no connection was ever made (see sentBy).
 async function guarded(work) {
   const original = globalThis.fetch;
-  const record = { passed: 0, reached: false, timedOut: false };
+  const record = { passed: 0, connected: false, connectErrors: 0, otherwise: false, timedOut: false };
+  const onConnected = () => { record.connected = true; };
+  const onConnectError = () => { record.connectErrors += 1; };
+  // A call that answered, or rejected with no connect-stage code, is "otherwise".
   const note = (err) => {
-    if (!connectStage(err)) record.reached = true;
+    if (!connectStage(err)) record.otherwise = true;
     if (timedOut(err)) record.timedOut = true;
   };
+  dc.subscribe(CONNECTED, onConnected);
+  dc.subscribe(CONNECT_ERROR, onConnectError);
   globalThis.fetch = function guardedFetch(resource, init) {
     record.passed += 1;
     let pending;
@@ -204,7 +227,7 @@ async function guarded(work) {
       throw err;
     }
     return Promise.resolve(pending).then(
-      (response) => { record.reached = true; return response; },
+      (response) => { record.otherwise = true; return response; },
       (err) => { note(err); throw err; },
     );
   };
@@ -212,9 +235,18 @@ async function guarded(work) {
     return await work(record);
   } finally {
     globalThis.fetch = original;
+    dc.unsubscribe(CONNECTED, onConnected);
+    dc.unsubscribe(CONNECT_ERROR, onConnectError);
   }
 }
-function sentBy(record) { return record.passed > 0 && record.reached; }
+// Not sent when no call was passed on: the router's one fetch is globalThis.fetch, looked up at each
+// call. Otherwise not sent only when all of these hold: connected was never published, connectError
+// was at least once, and every call passed on rejected with a connect-stage code. Anything else is
+// sent, a call for which neither channel fired included.
+function sentBy(record) {
+  if (record.passed === 0) return false;
+  return record.connected || record.connectErrors === 0 || record.otherwise;
+}
 
 // --- what a failure says --------------------------------------------------------------------------
 
@@ -238,8 +270,16 @@ function typeOf(err, record, r) {
   return sentBy(record) ? "other" : "connect";
 }
 
-// A key the source handed back is never passed on.
-function scrub(text, key) { return key ? text.split(key).join("[key]") : text; }
+// A key the source handed back is never passed on (a key under SCRUB_MIN characters is not looked for).
+function scrubbed(key) { return typeof key === "string" && key.length >= SCRUB_MIN; }
+function scrub(text, key) { return scrubbed(key) ? text.split(key).join("[key]") : text; }
+function holdsKey(text, key) { return scrubbed(key) && text.includes(key); }
+
+// The result's other fields, each only as a value writer.mjs knows: the router copies them from the
+// source's reply as given.
+function finishOf(value) { return FINISH_REASONS.has(value) ? value : null; }
+function tokensOf(value) { return Number.isSafeInteger(value) && value >= 0 ? value : null; }
+function tokenSourceOf(value, tokens) { return tokens !== null && TOKEN_SOURCES.has(value) ? value : "unreported"; }
 
 // --- complete -------------------------------------------------------------------------------------
 
@@ -270,11 +310,12 @@ export async function send(input, call) {
         // the text is taken only from the router's final result.
         onDelta: () => {},
       });
+      const inputTokens = tokensOf(result.promptTokens);
       return {
         text: scrub(result.text, input.key),
-        finishReason: result.finishReason ?? null,
-        inputTokens: result.promptTokens,
-        tokenSource: result.tokenSource,
+        finishReason: finishOf(result.finishReason),
+        inputTokens,
+        tokenSource: tokenSourceOf(result.tokenSource, inputTokens),
       };
     } catch (err) {
       return { error: { type: typeOf(err, record, r), message: messageOf(err), sent: sentBy(record) } };
@@ -326,7 +367,7 @@ async function list(input) {
     const timer = setTimeout(() => controller.abort(new DOMException("the list took too long", "TimeoutError")), limits.listMs);
     const base = input.address.replace(/\/+$/, "");
     // An id holding the key is dropped: the source handed the key back.
-    const ids = (body) => body.data.map((m) => m?.id).filter((id) => typeof id === "string" && !(input.key && id.includes(input.key)));
+    const ids = (body) => body.data.map((m) => m?.id).filter((id) => typeof id === "string" && !holdsKey(id, input.key));
     try {
       const models = [];
       if (input.kind === "standard") {

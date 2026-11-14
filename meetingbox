@@ -6,7 +6,7 @@
 #   press again -> stops, transcribes, writes the minutes
 #
 # Recordings never leave the Mac. Transcripts and minutes stay on it too unless you choose an outside
-# model for the minutes. No account, no upload, no per seat fee.
+# model for the minutes. No account and no per seat fee.
 #
 #   meetingbox.app    ->  audio.m4a          ScreenCaptureKit + your mic, one clock
 #                         (+ mic.m4a, call.m4a: each side on its own)
@@ -278,14 +278,31 @@ installed_by_us() { grep -qxF -- "$1" "$INSTALLED" 2>/dev/null; }
 
 remove_installed() {
   p="$1"
-  case "$p" in
-    ""|/|"$HOME"|"$HOME"/) warn "refusing to remove '$p'"; return 1 ;;
-    /*) ;;
-    *) warn "refusing to remove '$p': not a path"; return 1 ;;
-  esac
+  if ! removable "$p"; then warn "refusing to remove '$p'"; return 1; fi
   installed_by_us "$p" || return 1
   rm -rf -- "$p"
   forget_install "$p"
+}
+
+# A record line remove_installed may hand to rm: absolute, with no empty, . or .. part and no final /,
+# and neither BASE_DIR, nor in it or above it (so never a meeting folder), nor HOME or above it. Case is
+# ignored, as the Mac's disk ignores it.
+removable() {
+  local p="$1" base="${BASE_DIR%/}" home="${HOME%/}" nocase=0 ok=0
+  case "$p" in
+    /*/|*//*|*/./*|*/.|*/../*|*/..) return 1 ;;
+    /?*) ;;
+    *) return 1 ;;
+  esac
+  shopt -q nocasematch && nocase=1
+  shopt -s nocasematch
+  case "$p/" in "$base"/*) ;; *)
+    case "$base/" in "$p"/*) ;; *)
+      case "$home/" in "$p"/*) ;; *) ok=1 ;; esac ;;
+    esac ;;
+  esac
+  [ "$nocase" = 1 ] || shopt -u nocasematch
+  [ "$ok" = 1 ]
 }
 
 forget_install() {
@@ -784,7 +801,7 @@ remove_stored_key() {
 # status says set or none without reading the key. Each answers in one line on stdout and touches no
 # network; an address or key the rules refuse goes nowhere, and the answer is 1.
 key_cmd() {
-  local sub="$1" address="$OUTSIDE_ADDRESS" key had=0 status=0
+  local sub="$1" address="$OUTSIDE_ADDRESS" key had=0 status=0 stored=0
   umask 077
   case "$sub" in set|remove|status) ;; *) die "usage: meetingbox key set|remove|status --address URL" ;; esac
   if ! address_ok "$address"; then echo "That address is not one meetingbox accepts."; return 1; fi
@@ -813,19 +830,16 @@ key_cmd() {
       record_install "keychain:generic:$address"
       printf 'add-generic-password -U -s "%s" -a "%s" -w "%s"%s\n' "$KEY_SERVICE" "$address" "$key" "${MB_KEYCHAIN:+ \"$MB_KEYCHAIN\"}" \
         | security -i >/dev/null 2>&1 || true
-      if stored_key "$address" && [ "$STORED_KEY" = "$key" ]; then
-        STORED_KEY=""
-        echo set
-      else
-        STORED_KEY=""
-        # a new record line goes only once security says no item is there (44): one it cannot read may be
-        if [ "$had" = 0 ]; then
-          key_stored "$address" || status=$?
-          [ "$status" != 1 ] || forget_install "keychain:generic:$address"
-        fi
-        echo "The key could not be stored in the keychain."
-        return 1
-      fi ;;
+      if stored_key "$address" && [ "$STORED_KEY" = "$key" ]; then stored=1; fi
+      STORED_KEY=""
+      if [ "$stored" = 1 ]; then echo set; return 0; fi
+      # a new record line goes only once security says no item is there (44): one it cannot read may be
+      if [ "$had" = 0 ]; then
+        key_stored "$address" || status=$?
+        [ "$status" != 1 ] || forget_install "keychain:generic:$address"
+      fi
+      echo "The key could not be stored in the keychain."
+      return 1 ;;
   esac
 }
 
@@ -1161,10 +1175,12 @@ minutes_ready() {
 
 outside_failed() { warn "Outside models could not be set up: $1. Apple's on-device model still writes the minutes."; }
 
-# The npm beside a Node, resolved to npm's own script (npm-cli.js), printed; false when there is none.
+# The npm beside a Node, resolved to npm's own script, printed; false when there is none, or when it
+# resolves to anything but a file named npm-cli.js (as nvm's and Homebrew's do), such as a version
+# manager's shim.
 npm_beside() {
   local npm
-  npm="$(realpath "$(dirname "$1")/npm" 2>/dev/null)" && [ -f "$npm" ] || return 1
+  npm="$(realpath "$(dirname "$1")/npm" 2>/dev/null)" && [ -f "$npm" ] && [ "${npm##*/}" = npm-cli.js ] || return 1
   printf '%s' "$npm"
 }
 
@@ -1205,12 +1221,13 @@ find_node() {
 }
 
 # The build folders an interrupted install_minutes left beside MINUTES_DIR: each was put on the install
-# record before anything went in it, so each goes through the record.
+# record before anything went in it, so each goes through the record. Only the names mktemp makes.
 remove_minutes_leftovers() {
-  local p ours parent="${MINUTES_DIR%/*}"
+  # one of mktemp's characters: never a / or a .
+  local p ours parent="${MINUTES_DIR%/*}" X='[A-Za-z0-9]'
   ours="$(cat "$INSTALLED" 2>/dev/null || true)"
   while IFS= read -r p; do
-    case "$p" in "$parent"/.minutes.??????|"$parent"/.minutes-old.??????) remove_installed "$p" || true ;; esac
+    case "$p" in "$parent"/.minutes.$X$X$X$X$X$X|"$parent"/.minutes-old.$X$X$X$X$X$X) remove_installed "$p" || true ;; esac
   done <<< "$ours"
 }
 
@@ -1972,6 +1989,8 @@ engines_cmd() {
   status="${answer##*$'\n'}"
   answer="${answer%$'\n'*}"
   if [ "$status" = 124 ]; then echo "outside error it did not answer within 20 seconds"; return 0; fi
+  # 2: bad input, such as an address the rule accepts and the URL parser refuses (a label like xn--a)
+  if [ "$status" = 2 ]; then echo "outside error its address is not one meetingbox accepts"; return 0; fi
   if [ "$status" = 0 ] && printf '%s' "$answer" | jq -e 'type == "object" and (.models | type) == "array"' >/dev/null 2>&1; then
     printf '%s' "$answer" | jq -r '.models[] | select(type == "string" and test("\\A[A-Za-z0-9._:/+@-]{1,200}\\z")) | "outside model " + .' \
       | grep . || echo "outside none"
@@ -2893,7 +2912,7 @@ outside_context() {
 # Usage: outside_minutes TRANSCRIPT OUT
 outside_minutes() {
   local transcript="$1" dir="$2" kind="$OUTSIDE_KIND" address="$OUTSIDE_ADDRESS" model="$OUTSIDE_MODEL"
-  local host node key="" had_key=0 status=0 rc work limit chars finish tokens counted schema type
+  local host node key="" had_key=0 status=0 rc work limit chars finish tokens counted schema type request answer
   OUTSIDE_NOTE=""
   if ! address_ok "$address"; then outside_note "" 0 "its address is not one meetingbox accepts"; return 1; fi
   host="$ADDRESS_HOST"
@@ -2918,7 +2937,8 @@ outside_minutes() {
             --rawfile user "$work/user.txt" \
             '{kind: $kind, address: $address, model: $model, system: $system, user: $user, timeoutMs: 900000, maxTokens: 16000}' \
             > "$work/request.json" \
-     || ! chars="$(jq '(.system | length) + (.user | length)' "$work/request.json")"; then
+     || ! chars="$(jq '(.system | length) + (.user | length)' "$work/request.json")" \
+     || ! request="$(cat "$work/request.json")"; then
     remove_own_folder "$work" || true
     outside_note "$host" 0 "the request could not be prepared"; return 1
   fi
@@ -2927,17 +2947,15 @@ outside_minutes() {
   case "$limit" in ""|*[!0-9]*) limit=960 ;; esac
   say "writing the minutes with $model at $host"
   # writer.mjs's stderr is never shown: it is not meant for anyone, and the key must never reach a log.
-  # The key goes first on its stdin from the printf builtin, alone on its line: nothing else ever sees it.
-  if [ "$had_key" = 1 ]; then
-    { printf '{"key":"%s",' "$key"
-      tail -c +2 "$work/request.json"; } 2>/dev/null \
-      | run_limited "$limit" env -i "$node" "$MINUTES_DIR/writer.mjs" complete > "$work/answer" 2>/dev/null
-    rc="${PIPESTATUS[1]}"
-  else
-    run_limited "$limit" env -i "$node" "$MINUTES_DIR/writer.mjs" complete < "$work/request.json" > "$work/answer" 2>/dev/null
-    rc=$?
-  fi
+  # The request goes on its stdin from the printf builtin, the key first when there is one, as engines
+  # sends it: nothing but printf and writer.mjs ever has the key. Its stdout and status come back in
+  # answer, and the answer goes to $work/answer.
+  answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
+             | run_limited "$limit" env -i "$node" "$MINUTES_DIR/writer.mjs" complete 2>/dev/null; printf '\n%s' "${PIPESTATUS[1]}")"
   key=""
+  rc="${answer##*$'\n'}"
+  if ! printf '%s' "${answer%$'\n'*}" > "$work/answer" && [ "$rc" = 0 ]; then rc=1; fi
+  answer=""
 
   case "$rc" in
     0)   ;;
@@ -3871,7 +3889,7 @@ reset_cmd() {
           info "    the meetingbox signing certificate in your login keychain"; n=$((n + 1)) ;;
         keychain:generic:*)
           info "    the key stored for ${p#keychain:generic:}, in your keychain"; n=$((n + 1)) ;;
-        /*) if [ -e "$p" ] || [ -L "$p" ]; then info "    $p"; n=$((n + 1)); fi ;;
+        /*) if removable "$p" && { [ -e "$p" ] || [ -L "$p" ]; }; then info "    $p"; n=$((n + 1)); fi ;;
       esac
     done <<< "$ours"
     if old_recorder; then info "    $BIN_DIR/audio-capture (from v1.1.0)"; n=$((n + 1)); fi
@@ -3929,10 +3947,12 @@ reset_cmd() {
       "$LSREGISTER" -u "$APP_DIR" >/dev/null 2>&1 || true
     fi
     old_recorder && rm -f "$BIN_DIR/audio-capture"
+    # every line but the keychain's goes to remove_installed, which refuses (and says so) any it must not
     while IFS= read -r p; do
       case "$p" in
-        /*) remove_installed "$p" || true ;;
         keychain:generic:*) remove_stored_key "${p#keychain:generic:}" || true ;;
+        ""|keychain:*) ;;
+        *) remove_installed "$p" || true ;;
       esac
     done <<< "$ours"
     # The app has quit (quit_app), so its socket goes too: one left by a crash would otherwise stay.
@@ -3960,11 +3980,25 @@ reset_cmd() {
     rmdir "$STATE_DIR" 2>/dev/null || true
     ok "meetingbox removed"
     info "the PATH line in your shell profile stays, other tools use ~/.local/bin too"
+    keys_left || return 1
     return 0
   fi
 
   rule
   say "done. Run ${c_b}meetingbox setup${c_0} to set it up again."
+  keys_left || return 1
+}
+
+# One line for each key still on the install record once reset or uninstall is done (its delete
+# failed, or could not be confirmed), saying where it is; false when there is one.
+keys_left() {
+  local a left=0
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    warn "the key for $a is still in your keychain, under \"$KEY_SERVICE\""
+    left=1
+  done <<< "$(sed -n 's/^keychain:generic://p' "$INSTALLED" 2>/dev/null || true)"
+  [ "$left" = 0 ]
 }
 
 # ----------------------------------------------------------------------- version

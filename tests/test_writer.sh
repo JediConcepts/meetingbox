@@ -287,12 +287,14 @@ check "a keyless run's writer.mjs stderr (here the transcript) is discarded too"
 # --- leaks seen through files and real command lines ---
 # A shim for every external command the outside path and key set run, first on the engine's PATH: each
 # logs its argv and its environment to shims.log, then runs the real one, and rm first copies what it
-# removes into graveyard/, so a file that held the key for a moment is still seen. While the fake node
-# runs it looks through every file under the scratch home (the meeting, its stage and work folders,
-# the shims' log, the graveyard) for the key or 16 characters of it, and the suite looks again after.
+# removes into graveyard/, so a file that held the key for a moment is still seen. mktemp also logs
+# each path it made ("made: <path>"). The shimmed runs have TMPDIR inside the scratch home. While the
+# fake node runs it looks through every file under the scratch home (the meeting, its stage and work
+# folders, the temporary folder, the shims' log, the graveyard) for the key or 16 characters of it, and
+# the suite looks again after.
 SHIMMED="jq cat tail head cp mv rm mkdir mktemp chmod env sed awk grep date stat tr cut printf shasum basename dirname
          sort realpath sleep wc ls find touch ln rmdir paste uniq tee xargs"
-mkdir -p "$HOME/shims"; : > "$HOME/shims/.real"
+mkdir -p "$HOME/shims" "$HOME/tmp"; : > "$HOME/shims/.real"
 cat > "$HOME/shims/.shim" <<EOF
 #!/bin/bash
 h="$HOME"; name="\${0##*/}"
@@ -303,6 +305,12 @@ rec="\$rec
 env: \$(/usr/bin/env | /usr/bin/tr '\n' ' ')
 "
 printf '%s' "\$rec" >> "\$h/shims.log"
+if [ "\$name" = mktemp ]; then
+  made="\$("\$real" "\$@")" || exit \$?
+  case "\$made" in /*) printf 'made: %s\n' "\$made" ;; *) printf 'made: %s/%s\n' "\$PWD" "\$made" ;; esac >> "\$h/shims.log"
+  printf '%s\n' "\$made"
+  exit 0
+fi
 if [ "\$name" = rm ]; then
   for a in "\$@"; do
     case "\$a" in -*) continue ;; esac
@@ -318,17 +326,20 @@ for name in $SHIMMED; do
   printf '%s %s\n' "$name" "$real" >> "$HOME/shims/.real"
   ln -s .shim "$HOME/shims/$name"
 done
-shimmed() { ( export PATH="$HOME/shims:$PATH"; set -euo pipefail; "$@" ); }
-# The shims ran, the fake node's scan ran (when asked) and found nothing, and nothing is found now.
+shimmed() { ( export PATH="$HOME/shims:$PATH" TMPDIR="$HOME/tmp"; set -euo pipefail; "$@" ); }
+HOME_P="$(cd "$HOME" && pwd -P)"   # the scratch home as the shims' working folder may name it
+# The shims ran, the fake node's scan ran (when asked) and found nothing, nothing is found now, and
+# every path mktemp made is inside the scratch home, where the scans look.
 leak_free() {
   [ -s "$HOME/shims.log" ] && { [ ! -e "$HOME/node-scan" ] || [ -e "$HOME/scan-found" ]; } && [ ! -s "$HOME/scan-found" ] \
-    && [ -z "$(key_scan "$KEY")" ]
+    && [ -z "$(key_scan "$KEY")" ] && ! sed -n 's/^made: //p' "$HOME/shims.log" | grep -v "^$HOME/" | grep -qv "^$HOME_P/"
 }
 reset_run; meeting k1; fake_node; ok_reply; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"
 shimmed cli notes "$d" --writer outside --kind claude --address "$CLAUDE" --writer-model claude-test > "$d/.process-log" 2>&1; rc=$?
 check "a keyed run: no file under the scratch home holds the key, while Node runs or after, nor any command's argv or environment" \
   eval '[ "$rc" -eq 0 ] && outside_written claude-test api.anthropic.com && leak_free && [ -d "$HOME/graveyard" ]
-        && grep -q "^argv: jq " "$HOME/shims.log" && grep -q "^argv: env -i " "$HOME/shims.log" && grep -q "^argv: rm " "$HOME/shims.log"'
+        && grep -q "^argv: jq " "$HOME/shims.log" && grep -q "^argv: env -i " "$HOME/shims.log" && grep -q "^argv: rm " "$HOME/shims.log"
+        && grep -q "^made: .*/${d##*/}/.*\.work\.[^/]*$" "$HOME/shims.log" && grep -q "TMPDIR=$HOME/tmp " "$HOME/shims.log"'
 reset_run; meeting k2; fake_node; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"
 reply '{"error": {"type": "connect", "message": "TypeError", "sent": false}}'
 shimmed cli notes "$d" --writer outside --kind claude --address "$CLAUDE" --writer-model claude-test > "$d/.process-log" 2>&1; rc=$?
@@ -340,17 +351,221 @@ reset_run; rm -f "$HOME/node-scan"; mkdir -p "$STATE_DIR"; : > "$INSTALLED"
 out="$(printf '%s\n' "$KEY" | shimmed cli key set --address "$CLAUDE" 2>&1)"; rc=$?
 check "key set: the same" eval '[ "$rc" -eq 0 ] && [ "$out" = set ] && grep -q "^argv: tr " "$HOME/shims.log" && leak_free'
 
-# What a shim cannot see: a builtin's own redirection, or a command named by its absolute path. Every
-# line of meetingbox that expands a variable holding the key (key, STORED_KEY, and stored_key's got)
-# runs only builtins and functions and writes nowhere but /dev/null, and meetingbox names no absolute
-# path to printf, echo or test anywhere.
-key_lines="$(grep -nE '\$\{?(key|STORED_KEY|got)([^A-Za-z0-9_]|$)' "$ROOT/meetingbox")"
-bad_lines="$(printf '%s\n' "$key_lines" | sed -E 's#[[:space:]]+\#[[:space:]].*$##; s#[0-9]*>/dev/null##g' \
-  | grep -E '(^|[^A-Za-z0-9_-])(env|command|exec|eval|jq|echo|cat|tail|head|tee|sed|awk|grep|tr|cut|security|xargs|dd|curl)( |;|$)|/bin/|/usr/|>|--arg')"
+# What a shim cannot see: a builtin's own redirection or here-string, or a command named by a path or
+# through a variable. The rule below is read from meetingbox's source. A variable holds the key when
+# it is key, STORED_KEY or got, or is assigned a whole copy of one that does. For every line that
+# expands one (but in read_swap, whose key is a word of a .swap line), its block is the line, the lines
+# it goes on to, and every group, compound command or quotation it opens, up to the line that closes
+# it. On the block: each command is an allowed builtin or function (printf echo [ return true : key_ok
+# stored_key), or security or run_limited straight after a |, which take the key on stdin; no command
+# is named through a variable or a path; there is no << or <<<; and output goes nowhere but /dev/null.
+# Each group or compound command around the line may send its output only to /dev/null too. And
+# meetingbox names no absolute path to printf, echo or test anywhere.
+cat > "$HOME/key-rule.awk" <<'AWK'
+BEGIN {
+  REDIRECT = "[0-9]*(&>>|&>|>>|>\\||>&|<<<|<<-|<<|<>|<&|>|<)[ \t]*[^ \t;|&<>()]*"
+  split("printf echo [ return true : key_ok stored_key", a, " "); for (i in a) ALLOWED[a[i]] = 1
+  split("security run_limited", a, " "); for (i in a) RECEIVERS[a[i]] = 1
+  split("if then else elif do while until ! {", a, " "); for (i in a) LEADS[a[i]] = 1
+  split("} fi esac done", a, " "); for (i in a) ENDS[a[i]] = 1
+  split("{ if case while until for select", a, " "); for (i in a) OPENS[a[i]] = 1
+}
+{ src[NR] = $0 }
+
+# The line as code: each quoted text a Q, comments left out, the quoting carried from line to line in
+# MODE (a string of S single quote, D double quote, P command substitution).
+function code(line,    out, j, c, n, top) {
+  out = ""; n = length(line)
+  for (j = 1; j <= n; j++) {
+    c = substr(line, j, 1); top = substr(MODE, length(MODE), 1)
+    if (top == "S") { if (c == "'") { MODE = substr(MODE, 1, length(MODE) - 1); out = out "Q" } ; continue }
+    if (top == "D") {
+      if (c == "\\") { j++; continue }
+      if (c == "\"") { MODE = substr(MODE, 1, length(MODE) - 1); out = out "Q"; continue }
+      if (c == "$" && substr(line, j + 1, 1) == "(") { MODE = MODE "P"; PD[length(MODE)] = 0; out = out " $( "; j++ }
+      continue
+    }
+    if (c == "\\") { if (j == n) CONT = 1; j++; continue }
+    if (c == "'") { MODE = MODE "S"; continue }
+    if (c == "\"") { MODE = MODE "D"; continue }
+    if (c == "#" && (j == 1 || substr(line, j - 1, 1) ~ /[ \t;|&(]/)) break
+    if (c == "$" && substr(line, j + 1, 1) == "(") { MODE = MODE "P"; PD[length(MODE)] = 0; out = out " $( "; j++; continue }
+    if (top == "P" && c == "(") PD[length(MODE)]++
+    if (top == "P" && c == ")") {
+      if (PD[length(MODE)] == 0) { MODE = substr(MODE, 1, length(MODE) - 1); out = out " ) "; continue }
+      PD[length(MODE)]--
+    }
+    out = out c
+  }
+  return out
+}
+
+# Words that open and close groups and compound commands, counted on a line of code.
+function depth_change(text,    w, n, k, d) {
+  n = split(text, w, /[ \t;|&()]+/); d = 0
+  for (k = 1; k <= n; k++) { if (w[k] in OPENS) d++; else if (w[k] in ENDS) d-- }
+  return d
+}
+
+function bad(n, why) { printf "bad %d %s: %s\n", n, why, src[n] }
+
+# Every redirect on a line of code: output only to /dev/null (or another descriptor), and no << or <<<.
+function redirects(text, n,    m, op, target, rest) {
+  rest = text
+  while (match(rest, REDIRECT)) {
+    m = substr(rest, RSTART, RLENGTH); rest = substr(rest, RSTART + RLENGTH)
+    sub(/^[0-9]*/, "", m)
+    match(m, /^(&>>|&>|>>|>\||>&|<<<|<<-|<<|<>|<&|>|<)/); op = substr(m, 1, RLENGTH); target = substr(m, RLENGTH + 1)
+    sub(/^[ \t]*/, "", target)
+    if (op ~ /^<</) bad(n, "a here-string or here-document")
+    else if (op == ">&" && target ~ /^[0-9-]$/) continue
+    else if (op ~ />/ && target != "/dev/null") bad(n, "a redirect to " (target == "Q" ? "a quoted path" : target))
+  }
+}
+
+# The commands on the block's lines of code.
+function commands(first, last,    j, text, t, nt, k, w, want, after, pattern, casehead, skipfor) {
+  want = 1; after = "start"; pattern = 0; casehead = 0; skipfor = 0
+  for (j = first; j <= last; j++) {
+    text = VIS[j]
+    gsub(REDIRECT, " ", text)
+    if (j == first && text ~ /^[ \t]*\(?[^ \t();]+\)/) sub(/^[ \t]*\(?[^ \t();]+\)/, "", text)
+    gsub(/;;/, " DSEMI ", text); gsub(/\$\(/, " CS ", text); gsub(/\|\|/, " OR ", text); gsub(/&&/, " AND ", text)
+    gsub(/[;|&()]/, " & ", text)
+    nt = split(text, t, /[ \t]+/)
+    for (k = 1; k <= nt; k++) {
+      w = t[k]; if (w == "") continue
+      if (pattern) { if (w == ")") { pattern = 0; want = 1; after = "pattern" } ; continue }
+      if (casehead) { if (w == "in") { casehead = 0; pattern = 1 } ; continue }
+      if (skipfor) { if (w == "do") { skipfor = 0; want = 1 } ; continue }
+      if (w == "DSEMI") { pattern = 1; continue }
+      if (w == ";" || w == "&" || w == "AND" || w == "OR" || w == "(" || w == "CS" || w == "|") { want = 1; after = w; continue }
+      if (w == ")") { want = 0; continue }
+      if (!want) continue
+      if (w in LEADS) continue
+      if (w in ENDS) { want = 0; continue }
+      if (w == "case") { casehead = 1; continue }
+      if (w == "for" || w == "select") { skipfor = 1; continue }
+      if (w ~ /^[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=/) continue
+      if (w ~ /^[$Q]/ || w ~ /\//) bad(j, "a command named through a variable or a path (" w ")")
+      else if (!(w in ALLOWED) && !((w in RECEIVERS) && after == "|")) bad(j, "the command " w)
+      want = 0
+    }
+    if (!CONTD[j]) { want = 1; after = "line" }
+  }
+}
+
+END {
+  vars = "key|STORED_KEY|got"
+  do {
+    grew = 0
+    for (i = 1; i <= NR; i++) {
+      n = split(src[i], w, /[ \t;]+/)
+      for (k = 1; k <= n; k++) {
+        if (w[k] !~ ("^[A-Za-z_][A-Za-z0-9_]*=\"?\\$\\{?(" vars ")\\}?\"?$")) continue
+        name = w[k]; sub(/=.*/, "", name)
+        if (("|" vars "|") !~ ("\\|" name "\\|")) { vars = vars "|" name; grew = 1 }
+      }
+    }
+  } while (grew)
+  keyre = "\\$\\{?(" vars ")([^A-Za-z0-9_]|$)"
+
+  fn = ""; MODE = ""; depth = 0; heredoc = ""
+  for (i = 1; i <= NR; i++) {
+    line = src[i]
+    if (heredoc != "") {
+      HEREDOC[i] = 1; FN[i] = fn
+      t = line; sub(/^[ \t]*/, "", t); if (t == heredoc) heredoc = ""
+      continue
+    }
+    if (line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{/) {
+      if (fn != "" && HASKEY[fn]) print "lost " fn
+      fn = line; sub(/\(.*/, "", fn); MODE = ""; depth = 0
+      sub(/^[^{]*\{/, "", line)
+    }
+    CONT = 0
+    BEFORE[i] = depth
+    VIS[i] = code(line)
+    t = VIS[i]; sub(/[ \t]+$/, "", t)
+    CONTD[i] = CONT || t ~ /(\||&&|\|\|)$/ || MODE != ""
+    depth += depth_change(VIS[i])
+    AFTER[i] = depth; FN[i] = fn
+    if (src[i] ~ /<<-?[ \t]*['"]?[A-Za-z_][A-Za-z0-9_]*/ && src[i] !~ /<<</) {
+      t = src[i]; sub(/.*<<-?[ \t]*['"]?/, "", t); sub(/[^A-Za-z0-9_].*/, "", t); heredoc = t
+    }
+    if (src[i] ~ keyre && fn != "" && fn != "read_swap") { KEY[i] = 1; HASKEY[fn] = 1 }
+    if (fn != "" && depth < 0) {
+      if (MODE != "" && HASKEY[fn]) print "lost " fn
+      fn = ""; depth = 0; MODE = ""
+    }
+  }
+  if (fn != "" && HASKEY[fn]) print "lost " fn
+  for (i = 1; i <= NR; i++) if (HEREDOC[i] && src[i] ~ keyre) { print "key " i; bad(i, "a here-document") }
+
+  for (i = 1; i <= NR; i++) {
+    if (!KEY[i]) continue
+    print "key " i
+    last = i
+    while ((CONTD[last] || AFTER[last] > BEFORE[i]) && last < NR && FN[last + 1] == FN[i]) last++
+    for (j = i; j <= last; j++) redirects(VIS[j], j)
+    commands(i, last)
+    low = BEFORE[i]
+    for (j = last + 1; j <= NR && FN[j] == FN[i] && low > 0; j++) {
+      if (AFTER[j] < low) { low = AFTER[j]; redirects(VIS[j], j) }
+    }
+  }
+}
+AWK
+key_rule() { awk -f "$HOME/key-rule.awk" "$1"; }
+# The rule itself, on one small function for each thing it must find.
+rule_case() {   # $1: what it must find; the function's body on stdin
+  { printf 'f() {\n'; cat; printf '}\n'; } > "$HOME/rule-case"
+  key_rule "$HOME/rule-case" | grep -q "^bad .*$1" || rule_missed="$rule_missed [$1]"
+}
+rule_missed=""
+rule_case 'here-string' <<'EOF'
+  read -r k <<< "$key"
+EOF
+rule_case 'here-document' <<'EOF'
+  read -r k <<KEYDOC
+$got
+KEYDOC
+EOF
+rule_case 'a redirect to a quoted path' <<'EOF'
+  { printf '%s' "$key"
+  } > "${TMPDIR:-/tmp}/k"
+EOF
+rule_case 'a redirect to a quoted path' <<'EOF'
+  if true; then
+    printf '%s' "$key"
+  fi > "/tmp/k"
+EOF
+rule_case 'a redirect to a quoted path' <<'EOF'
+  copy="$key"
+  printf '%s' "$copy" > "/tmp/k"
+EOF
+rule_case 'through a variable or a path' <<'EOF'
+  { "$PRN"/printf '%s' "$key"; }
+EOF
+rule_case 'through a variable or a path' <<'EOF'
+  "$MB_JQ" -n --arg k "$STORED_KEY" '$k'
+EOF
+rule_case 'the command tail' <<'EOF'
+  { printf '%s' "$key"
+    tail -c +2 file; } | run_limited 5 cat
+EOF
+rule_case 'the command security' <<'EOF'
+  security add-generic-password -w "$key"
+EOF
+check "the key rule finds a here-string, a here-document, a redirect at a group's or compound command's closing line or through a copy, a command named through a variable or a path, and a command not allowed" \
+  eval '[ -z "$rule_missed" ]'
+[ -z "$rule_missed" ] || printf 'missed:%s\n' "$rule_missed"
+rule_out="$(key_rule "$ROOT/meetingbox")"
+rule_bad="$(printf '%s\n' "$rule_out" | grep -v '^key ')"
 abs_paths="$(grep -nE '(^|[^A-Za-z0-9_.-])/(usr/)?(local/)?bin/(printf|echo|test)([^A-Za-z0-9_]|$)' "$ROOT/meetingbox")"
-check "every line expanding the key runs only builtins and writes nowhere but /dev/null, and meetingbox names no /bin printf, echo or test" \
-  eval '[ "$(printf "%s\n" "$key_lines" | grep -c .)" -ge 12 ] && [ -z "$bad_lines" ] && [ -z "$abs_paths" ]'
-[ -z "$bad_lines$abs_paths" ] || printf '%s\n' "$bad_lines" "$abs_paths"
+check "every block that expands the key runs only allowed builtins, names no command through a variable or a path, has no << or <<<, and writes nowhere but /dev/null, nor does anything around it; and meetingbox names no /bin printf, echo or test" \
+  eval '[ "$(printf "%s\n" "$rule_out" | grep -c "^key ")" -ge 12 ] && [ -z "$rule_bad" ] && [ -z "$abs_paths" ]'
+[ -z "$rule_bad$abs_paths" ] || printf '%s\n' "$rule_bad" "$abs_paths"
 
 # --- a runtime that is not set up is never sent to ---
 not_set_up() {   # $1: name; expects the not-sent note, and no complete call
@@ -396,6 +611,24 @@ if [ -n "$REAL_NODE" ]; then
     std
     check "the real writer.mjs with its router $broken: not sent, outside models are not set up, and no request" \
       eval '[ "$rc" -eq 0 ] && no_send && fell_back "$(not_sent 127.0.0.1 "outside models are not set up")"'
+  done
+  # An address both rules accept and the URL parser refuses (a label such as xn--a): writer.mjs, with a
+  # stand-in router that notes any call, exits 2, so the run is not sent, and engines says so too.
+  rm -rf "$MINUTES_DIR/node_modules"; mkdir -p "$MINUTES_DIR/node_modules/ai-execution-router"
+  printf '%s\n' '{"name": "ai-execution-router", "version": "1.1.1", "type": "module", "exports": {".": "./index.js", "./package.json": "./package.json"}}' \
+    > "$MINUTES_DIR/node_modules/ai-execution-router/package.json"
+  printf 'import { writeFileSync } from "node:fs";\nexport async function complete() { writeFileSync("%s/router-called", "complete"); throw new Error("no"); }\n' \
+    "$HOME" > "$MINUTES_DIR/node_modules/ai-execution-router/index.js"
+  for address in https://xn--a/v1 https://xn--a.example/v1; do
+    reset_run; meeting "xn$RANDOM"; rm -f "$HOME/router-called"
+    printf '%s\n' "$REAL_NODE" > "$NODE_FILE"; record_install "$NODE_FILE"
+    engine cli notes "$d" --writer outside --kind standard --address "$address" --writer-model llama3
+    host="${address#https://}"; host="${host%%/*}"
+    check "the real writer.mjs with $address, which the URL parser refuses: not sent, its address is not one meetingbox accepts, and no request" \
+      eval '[ "$rc" -eq 0 ] && fell_back "$(not_sent "$host" "its address is not one meetingbox accepts")" && [ ! -e "$HOME/router-called" ]'
+    o="$( (set -euo pipefail; have() { [ "$1" = speech-analyzer ]; }; cli engines --kind standard --address "$address") 2>/dev/null | tail -n 1)"
+    check "engines with the real writer.mjs and $address: outside error its address is not one meetingbox accepts" \
+      eval '[ "$o" = "outside error its address is not one meetingbox accepts" ]'
   done
   rm -rf "$MINUTES_DIR/node_modules"; : > "$MINUTES_DIR/writer.mjs"
 else
@@ -727,6 +960,10 @@ FIND_STATUS=36; rm -f "$HOME/node.stdin.list"; o7="$(eo --kind standard --addres
 check "engines: it refused the key when a key was sent; an HTTP error with its status; a keychain that cannot be read, with no list" \
   eval '[ "$o5" = "outside error it refused the key" ] && [ "$o6" = "outside error it answered with an error (HTTP 503)" ]
         && [ "$o7" = "outside error its key could not be read from the keychain" ] && [ ! -e "$HOME/node.stdin.list" ]'
+reset_run; fake_node; : > "$HOME/node-list"; echo 2 > "$HOME/node-status"
+o8="$(eo --kind standard --address https://xn--a.example/v1 | tail -n 1)"; rm -f "$HOME/node-status"
+check "engines: a list that exits 2 (bad input: an address the URL parser refuses) is outside error its address is not one meetingbox accepts" \
+  eval '[ "$o8" = "outside error its address is not one meetingbox accepts" ]'
 reset_run; fake_node; store_key "$CLAUDE" "$KEY"; echo '{"models": ["claude-a"]}' > "$HOME/node-list"
 out="$(eo --kind claude --address "$CLAUDE")"
 check "engines with a Claude API source: its stored key goes on stdin only" \
@@ -895,6 +1132,39 @@ fresh_setup; make_node "$HOME/p1" good; rm -f "$HOME/p1/npm"; make_node "$HOME/b
 out="$(PATH="$HOME/p1:/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
 check "a good Node with no npm beside it is passed over, named, and Homebrew's is used" \
   eval '[ "$rc" -eq 0 ] && [ "$(cat "$NODE_FILE")" = "$HOME/brew/bin/node" ] && printf "%s" "$out" | grep -qF "passing over $HOME/p1/node: it has no npm beside it"'
+# A version manager's shims (asdf, nodenv): a node script that answers --version, beside an npm script
+# that is not npm's own npm-cli.js. Passed over, and Homebrew's is used.
+fresh_setup; make_node "$HOME/brew/bin" good; rm -rf "$HOME/asdf"; mkdir -p "$HOME/asdf/shims"
+printf '#!/bin/bash\n[ "$1" = --version ] && { echo v22.11.0; exit 0; }\nexit 126\n' > "$HOME/asdf/shims/node"
+printf '#!/bin/bash\nexec node "$@"\n' > "$HOME/asdf/shims/npm"
+chmod 755 "$HOME/asdf/shims/node" "$HOME/asdf/shims/npm"
+out="$(PATH="$HOME/asdf/shims:/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "a version manager's node and npm shims are passed over, named, and Homebrew's Node is used" \
+  eval '[ "$rc" -eq 0 ] && [ "$(cat "$NODE_FILE")" = "$HOME/brew/bin/node" ]
+        && printf "%s" "$out" | grep -qF "passing over $HOME/asdf/shims/node: it has no npm beside it"'
+rm -rf "$HOME/asdf"
+
+# An update: the old copy's folder is on the record from before anything goes in it, and it and its
+# line are gone once the new copy is in.
+fresh_setup; make_node "$HOME/brew/bin" good
+PATH="/usr/bin:/bin" install_minutes > /dev/null 2>&1
+printf '// an update\n' >> "$SOURCE_DIR/minutes/writer.mjs"
+out="$(PATH="/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "a successful update leaves only minutes beside it, and neither a build folder nor the old copy's on the record" \
+  eval '[ "$rc" -eq 0 ] && cmp -s "$MINUTES_DIR/writer.mjs" "$SOURCE_DIR/minutes/writer.mjs" && [ "$(ls -A "$SRC_DIR")" = minutes ]
+        && ! grep -q "/\.minutes" "$INSTALLED" && installed_by_us "$MINUTES_DIR" && minutes_ready'
+# Killed between the update's two renames (the installed copy moved aside, the new one not yet in):
+# both folders are on the record, and the next install removes them and installs.
+printf '// another update\n' >> "$SOURCE_DIR/minutes/writer.mjs"
+{ ( mv() { case "$1|$2" in "$SRC_DIR"/.minutes.*"|$MINUTES_DIR") /bin/sh -c 'kill -KILL $PPID' ;; esac; command mv "$@"; }
+    PATH="/usr/bin:/bin" install_minutes ) > /dev/null 2>&1; } 2>/dev/null
+between="$(ls -A "$SRC_DIR" | tr '\n' ' ')"; between_lines="$(grep -c '/\.minutes' "$INSTALLED")"
+out="$(PATH="/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "an update killed between its two renames leaves both folders on the record, and the next install removes them and installs" \
+  eval 'case "$between" in ".minutes-old."??????" .minutes."??????" ") true ;; *) false ;; esac && [ "$between_lines" = 2 ]
+        && [ "$rc" -eq 0 ] && [ "$(ls -A "$SRC_DIR")" = minutes ] && ! grep -q "/\.minutes" "$INSTALLED"
+        && cmp -s "$MINUTES_DIR/writer.mjs" "$SOURCE_DIR/minutes/writer.mjs" && minutes_ready'
+cp "$ROOT/minutes/writer.mjs" "$SOURCE_DIR/minutes/writer.mjs" 2>/dev/null
 
 # Due: a changed source writer.mjs, and on a release update whenever the recorder step is.
 recount() {
@@ -989,8 +1259,98 @@ for level in tools all; do
     check "reset_cmd $level with $fault: warns that the key could not be removed, and keeps its line" \
       eval 'printf "%s" "$out" | grep -qF "the key for $LOCAL could not be removed from the keychain"
             && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"'
+    check "reset_cmd $level with $fault: the output ends saying the key is still in the keychain and under what name, and the status is 1" \
+      eval '[ "$rc" -eq 1 ] && printf "%s\n" "$out" | tail -n 1 | grep -qF "the key for $LOCAL is still in your keychain, under \"meetingbox outside model\""
+            && [ "$(printf "%s\n" "$out" | grep -cF "is still in your keychain")" = 1 ]'
   done
 done
+# Two keys kept: one line each, at the end.
+fresh_setup; reset_run; fake_node; : > "$KEYSTORE"
+printf '%s\n' "$KEY" | (cli key set --address "$LOCAL") > /dev/null 2>&1
+printf '%s\n' "$KEY" | (cli key set --address "$CLAUDE") > /dev/null 2>&1
+out="$( (DELETE_STATUS=51; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
+         reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
+         reset_cmd all) 2>&1 )"; rc=$?
+check "uninstall with two keys it could not remove ends with one line for each, and the status is 1" \
+  eval '[ "$rc" -eq 1 ] && printf "%s\n" "$out" | tail -n 2 | head -n 1 | grep -qF "the key for $LOCAL is still in your keychain"
+        && printf "%s\n" "$out" | tail -n 1 | grep -qF "the key for $CLAUDE is still in your keychain"'
+
+# ======================================================================== the record never removes a meeting folder
+
+# remove_installed refuses a record line that is not absolute, has an empty, . or .. part or ends in /,
+# or is equal to, under or above BASE_DIR, or equal to or above HOME. The rm here is the real one, but
+# only for paths inside the scratch home: any other is refused and logged, so a broken guard fails a
+# check instead of removing anything outside it.
+SCRATCH="$(cd "$HOME" && pwd -P)"
+safe_rm() {
+  local a real
+  for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    [ -e "$a" ] || [ -L "$a" ] || continue
+    case "$(basename -- "$a")" in .|..) printf '%s\n' "$a" >> "$HOME/rm-refused"; return 1 ;; esac
+    real="$(cd -P -- "$(dirname -- "$a")" 2>/dev/null && pwd -P)/$(basename -- "$a")"
+    case "$real" in "$SCRATCH"/?*) ;; *) printf '%s\n' "$a" >> "$HOME/rm-refused"; return 1 ;; esac
+  done
+  command rm "$@"
+}
+for level in tools all; do
+  fresh_setup; reset_run; fake_node; rm -f "$HOME/rm-refused"
+  base="$HOME/Documents/Meetings"; m="$base/2026-11-10_1754"
+  rm -rf "$HOME/Documents" "$HOME/Meetings2"
+  mkdir -p "$m" "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/.minutes.a" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" "$SRC_DIR/plain"
+  printf 'aac' > "$m/audio.m4a"
+  for f in "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" "$SRC_DIR/plain"; do : > "$f/keep"; done
+  refused=("$m" "$base" "$HOME/Documents" "$HOME" "$HOME/" "$HOME//" "//" "${HOME%/*}" "$SRC_DIR/../../../Meetings2"
+           "$SRC_DIR/.minutes./../.." "$SRC_DIR/.minutes.a/../x" "$SRC_DIR//keep-empty" "$SRC_DIR/./keep-dot" "$SRC_DIR/keep-slash/"
+           "relative/path" "$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')")
+  printf '%s\n' "${refused[@]}" "$SRC_DIR/plain" >> "$INSTALLED"
+  out="$( (BASE_DIR="$base"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
+           reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
+           reset_cmd "$level") 2>&1 )"; rc=$?
+  missing=""
+  for p in "${refused[@]}"; do
+    grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
+    printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
+    printf '%s\n' "$out" | sed $'s/\033\\[[0-9;]*m//g; s/^ *//' | grep -qxF -- "$p" && missing="$missing [$p: listed to delete]"
+  done
+  check "reset_cmd $level refuses, with a warning, every record line naming a meeting folder, BASE_DIR or above it, HOME or above it, or a path with an empty, . or .. part, a trailing / or no leading /, keeps each line, and lists none of them to delete" \
+    eval '[ -z "$missing" ]'
+  [ -z "$missing" ] || printf '%s\n' "$missing"
+  check "reset_cmd $level: the meeting folder and its audio, and every folder those lines reach, are still there, and a plain recorded path is removed" \
+    eval '[ -f "$m/audio.m4a" ] && [ -f "$HOME/Meetings2/keep" ] && [ -f "$SRC_DIR/x/keep" ] && [ -f "$SRC_DIR/keep-empty/keep" ]
+          && [ -f "$SRC_DIR/keep-dot/keep" ] && [ -f "$SRC_DIR/keep-slash/keep" ] && [ ! -e "$SRC_DIR/plain" ]
+          && ! grep -qxF "$SRC_DIR/plain" "$INSTALLED" && [ ! -e "$HOME/rm-refused" ]'
+done
+rm -rf "$HOME/Documents" "$HOME/Meetings2"
+# With BASE_DIR on another disk, nothing but the HOME rule stands between rm and HOME or a folder
+# above it.
+fresh_setup; rm -f "$HOME/rm-refused"
+above=("$HOME" "${HOME%/*}" "${HOME%/*/*}")
+printf '%s\n' "${above[@]}" >> "$INSTALLED"
+out="$( (BASE_DIR="/Volumes/meetingbox-elsewhere/Meetings"; rm() { safe_rm "$@"; }
+         for p in "${above[@]}"; do remove_installed "$p"; done) 2>&1 )"
+missing=""
+for p in "${above[@]}"; do
+  grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
+  printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
+done
+check "with BASE_DIR on another disk, HOME and the folders above it are still refused, with a warning, and their lines kept" \
+  eval '[ -z "$missing" ] && [ -d "$HOME/.meetingbox" ] && [ ! -e "$HOME/rm-refused" ]'
+: > "$INSTALLED"
+
+# The leftover sweep takes only the names mktemp makes: .minutes. or .minutes-old. and six letters or
+# digits.
+fresh_setup; reset_run
+sweep="$SRC_DIR/.minutes.Ab3dE9 $SRC_DIR/.minutes-old.Zz09aa $SRC_DIR/.minutes.ab/cde $SRC_DIR/.minutes.a.b.cd $SRC_DIR/.minutes-old.a/b/cd"
+for p in $sweep; do mkdir -p "$p"; : > "$p/keep"; record_install "$p"; done
+( rm() { safe_rm "$@"; }; remove_minutes_leftovers ) > /dev/null 2>&1
+check "the leftover sweep removes recorded .minutes.XXXXXX and .minutes-old.XXXXXX folders, and no other name, such as one holding a / or a ." \
+  eval '[ ! -e "$SRC_DIR/.minutes.Ab3dE9" ] && [ ! -e "$SRC_DIR/.minutes-old.Zz09aa" ] && ! installed_by_us "$SRC_DIR/.minutes.Ab3dE9"
+        && ! installed_by_us "$SRC_DIR/.minutes-old.Zz09aa"
+        && [ -f "$SRC_DIR/.minutes.ab/cde/keep" ] && [ -f "$SRC_DIR/.minutes.a.b.cd/keep" ] && [ -f "$SRC_DIR/.minutes-old.a/b/cd/keep" ]
+        && installed_by_us "$SRC_DIR/.minutes.ab/cde" && installed_by_us "$SRC_DIR/.minutes.a.b.cd" && installed_by_us "$SRC_DIR/.minutes-old.a/b/cd"
+        && [ ! -e "$HOME/rm-refused" ]'
+rm -rf "$SRC_DIR"/.minutes.* "$SRC_DIR"/.minutes-old.*; : > "$INSTALLED"
 
 # ======================================================================== as the app runs them
 
@@ -1021,5 +1381,8 @@ else fail "usage gives the promise, the key commands and the outside writer's op
 if ! head -n 20 "$ROOT/meetingbox" | grep -qi 'all on device\|nothing leaves the Mac'; then
   pass "the script's header no longer promises that everything stays on device"
 else fail "the script's header no longer promises that everything stays on device: $(head -n 10 "$ROOT/meetingbox")"; fi
+if ! head -n 20 "$ROOT/meetingbox" | grep -qi 'no upload' && head -n 20 "$ROOT/meetingbox" | grep -qF 'No account and no per seat fee.'; then
+  pass "the script's header no longer says no upload"
+else fail "the script's header no longer says no upload: $(head -n 10 "$ROOT/meetingbox")"; fi
 
 finish
