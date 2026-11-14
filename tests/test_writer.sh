@@ -763,12 +763,13 @@ check "every block that expands the key runs only allowed builtins, names no com
 # by the awk rule, not the pin. read_swap's key is a word of a .swap line, not the key, but a text
 # search cannot tell them apart, so its lines are pinned with the rest.
 KEY_VARS='key|got|STORED_KEY'
-CMD_START='(^[[:space:]]*|[;|&({!][[:space:]]*|(then|do|else)[[:space:]]+)'   # where a command word can start
+# where a command word can start: the line, a separator, a case label's ), a backtick, or a word that takes a command
+CMD_START='(^[[:space:]]*|[;|&({!)`][[:space:]]*|(then|do|else|while|until|elif|builtin|command)[[:space:]]+)'
 DUMPERS='set|declare|typeset|local|readonly|export'
 key_lines() {
   grep -E -e '\$\{?('"$KEY_VARS"')([^A-Za-z0-9_]|$)' -e '(^|[[:space:]])('"$KEY_VARS"')\+?=' \
           -e '(^|[^A-Za-z0-9_])(key_ok|stored_key|eval)([^A-Za-z0-9_]|$)' -e 'find-generic-password|dump-keychain|\$\{!' \
-          -e "$CMD_START($DUMPERS)([[:space:]]+-[A-Za-z]+)*[[:space:]]*([;|&)}><#]|\$)" \
+          -e "$CMD_START($DUMPERS)([[:space:]]+(-[A-Za-z]+|[0-9]*[<>][^[:space:];|&]*))*[[:space:]]*([;|&)}><#\`]|\$)" \
           -e "$CMD_START($DUMPERS)[^#]*[[:space:]]-[A-Za-z]*p" \
           -e "${CMD_START}trap([[:space:]]|\$)|set[[:space:]]+-[A-Za-z]*T|functrace|extdebug" \
           -e "$CMD_START($DUMPERS)[^#]*[[:space:]]($KEY_VARS)([^A-Za-z0-9_]|\$)" "$1" \
@@ -817,6 +818,7 @@ stored_key "$address" || status=$?
 if ! outside_runtime; then key=""; outside_note "$host" 0 "outside models are not set up"; return 1; fi
 answer="$( { if [ "$had_key" = 1 ]; then printf '{"key":"%s",%s' "$key" "${request#\{}"; else printf '%s' "$request"; fi; } 2>/dev/null \
 key=""
+# where `mapfile` is missing and an empty array trips `set -u`.
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -874,11 +876,12 @@ return "$rc"
 }
 FN
 rl_diff="$(sed -n '/^run_limited() {$/,/^}$/p' "$ROOT/meetingbox" | sed 's/^[[:space:]]*//' | diff "$HOME/run-limited" -)"
-defined() { grep -cE "^[[:space:]]*(function[[:space:]]+)?($1)[[:space:]]*\(\)|^[[:space:]]*function[[:space:]]+($1)([[:space:]{]|\$)" "$ROOT/meetingbox"; }
+# a definition of NAME, by either form, at any command start: NAME() { or function NAME {
+defined() { grep -cE "$CMD_START(function[[:space:]]+)?($1)[[:space:]]*\(\)|${CMD_START}function[[:space:]]+($1)([[:space:]{]|\$)" "$ROOT/meetingbox"; }
 once=""
 for f in key_ok run_limited stored_key outside_note outside_runtime; do [ "$(defined "$f")" = 1 ] || once="$once [$f defined $(defined "$f") times]"; done
-SHADOW='printf|echo|read|builtin|command|test|eval|exec|security|tr|env|jq|cat|kill|sleep|wait|shift|return|true|set|declare|typeset|local|readonly|export|trap'
-shadowed="$(grep -nE "^[[:space:]]*(function[[:space:]]+)?($SHADOW)[[:space:]]*\(\)|^[[:space:]]*function[[:space:]]+($SHADOW)([[:space:]{]|\$)" "$ROOT/meetingbox")"
+SHADOW='printf|echo|read|builtin|command|test|\[|eval|exec|security|tr|env|jq|cat|kill|sleep|wait|shift|return|true|set|declare|typeset|local|readonly|export|trap'
+shadowed="$(grep -nE "$CMD_START(function[[:space:]]+)?($SHADOW)[[:space:]]*\(\)|${CMD_START}function[[:space:]]+($SHADOW)([[:space:]{]|\$)" "$ROOT/meetingbox")"
 check "run_limited, handed the key on its input, is word for word the pinned text; it, key_ok, stored_key, outside_note and outside_runtime are defined once; and no function takes the name of a builtin or command a key line runs" \
   eval '[ -z "$rl_diff" ] && [ -z "$once" ] && [ -z "$shadowed" ]'
 [ -z "$rl_diff$once$shadowed" ] || printf '%s\n' "$rl_diff" "$once" "$shadowed"
@@ -1679,8 +1682,9 @@ check "with BASE_DIR on another disk, HOME and the folders above it are still re
 # Each line is refused with the warning and kept, every meeting's audio is still there, and the plain
 # recorded paths (MINUTES_DIR, NODE_FILE and a folder of setup's) are removed. SPELL_DATA names the
 # Data volume, SPELL_CWD the folder reset runs from, and SPELL_APP and SPELL_ROOTS what the app's
-# Preferences name: its meetings folder, and the other folders it was told to record into.
-NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'; OTHER=$'R\xc3\xa9unions d\x27\xc3\xa9quipe'
+# Preferences name: its meetings folder, and the other folders it was told to record into (which the
+# guard leaves to the app).
+NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'
 # The app's Preferences as a test names them: defaults read answers SPELL_APP for meetingsFolder, and
 # defaults export gives a property list with SPELL_ROOTS (one path a line) as otherRoots.
 fake_defaults() {
@@ -1702,8 +1706,7 @@ spellings_case() {   # $1: name; $2: BASE_DIR as reset sees it (from $HOME); $3:
   shift 3
   for level in tools all; do
     fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
-    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub" \
-           "$HOME/$OTHER" "$HOME/Calls"
+    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
     mkdir -p "$real/m1" "$SRC_DIR/plain" "${SPELL_CWD:-$HOME}"; printf 'aac' > "$real/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
     case "$name" in "a BASE_DIR that is a link"*) ln -s "$HOME/elsewhere/Real" "$HOME/MeetingsLink" ;; esac
     ln -s "$real" "$SRC_DIR/link"
@@ -1743,16 +1746,27 @@ SPELL_CWD="$HOME/sub" spellings_case "MB_DIR with a ~/ left unexpanded, naming a
   "$HOME/Docs/Mtgs/m1" "$HOME/Docs/Mtgs" "$HOME/Docs"
 SPELL_CWD="$HOME/sub" spellings_case "a relative BASE_DIR, reset run from another folder" "Meetings" "$HOME/Meetings" \
   "$HOME/Meetings/m1" "$HOME/Meetings"
-# And the folders the app was told to record into with --dir or MB_DIR, which it keeps as otherRoots:
-# read as a property list, so a name with a space, a quote and an accent comes through whole; and a
-# relative MB_DIR=Calls recorded from $HOME, reset from elsewhere, once the app remembers ~/Calls.
-SPELL_ROOTS="$HOME/$OTHER" spellings_case "a folder in the app's otherRoots, with a space, a quote and an accent" "$HOME/m" "$HOME/$OTHER" \
-  "$HOME/$OTHER/m1" "$HOME/$OTHER"
-SPELL_CWD="$HOME/sub" SPELL_ROOTS="$HOME/Calls" spellings_case "MB_DIR=Calls, reset run from another folder, with ~/Calls in the app's otherRoots" \
-  "Calls" "$HOME/Calls" "$HOME/Calls/m1" "$HOME/Calls"
-rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub" \
-       "$HOME/$OTHER" "$HOME/Calls"
+rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink" "$HOME/Meetings" "$HOME/Documents" "$HOME/Docs" "$HOME/sub"
 : > "$INSTALLED"
+
+# The folders the app was told to record into with --dir or MB_DIR, which it keeps as otherRoots, are
+# left to the app: one `meetingbox start --dir .` from a Terminal in HOME puts HOME there for good, and
+# a guard that read them would then refuse every recorded path (so setup could not replace its own
+# app). With HOME in otherRoots, claim_path replaces a recorded app, and reset removes every normally
+# recorded path, refuses nothing, and keeps a meeting's audio in ~/Meetings.
+fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"; rm -rf "$HOME/Meetings" "$APP_DIR" "$SRC_DIR/plain"
+mkdir -p "$HOME/Meetings/m1" "$APP_DIR/Contents" "$SRC_DIR/plain"; printf 'aac' > "$HOME/Meetings/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
+record_install "$APP_DIR"; record_install "$SRC_DIR/plain"
+out1="$( (SPELL_ROOTS="$HOME"; defaults() { fake_defaults "$@"; }; rm() { safe_rm "$@"; }; claim_path "$APP_DIR") 2>&1 )"; rc1=$?
+claimed=0; [ -e "$APP_DIR" ] || claimed=1
+out="$( (SPELL_ROOTS="$HOME"; defaults() { fake_defaults "$@"; }; BASE_DIR="$HOME/Meetings"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }
+         adopt_own_app() { :; }; quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }
+         remove_signing_identity() { :; }; brew() { return 1; }; reset_cmd tools) 2>&1 )"; rc=$?
+check "with HOME in the app's otherRoots, claim_path replaces a recorded app, and reset_cmd tools removes every normally recorded path, refuses nothing, and keeps the meeting's audio in ~/Meetings" \
+  eval '[ "$rc1" -eq 0 ] && [ "$claimed" = 1 ] && [ "$rc" -eq 0 ] && ! printf "%s%s" "$out1" "$out" | grep -q "refusing to remove"
+        && [ ! -e "$APP_DIR" ] && [ ! -e "$SRC_DIR/plain" ] && [ ! -e "$MINUTES_DIR" ] && [ ! -e "$NODE_FILE" ] && ! installed_by_us "$SRC_DIR/plain"
+        && [ -f "$HOME/Meetings/m1/audio.m4a" ] && [ ! -e "$HOME/rm-refused" ]'
+rm -rf "$HOME/Meetings"; : > "$INSTALLED"
 
 # A line through a link into a meeting folder, or a meeting's own volfs name (/.vol/<device>/<inode>),
 # spells no meetings folder above it: the guard follows the physical path too, and refuses every volfs
