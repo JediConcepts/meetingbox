@@ -4,13 +4,15 @@
 
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { readFileSync, existsSync, mkdtempSync, copyFileSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
+import { createServer as createTlsServer } from "node:https";
+import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { complete as routerComplete } from "ai-execution-router";
-import { run, send } from "../writer.mjs";
+import { run, send, addressHost, limits, BAD_PORTS } from "../writer.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const WRITER = join(here, "..", "writer.mjs");
@@ -309,13 +311,15 @@ test("a 500 gives http, with its status in the message", async () => {
   assert.match(e.message, /^[A-Za-z]+ \(HTTP 500\)/);
 });
 
-test("the message is the name, the status and the first line, cut to 200, with the key as [key]", async () => {
-  const e = await errorOf(() => json(500, { error: { message: `upstream rejected ${KEY} today\u0007 ${"z".repeat(300)}\nsecond line` } }), { key: KEY });
-  assert.ok(e.message.startsWith(`TransientError (HTTP 500): upstream rejected [key] today ${"z".repeat(20)}`), e.message);
-  assert.ok(e.message.length <= 200 + "TransientError (HTTP 500): ".length, String(e.message.length));
-  assert.ok(!e.message.includes("second line"));
-  assert.ok(!e.message.includes(KEY));
-  assert.ok(!/[\u0000-\u001f]/.test(e.message));
+test("the message is the error's name and its status only, never any of the source's text", async () => {
+  let e = await errorOf(() => json(500, { error: { message: `upstream rejected ${KEY} today ZEBRAREPLY\nsecond line` } }), { key: KEY });
+  assert.equal(e.message, "TransientError (HTTP 500)");
+  e = await errorOf(() => new Response("ZEBRAREPLY the provider says no", { status: 400, headers: { "content-type": "text/plain" } }));
+  assert.equal(e.message, "PermanentError (HTTP 400)");
+  e = await errorOf(() => json(401, { error: { message: `bad credential ${Buffer.from(KEY).toString("base64")}` } }), { key: KEY });
+  assert.equal(e.message, "AuthError (HTTP 401)");
+  e = await errorOf(() => { throw fetchFailed(coded("ECONNREFUSED", `connect ECONNREFUSED ${SECRET}`)); });
+  assert.equal(e.message, "TransientError");
 });
 
 // --- sent -----------------------------------------------------------------------------------------
@@ -454,6 +458,11 @@ test("every allow line of the address table is accepted", async () => {
     useFetch(() => standardReply(MINUTES));
     const r = await run("complete", req({ address }));
     assert.equal(r.code, 0, address);
+    if (BAD_PORTS.has(new URL(address).port)) {
+      // the rule allows it, and fetch would refuse it: answered at once, never sent
+      assert.deepEqual([r.output.error.type, r.output.error.sent, calls.length], ["connect", false, 0], address);
+      continue;
+    }
     assert.equal(r.output.text, MINUTES, address);
     assert.equal(calls[0].url, `${address.replace(/\/+$/, "")}/chat/completions`);
   }
@@ -464,9 +473,9 @@ test("every allow line of the address table is accepted", async () => {
 
 // --- leaks: the key and the transcript never reach stdout or stderr -------------------------------
 
-function cli(args, stdin, { preload, env = {} } = {}) {
+function cli(args, stdin, { preload, env = {}, writer = WRITER } = {}) {
   return new Promise((resolve) => {
-    const argv = [...(preload ? ["--import", pathToFileURL(join(here, preload)).href] : []), WRITER, ...args];
+    const argv = [...(preload ? ["--import", pathToFileURL(join(here, preload)).href] : []), writer, ...args];
     const child = spawn(process.execPath, argv, { env, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     let err = "";
@@ -659,4 +668,146 @@ test("list errors: a 401 is refused, a closed port is connect, a body that is no
   r = await run("list", { kind: "standard", address: STANDARD });
   assert.equal(r.output.error.type, "other");
   for (const out of [r.output]) assert.ok(!JSON.stringify(out).includes(KEY));
+});
+
+// --- round 1 --------------------------------------------------------------------------------------
+
+test("list gives up at its own limit (10 s, shortened here), as timeout", async () => {
+  assert.equal(limits.listMs, 10_000);
+  limits.listMs = 100;
+  try {
+    useFetch((c) => waitForAbort(c));
+    const start = Date.now();
+    const r = await run("list", { kind: "standard", address: STANDARD });
+    assert.equal(r.output.error.type, "timeout");
+    assert.ok(Date.now() - start < 3000, String(Date.now() - start));
+    useFetch((c, n) => (n === 1 ? json(200, { data: [{ id: "a" }], has_more: true, last_id: "a" }) : waitForAbort(c)));
+    const r2 = await run("list", { kind: "claude", address: CLAUDE, key: KEY });
+    assert.equal(r2.output.error.type, "timeout", "one limit over every page");
+  } finally {
+    limits.listMs = 10_000;
+  }
+});
+
+test("a key the source hands back is scrubbed: list drops an id holding it, and complete puts [key] in its place", async () => {
+  for (const [kind, address, reply] of [["standard", STANDARD, standardReply], ["claude", CLAUDE, claudeReply]]) {
+    useFetch(() => json(200, { data: [{ id: "m1" }, { id: `leak-${KEY}` }, { id: KEY }, { id: "m2" }], has_more: false }));
+    let r = await run("list", { kind, address, key: KEY });
+    assert.deepEqual(r.output, { models: ["m1", "m2"] }, kind);
+    useFetch(() => reply(`## Summary\nYour key is ${KEY}, and again ${KEY}.\n`));
+    r = await run("complete", req({ kind, address, key: KEY }));
+    assert.equal(r.output.text, "## Summary\nYour key is [key], and again [key].\n", kind);
+    assert.ok(!JSON.stringify(r.output).includes(KEY), kind);
+  }
+});
+
+test("a port fetch refuses (6000, 10080) is answered at once: connect, not sent, and no fetch", async () => {
+  useFetch(() => standardReply(MINUTES));
+  let r = await run("complete", req({ address: "http://127.0.0.1:6000/v1" }));
+  assert.deepEqual([r.output.error.type, r.output.error.sent], ["connect", false]);
+  r = await run("complete", req({ kind: "claude", address: "https://h.example:10080", key: KEY }));
+  assert.deepEqual([r.output.error.type, r.output.error.sent], ["connect", false]);
+  r = await run("list", { kind: "standard", address: "http://localhost:6000/v1" });
+  assert.equal(r.output.error.type, "connect");
+  assert.equal(calls.length, 0);
+  useFetch(() => standardReply(MINUTES));
+  r = await run("complete", req({ address: "http://127.0.0.1:6001/v1" }));
+  assert.equal(r.output.text, MINUTES);
+  for (const p of ["1", "6000", "6665", "6669", "10080", "2049", "5060"]) assert.ok(BAD_PORTS.has(p), p);
+  for (const p of ["", "80", "443", "11434", "1234", "8443"]) assert.ok(!BAD_PORTS.has(p), p);
+});
+
+// Node's documented X509 certificate error codes, less OUT_OF_MEM, and the altname check: all of them
+// fail the handshake, before any request is written.
+const CERT_CODES = ["UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+  "UNABLE_TO_DECRYPT_CRL_SIGNATURE", "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY", "CERT_SIGNATURE_FAILURE", "CRL_SIGNATURE_FAILURE",
+  "CERT_NOT_YET_VALID", "CERT_HAS_EXPIRED", "CRL_NOT_YET_VALID", "CRL_HAS_EXPIRED", "ERROR_IN_CERT_NOT_BEFORE_FIELD",
+  "ERROR_IN_CERT_NOT_AFTER_FIELD", "ERROR_IN_CRL_LAST_UPDATE_FIELD", "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+  "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "CERT_CHAIN_TOO_LONG", "CERT_REVOKED", "INVALID_CA", "PATH_LENGTH_EXCEEDED",
+  "INVALID_PURPOSE", "CERT_UNTRUSTED", "CERT_REJECTED", "HOSTNAME_MISMATCH", "ERR_TLS_CERT_ALTNAME_INVALID"];
+
+test("a certificate the handshake refuses is not sent; other TLS failures are", async () => {
+  for (const code of CERT_CODES) {
+    const e = await errorOf(() => { throw fetchFailed(coded(code)); });
+    assert.deepEqual([e.type, e.sent], ["connect", false], code);
+  }
+  for (const code of ["ERR_SSL_PACKET_LENGTH_TOO_LONG", "ERR_SSL_WRONG_VERSION_NUMBER", "OUT_OF_MEM", "ECONNRESET"]) {
+    const e = await errorOf(() => { throw fetchFailed(coded(code)); });
+    assert.equal(e.sent, true, code);
+  }
+});
+
+const haveOpenssl = spawnSync("openssl", ["version"], { stdio: "ignore" }).status === 0;
+test("a self-signed https source on 127.0.0.1, reached as https://localhost, gets no request and is not sent",
+  { skip: haveOpenssl ? false : "no openssl to make a certificate" }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "writer-tls-"));
+    try {
+      const made = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", join(dir, "key.pem"),
+        "-out", join(dir, "cert.pem"), "-days", "2", "-subj", "/CN=localhost"], { stdio: "ignore" });
+      assert.equal(made.status, 0);
+      let requests = 0;
+      const s = createTlsServer({ key: readFileSync(join(dir, "key.pem")), cert: readFileSync(join(dir, "cert.pem")) },
+        (rq, rs) => { requests++; rs.end("{}"); });
+      await new Promise((resolve) => s.listen(0, "127.0.0.1", resolve));
+      try {
+        const r = await run("complete", req({ address: `https://localhost:${s.address().port}/v1` }));
+        assert.deepEqual([r.output.error.type, r.output.error.sent, requests], ["connect", false, 0]);
+      } finally {
+        await new Promise((resolve) => { s.closeAllConnections?.(); s.close(() => resolve()); });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+// A copy of writer.mjs in a folder of its own, with no router, or with one whose entry throws on import.
+function writerWithout(router) {
+  const dir = mkdtempSync(join(tmpdir(), "writer-router-"));
+  copyFileSync(WRITER, join(dir, "writer.mjs"));
+  if (router === "throwing") {
+    const pkg = join(dir, "node_modules", "ai-execution-router");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "ai-execution-router", version: "1.1.1", type: "module",
+      exports: { ".": "./index.js", "./package.json": "./package.json" } }));
+    writeFileSync(join(pkg, "index.js"), `throw new Error("broken router ${KEY} ${SECRET}");\n`);
+  }
+  return dir;
+}
+
+test("a router that is missing, or whose entry throws, gives exit 3 and only writer failed, for every command, with no request", async () => {
+  let reached = 0;
+  const s = await server((rq, rs) => { reached++; rq.resume(); rq.on("end", () => rs.end("{}")); });
+  const dirs = [writerWithout("missing"), writerWithout("throwing")];
+  try {
+    for (const dir of dirs) {
+      for (const [command, stdin] of [["version", ""], ["complete", JSON.stringify(req({ address: `${s.url}/v1`, key: KEY }))],
+        ["list", JSON.stringify({ kind: "standard", address: `${s.url}/v1` })]]) {
+        const r = await cli([command], stdin, { writer: join(dir, "writer.mjs") });
+        assert.deepEqual([r.code, r.out, r.err], [3, "", "writer failed\n"], `${dir} ${command}`);
+        clean(r);
+      }
+    }
+    assert.equal(reached, 0);
+  } finally {
+    await s.close();
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("for every allow line, the URL parser's hostname is the host the rule parsed", () => {
+  for (const [verdict, address] of addressCases()) {
+    if (verdict === "allow") assert.equal(new URL(address).hostname, addressHost(address), address);
+  }
+});
+
+test("hosts that are numbers to the URL parser are refused: 0x forms, and a trailing dot on a local host", async () => {
+  useFetch(() => standardReply(MINUTES));
+  for (const address of ["https://0x7f000001/v1", "https://0xc0a80001:8443/v1", "https://127.0.0.0x1/v1", "https://0x7f.0.0.0x1",
+    "https://1.2.3.0xa", "https://0x", "https://1.0x", "https://a.0x", "http://localhost.:11434", "http://127.0.0.1."]) {
+    assert.equal(addressHost(address), null, address);
+    assert.equal((await run("complete", req({ address }))).code, 2, address);
+  }
+  for (const address of ["https://a.0xg", "https://0xg.example", "https://00x1.example"]) assert.notEqual(addressHost(address), null, address);
+  assert.equal(calls.length, 0);
 });

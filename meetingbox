@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# meetingbox: one key, whole meeting. Record, transcribe, summarise, all on device.
+# meetingbox: one key, whole meeting. Record, transcribe, summarise.
 #
 #   press once  -> records you and everyone else
 #   press again -> stops, transcribes, writes the minutes
@@ -649,7 +649,9 @@ address_ok() {
 }
 
 # Lower-case labels of letters, digits and hyphens, 1 to 63 each and not starting or ending with a
-# hyphen, the last with a letter in it (so never an IPv4 literal), at most 253 characters in all.
+# hyphen, at most 253 characters in all, the last of which is not a number to the URL parser: it has a
+# letter in it (so never an IPv4 literal), and is not 0x followed only by hex digits (0x7f000001 is
+# 127.0.0.1 to it, and 0x alone is 0.0.0.0).
 dns_name_ok() {
   local rest="$1" label last=""
   [ -n "$rest" ] && [ "${#rest}" -le 253 ] || return 1
@@ -662,13 +664,18 @@ dns_name_ok() {
     [ "$label" != "$rest" ] || break
     rest="${rest#*.}"
   done
-  case "$last" in *[$LOWER]*) return 0 ;; esac
-  return 1
+  case "$last" in *[$LOWER]*) ;; *) return 1 ;; esac
+  case "$last" in
+    0x*) case "${last#0x}" in *[!0123456789abcdef]*) ;; *) return 1 ;; esac ;;
+  esac
+  return 0
 }
 
-# Lower-case hex groups of 1 to 4 digits: eight of them, or at most seven around one "::".
+# Lower-case hex groups of 1 to 4 digits, eight of them or at most seven around one "::", written as
+# the URL parser writes them, so the host shown is the one connected to: no leading zero, and the first
+# longest run of two or more zero groups, and only that, as "::".
 ipv6_ok() {
-  local s="$1" left right part rest g n=0 double=0
+  local s="$1" left right part side rest g n=0 double=0 lp="" rp="" pieces i j run best=0 at=0 canon="" piece
   [ -n "$s" ] || return 1
   case "$s" in *[!0123456789abcdef:]*) return 1 ;; esac
   case "$s" in
@@ -676,18 +683,44 @@ ipv6_ok() {
           case "$right" in *::*) return 1 ;; esac ;;
     *)    left="$s"; right="" ;;
   esac
-  for part in "$left" "$right"; do
-    [ -n "$part" ] || continue
-    rest="$part"
+  # each half's groups, as numbers: L for the left of any "::", R for the right
+  for part in "L$left" "R$right"; do
+    side="${part:0:1}"; rest="${part:1}"
+    [ -n "$rest" ] || continue
     while :; do
       g="${rest%%:*}"
       [ -n "$g" ] && [ "${#g}" -le 4 ] || return 1
       n=$((n + 1))
+      if [ "$side" = L ]; then lp="$lp $((16#$g))"; else rp="$rp $((16#$g))"; fi
       [ "$g" != "$rest" ] || break
       rest="${rest#*:}"
     done
   done
-  if [ "$double" = 1 ]; then [ "$n" -le 7 ]; else [ "$n" -eq 8 ]; fi
+  if [ "$double" = 1 ]; then [ "$n" -le 7 ] || return 1; else [ "$n" -eq 8 ] || return 1; fi
+  pieces="$lp"
+  i=$n; while [ "$i" -lt 8 ]; do pieces="$pieces 0"; i=$((i + 1)); done
+  pieces="$pieces$rp"
+  # shellcheck disable=SC2086   # eight numbers
+  set -- $pieces
+  i=1
+  while [ "$i" -le 8 ]; do
+    if [ "${!i}" = 0 ]; then
+      j=$i; while [ "$j" -le 8 ] && [ "${!j}" = 0 ]; do j=$((j + 1)); done
+      run=$((j - i))
+      if [ "$run" -ge 2 ] && [ "$run" -gt "$best" ]; then best=$run; at=$i; fi
+      i=$j
+    else
+      i=$((i + 1))
+    fi
+  done
+  i=1
+  while [ "$i" -le 8 ]; do
+    if [ "$i" = "$at" ]; then canon="$canon::"; i=$((i + best)); continue; fi
+    printf -v piece '%x' "${!i}"
+    case "$canon" in ""|*::) canon="$canon$piece" ;; *) canon="$canon:$piece" ;; esac
+    i=$((i + 1))
+  done
+  [ "$canon" = "$s" ]
 }
 
 # A key is 1 to 4096 characters of A-Za-z0-9._~+/=-, and a model name 1 to 200 of A-Za-z0-9._:/+@-
@@ -702,35 +735,46 @@ model_ok() {
 }
 
 # Every security call names MB_KEYCHAIN when it is set (tests only, like MB_WRITER_LIMIT; the app never
-# passes MB_*), else the default keychain. These two ask whether an item is there, and remove it,
-# without reading the key.
-key_stored() { security find-generic-password -s "$KEY_SERVICE" -a "$1" ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} >/dev/null 2>&1; }
+# passes MB_*), else the default keychain. security answers 44 when the item is not there; any other
+# failure (a locked keychain, a refused prompt) means the keychain could not be read, which is never
+# taken for "no key". key_stored asks whether an item is there without reading the key: 0 when it is,
+# 1 when it is not (44), 2 when the keychain could not be read. key_delete removes it.
+key_stored() {
+  local status=0
+  security find-generic-password -s "$KEY_SERVICE" -a "$1" ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} >/dev/null 2>&1 || status=$?
+  case "$status" in 0) return 0 ;; 44) return 1 ;; *) return 2 ;; esac
+}
 key_delete() { security delete-generic-password -s "$KEY_SERVICE" -a "$1" ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} >/dev/null 2>&1; }
 
 # The key stored for ADDRESS, read back through security into STORED_KEY (never a file or an argument)
-# and checked again. Status 0, or 1 when none is stored, or 2 when the one stored breaks the key rule.
+# and checked again. Status 0; 1 when none is stored (44); 2 when the one stored breaks the key rule;
+# 3 when the keychain could not be read.
 stored_key() {
   local got status
   STORED_KEY=""
   got="$(security find-generic-password -s "$KEY_SERVICE" -a "$1" -w ${MB_KEYCHAIN:+"$MB_KEYCHAIN"} 2>/dev/null; printf '.%s' "$?")"
   status="${got##*.}"
   got="${got%.*}"
-  [ "$status" = 0 ] || return 1
+  case "$status" in 0) ;; 44) return 1 ;; *) return 3 ;; esac
   got="${got%$'\n'}"   # security ends what it prints with one newline of its own
   key_ok "$got" || return 2
   STORED_KEY="$got"
 }
 
-# Removes the stored key for ADDRESS and forgets its record line. A record line naming an address the
-# rule refuses never came from meetingbox: it is forgotten, and security is never handed it.
+# Removes the stored key for ADDRESS, and forgets its record line only once security says the item is
+# not there (44): a delete that failed, or that cannot be confirmed, keeps the line for a later run. A
+# record line naming an address the rule refuses never came from meetingbox: it is forgotten, and
+# security is never handed it.
 remove_stored_key() {
+  local status=0
   if ! address_ok "$1"; then
     warn "the install record names a key for an address meetingbox does not accept, so it was left alone"
     forget_install "keychain:generic:$1"
     return 1
   fi
   key_delete "$1" || true
-  if key_stored "$1"; then warn "the key for $1 could not be removed from the keychain"; return 1; fi
+  key_stored "$1" || status=$?
+  if [ "$status" != 1 ]; then warn "the key for $1 could not be removed from the keychain"; return 1; fi
   forget_install "keychain:generic:$1"
 }
 
@@ -740,12 +784,18 @@ remove_stored_key() {
 # status says set or none without reading the key. Each answers in one line on stdout and touches no
 # network; an address or key the rules refuse goes nowhere, and the answer is 1.
 key_cmd() {
-  local sub="$1" address="$OUTSIDE_ADDRESS" key had=0
+  local sub="$1" address="$OUTSIDE_ADDRESS" key had=0 status=0
   umask 077
   case "$sub" in set|remove|status) ;; *) die "usage: meetingbox key set|remove|status --address URL" ;; esac
   if ! address_ok "$address"; then echo "That address is not one meetingbox accepts."; return 1; fi
   case "$sub" in
-    status) if key_stored "$address"; then echo set; else echo none; fi ;;
+    status)
+      key_stored "$address" || status=$?
+      case "$status" in
+        0) echo set ;;
+        1) echo none ;;
+        *) echo "The keychain could not be read."; return 1 ;;
+      esac ;;
     remove)
       if remove_stored_key "$address" 2>/dev/null; then echo none
       else echo "The key could not be removed from the keychain."; return 1; fi ;;
@@ -768,7 +818,11 @@ key_cmd() {
         echo set
       else
         STORED_KEY=""
-        [ "$had" = 1 ] || key_stored "$address" || forget_install "keychain:generic:$address"
+        # a new record line goes only once security says no item is there (44): one it cannot read may be
+        if [ "$had" = 0 ]; then
+          key_stored "$address" || status=$?
+          [ "$status" != 1 ] || forget_install "keychain:generic:$address"
+        fi
         echo "The key could not be stored in the keychain."
         return 1
       fi ;;
@@ -810,10 +864,10 @@ outside_runtime() {
   OUTSIDE_NODE=""; OUTSIDE_NODE_VERSION=""; OUTSIDE_WHY=""
   if ! installed_by_us "$NODE_FILE" || [ ! -f "$NODE_FILE" ]; then OUTSIDE_WHY="outside models are not set up"; return 1; fi
   node="$(recorded_node)" || { OUTSIDE_WHY="the Node setup found is no longer there"; return 1; }
+  [ -f "$MINUTES_DIR/writer.mjs" ] || { OUTSIDE_WHY="the router is not installed"; return 1; }
   version="$(node_version "$node")" || { OUTSIDE_WHY="the Node setup found does not run"; return 1; }
   [ "${version%%.*}" -ge 20 ] || { OUTSIDE_WHY="the Node setup found is version $version, older than 20"; return 1; }
-  [ -f "$MINUTES_DIR/writer.mjs" ] && [ "$(router_version "$node" "$MINUTES_DIR")" = "$ROUTER_VERSION" ] \
-    || { OUTSIDE_WHY="the router is not installed"; return 1; }
+  [ "$(router_version "$node" "$MINUTES_DIR")" = "$ROUTER_VERSION" ] || { OUTSIDE_WHY="the router is not installed"; return 1; }
   OUTSIDE_NODE="$node"
   OUTSIDE_NODE_VERSION="$version"
 }
@@ -826,15 +880,18 @@ outside_reason() {
     timeout) echo "it stopped answering, or did not finish within 15 minutes" ;;
     quota)   if [ "$2" = claude ]; then echo "your Claude API quota is used up"; else echo "its quota is used up"; fi ;;
     rate)    echo "it was rate limited" ;;
-    refused) if [ "$2" = claude ] && [ "$3" = 0 ]; then echo "the Claude API needs a key"; else echo "it refused the key"; fi ;;
+    refused) if [ "$3" = 1 ]; then echo "it refused the key"
+             elif [ "$2" = claude ]; then echo "the Claude API needs a key"
+             else echo "it asked for a key"; fi ;;
     context) echo "the transcript is too long for $4" ;;
     http)    if [ -n "$5" ]; then echo "it answered with an error (HTTP $5)"; else echo "it answered with an error"; fi ;;
     *)       echo "it gave an unexpected answer" ;;
   esac
 }
 
-# The status in writer.mjs's error message, which starts "<name> (HTTP <status>)" when there is one.
-error_status() { jq -r '.error.message | strings | capture("^[A-Za-z0-9_]+ \\(HTTP (?<s>[1-5][0-9][0-9])\\)").s // empty' "$1" 2>/dev/null || true; }
+# The status in writer.mjs's error message on stdin, which is "<name> (HTTP <status>)" when there is
+# one. The one place that reads that form.
+error_status() { jq -r '.error.message | strings | capture("^[A-Za-z0-9_]+ \\(HTTP (?<s>[1-5][0-9][0-9])\\)").s // empty' 2>/dev/null || true; }
 
 # ------------------------------------------------------------------ setup steps
 
@@ -1104,10 +1161,17 @@ minutes_ready() {
 
 outside_failed() { warn "Outside models could not be set up: $1. Apple's on-device model still writes the minutes."; }
 
+# The npm beside a Node, resolved to npm's own script (npm-cli.js), printed; false when there is none.
+npm_beside() {
+  local npm
+  npm="$(realpath "$(dirname "$1")/npm" 2>/dev/null)" && [ -f "$npm" ] || return 1
+  printf '%s' "$npm"
+}
+
 # Node 20 or later, as setup finds it: the first on the PATH, then in NODE_PLACES (Homebrew's folders),
 # then the newest nvm version. One counts only if it runs and says version 20 or later within 5
-# seconds (an Intel build on Apple silicon does not start); each one passed over is named. Prints the
-# path as found, never resolved.
+# seconds (an Intel build on Apple silicon does not start), and has an npm beside it; each one passed
+# over is named. Prints the path as found, never resolved.
 find_node() {
   local c d v list="" versions="" seen=$'\n' rest="$PATH:"
   # each PATH entry in turn, by expansion rather than word splitting, so none is taken as a pattern
@@ -1133,21 +1197,33 @@ find_node() {
     [ -f "$c" ] && [ -x "$c" ] || continue
     if ! v="$(node_version "$c")"; then info "passing over $c: it does not run here"; continue; fi
     if [ "${v%%.*}" -lt 20 ]; then info "passing over $c: it is version $v, and outside models need 20 or later"; continue; fi
+    if ! npm_beside "$c" > /dev/null; then info "passing over $c: it has no npm beside it"; continue; fi
     printf '%s\n' "$c"
     return 0
   done <<< "$list"
   return 1
 }
 
-# Outside models (optional). Finds Node 20 or later (or offers Homebrew's), then installs the router:
-# only writer.mjs, package.json and package-lock.json are copied from the source's minutes/ into a
-# temporary folder beside MINUTES_DIR, npm runs `ci --ignore-scripts --omit=dev` there as that Node
-# running npm's own script (npm's launcher would start whichever node is first on the PATH), with its
-# cache in a temporary folder removed afterwards, and writer.mjs must then say the router is
-# ROUTER_VERSION. Only then does the new copy replace MINUTES_DIR, and NODE_FILE record the Node.
-# Any failure says so and returns 1; setup carries on, and a working install is kept.
+# The build folders an interrupted install_minutes left beside MINUTES_DIR: each was put on the install
+# record before anything went in it, so each goes through the record.
+remove_minutes_leftovers() {
+  local p ours parent="${MINUTES_DIR%/*}"
+  ours="$(cat "$INSTALLED" 2>/dev/null || true)"
+  while IFS= read -r p; do
+    case "$p" in "$parent"/.minutes.??????|"$parent"/.minutes-old.??????) remove_installed "$p" || true ;; esac
+  done <<< "$ours"
+}
+
+# Outside models (optional). Finds Node 20 or later with npm beside it (or offers Homebrew's), then
+# installs the router: only writer.mjs, package.json and package-lock.json are copied from the
+# source's minutes/ into a build folder beside MINUTES_DIR, recorded before anything goes in it, and
+# npm runs `ci --ignore-scripts --omit=dev` there as that Node running npm's own script (npm's launcher
+# would start whichever node is first on the PATH), with its cache inside the build folder, removed
+# once it is done. writer.mjs must then say the router is ROUTER_VERSION. Only then does the new copy
+# replace MINUTES_DIR, and NODE_FILE record the Node. Any failure says so and returns 1; setup carries
+# on, and a working install is kept. Folders a killed install left are removed first.
 install_minutes() {
-  local node version npm tmp new old f parent="${MINUTES_DIR%/*}"
+  local node version npm new old f parent="${MINUTES_DIR%/*}"
   say "outside models (optional)"
   info "lets a model you choose, such as the Claude API or Ollama, write the minutes; needs Node 20 or later"
   node="$(find_node)" || node=""
@@ -1161,8 +1237,7 @@ install_minutes() {
     node="$(find_node)" || { outside_failed "no Node 20 or later was found after installing it"; return 1; }
   fi
   version="$(node_version "$node")" || { outside_failed "$node does not run"; return 1; }
-  npm="$(realpath "$(dirname "$node")/npm" 2>/dev/null)" && [ -f "$npm" ] \
-    || { outside_failed "there is no npm beside $node"; return 1; }
+  npm="$(npm_beside "$node")" || { outside_failed "there is no npm beside $node"; return 1; }
   if { [ -e "$NODE_FILE" ] || [ -L "$NODE_FILE" ]; } && ! { installed_by_us "$NODE_FILE" && [ -f "$NODE_FILE" ] && [ ! -L "$NODE_FILE" ]; }; then
     warn "$NODE_FILE already exists and meetingbox did not create it, so I will not replace it"
     outside_failed "$NODE_FILE is not meetingbox's"; return 1
@@ -1176,33 +1251,44 @@ install_minutes() {
   for f in writer.mjs package.json package-lock.json; do
     [ -f "$SOURCE_DIR/minutes/$f" ] || { outside_failed "the source has no minutes/$f"; return 1; }
   done
-  # the new copy is made beside MINUTES_DIR, so it goes in by a rename on the same volume
+  remove_minutes_leftovers
+  # The new copy is built beside MINUTES_DIR, so it goes in by a rename on the same volume. It is on
+  # the record from before anything goes in it until it is renamed or removed, so a killed setup leaves
+  # nothing the next one, or uninstall, cannot find.
   mkdir -p "$parent" && new="$(mktemp -d "$parent/.minutes.XXXXXX")" || { outside_failed "no folder could be made in $parent"; return 1; }
-  tmp="$(mktemp -d)" || { rm -rf -- "$new"; outside_failed "no temporary folder"; return 1; }
+  record_install "$new"
   if ! cp "$SOURCE_DIR/minutes/writer.mjs" "$SOURCE_DIR/minutes/package.json" "$SOURCE_DIR/minutes/package-lock.json" "$new/"; then
-    rm -rf -- "$new" "$tmp"; outside_failed "the source could not be copied"; return 1
+    remove_installed "$new"; outside_failed "the source could not be copied"; return 1
   fi
   info "installing ai-execution-router $ROUTER_VERSION, pinned by its hash, with Node $version"
-  if ! (cd "$new" && "$node" "$npm" ci --ignore-scripts --omit=dev --cache "$tmp/cache" \
+  if ! (cd "$new" && "$node" "$npm" ci --ignore-scripts --omit=dev --cache "$new/.npm-cache" \
           --no-audit --no-fund --no-update-notifier >&2); then
-    rm -rf -- "$new" "$tmp"; outside_failed "npm could not install the router"; return 1
+    remove_installed "$new"; outside_failed "npm could not install the router"; return 1
   fi
-  rm -rf -- "$tmp"
+  # npm's cache, inside this run's own build folder, goes before the copy is used
+  rm -rf -- "$new/.npm-cache"
   if [ "$(router_version "$node" "$new")" != "$ROUTER_VERSION" ]; then
-    rm -rf -- "$new"; outside_failed "the router did not answer once installed"; return 1
+    remove_installed "$new"; outside_failed "the router did not answer once installed"; return 1
   fi
   # The new copy goes in by renames, so a failure leaves the one that was there.
   if [ -d "$MINUTES_DIR" ]; then
-    old="$(mktemp -d "$parent/.minutes-old.XXXXXX")" || { rm -rf -- "$new"; outside_failed "no folder could be made in $parent"; return 1; }
-    if ! mv "$MINUTES_DIR" "$old/minutes"; then rm -rf -- "$new" "$old"; outside_failed "the installed copy could not be moved aside"; return 1; fi
+    old="$(mktemp -d "$parent/.minutes-old.XXXXXX")" || { remove_installed "$new"; outside_failed "no folder could be made in $parent"; return 1; }
+    record_install "$old"
+    if ! mv "$MINUTES_DIR" "$old/minutes"; then
+      remove_installed "$new"; remove_installed "$old"; outside_failed "the installed copy could not be moved aside"; return 1
+    fi
     if ! mv "$new" "$MINUTES_DIR"; then
       mv "$old/minutes" "$MINUTES_DIR" || true
-      rm -rf -- "$new" "$old"; outside_failed "the new copy could not be put in place"; return 1
+      remove_installed "$new"; remove_installed "$old"; outside_failed "the new copy could not be put in place"; return 1
     fi
-    rm -rf -- "$old"
+    forget_install "$new"
+    remove_installed "$old"
   else
     record_install "$MINUTES_DIR"
-    mv "$new" "$MINUTES_DIR" || { forget_install "$MINUTES_DIR"; rm -rf -- "$new"; outside_failed "the new copy could not be put in place"; return 1; }
+    if ! mv "$new" "$MINUTES_DIR"; then
+      forget_install "$MINUTES_DIR"; remove_installed "$new"; outside_failed "the new copy could not be put in place"; return 1
+    fi
+    forget_install "$new"
   fi
   record_install "$NODE_FILE"
   printf '%s\n' "$node" > "$NODE_FILE" || { outside_failed "$NODE_FILE could not be written"; return 1; }
@@ -1875,6 +1961,7 @@ engines_cmd() {
   case "$status" in
     0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
     2) echo "outside error the stored key is not valid"; return 0 ;;
+    3) echo "outside error its key could not be read from the keychain"; return 0 ;;
   esac
   if [ "$OUTSIDE_KIND" = claude ] && [ "$had_key" = 0 ]; then echo "outside error the Claude API needs a key"; return 0; fi
   # The key goes first on stdin, never in an argument: the rest of the request comes from jq.
@@ -1892,7 +1979,7 @@ engines_cmd() {
     case "$(printf '%s' "$answer" | jq -r '.error.type | strings')" in
       timeout) reason="it did not answer within 10 seconds" ;;
       *) reason="$(outside_reason "$(printf '%s' "$answer" | jq -r '.error.type | strings')" "$OUTSIDE_KIND" "$had_key" "" \
-                   "$(printf '%s' "$answer" | jq -r '.error.message | strings | capture("^[A-Za-z0-9_]+ \\(HTTP (?<s>[1-5][0-9][0-9])\\)").s // empty' 2>/dev/null)")" ;;
+                   "$(printf '%s' "$answer" | error_status)")" ;;
     esac
     echo "outside error $reason"
   else
@@ -2811,15 +2898,17 @@ outside_minutes() {
   if ! address_ok "$address"; then outside_note "" 0 "its address is not one meetingbox accepts"; return 1; fi
   host="$ADDRESS_HOST"
   if ! model_ok "$model"; then outside_note "$host" 0 "the model name is not one meetingbox accepts"; return 1; fi
-  if ! node="$(recorded_node)" || [ ! -f "$MINUTES_DIR/writer.mjs" ]; then
-    outside_note "$host" 0 "outside models are not set up"; return 1
-  fi
   stored_key "$address" || status=$?
   case "$status" in
     0) key="$STORED_KEY"; STORED_KEY=""; had_key=1 ;;
     2) outside_note "$host" 0 "the stored key is not valid"; return 1 ;;
+    3) outside_note "$host" 0 "its key could not be read from the keychain"; return 1 ;;
   esac
   if [ "$kind" = claude ] && [ "$had_key" = 0 ]; then outside_note "$host" 0 "the Claude API needs a key"; return 1; fi
+  # The runtime as engines checks it: the recorded Node runs at 20 or later and writer.mjs, loading the
+  # router, says it is ROUTER_VERSION. Without that nothing can be sent, and the note says so.
+  if ! outside_runtime; then key=""; outside_note "$host" 0 "outside models are not set up"; return 1; fi
+  node="$OUTSIDE_NODE"
   if ! work="$(mktemp -d "${dir:?}/.work.XXXXXX")"; then outside_note "$host" 0 "the request could not be prepared"; return 1; fi
 
   # The user message: the context line, a blank line, then the transcript between <transcript> tags.
@@ -2838,8 +2927,10 @@ outside_minutes() {
   case "$limit" in ""|*[!0-9]*) limit=960 ;; esac
   say "writing the minutes with $model at $host"
   # writer.mjs's stderr is never shown: it is not meant for anyone, and the key must never reach a log.
+  # The key goes first on its stdin from the printf builtin, alone on its line: nothing else ever sees it.
   if [ "$had_key" = 1 ]; then
-    { printf '{"key":"%s",' "$key" && tail -c +2 "$work/request.json"; } 2>/dev/null \
+    { printf '{"key":"%s",' "$key"
+      tail -c +2 "$work/request.json"; } 2>/dev/null \
       | run_limited "$limit" env -i "$node" "$MINUTES_DIR/writer.mjs" complete > "$work/answer" 2>/dev/null
     rc="${PIPESTATUS[1]}"
   else
@@ -2852,7 +2943,8 @@ outside_minutes() {
     0)   ;;
     124) outside_note "$host" 1 "it did not finish within 16 minutes" ;;
     2)   outside_note "$host" 0 "its address is not one meetingbox accepts" ;;
-    126|127) outside_note "$host" 0 "outside models are not set up" ;;
+    # 3: writer.mjs could not load the router; 126 and 127: env could not start Node
+    3|126|127) outside_note "$host" 0 "outside models are not set up" ;;
     *)   outside_note "$host" 1 "it gave an unexpected answer" ;;
   esac
   if [ -z "$OUTSIDE_NOTE" ]; then
@@ -2876,7 +2968,7 @@ outside_minutes() {
     elif jq -e 'type == "object" and (.error | type) == "object"' "$work/answer" >/dev/null 2>&1; then
       type="$(jq -r '.error.type | strings' "$work/answer" 2>/dev/null)" || type=""
       outside_note "$host" "$(jq -r 'if .error.sent == false then 0 else 1 end' "$work/answer" 2>/dev/null || echo 1)" \
-        "$(outside_reason "$type" "$kind" "$had_key" "$model" "$(error_status "$work/answer")")"
+        "$(outside_reason "$type" "$kind" "$had_key" "$model" "$(error_status < "$work/answer")")"
     else
       outside_note "$host" 1 "it gave an unexpected answer"
     fi

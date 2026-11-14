@@ -19,9 +19,15 @@ allow https://example.com/path/with-dash_and.dot~tilde/
 allow https://example.com/v1/%7Euser
 allow https://example.com/v1/../../x
 allow https://example.com/a;b=c,d!$&()*+:e
+allow https://a.0xg
+allow https://0xg.example/v1
 allow https://[2001:db8::1]/v1
 allow https://[::1]/v1
-allow https://[2001:db8:0:0:0:0:0:1]:8443
+allow https://[2001:db8::1]:8443
+allow https://[2001:0:0:1::1]/
+allow https://[1:0:2:3:4:5:6:7]/
+allow https://[1::]/
+allow https://[::]/
 allow http://127.0.0.1
 allow http://127.0.0.1:11434/v1
 allow http://127.0.0.1:11434/v1/
@@ -53,9 +59,24 @@ refuse http://[::2]:80
 refuse http://[0:0:0:0:0:0:0:1]:80
 refuse http://LOCALHOST:11434
 refuse http://Localhost
+refuse http://localhost.
+refuse http://localhost.:11434
+refuse http://localhost.:11434/v1
+refuse http://127.0.0.1.
 # https for a DNS name (lower case) or a bracketed IPv6 literal, never an IPv4 literal
 refuse https://1.2.3.4/v1
 refuse https://127.0.0.1:8443
+# a last label of 0x and hex digits (0x alone included) is a number to the URL parser
+refuse https://0x7f000001
+refuse https://0x7f000001/v1
+refuse https://0xc0a80001:8443/v1
+refuse https://127.0.0.0x1/v1
+refuse https://0x7f.0.0.0x1
+refuse https://1.2.3.0xa
+refuse https://0x
+refuse https://1.0x
+refuse https://a.0x
+refuse https://a.0xff/v1
 refuse https://API.anthropic.com
 refuse https://-example.com
 refuse https://example-.com
@@ -76,6 +97,13 @@ refuse https://[::g]/
 refuse https://[::FFFF]/
 refuse https://[1::2::3]/
 refuse https://[::1.2.3.4]/
+# IPv6 only as the URL parser writes it: no leading zero, the first longest run of zeros as ::
+refuse https://[2001:db8:0:0:0:0:0:1]:8443
+refuse https://[2001:db8::01]/
+refuse https://[2001::1:0:0:0:1]/
+refuse https://[::0:1]/
+refuse https://[1::2:3:4:5:6:7]/
+refuse https://[0::1]/
 # the port: 1 to 65535, digits only, no leading zero
 refuse https://example.com:0
 refuse https://example.com:65536

@@ -47,7 +47,10 @@ afinfo() { echo "afinfo $*" >> "$HOME/calls.log"; printf 'File:     %s\nestimate
 
 # The keychain, as a file of "<address> <key>" lines. As the real one does, security -i reads its
 # commands on stdin; each call's arguments are logged, and -i's stdin goes to security-stdin.log.
-# STORED_RAW, when set, is what find-generic-password -w prints instead of the stored key.
+# security -i also notes in security-recorded.log whether the record line was already there when it
+# stored the item ("recorded" or "unrecorded"). An absent item is status 44, as on this Mac.
+# STORED_RAW, when set, is what find-generic-password -w prints instead of the stored key; FIND_STATUS
+# makes every find answer that status, and DELETE_STATUS makes a delete answer it and keep the item.
 KEYSTORE="$HOME/keystore"
 security() {
   { printf 'security'; printf ' %s' "$@"; printf '\n'; } >> "$HOME/calls.log"
@@ -60,17 +63,21 @@ security() {
         case "$line" in
           'add-generic-password -U -s "meetingbox outside model" -a "'*)
             rest="${line#*-a \"}"; acct="${rest%%\"*}"; rest="${rest#*-w \"}"; k="${rest%%\"*}"
+            if grep -qxF "keychain:generic:$acct" "$INSTALLED" 2>/dev/null; then echo recorded; else echo unrecorded; fi \
+              >> "$HOME/security-recorded.log"
             { grep -vF "$acct " "$KEYSTORE" 2>/dev/null || true; printf '%s %s\n' "$acct" "$k"; } > "$KEYSTORE.new"
             mv "$KEYSTORE.new" "$KEYSTORE" ;;
         esac
       done
       return 0 ;;
     find-generic-password)
+      [ -z "${FIND_STATUS:-}" ] || return "$FIND_STATUS"
       awk -v a="$acct" '$1 == a { f = 1 } END { exit !f }' "$KEYSTORE" 2>/dev/null || return 44
       [ "$w" = 1 ] || return 0
       if [ -n "${STORED_RAW+x}" ]; then printf '%s\n' "$STORED_RAW"
       else awk -v a="$acct" '$1 == a { print $2 }' "$KEYSTORE"; fi ;;
     delete-generic-password)
+      [ -z "${DELETE_STATUS:-}" ] || return "$DELETE_STATUS"
       awk -v a="$acct" '$1 == a { f = 1 } END { exit !f }' "$KEYSTORE" 2>/dev/null || return 44
       awk -v a="$acct" '$1 != a' "$KEYSTORE" > "$KEYSTORE.new"; mv "$KEYSTORE.new" "$KEYSTORE" ;;
     *) return 1 ;;
@@ -94,9 +101,15 @@ meeting() {
 }
 reset_run() {
   : > "$HOME/calls.log"
-  rm -f "$HOME/node.log" "$HOME"/node.stdin.* "$HOME"/node-* "$HOME/fm-brief.in" "$HOME/security-stdin.log" "$KEYSTORE"
-  HAVE_FM=1; unset STORED_RAW MB_WRITER_LIMIT MB_KEYCHAIN AUDIO_SECONDS
+  rm -f "$HOME/node.log" "$HOME"/node.stdin.* "$HOME"/node-* "$HOME/fm-brief.in" "$HOME/security-stdin.log" "$KEYSTORE" \
+        "$HOME/security-recorded.log" "$HOME/scan-found" "$HOME/shims.log"
+  rm -rf "$HOME/graveyard"
+  HAVE_FM=1; unset STORED_RAW MB_WRITER_LIMIT MB_KEYCHAIN AUDIO_SECONDS FIND_STATUS DELETE_STATUS
 }
+# The complete call's own lines in node.log: its argv, then its environment.
+complete_argv() { grep '^argv:.*writer.mjs complete$' "$HOME/node.log"; }
+complete_env() { grep -A1 '^argv:.*writer.mjs complete$' "$HOME/node.log" | grep '^env:'; }
+no_send() { [ ! -e "$HOME/node.stdin.complete" ] && ! grep -q 'writer.mjs complete$' "$HOME/calls.log"; }
 calls() { grep -c "^$1" "$HOME/calls.log" | tr -d ' '; }
 no_node() { [ ! -e "$HOME/node.log" ]; }
 no_security() { ! grep -q '^security' "$HOME/calls.log"; }
@@ -223,14 +236,19 @@ else fail "a defaults that answers a source for every key changes nothing: Apple
 
 reset_run; meeting c1; fake_node; ok_reply
 std
-argv_line="$(grep '^argv:' "$HOME/node.log")"
-env_line="$(grep '^env:' "$HOME/node.log")"
+argv_line="$(complete_argv)"
+env_line="$(complete_env)"
+version_env="$(grep -A1 '^argv:.*writer.mjs version$' "$HOME/node.log" | grep '^env:')"
 node_path="$(cat "$NODE_FILE")"
 check "the engine runs exactly env -i <recorded node> <MINUTES_DIR>/writer.mjs complete, once, under run_limited 960" \
-  eval '[ "$rc" -eq 0 ] && [ "$argv_line" = "argv: $MINUTES_DIR/writer.mjs complete" ] && [ "$(calls run_limited)" = 1 ]
+  eval '[ "$rc" -eq 0 ] && [ "$argv_line" = "argv: $MINUTES_DIR/writer.mjs complete" ] && [ "$(grep -c "writer.mjs complete$" "$HOME/calls.log")" = 1 ]
         && grep -qxF "run_limited 960 env -i $node_path $MINUTES_DIR/writer.mjs complete" "$HOME/calls.log"'
 check "Node runs with an empty environment: no HOME, PATH, USER or MB_ setting" \
   eval 'case "$env_line" in *HOME=*|*PATH=*|*USER=*|*MB_*|*TMPDIR=*) false ;; env:*) true ;; *) false ;; esac'
+check "before the send, the runtime is checked: exactly run_limited 20 env -i <node> <MINUTES_DIR>/writer.mjs version, with an empty environment" \
+  eval 'grep -qxF "run_limited 20 env -i $node_path $MINUTES_DIR/writer.mjs version" "$HOME/calls.log"
+        && [ "$(grep -n "writer.mjs version$" "$HOME/calls.log" | head -n 1 | cut -d: -f1)" -lt "$(grep -n "writer.mjs complete$" "$HOME/calls.log" | cut -d: -f1)" ]
+        && case "$version_env" in *HOME=*|*PATH=*|*USER=*|*MB_*|*TMPDIR=*) false ;; env:*) true ;; *) false ;; esac'
 user_want="$(printf '%s\n\n<transcript>\n%s\n%s\n</transcript>' "$CONTEXT" "$TLINE1" "$TLINE2")"
 check "stdin carries the kind, address, model, the limits, and no key for a keyless source" \
   jq -e --arg a "$LOCAL" '.kind == "standard" and .address == $a and .model == "llama3" and .timeoutMs == 900000
@@ -261,6 +279,152 @@ check "the key is never in Node's arguments or environment, nor in any logged ca
 check "a fake node that writes the key to stderr: nothing of it reaches .process-log" \
   eval '[ -s "$d/.process-log" ] && ! grep -qF "$KEY" "$d/.process-log" && ! grep -qF "$SECRET" "$d/.process-log"
         && outside_written claude-test api.anthropic.com'
+reset_run; meeting c3; fake_node; ok_reply; touch "$HOME/node-stderr-stdin"
+( set -euo pipefail; cli notes "$d" --writer outside --kind standard --address "$LOCAL" --writer-model llama3 ) > "$d/.process-log" 2>&1; rc=$?
+check "a keyless run's writer.mjs stderr (here the transcript) is discarded too" \
+  eval '[ "$rc" -eq 0 ] && [ -s "$d/.process-log" ] && ! grep -qF "$SECRET" "$d/.process-log" && outside_written llama3 127.0.0.1'
+
+# --- leaks seen through files and real command lines ---
+# A shim for every external command the outside path and key set run, first on the engine's PATH: each
+# logs its argv and its environment to shims.log, then runs the real one, and rm first copies what it
+# removes into graveyard/, so a file that held the key for a moment is still seen. While the fake node
+# runs it looks through every file under the scratch home (the meeting, its stage and work folders,
+# the shims' log, the graveyard) for the key or 16 characters of it, and the suite looks again after.
+SHIMMED="jq cat tail head cp mv rm mkdir mktemp chmod env sed awk grep date stat tr cut printf shasum basename dirname
+         sort realpath sleep wc ls find touch ln rmdir paste uniq tee xargs"
+mkdir -p "$HOME/shims"; : > "$HOME/shims/.real"
+cat > "$HOME/shims/.shim" <<EOF
+#!/bin/bash
+h="$HOME"; name="\${0##*/}"
+real="\$(/usr/bin/awk -v n="\$name" '\$1 == n { print \$2; exit }' "\$h/shims/.real")"
+# one record, written whole, so shims running at once (the watchdog's sleep, say) never mix lines
+rec="argv: \$name"; for a in "\$@"; do rec="\$rec \$a"; done
+rec="\$rec
+env: \$(/usr/bin/env | /usr/bin/tr '\n' ' ')
+"
+printf '%s' "\$rec" >> "\$h/shims.log"
+if [ "\$name" = rm ]; then
+  for a in "\$@"; do
+    case "\$a" in -*) continue ;; esac
+    [ -e "\$a" ] || continue
+    g="\$h/graveyard/\$\$-\$RANDOM"; /bin/mkdir -p "\$g"; /bin/cp -R "\$a" "\$g/" 2>/dev/null
+  done
+fi
+exec "\$real" "\$@"
+EOF
+chmod 755 "$HOME/shims/.shim"
+for name in $SHIMMED; do
+  real="$(type -P "$name")" || continue
+  printf '%s %s\n' "$name" "$real" >> "$HOME/shims/.real"
+  ln -s .shim "$HOME/shims/$name"
+done
+shimmed() { ( export PATH="$HOME/shims:$PATH"; set -euo pipefail; "$@" ); }
+# The shims ran, the fake node's scan ran (when asked) and found nothing, and nothing is found now.
+leak_free() {
+  [ -s "$HOME/shims.log" ] && { [ ! -e "$HOME/node-scan" ] || [ -e "$HOME/scan-found" ]; } && [ ! -s "$HOME/scan-found" ] \
+    && [ -z "$(key_scan "$KEY")" ]
+}
+reset_run; meeting k1; fake_node; ok_reply; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"
+shimmed cli notes "$d" --writer outside --kind claude --address "$CLAUDE" --writer-model claude-test > "$d/.process-log" 2>&1; rc=$?
+check "a keyed run: no file under the scratch home holds the key, while Node runs or after, nor any command's argv or environment" \
+  eval '[ "$rc" -eq 0 ] && outside_written claude-test api.anthropic.com && leak_free && [ -d "$HOME/graveyard" ]
+        && grep -q "^argv: jq " "$HOME/shims.log" && grep -q "^argv: env -i " "$HOME/shims.log" && grep -q "^argv: rm " "$HOME/shims.log"'
+reset_run; meeting k2; fake_node; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"
+reply '{"error": {"type": "connect", "message": "TypeError", "sent": false}}'
+shimmed cli notes "$d" --writer outside --kind claude --address "$CLAUDE" --writer-model claude-test > "$d/.process-log" 2>&1; rc=$?
+check "a keyed run that falls back: the same" eval '[ "$rc" -eq 0 ] && fell_back "$(not_sent api.anthropic.com "no connection could be made")" && leak_free'
+reset_run; fake_node; store_key "$CLAUDE" "$KEY"; touch "$HOME/node-scan"; echo '{"models": ["claude-a"]}' > "$HOME/node-list"
+out="$(shimmed cli engines --kind claude --address "$CLAUDE" 2>/dev/null)"; rc=$?
+check "engines with a keyed source: the same" eval '[ "$rc" -eq 0 ] && [ "$(printf "%s\n" "$out" | tail -n 1)" = "outside model claude-a" ] && leak_free'
+reset_run; rm -f "$HOME/node-scan"; mkdir -p "$STATE_DIR"; : > "$INSTALLED"
+out="$(printf '%s\n' "$KEY" | shimmed cli key set --address "$CLAUDE" 2>&1)"; rc=$?
+check "key set: the same" eval '[ "$rc" -eq 0 ] && [ "$out" = set ] && grep -q "^argv: tr " "$HOME/shims.log" && leak_free'
+
+# What a shim cannot see: a builtin's own redirection, or a command named by its absolute path. Every
+# line of meetingbox that expands a variable holding the key (key, STORED_KEY, and stored_key's got)
+# runs only builtins and functions and writes nowhere but /dev/null, and meetingbox names no absolute
+# path to printf, echo or test anywhere.
+key_lines="$(grep -nE '\$\{?(key|STORED_KEY|got)([^A-Za-z0-9_]|$)' "$ROOT/meetingbox")"
+bad_lines="$(printf '%s\n' "$key_lines" | sed -E 's#[[:space:]]+\#[[:space:]].*$##; s#[0-9]*>/dev/null##g' \
+  | grep -E '(^|[^A-Za-z0-9_-])(env|command|exec|eval|jq|echo|cat|tail|head|tee|sed|awk|grep|tr|cut|security|xargs|dd|curl)( |;|$)|/bin/|/usr/|>|--arg')"
+abs_paths="$(grep -nE '(^|[^A-Za-z0-9_.-])/(usr/)?(local/)?bin/(printf|echo|test)([^A-Za-z0-9_]|$)' "$ROOT/meetingbox")"
+check "every line expanding the key runs only builtins and writes nowhere but /dev/null, and meetingbox names no /bin printf, echo or test" \
+  eval '[ "$(printf "%s\n" "$key_lines" | grep -c .)" -ge 12 ] && [ -z "$bad_lines" ] && [ -z "$abs_paths" ]'
+[ -z "$bad_lines$abs_paths" ] || printf '%s\n' "$bad_lines" "$abs_paths"
+
+# --- a runtime that is not set up is never sent to ---
+not_set_up() {   # $1: name; expects the not-sent note, and no complete call
+  std
+  check "$1: not sent, outside models are not set up, and no request" \
+    eval '[ "$rc" -eq 0 ] && no_send && fell_back "$(not_sent 127.0.0.1 "outside models are not set up")"'
+}
+reset_run; meeting rt1; fake_node; ok_reply; : > "$HOME/node-router-version"; echo 3 > "$HOME/node-router-status"
+not_set_up "writer.mjs version failing with status 3 (a router missing, or whose entry throws)"
+reset_run; meeting rt2; fake_node; ok_reply; printf '%s\n' /usr/bin/true > "$NODE_FILE"
+not_set_up "NODE_FILE naming a program that is not Node (/usr/bin/true)"
+reset_run; meeting rt3; fake_node; ok_reply; printf '#!/bin/bash\necho hello\n' > "$HOME/not-node"; chmod 755 "$HOME/not-node"
+printf '%s\n' "$HOME/not-node" > "$NODE_FILE"
+not_set_up "NODE_FILE naming a program that says something else"
+reset_run; meeting rt4; fake_node; ok_reply; echo v18.19.0 > "$HOME/node-version"
+not_set_up "a recorded Node now older than 20"
+for s in 3 126 127; do
+  reset_run; meeting "rt-$s"; fake_node; : > "$HOME/node-reply"; echo "$s" > "$HOME/node-status"
+  std
+  check "complete exiting $s after a good router check: not sent, outside models are not set up" \
+    eval '[ "$rc" -eq 0 ] && fell_back "$(not_sent 127.0.0.1 "outside models are not set up")"'
+done
+# The real writer.mjs, run by a real Node from the PATH, with its router missing or throwing on import.
+REAL_NODE=""
+rest="$PATH:"
+while [ -n "$rest" ]; do
+  dir="${rest%%:*}"; rest="${rest#*:}"
+  [ -n "$dir" ] && [ -f "$dir/node" ] && [ -x "$dir/node" ] || continue
+  v="$("$dir/node" --version 2>/dev/null)" || continue
+  case "$v" in v[0-9]*.*) v="${v#v}"; [ "${v%%.*}" -ge 20 ] 2>/dev/null && { REAL_NODE="$dir/node"; break; } ;; esac
+done
+if [ -n "$REAL_NODE" ]; then
+  for broken in missing throwing; do
+    reset_run; meeting "rr-$broken"; mkdir -p "$MINUTES_DIR"; rm -rf "$MINUTES_DIR/node_modules"
+    cp "$ROOT/minutes/writer.mjs" "$MINUTES_DIR/writer.mjs"
+    if [ "$broken" = throwing ]; then
+      mkdir -p "$MINUTES_DIR/node_modules/ai-execution-router"
+      printf '%s\n' '{"name": "ai-execution-router", "version": "1.1.1", "type": "module", "exports": {".": "./index.js", "./package.json": "./package.json"}}' \
+        > "$MINUTES_DIR/node_modules/ai-execution-router/package.json"
+      printf 'throw new Error("a broken router");\n' > "$MINUTES_DIR/node_modules/ai-execution-router/index.js"
+    fi
+    printf '%s\n' "$REAL_NODE" > "$NODE_FILE"; record_install "$NODE_FILE"
+    std
+    check "the real writer.mjs with its router $broken: not sent, outside models are not set up, and no request" \
+      eval '[ "$rc" -eq 0 ] && no_send && fell_back "$(not_sent 127.0.0.1 "outside models are not set up")"'
+  done
+  rm -rf "$MINUTES_DIR/node_modules"; : > "$MINUTES_DIR/writer.mjs"
+else
+  echo "note: no Node 20 or later on the PATH, so the real writer.mjs's router checks were skipped"
+fi
+
+# --- a keychain that cannot be read is not "no key" ---
+for st in 36 128; do
+  for kind in standard claude; do
+    reset_run; meeting "kc-$st-$kind"; fake_node; ok_reply
+    if [ "$kind" = claude ]; then store_key "$CLAUDE" "$KEY"; FIND_STATUS=$st; claude; host=api.anthropic.com
+    else store_key "$LOCAL" "$KEY"; FIND_STATUS=$st; std; host=127.0.0.1; fi
+    unset FIND_STATUS
+    check "a find answering $st, $kind: not sent, its key could not be read from the keychain, and no request" \
+      eval '[ "$rc" -eq 0 ] && no_send && fell_back "$(not_sent "$host" "its key could not be read from the keychain")"'
+  done
+done
+
+# --- the host shown, for IPv6 and for a DNS name with a port ---
+for pair in "http://[::1]:8080/v1|[::1]" "https://my-gateway.example.co.uk:8443/openai/v1|my-gateway.example.co.uk"; do
+  address="${pair%|*}"; host="${pair#*|}"
+  reset_run; meeting "h$RANDOM"; fake_node; ok_reply
+  engine cli notes "$d" --writer outside --kind standard --address "$address" --writer-model llama3
+  check "the host shown for $address is $host: in Minutes written by" eval '[ "$rc" -eq 0 ] && outside_written llama3 "$host"'
+  reset_run; meeting "h$RANDOM"; fake_node; reply '{"error": {"type": "http", "message": "TransientError (HTTP 502)", "sent": true}}'
+  engine cli notes "$d" --writer outside --kind standard --address "$address" --writer-model llama3
+  check "the host shown for $address is $host: in the note" \
+    eval '[ "$rc" -eq 0 ] && fell_back "$(was_sent "$host" "it answered with an error (HTTP 502)")"'
+done
 
 # --- the context line ---
 reset_run; meeting 2026-11-10_1754; fake_node; ok_reply
@@ -359,6 +523,9 @@ sent_case "quota, Claude API" "$(err quota QuotaExhaustedError)" "your Claude AP
 sent_case "quota, Standard" "$(err quota QuotaExhaustedError)" "its quota is used up"
 sent_case rate "$(err rate RateLimitError)" "it was rate limited"
 sent_case "refused, a 401 with a key" "$(err refused 'AuthError (HTTP 401): invalid x-api-key')" "it refused the key" claude
+sent_case "refused, a keyless Standard source" "$(err refused 'AuthError (HTTP 401)')" "it asked for a key"
+reset_run; meeting s-keyed-std; fake_node; reply "$(err refused 'AuthError (HTTP 403)')"; store_key "$LOCAL" "$KEY"; std
+check "refused, a Standard source with a key: it refused the key" eval '[ "$rc" -eq 0 ] && fell_back "$(was_sent 127.0.0.1 "it refused the key")"'
 sent_case context "$(err context ContextLengthError)" "the transcript is too long for llama3"
 sent_case http "$(err http 'TransientError (HTTP 503): upstream')" "it answered with an error (HTTP 503)"
 sent_case "other, an HTML 200" "$(err other 'MalformedResponseError (HTTP 502)')" "it gave an unexpected answer"
@@ -445,6 +612,33 @@ check "key remove: deletes the item and forgets the line; key status then says n
         && ! grep -q "keychain:generic:" "$INSTALLED" && [ ! -s "$KEYSTORE" ] && [ "$out2" = none ]'
 out="$( (set -euo pipefail; cli key remove --address "$LOCAL") 2>&1 )"; rc=$?
 check "key remove with nothing stored succeeds" eval '[ "$rc" -eq 0 ]'
+check "key set records its line before security -i stores the item" \
+  eval '[ -s "$HOME/security-recorded.log" ] && ! grep -q unrecorded "$HOME/security-recorded.log"'
+
+# A keychain that cannot be read (a find answering anything but 44) is never taken for "no key".
+reset_run; mkdir -p "$STATE_DIR"; : > "$INSTALLED"
+printf '%s\n' "$KEY" | (cli key set --address "$LOCAL") > /dev/null 2>&1
+for st in 36 128; do
+  FIND_STATUS=$st; out="$( (set -euo pipefail; cli key status --address "$LOCAL") 2>&1 )"; rc=$?; unset FIND_STATUS
+  check "key status with a find answering $st: The keychain could not be read., exit 1" \
+    eval '[ "$rc" -eq 1 ] && [ "$out" = "The keychain could not be read." ]'
+done
+DELETE_STATUS=51; out="$( (set -euo pipefail; cli key remove --address "$LOCAL") 2>&1 )"; rc=$?; unset DELETE_STATUS
+check "key remove with a delete answering 51 while the item stays: exit 1, the line and the item kept" \
+  eval '[ "$rc" -eq 1 ] && [ "$out" = "The key could not be removed from the keychain." ] && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"
+        && grep -q "^$LOCAL " "$KEYSTORE"'
+FIND_STATUS=36; out="$( (set -euo pipefail; cli key remove --address "$LOCAL") 2>&1 )"; rc=$?; unset FIND_STATUS
+check "key remove whose delete cannot be confirmed (the find after it answers 36): exit 1, and the line kept" \
+  eval '[ "$rc" -eq 1 ] && [ "$out" = "The key could not be removed from the keychain." ] && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"'
+reset_run; mkdir -p "$STATE_DIR"; : > "$INSTALLED"
+FIND_STATUS=36; out="$(printf '%s\n' "$KEY" | (set -euo pipefail; cli key set --address "$LOCAL") 2>&1)"; rc=$?; unset FIND_STATUS
+check "key set whose item cannot be read back (36): could not be stored, exit 1, and the line kept, as the item may be there" \
+  eval '[ "$rc" -eq 1 ] && [ "$out" = "The key could not be stored in the keychain." ] && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"'
+reset_run; mkdir -p "$STATE_DIR"; : > "$INSTALLED"
+out="$(printf '%s\n' "$KEY" | (set -euo pipefail; security() { { printf "security"; printf " %s" "$@"; printf "\n"; } >> "$HOME/calls.log"
+         [ "$1" = -i ] && { cat > /dev/null; return 0; }; return 44; }; cli key set --address "$LOCAL") 2>&1)"; rc=$?
+check "key set whose item is not there afterwards (44): could not be stored, exit 1, and the new line forgotten" \
+  eval '[ "$rc" -eq 1 ] && [ "$out" = "The key could not be stored in the keychain." ] && ! grep -q "keychain:generic:" "$INSTALLED"'
 
 reset_run; : > "$INSTALLED"; bad=""
 for k in $'two\nlines' 'with"quote' 'back\slash' 'a space' "it's" 'é' '' "$(printf 'x%.0s' $(seq 1 4097))"; do
@@ -526,7 +720,13 @@ echo '{"models": []}' > "$HOME/node-list"; o2="$(eo --kind standard --address "$
 echo '{"error": {"type": "connect", "message": "TypeError"}}' > "$HOME/node-list"; o3="$(eo --kind standard --address "$LOCAL" | tail -n 1)"
 echo '{"error": {"type": "refused", "message": "AuthError (HTTP 401)"}}' > "$HOME/node-list"; o4="$(eo --kind standard --address "$LOCAL" | tail -n 1)"
 check "engines with a source: outside none for no models (or none usable), outside error <reason> for a failure" \
-  eval '[ "$o1" = "outside none" ] && [ "$o2" = "outside none" ] && [ "$o3" = "outside error no connection could be made" ] && [ "$o4" = "outside error it refused the key" ]'
+  eval '[ "$o1" = "outside none" ] && [ "$o2" = "outside none" ] && [ "$o3" = "outside error no connection could be made" ] && [ "$o4" = "outside error it asked for a key" ]'
+store_key "$LOCAL" "$KEY"; o5="$(eo --kind standard --address "$LOCAL" | tail -n 1)"
+echo '{"error": {"type": "http", "message": "TransientError (HTTP 503)"}}' > "$HOME/node-list"; o6="$(eo --kind standard --address "$LOCAL" | tail -n 1)"
+FIND_STATUS=36; rm -f "$HOME/node.stdin.list"; o7="$(eo --kind standard --address "$LOCAL" | tail -n 1)"; unset FIND_STATUS
+check "engines: it refused the key when a key was sent; an HTTP error with its status; a keychain that cannot be read, with no list" \
+  eval '[ "$o5" = "outside error it refused the key" ] && [ "$o6" = "outside error it answered with an error (HTTP 503)" ]
+        && [ "$o7" = "outside error its key could not be read from the keychain" ] && [ ! -e "$HOME/node.stdin.list" ]'
 reset_run; fake_node; store_key "$CLAUDE" "$KEY"; echo '{"models": ["claude-a"]}' > "$HOME/node-list"
 out="$(eo --kind claude --address "$CLAUDE")"
 check "engines with a Claude API source: its stored key goes on stdin only" \
@@ -570,8 +770,11 @@ case "\$1" in
   --version) echo v22.22.2 ;;
   */npm-cli.js)
     [ ! -e "\$h/npm-fails" ] || { echo "npm error network" >&2; exit 1; }
-    /bin/mkdir -p node_modules/ai-execution-router && echo '{"version": "1.1.1"}' > node_modules/ai-execution-router/package.json ;;
+    prev=""; for a in "\$@"; do [ "\$prev" != --cache ] || { /bin/mkdir -p "\$a" && : > "\$a/index"; }; prev="\$a"; done
+    /bin/mkdir -p node_modules/ai-execution-router && echo '{"version": "1.1.1"}' > node_modules/ai-execution-router/package.json
+    if [ -e "\$h/npm-sleeps" ]; then echo \$\$ > "\$h/npm.pid"; exec /bin/sleep 20; fi ;;
   */writer.mjs)
+    [ ! -e "\$h/router-silent" ] || exit 0
     [ "\$2" = version ] && [ -f "\$(/usr/bin/dirname "\$1")/node_modules/ai-execution-router/package.json" ] && echo '{"router": "1.1.1"}' ;;
   *) exit 1 ;;
 esac
@@ -582,7 +785,8 @@ EOF
   ln -s "$NPM_CLI" "$dir/npm"
 }
 fresh_setup() {
-  rm -rf "$HOME/p1" "$HOME/p2" "$HOME/brew" "$HOME/usrlocal" "$HOME/.nvm" "$HOME/cellar" "$MINUTES_DIR" "$HOME/setup-node.log" "$HOME/npm-fails"
+  rm -rf "$HOME/p1" "$HOME/p2" "$HOME/brew" "$HOME/usrlocal" "$HOME/.nvm" "$HOME/cellar" "$MINUTES_DIR" "$HOME/setup-node.log" "$HOME/npm-fails" \
+         "$HOME/npm-sleeps" "$HOME/npm.pid" "$HOME/router-silent" "$SRC_DIR"/.minutes.* "$SRC_DIR"/.minutes-old.*
   rm -f "$NODE_FILE" "$INSTALLED"; mkdir -p "$STATE_DIR"; : > "$HOME/calls.log"
 }
 SETUP_PATH="$HOME/p1:$HOME/p2:/usr/bin:/bin"
@@ -599,9 +803,12 @@ check "install_minutes: a failing Node and a v18 Node on the PATH are skipped an
 check "install_minutes: each candidate is tried with run_limited 5 <node> --version" \
   eval 'grep -qxF "run_limited 5 $HOME/p1/node --version" "$HOME/calls.log" && grep -qxF "run_limited 5 $HOME/p2/node --version" "$HOME/calls.log"
         && grep -qxF "run_limited 5 $HOME/brew/bin/node --version" "$HOME/calls.log"'
-check "install_minutes: npm runs as <recorded node> <real path of the npm beside it> ci --ignore-scripts --omit=dev --cache <tmp>, and the temporary folder is gone" \
+check "install_minutes: npm runs as <recorded node> <real path of the npm beside it> ci --ignore-scripts --omit=dev --cache <its cache>, and the temporary folder is gone" \
   eval 'case "$npm_line" in "node $(realpath "$NPM_CLI") ci --ignore-scripts --omit=dev --cache $cache --no-audit --no-fund --no-update-notifier | in "*) true ;; *) false ;; esac
         && [ "$(head -n 1 "$HOME/setup-node.log" | cut -c1-14)" = "node --version" ] && [ -n "$cache" ] && [ ! -e "$(dirname "$cache")" ]'
+check "install_minutes: npm's cache is inside the recorded build folder, gone before the swap, and the record holds no build folder now" \
+  eval 'case "$cache" in "$SRC_DIR"/.minutes.??????/.npm-cache) true ;; *) false ;; esac && [ ! -e "$MINUTES_DIR/.npm-cache" ]
+        && ! grep -q "/\.minutes" "$INSTALLED" && [ "$(ls -A "$SRC_DIR")" = minutes ]'
 check "install_minutes: MINUTES_DIR is recorded and holds the three files and node_modules only, without the source's stray node_modules" \
   eval 'installed_by_us "$MINUTES_DIR" && [ "$(ls -A "$MINUTES_DIR" | tr "\n" " ")" = "node_modules package-lock.json package.json writer.mjs " ]
         && [ ! -e "$MINUTES_DIR/node_modules/stray" ] && cmp -s "$MINUTES_DIR/writer.mjs" "$SOURCE_DIR/minutes/writer.mjs"
@@ -648,6 +855,46 @@ out="$(PATH="/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
 check "an update whose npm fails keeps the working install" \
   eval '[ "$rc" -ne 0 ] && cmp -s "$MINUTES_DIR/writer.mjs" "$HOME/installed-writer.before" && [ -f "$MINUTES_DIR/node_modules/ai-execution-router/package.json" ]'
 rm -f "$HOME/npm-fails"
+
+# The router not answering after a good npm: nothing is left beside MINUTES_DIR, and no record line.
+fresh_setup; make_node "$HOME/brew/bin" good; touch "$HOME/router-silent"
+out="$(PATH="/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "the router not answering after npm: could not be set up, and no build folder is left or recorded" \
+  eval '[ "$rc" -ne 0 ] && printf "%s" "$out" | grep -qF "Outside models could not be set up: the router did not answer once installed"
+        && [ -z "$(ls -A "$SRC_DIR" 2>/dev/null)" ] && ! grep -q "/\.minutes" "$INSTALLED"'
+rm -f "$HOME/router-silent"
+
+# A setup killed while npm runs: its build folder is on the record, the next setup removes it, and
+# uninstall removes one through the record.
+killed_install() {   # runs install_minutes in the background, kills it and its npm while npm runs
+  local bg
+  rm -f "$HOME/npm.pid"; touch "$HOME/npm-sleeps"
+  ( PATH="/usr/bin:/bin" install_minutes > /dev/null 2>&1 ) &
+  bg=$!
+  for _ in $(seq 1 100); do [ -s "$HOME/npm.pid" ] && break; sleep 0.1; done
+  kill -TERM "$bg" 2>/dev/null; kill -TERM "$(cat "$HOME/npm.pid" 2>/dev/null)" 2>/dev/null
+  wait "$bg" 2>/dev/null
+  rm -f "$HOME/npm-sleeps" "$HOME/npm.pid"
+  left="$(ls -A "$SRC_DIR" | grep '^\.minutes\.' | head -n 1)"
+}
+fresh_setup; make_node "$HOME/brew/bin" good
+killed_install
+check "a setup killed during npm leaves its build folder on the install record" \
+  eval '[ -n "$left" ] && [ -d "$SRC_DIR/$left/node_modules" ] && installed_by_us "$SRC_DIR/$left"'
+out="$(PATH="/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "the next install_minutes removes that leftover through the record, and installs" \
+  eval '[ "$rc" -eq 0 ] && [ ! -e "$SRC_DIR/$left" ] && ! installed_by_us "$SRC_DIR/$left" && [ "$(ls -A "$SRC_DIR")" = minutes ] && minutes_ready'
+killed_install
+out="$( (refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }; reset_through_app() { return 1; }
+         stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }; reset_cmd all) 2>&1 )"; rc=$?
+check "uninstall removes a killed setup's leftover through the record, and the folder with it" \
+  eval '[ "$rc" -eq 0 ] && [ -n "$left" ] && [ ! -e "$SRC_DIR/$left" ] && [ ! -e "$SRC_DIR" ] && [ ! -e "$INSTALLED" ]'
+
+# A Node with no npm beside it is passed over for the next.
+fresh_setup; make_node "$HOME/p1" good; rm -f "$HOME/p1/npm"; make_node "$HOME/brew/bin" good
+out="$(PATH="$HOME/p1:/usr/bin:/bin" install_minutes 2>&1)"; rc=$?
+check "a good Node with no npm beside it is passed over, named, and Homebrew's is used" \
+  eval '[ "$rc" -eq 0 ] && [ "$(cat "$NODE_FILE")" = "$HOME/brew/bin/node" ] && printf "%s" "$out" | grep -qF "passing over $HOME/p1/node: it has no npm beside it"'
 
 # Due: a changed source writer.mjs, and on a release update whenever the recorder step is.
 recount() {
@@ -730,6 +977,20 @@ for level in tools all; do
   check "reset_cmd $level never hands security a recorded address the rule refuses" \
     eval '! grep "^security" "$HOME/calls.log" | grep -qF "http://example.com"'
 done
+# A delete that fails, or that the find after it cannot confirm: reset and uninstall warn, and the
+# line (and the key) stay, so a later run can still remove it.
+for level in tools all; do
+  for fault in "DELETE_STATUS=51" "FIND_STATUS=36"; do
+    fresh_setup; reset_run; fake_node; : > "$KEYSTORE"
+    printf '%s\n' "$KEY" | (cli key set --address "$LOCAL") > /dev/null 2>&1
+    out="$( (eval "$fault"; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
+             reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
+             reset_cmd "$level") 2>&1 )"; rc=$?
+    check "reset_cmd $level with $fault: warns that the key could not be removed, and keeps its line" \
+      eval 'printf "%s" "$out" | grep -qF "the key for $LOCAL could not be removed from the keychain"
+            && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"'
+  done
+done
 
 # ======================================================================== as the app runs them
 
@@ -757,5 +1018,8 @@ if printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | grep -qF "Recordings never lea
    && printf '%s' "$out" | grep -qF "meetingbox key set --address" && printf '%s' "$out" | grep -qF -- "--writer outside"; then
   pass "usage gives the promise, the key commands and the outside writer's options"
 else fail "usage gives the promise, the key commands and the outside writer's options: $out"; fi
+if ! head -n 20 "$ROOT/meetingbox" | grep -qi 'all on device\|nothing leaves the Mac'; then
+  pass "the script's header no longer promises that everything stays on device"
+else fail "the script's header no longer promises that everything stays on device: $(head -n 10 "$ROOT/meetingbox")"; fi
 
 finish

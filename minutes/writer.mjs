@@ -9,35 +9,59 @@
 //              or {"error": {"type", "message", "sent"}}
 //
 // It exits 0 even when the request failed; 2 means bad input (an address the rule refuses included),
-// with the one line "bad input" on stderr. Anything it did not expect prints "writer failed" and
+// with the one line "bad input" on stderr; 3 means the router could not be loaded, so nothing was
+// sent, with the one line "writer failed". Anything else it did not expect prints "writer failed" and
 // exits 1. The key, the transcript and the source's reply never reach stdout (but for the reply's text
-// on success), stderr or a file, and nothing is read from the environment.
+// on success, with any copy of the key in it replaced by [key]), stderr or a file, and nothing is read
+// from the environment.
 
 import { realpathSync, writeSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import {
-  complete,
-  AuthError,
-  ContextLengthError,
-  MalformedResponseError,
-  QuotaExhaustedError,
-  RateLimitError,
-  TimeoutError,
-} from "ai-execution-router";
-
-const ROUTER_VERSION = createRequire(import.meta.url)("ai-execution-router/package.json").version;
 
 const KEY_RULE = /^[A-Za-z0-9._~+/=-]{1,4096}$/;
 const MODEL_RULE = /^[A-Za-z0-9._:/+@-]{1,200}$/;
-// A fetch that rejected with one of these, on its cause or in an AggregateError, never connected.
-const CONNECT_CODES = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
+// A fetch that rejected with one of these, on its cause or in an AggregateError, wrote no request: it
+// never connected, or its TLS handshake refused the certificate (Node's documented X509 codes, less
+// OUT_OF_MEM, and the altname check), which happens before any request is written.
+const CONNECT_CODES = new Set([
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_CONNECT_TIMEOUT",
+  "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO_DECRYPT_CERT_SIGNATURE", "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+  "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY", "CERT_SIGNATURE_FAILURE", "CRL_SIGNATURE_FAILURE", "CERT_NOT_YET_VALID",
+  "CERT_HAS_EXPIRED", "CRL_NOT_YET_VALID", "CRL_HAS_EXPIRED", "ERROR_IN_CERT_NOT_BEFORE_FIELD",
+  "ERROR_IN_CERT_NOT_AFTER_FIELD", "ERROR_IN_CRL_LAST_UPDATE_FIELD", "ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+  "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "CERT_CHAIN_TOO_LONG", "CERT_REVOKED", "INVALID_CA", "PATH_LENGTH_EXCEEDED",
+  "INVALID_PURPOSE", "CERT_UNTRUSTED", "CERT_REJECTED", "HOSTNAME_MISMATCH", "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
 // Node's own waits: for the reply's headers, or for the next part of its body.
 const TIMEOUT_CODES = new Set(["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
-const LIST_LIMIT_MS = 10_000;
+// The Fetch standard's bad ports: fetch refuses them before connecting, so they are answered here, at
+// once, as not sent.
+export const BAD_PORTS = new Set(["1", "7", "9", "11", "13", "15", "17", "19", "20", "21", "22", "23", "25", "37", "42", "43",
+  "53", "69", "77", "79", "87", "95", "101", "102", "103", "104", "109", "110", "111", "113", "115", "117", "119", "123",
+  "135", "137", "139", "143", "161", "179", "389", "427", "465", "512", "513", "514", "515", "526", "530", "531", "532",
+  "540", "548", "554", "556", "563", "587", "601", "636", "989", "990", "993", "995", "1719", "1720", "1723", "2049",
+  "3659", "4045", "4190", "5060", "5061", "6000", "6566", "6665", "6666", "6667", "6668", "6669", "6679", "6697", "10080"]);
+// The list's own limit, over every page; a test may shorten it.
+export const limits = { listMs: 10_000 };
 const LIST_PAGES = 10;
 const MAX_INPUT = 64 * 1024 * 1024;
-const MESSAGE_LIMIT = 200;
+
+// --- the router, loaded only when needed --------------------------------------------------------
+
+let router = null;
+let routerVersion = null;
+// Imported, not named in a static import, so that a router that is missing or whose entry throws is an
+// error main can catch, after its handlers are installed, and answer with status 3.
+async function loadRouter() {
+  if (!router) {
+    const loaded = await import("ai-execution-router");
+    routerVersion = createRequire(import.meta.url)("ai-execution-router/package.json").version;
+    router = loaded;
+  }
+  return router;
+}
 
 // --- the address rule (spec section 5, tests/fixtures/addresses.txt) -------------------------------
 
@@ -79,22 +103,42 @@ export function addressHost(address) {
   return dnsName(host) ? host : null;
 }
 
-// Lower-case labels of letters, digits and hyphens, the last with a letter in it (so never an IPv4
-// literal), at most 253 characters in all.
+// Lower-case labels of letters, digits and hyphens, at most 253 characters in all, whose last label
+// is not a number to the URL parser: it has a letter, and is not 0x followed only by hex digits.
 function dnsName(host) {
   if (host.length === 0 || host.length > 253) return false;
   const labels = host.split(".");
-  return labels.every((l) => DNS_LABEL.test(l)) && /[a-z]/.test(labels[labels.length - 1]);
+  const last = labels[labels.length - 1];
+  return labels.every((l) => DNS_LABEL.test(l)) && /[a-z]/.test(last) && !/^0x[0-9a-f]*$/.test(last);
 }
 
-// Lower-case hex groups of 1 to 4 digits: eight of them, or at most seven around one "::".
+// Lower-case hex groups of 1 to 4 digits, eight of them or at most seven around one "::", written as
+// the URL parser writes them: no leading zero, and the first longest run of two or more zero groups,
+// and only that, as "::".
 function ipv6(text) {
   if (!/^[0-9a-f:]+$/.test(text)) return false;
   const halves = text.split("::");
   if (halves.length > 2) return false;
-  const groups = halves.flatMap((h) => (h === "" ? [] : h.split(":")));
+  const parts = halves.map((h) => (h === "" ? [] : h.split(":")));
+  const groups = parts.flat();
   if (!groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return false;
-  return halves.length === 2 ? groups.length <= 7 : groups.length === 8;
+  if (halves.length === 2 ? groups.length > 7 : groups.length !== 8) return false;
+  const pieces = halves.length === 2 ? [...parts[0], ...Array(8 - groups.length).fill("0"), ...parts[1]] : groups;
+  return canonical(pieces.map((g) => parseInt(g, 16))) === text;
+}
+function canonical(pieces) {
+  let start = -1;
+  let length = 0;
+  for (let i = 0; i < 8;) {
+    if (pieces[i] !== 0) { i++; continue; }
+    let j = i;
+    while (j < 8 && pieces[j] === 0) j++;
+    if (j - i > length && j - i >= 2) [start, length] = [i, j - i];
+    i = j;
+  }
+  const hex = pieces.map((p) => p.toString(16));
+  if (start === -1) return hex.join(":");
+  return `${hex.slice(0, start).join(":")}::${hex.slice(start + length).join(":")}`;
 }
 
 // --- input ----------------------------------------------------------------------------------------
@@ -120,6 +164,9 @@ function checkComplete(input) {
   if (!Number.isInteger(maxTokens) || maxTokens < 1 || maxTokens > 1_000_000) return null;
   return { ...source, model, system, user, timeoutMs, maxTokens };
 }
+
+// The address's port is one fetch refuses.
+function badPort(address) { return BAD_PORTS.has(new URL(address).port); }
 
 // --- the fetch guard ------------------------------------------------------------------------------
 
@@ -171,44 +218,28 @@ function sentBy(record) { return record.passed > 0 && record.reached; }
 
 // --- what a failure says --------------------------------------------------------------------------
 
-// A run of SIZE characters of TEXT inside LINE: the line repeats what was sent, so it is dropped.
-function shares(line, text, size) {
-  if (!text || size < 1 || line.length < size) return false;
-  for (let i = 0; i + size <= line.length; i++) if (text.includes(line.slice(i, i + size))) return true;
-  return false;
-}
-
-// Built only from the error's name, its status and the first line of its message: control characters
-// removed, the key replaced by [key], cut to 200 characters. A line that still repeats eight
-// characters running of what was sent (the transcript, the context line), or of the key, is left out.
-// Never the body or the cause.
-function messageOf(err, input) {
+// Only the error's name and, when it has one, its status: never any text the source sent, which could
+// carry the key or the transcript in any spelling. The engine reads only the status.
+function messageOf(err) {
   const name = typeof err?.name === "string" && /^[A-Za-z0-9_]{1,40}$/.test(err.name) ? err.name : "Error";
   const status = Number.isInteger(err?.status) && err.status >= 100 && err.status <= 599 ? err.status : undefined;
-  let line = "";
-  try {
-    line = String(err?.message ?? "").split(/\r\n|\r|\n/)[0];
-  } catch {
-    line = "";
-  }
-  line = line.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "");
-  if (input.key) line = line.split(input.key).join("[key]");
-  line = line.slice(0, MESSAGE_LIMIT);
-  if (shares(line, input.user, 8) || (input.key && shares(line, input.key, Math.min(8, input.key.length)))) line = "";
-  return name + (status ? ` (HTTP ${status})` : "") + (line ? `: ${line}` : "");
+  return name + (status ? ` (HTTP ${status})` : "");
 }
 
 // The error's type, checked in the contract's order.
-function typeOf(err, record) {
-  if (err instanceof TimeoutError || err?.name === "TimeoutError" || record.timedOut || timedOut(err)) return "timeout";
-  if (err instanceof QuotaExhaustedError) return "quota";
-  if (err instanceof RateLimitError) return "rate";
-  if (err instanceof AuthError) return "refused";
-  if (err instanceof ContextLengthError) return "context";
-  if (err instanceof MalformedResponseError) return "other";
+function typeOf(err, record, r) {
+  if (err instanceof r.TimeoutError || err?.name === "TimeoutError" || record.timedOut || timedOut(err)) return "timeout";
+  if (err instanceof r.QuotaExhaustedError) return "quota";
+  if (err instanceof r.RateLimitError) return "rate";
+  if (err instanceof r.AuthError) return "refused";
+  if (err instanceof r.ContextLengthError) return "context";
+  if (err instanceof r.MalformedResponseError) return "other";
   if (typeof err?.status === "number") return "http";
   return sentBy(record) ? "other" : "connect";
 }
+
+// A key the source handed back is never passed on.
+function scrub(text, key) { return key ? text.split(key).join("[key]") : text; }
 
 // --- complete -------------------------------------------------------------------------------------
 
@@ -216,19 +247,20 @@ function typeOf(err, record) {
  * One outside-minutes request through the router's complete(), streamed. INPUT has passed the input
  * checks; CALL is the router's complete() unless a test gives another.
  */
-export async function send(input, call = complete) {
+export async function send(input, call) {
+  const r = await loadRouter();
+  const ask = call ?? r.complete;
   return guarded(async (record) => {
     // The router would refuse a call with no credential at all; a Claude API source always needs one.
-    if (input.kind === "claude" && !input.key) {
-      return { error: { type: "refused", message: "AuthError: the Claude API needs a key", sent: false } };
-    }
+    if (input.kind === "claude" && !input.key) return { error: { type: "refused", message: "AuthError", sent: false } };
+    if (badPort(input.address)) return { error: { type: "connect", message: "BadPortError", sent: false } };
     const endpoint = { provider: input.kind === "claude" ? "anthropic" : "openai-chat", baseUrl: input.address };
     // With no key, one fixed header that carries no secret passes the router's credential check, and
     // no Authorization header is sent.
     if (input.key) endpoint.apiKey = input.key;
     else endpoint.headers = { "x-meetingbox": "1" };
     try {
-      const result = await call({
+      const result = await ask({
         model: input.model,
         input: { system: input.system, messages: [{ role: "user", content: input.user }] },
         maxTokens: input.maxTokens,
@@ -239,13 +271,13 @@ export async function send(input, call = complete) {
         onDelta: () => {},
       });
       return {
-        text: result.text,
+        text: scrub(result.text, input.key),
         finishReason: result.finishReason ?? null,
         inputTokens: result.promptTokens,
         tokenSource: result.tokenSource,
       };
     } catch (err) {
-      return { error: { type: typeOf(err, record), message: messageOf(err, input), sent: sentBy(record) } };
+      return { error: { type: typeOf(err, record, r), message: messageOf(err), sent: sentBy(record) } };
     }
   });
 }
@@ -288,11 +320,13 @@ function listType(err, record) {
 /** The source's models, from its own list call (the router only runs requests). */
 async function list(input) {
   return guarded(async (record) => {
-    if (input.kind === "claude" && !input.key) return { error: { type: "refused", message: "AuthError: the Claude API needs a key" } };
+    if (input.kind === "claude" && !input.key) return { error: { type: "refused", message: "AuthError" } };
+    if (badPort(input.address)) return { error: { type: "connect", message: "BadPortError" } };
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new DOMException("the list took too long", "TimeoutError")), LIST_LIMIT_MS);
+    const timer = setTimeout(() => controller.abort(new DOMException("the list took too long", "TimeoutError")), limits.listMs);
     const base = input.address.replace(/\/+$/, "");
-    const ids = (body) => body.data.map((m) => m?.id).filter((id) => typeof id === "string");
+    // An id holding the key is dropped: the source handed the key back.
+    const ids = (body) => body.data.map((m) => m?.id).filter((id) => typeof id === "string" && !(input.key && id.includes(input.key)));
     try {
       const models = [];
       if (input.kind === "standard") {
@@ -311,7 +345,7 @@ async function list(input) {
       }
       return { models };
     } catch (err) {
-      return { error: { type: listType(err, record), message: messageOf(err, { key: input.key, user: "" }) } };
+      return { error: { type: listType(err, record), message: messageOf(err) } };
     } finally {
       clearTimeout(timer);
     }
@@ -322,7 +356,10 @@ async function list(input) {
 
 /** Runs one command on its input: {code, output}, where code 2 means bad input and output is null. */
 export async function run(command, input) {
-  if (command === "version") return { code: 0, output: { router: ROUTER_VERSION } };
+  if (command === "version") {
+    await loadRouter();
+    return { code: 0, output: { router: routerVersion } };
+  }
   if (command === "list") {
     const checked = checkSource(input);
     return checked ? { code: 0, output: await list(checked) } : { code: 2, output: null };
@@ -343,9 +380,9 @@ function writeAll(fd, text) {
 }
 
 // One fixed line, never the error, which may quote the key or the transcript.
-function writerFailed() {
+function writerFailed(status = 1) {
   try { writeAll(2, "writer failed\n"); } catch { /* nothing more can be said */ }
-  process.exit(1);
+  process.exit(status);
 }
 
 async function readInput() {
@@ -364,8 +401,14 @@ async function readInput() {
 }
 
 async function main() {
-  process.on("uncaughtException", writerFailed);
-  process.on("unhandledRejection", writerFailed);
+  process.on("uncaughtException", () => writerFailed(1));
+  process.on("unhandledRejection", () => writerFailed(1));
+  // The router first, for every command: without it nothing can have been sent.
+  try {
+    await loadRouter();
+  } catch {
+    writerFailed(3);
+  }
   const command = process.argv[2];
   // version reads nothing: its stdin is whatever the engine's is.
   const input = command === "version" ? {} : await readInput();
@@ -382,4 +425,4 @@ function isMain() {
     return false;
   }
 }
-if (isMain()) main().catch(writerFailed);
+if (isMain()) main().catch(() => writerFailed(1));

@@ -64,15 +64,18 @@ install_minutes() { echo "install_minutes" >> "$HOME/calls.log"; return 0; }
 # absolute. Each call appends "argv: ..." and "env: ..." lines to $HOME/node.log; "Never calls Node"
 # means that file does not exist. What it reads on stdin goes to $HOME/node.stdin.<command>. It answers:
 #   --version             $HOME/node-version, else v22.22.2
-#   <writer.mjs> version  {"router": "1.1.1"}, or $HOME/node-router-version's text
+#   <writer.mjs> version  {"router": "1.1.1"}, or $HOME/node-router-version's text, with the status
+#                         in $HOME/node-router-status (default 0)
 #   <writer.mjs> list     $HOME/node-list, else {"models": []}
 #   <writer.mjs> complete $HOME/node-reply, else minutes in Markdown
 # with the status in $HOME/node-status (default 0). $HOME/node-sleep makes complete sleep that many
 # seconds first (exec, so a TERM reaches the sleep), and $HOME/node-stderr-stdin makes it copy its
-# stdin to stderr, the key included.
+# stdin to stderr, the key included. With $HOME/node-scan, a list or complete that was handed a key
+# runs key_scan on it while the engine waits, appending what it finds to $HOME/scan-found.
 fake_node() {
   local f="$HOME/fake-node/node"
   mkdir -p "$HOME/fake-node" "$STATE_DIR" "$MINUTES_DIR"
+  key_scanner
   cat > "$f" <<EOF
 #!/bin/bash
 h="$HOME"
@@ -81,8 +84,13 @@ case "\$1" in --version) /bin/cat "\$h/node-version" 2>/dev/null || echo v22.22.
 cmd="\${2:-}"
 case "\$cmd" in list|complete) /bin/cat > "\$h/node.stdin.\$cmd" ;; esac
 [ ! -e "\$h/node-stderr-stdin" ] || /bin/cat "\$h/node.stdin.\$cmd" >&2
+if [ -e "\$h/node-scan" ] && [ -e "\$h/node.stdin.\$cmd" ]; then
+  k="\$($(type -P jq) -r '.key // empty' "\$h/node.stdin.\$cmd" 2>/dev/null)"
+  [ -z "\$k" ] || "\$h/fake-node/key-scan" "\$k" >> "\$h/scan-found"
+fi
 case "\$cmd" in
-  version) if [ -e "\$h/node-router-version" ]; then /bin/cat "\$h/node-router-version"; else echo '{"router": "1.1.1"}'; fi ;;
+  version) if [ -e "\$h/node-router-version" ]; then /bin/cat "\$h/node-router-version"; else echo '{"router": "1.1.1"}'; fi
+           exit "\$(/bin/cat "\$h/node-router-status" 2>/dev/null || echo 0)" ;;
   list) if [ -e "\$h/node-list" ]; then /bin/cat "\$h/node-list"; else echo '{"models": []}'; fi ;;
   complete)
     [ ! -e "\$h/node-sleep" ] || exec /bin/sleep "\$(/bin/cat "\$h/node-sleep")"
@@ -96,3 +104,21 @@ EOF
   record_install "$NODE_FILE"
   [ -e "$MINUTES_DIR/writer.mjs" ] || : > "$MINUTES_DIR/writer.mjs"
 }
+
+# $HOME/fake-node/key-scan KEY prints every file under the scratch home holding KEY, or any 16
+# characters of it running, but the stand-ins' own records of what they were handed: the keychain
+# stub's store and its security -i stdin, and the fake node's stdin. "key_scan KEY" runs it.
+key_scanner() {
+  mkdir -p "$HOME/fake-node"
+  cat > "$HOME/fake-node/key-scan" <<EOF
+#!/bin/bash
+h="$HOME"; key="\$1"; n=\${#key}; w=16; [ "\$n" -ge "\$w" ] || w=\$n
+/bin/mkdir -p "\$h/.scan"; : > "\$h/.scan/runs"
+i=0; while [ \$((i + w)) -le "\$n" ]; do printf '%s\n' "\${key:\$i:\$w}" >> "\$h/.scan/runs"; i=\$((i + 1)); done
+/usr/bin/grep -rlF -f "\$h/.scan/runs" "\$h" --exclude-dir=.scan --exclude=keystore --exclude='keystore.*' \\
+  --exclude=security-stdin.log --exclude='node.stdin.*' 2>/dev/null
+exit 0
+EOF
+  chmod 755 "$HOME/fake-node/key-scan"
+}
+key_scan() { [ -x "$HOME/fake-node/key-scan" ] || key_scanner; "$HOME/fake-node/key-scan" "$1"; }
