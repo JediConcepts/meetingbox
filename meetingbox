@@ -285,10 +285,14 @@ remove_installed() {
 }
 
 # A record line remove_installed may hand to rm: absolute, with no empty, . or .. part and no final /,
-# and neither BASE_DIR, nor in it or above it (so never a meeting folder), nor HOME or above it. Case is
-# ignored, as the Mac's disk ignores it.
+# and neither BASE_DIR, nor in it or above it (so never a meeting folder), nor HOME or above it. First
+# by spelling, case ignored as the Mac's disk ignores it; then by folder (device and inode), so no
+# other spelling of the same folder passes: a link, /private, the Data volume's own path, another
+# Unicode form. A relative BASE_DIR is taken from the current folder. A path or folder that cannot be
+# examined is refused.
 removable() {
-  local p="$1" base="${BASE_DIR%/}" home="${HOME%/}" nocase=0 ok=0
+  local p="$1" base home="${HOME%/}" nocase=0 ok=0 a ids n=0 id first=""
+  case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
   case "$p" in
     /*/|*//*|*/./*|*/.|*/../*|*/..) return 1 ;;
     /?*) ;;
@@ -302,7 +306,54 @@ removable() {
     esac ;;
   esac
   [ "$nocase" = 1 ] || shopt -u nocasematch
-  [ "$ok" = 1 ]
+  [ "$ok" = 1 ] || return 1
+  [ "$GUARD_FIXED" = 1 ] || guard_folders || return 1
+  # the path and every folder above it that is there, in one stat
+  set --
+  if [ -e "$p" ]; then set -- "$p"; first=1; fi
+  a="${p%/*}"
+  while [ -n "$a" ]; do [ ! -e "$a" ] || set -- "$@" "$a"; a="${a%/*}"; done   # p is absolute
+  [ "$#" -gt 0 ] || return 0
+  ids="$(stat -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
+  while IFS= read -r id; do
+    n=$((n + 1))
+    [ -n "$id" ] || return 1
+    # inside BASE_DIR, or BASE_DIR itself
+    [ "$id" != "$GUARD_BASE" ] || return 1
+    # the path itself is BASE_DIR, HOME or a folder above either
+    if [ "$n" = 1 ] && [ -n "$first" ]; then case "$GUARD_ABOVE" in *" $id "*) return 1 ;; esac; fi
+  done <<< "$ids"
+  [ "$n" = "$#" ]
+}
+
+# The folders removable protects, by device and inode: GUARD_BASE is BASE_DIR's (empty when it is not
+# there), and GUARD_ABOVE holds BASE_DIR's, HOME's and every folder's above them, above their spelt
+# paths, their physical paths (cd -P), and those on the Data volume (/System/Volumes/Data). False when
+# a folder there cannot be examined. reset works them out once (GUARD_FIXED); otherwise each call does.
+GUARD_FIXED=0; GUARD_BASE=""; GUARD_ABOVE=""
+DATA_VOLUME="/System/Volumes/Data"   # macOS's Data volume, which gives the same folders a second path
+guard_folders() {
+  local base f d real list="" ids
+  case "$BASE_DIR" in /*) base="${BASE_DIR%/}" ;; *) base="$PWD/${BASE_DIR%/}" ;; esac
+  GUARD_BASE=""; GUARD_ABOVE=" "
+  for f in "$base" "${HOME%/}"; do
+    # the folder as spelt, then the nearest folder of it that is there, physically, and on the Data volume
+    d="$f"; list="$list$f"$'\n'
+    while [ ! -d "$d" ] && [ -n "$d" ]; do case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac; done
+    real="$(cd -P -- "${d:-/}" 2>/dev/null && pwd -P)" || return 1
+    list="$list$real"$'\n'
+    if [ -d "$DATA_VOLUME$real" ]; then list="$list$DATA_VOLUME$real"$'\n'; fi
+  done
+  set --
+  while IFS= read -r f; do
+    while [ -n "$f" ]; do [ ! -e "$f" ] || set -- "$@" "$f"; case "$f" in */*) f="${f%/*}" ;; *) f="" ;; esac; done
+  done <<< "$list"
+  set -- "$@" /
+  ids="$(stat -L -f %d:%i -- "$@" 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$ids" | grep -c .)" = "$#" ] || return 1
+  GUARD_ABOVE=" $(printf '%s' "$ids" | tr '\n' ' ') "
+  if [ -e "$base" ]; then GUARD_BASE="$(stat -L -f %d:%i -- "$base" 2>/dev/null)" || return 1; fi
+  return 0
 }
 
 forget_install() {
@@ -3880,6 +3931,8 @@ reset_cmd() {
   info "  so macOS asks again next time"
   if [ "$level" != state ]; then
     info "  quit the meetingbox app, if it is running"
+    # the folders no record line may remove, worked out once for every line
+    if guard_folders; then GUARD_FIXED=1; fi
     ours="$(cat "$INSTALLED" 2>/dev/null || true)"
     info "  delete what setup installed:"
     n=0
@@ -3986,7 +4039,8 @@ reset_cmd() {
 
   rule
   say "done. Run ${c_b}meetingbox setup${c_0} to set it up again."
-  keys_left || return 1
+  # only reset --tools removes keys, so only it says when one stays
+  [ "$level" = state ] || keys_left || return 1
 }
 
 # One line for each key still on the install record once reset or uninstall is done (its delete

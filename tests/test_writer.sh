@@ -400,7 +400,52 @@ function code(line,    out, j, c, n, top) {
   return out
 }
 
-# Words that open and close groups and compound commands, counted on a line of code.
+# The shell words of a logical line, quoting kept, a $( ) or ${ } inside the word it belongs to: W[1..n].
+function words(text,    j, n, c, d, cur, mode, top, nw) {
+  nw = 0; cur = ""; mode = ""; n = length(text)
+  for (j = 1; j <= n; j++) {
+    c = substr(text, j, 1); d = substr(text, j + 1, 1); top = substr(mode, length(mode), 1)
+    if (top == "S") { cur = cur c; if (c == "'") mode = substr(mode, 1, length(mode) - 1); continue }
+    if (c == "\\") { cur = cur c d; j++; continue }
+    if (top == "D") {
+      cur = cur c
+      if (c == "\"") mode = substr(mode, 1, length(mode) - 1)
+      else if (c == "$" && d == "(") { mode = mode "P"; WD[length(mode)] = 0; cur = cur d; j++ }
+      else if (c == "$" && d == "{") { mode = mode "B"; cur = cur d; j++ }
+      continue
+    }
+    if (top == "B") { cur = cur c; if (c == "}") mode = substr(mode, 1, length(mode) - 1); else if (c == "\"") mode = mode "D"; continue }
+    if (c == "'") { mode = mode "S"; cur = cur c; continue }
+    if (c == "\"") { mode = mode "D"; cur = cur c; continue }
+    if (c == "$" && d == "(") { mode = mode "P"; WD[length(mode)] = 0; cur = cur c d; j++; continue }
+    if (c == "$" && d == "{") { mode = mode "B"; cur = cur c d; j++; continue }
+    if (top == "P") {
+      cur = cur c
+      if (c == "(") WD[length(mode)]++
+      else if (c == ")") { if (WD[length(mode)] == 0) mode = substr(mode, 1, length(mode) - 1); else WD[length(mode)]-- }
+      continue
+    }
+    if (c == "#" && cur == "") break
+    if (c ~ /[ \t;|&()<>]/) { if (cur != "") W[++nw] = cur; cur = ""; continue }
+    cur = cur c
+  }
+  if (cur != "") W[++nw] = cur
+  return nw
+}
+
+# The variables holding the key that a line in function FN can name, as a regular expression.
+function keyre(fn) { return "\\$\\{?(" VARS_G (VARS_L[fn] != "" ? "|" VARS_L[fn] : "") ")([^A-Za-z0-9_]|$)" }
+
+# NAME, in FN, now holds the key: a local of FN for FN only, any other name everywhere.
+function holds(name, fn) {
+  if ((fn SUBSEP name) in LOCAL) {
+    if (("|" VARS_L[fn] "|") ~ ("\\|" name "\\|")) return 0
+    VARS_L[fn] = VARS_L[fn] (VARS_L[fn] == "" ? "" : "|") name; return 1
+  }
+  if (("|" VARS_G "|") ~ ("\\|" name "\\|")) return 0
+  VARS_G = VARS_G "|" name; return 1
+}
+
 function depth_change(text,    w, n, k, d) {
   n = split(text, w, /[ \t;|&()]+/); d = 0
   for (k = 1; k <= n; k++) { if (w[k] in OPENS) d++; else if (w[k] in ENDS) d-- }
@@ -409,7 +454,8 @@ function depth_change(text,    w, n, k, d) {
 
 function bad(n, why) { printf "bad %d %s: %s\n", n, why, src[n] }
 
-# Every redirect on a line of code: output only to /dev/null (or another descriptor), and no << or <<<.
+# Every redirect on a line of code: output only to /dev/null, a copy only onto 1 or 2 (or a close),
+# and no << or <<<.
 function redirects(text, n,    m, op, target, rest) {
   rest = text
   while (match(rest, REDIRECT)) {
@@ -418,12 +464,23 @@ function redirects(text, n,    m, op, target, rest) {
     match(m, /^(&>>|&>|>>|>\||>&|<<<|<<-|<<|<>|<&|>|<)/); op = substr(m, 1, RLENGTH); target = substr(m, RLENGTH + 1)
     sub(/^[ \t]*/, "", target)
     if (op ~ /^<</) bad(n, "a here-string or here-document")
-    else if (op == ">&" && target ~ /^[0-9-]$/) continue
+    else if (op == ">&") { if (target !~ /^[12-]$/) bad(n, "a redirect to descriptor " target) }
     else if (op ~ />/ && target != "/dev/null") bad(n, "a redirect to " (target == "Q" ? "a quoted path" : target))
   }
 }
 
-# The commands on the block's lines of code.
+# After a |, security runs only as security -i, and run_limited only what the real sends run.
+function receivers(n,    t, rest) {
+  t = src[n]
+  while (match(t, /\|[ \t]*(run_limited|security)([ \t]|$)/)) {
+    rest = substr(t, RSTART)
+    if (rest !~ /^\|[ \t]*security -i([ \t;)]|$)/ &&
+        rest !~ /^\|[ \t]*run_limited ("\$limit"|[0-9]+) env -i "\$(OUTSIDE_NODE|node)" "\$MINUTES_DIR\/writer\.mjs" (list|complete)([ \t;)]|$)/)
+      bad(n, "a receiver running something other than writer.mjs or security -i")
+    t = substr(t, RSTART + RLENGTH)
+  }
+}
+
 function commands(first, last,    j, text, t, nt, k, w, want, after, pattern, casehead, skipfor) {
   want = 1; after = "start"; pattern = 0; casehead = 0; skipfor = 0
   for (j = first; j <= last; j++) {
@@ -456,20 +513,7 @@ function commands(first, last,    j, text, t, nt, k, w, want, after, pattern, ca
 }
 
 END {
-  vars = "key|STORED_KEY|got"
-  do {
-    grew = 0
-    for (i = 1; i <= NR; i++) {
-      n = split(src[i], w, /[ \t;]+/)
-      for (k = 1; k <= n; k++) {
-        if (w[k] !~ ("^[A-Za-z_][A-Za-z0-9_]*=\"?\\$\\{?(" vars ")\\}?\"?$")) continue
-        name = w[k]; sub(/=.*/, "", name)
-        if (("|" vars "|") !~ ("\\|" name "\\|")) { vars = vars "|" name; grew = 1 }
-      }
-    }
-  } while (grew)
-  keyre = "\\$\\{?(" vars ")([^A-Za-z0-9_]|$)"
-
+  # one pass over the source: each line's code, depth, quoting and function
   fn = ""; MODE = ""; depth = 0; heredoc = ""
   for (i = 1; i <= NR; i++) {
     line = src[i]
@@ -479,7 +523,7 @@ END {
       continue
     }
     if (line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\)[ \t]*\{/) {
-      if (fn != "" && HASKEY[fn]) print "lost " fn
+      if (fn != "") LOST[fn] = 1
       fn = line; sub(/\(.*/, "", fn); MODE = ""; depth = 0
       sub(/^[^{]*\{/, "", line)
     }
@@ -493,21 +537,77 @@ END {
     if (src[i] ~ /<<-?[ \t]*['"]?[A-Za-z_][A-Za-z0-9_]*/ && src[i] !~ /<<</) {
       t = src[i]; sub(/.*<<-?[ \t]*['"]?/, "", t); sub(/[^A-Za-z0-9_].*/, "", t); heredoc = t
     }
-    if (src[i] ~ keyre && fn != "" && fn != "read_swap") { KEY[i] = 1; HASKEY[fn] = 1 }
     if (fn != "" && depth < 0) {
-      if (MODE != "" && HASKEY[fn]) print "lost " fn
+      if (MODE != "") LOST[fn] = 1
       fn = ""; depth = 0; MODE = ""
     }
   }
-  if (fn != "" && HASKEY[fn]) print "lost " fn
-  for (i = 1; i <= NR; i++) if (HEREDOC[i] && src[i] ~ keyre) { print "key " i; bad(i, "a here-document") }
+  if (fn != "") LOST[fn] = 1
+
+  # each function's locals, and the logical lines (a line ending in \ goes on)
+  nl = 0
+  for (i = 1; i <= NR; i++) {
+    if (i == 1 || src[i - 1] !~ /\\$/) { nl++; LSTART[nl] = i; LTEXT[nl] = "" }
+    t = src[i]; if (t ~ /\\$/) t = substr(t, 1, length(t) - 1)
+    LTEXT[nl] = LTEXT[nl] t " "
+  }
+  for (l = 1; l <= nl; l++) {
+    f = FN[LSTART[l]]; if (f == "" || HEREDOC[LSTART[l]]) continue
+    n = words(LTEXT[l])
+    for (k = 1; k <= n; k++) {
+      if (W[k] != "local" && W[k] != "declare" && W[k] != "typeset") continue
+      for (m = k + 1; m <= n && W[m] ~ /^(-[A-Za-z]+|[A-Za-z_][A-Za-z0-9_]*(\+?=.*)?)$/; m++) {
+        if (W[m] ~ /^-/) continue
+        name = W[m]; sub(/\+?=.*/, "", name); LOCAL[f, name] = 1
+      }
+    }
+  }
+
+  # copies: an assignment (local and declare included, += too) whose value expands a variable holding
+  # the key, but for a $( ) that pipes it to run_limited or security (the receiver's output is no
+  # copy, and the pipeline is checked as the block), and printf -v
+  VARS_G = "key|STORED_KEY|got"
+  do {
+    grew = 0
+    for (l = 1; l <= nl; l++) {
+      f = FN[LSTART[l]]; if (f == "" || f == "read_swap" || HEREDOC[LSTART[l]]) continue
+      re = keyre(f)
+      if (LTEXT[l] !~ re) continue
+      n = words(LTEXT[l])
+      for (k = 1; k <= n; k++) {
+        if (W[k] == "printf" && W[k + 1] == "-v" && W[k + 2] ~ /^[A-Za-z_][A-Za-z0-9_]*$/) grew += holds(W[k + 2], f)
+        if (W[k] !~ /^[A-Za-z_][A-Za-z0-9_]*\+?=/) continue
+        name = W[k]; sub(/\+?=.*/, "", name); value = W[k]; sub(/^[A-Za-z_][A-Za-z0-9_]*\+?=/, "", value)
+        if (value !~ re) continue
+        if (index(value, "$(") && value ~ /\|[ \t]*(run_limited|security)[ \t]/) continue
+        grew += holds(name, f)
+      }
+    }
+  } while (grew)
+
+  for (i = 1; i <= NR; i++) {
+    f = FN[i]
+    if (f == "" || f == "read_swap" || HEREDOC[i]) continue
+    if (src[i] ~ keyre(f)) { KEY[i] = 1; HASKEY[f] = 1 }
+  }
+  for (f in LOST) if (HASKEY[f]) print "lost " f
+  for (i = 1; i <= NR; i++) if (HEREDOC[i] && FN[i] != "" && src[i] ~ keyre(FN[i])) { print "key " i; bad(i, "a here-document") }
+
+  # in a function that holds the key: no eval, no exec, no ${! indirection
+  for (i = 1; i <= NR; i++) {
+    if (!HASKEY[FN[i]] || HEREDOC[i]) continue
+    t = " " VIS[i] " "
+    if (t ~ /[ \t;|&(]eval[ \t;]/) bad(i, "eval in a function that holds the key")
+    if (t ~ /[ \t;|&(]exec[ \t;]/) bad(i, "exec in a function that holds the key")
+    if (index(src[i], "${!")) bad(i, "${! in a function that holds the key")
+  }
 
   for (i = 1; i <= NR; i++) {
     if (!KEY[i]) continue
     print "key " i
     last = i
     while ((CONTD[last] || AFTER[last] > BEFORE[i]) && last < NR && FN[last + 1] == FN[i]) last++
-    for (j = i; j <= last; j++) redirects(VIS[j], j)
+    for (j = i; j <= last; j++) { redirects(VIS[j], j); receivers(j) }
     commands(i, last)
     low = BEFORE[i]
     for (j = last + 1; j <= NR && FN[j] == FN[i] && low > 0; j++) {
@@ -520,7 +620,7 @@ key_rule() { awk -f "$HOME/key-rule.awk" "$1"; }
 # The rule itself, on one small function for each thing it must find.
 rule_case() {   # $1: what it must find; the function's body on stdin
   { printf 'f() {\n'; cat; printf '}\n'; } > "$HOME/rule-case"
-  key_rule "$HOME/rule-case" | grep -q "^bad .*$1" || rule_missed="$rule_missed [$1]"
+  key_rule "$HOME/rule-case" | grep '^bad ' | grep -qF -- "$1" || rule_missed="$rule_missed [$1]"
 }
 rule_missed=""
 rule_case 'here-string' <<'EOF'
@@ -554,12 +654,77 @@ rule_case 'the command tail' <<'EOF'
   { printf '%s' "$key"
     tail -c +2 file; } | run_limited 5 cat
 EOF
-rule_case 'the command security' <<'EOF'
+rule_case 'the command security' <<'CASE'
   security add-generic-password -w "$key"
-EOF
+CASE
 check "the key rule finds a here-string, a here-document, a redirect at a group's or compound command's closing line or through a copy, a command named through a variable or a path, and a command not allowed" \
   eval '[ -z "$rule_missed" ]'
 [ -z "$rule_missed" ] || printf 'missed:%s\n' "$rule_missed"
+# Round 3's forms: eval, exec and ${! anywhere in a function that holds the key; a copy onto a
+# descriptor but 1 or 2; copies through printf -v, +=, local and any assignment that expands the key;
+# and after a |, run_limited running anything but writer.mjs.
+rule_missed=""
+rule_case 'eval in a function that holds the key' <<'CASE'
+  printf '%s' "$key" | security -i
+  [ "$had_key" = 0 ] || eval "printf '%s\\n' \"\${k""ey}\" >> \"/x/f\""
+CASE
+rule_case '${! in a function that holds the key' <<'CASE'
+  printf '%s' "$key" | security -i
+  local kv=key; printf '%s\n' "${!kv}" >> /x/f
+CASE
+rule_case 'exec in a function that holds the key' <<'CASE'
+  exec > /x/f
+  echo "$key"
+CASE
+rule_case 'a redirect to descriptor 3' <<'CASE'
+  { printf "$key"; } >&3
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  local kl
+  printf -v kl '%s' "$key"
+  printf '%s\n' "$kl" >> /x/f
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  kc+="$key"
+  printf '%s' "$kc" > /x/f
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  kc="x$key"
+  printf '%s' "$kc" > /x/f
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  kc=${key:-}
+  printf '%s' "$kc" > /x/f
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  local kc="a $key b"
+  printf '%s' "$kc" > /x/f
+CASE
+rule_case 'a redirect to /x/f' <<'CASE'
+  kc="$(printf '%s' "$key"; echo | true)"
+  printf '%s' "$kc" > /x/f
+CASE
+rule_case 'a command named through a variable or a path' <<'CASE'
+  local tool=/abs/prog kl
+  printf -v kl '%s' "$key"
+  "$tool" "$kl"
+CASE
+rule_case 'a receiver running something other than writer.mjs' <<'CASE'
+  printf '%s' "$key" | run_limited 5 tee /x/f
+CASE
+check "the key rule finds eval, exec and \${! in a function that holds the key, a copy onto descriptor 3, copies through printf -v, +=, local and any assignment, and run_limited running anything but writer.mjs" \
+  eval '[ -z "$rule_missed" ]'
+[ -z "$rule_missed" ] || printf 'missed:%s\n' "$rule_missed"
+# The real sends pass: a $( ) that pipes the key to writer.mjs is that program's output, no copy.
+{ printf 'f() {\n'; cat <<'CASE'; printf '}\n'; } > "$HOME/rule-case"
+  answer="$( { printf '{"key":"%s",%s' "$key" "${request#\{}"; } 2>/dev/null \
+             | run_limited "$limit" env -i "$node" "$MINUTES_DIR/writer.mjs" complete 2>/dev/null; printf '\n%s' "${PIPESTATUS[1]}")"
+  printf '%s' "$answer" | jq -e . > /dev/null
+  printf '%s' "$key" 2>&1 | security -i >/dev/null 2>&-
+CASE
+clean_out="$(key_rule "$HOME/rule-case" | grep -v '^key ')"
+check "the key rule passes the real send's form: a \$( ) piping the key to writer.mjs, its answer used after it, and copies onto 1 or 2" \
+  eval '[ -z "$clean_out" ]'
 rule_out="$(key_rule "$ROOT/meetingbox")"
 rule_bad="$(printf '%s\n' "$rule_out" | grep -v '^key ')"
 abs_paths="$(grep -nE '(^|[^A-Za-z0-9_.-])/(usr/)?(local/)?bin/(printf|echo|test)([^A-Za-z0-9_]|$)' "$ROOT/meetingbox")"
@@ -1274,6 +1439,16 @@ out="$( (DELETE_STATUS=51; refuse_while_busy() { return 0; }; adopt_own_app() { 
 check "uninstall with two keys it could not remove ends with one line for each, and the status is 1" \
   eval '[ "$rc" -eq 1 ] && printf "%s\n" "$out" | tail -n 2 | head -n 1 | grep -qF "the key for $LOCAL is still in your keychain"
         && printf "%s\n" "$out" | tail -n 1 | grep -qF "the key for $CLAUDE is still in your keychain"'
+# A plain reset (the state level) removes no key, so it says nothing about one, and exits 0.
+for app_rc in 0 1; do
+  fresh_setup; reset_run; fake_node; : > "$KEYSTORE"
+  printf '%s\n' "$KEY" | (cli key set --address "$LOCAL") > /dev/null 2>&1
+  cp "$INSTALLED" "$HOME/installed.state"; cp "$KEYSTORE" "$HOME/keystore.state"; : > "$HOME/calls.log"
+  out="$( (reset_through_app() { return "$app_rc"; }; stop_recorders() { :; }; reset_cmd state) 2>&1 )"; rc=$?
+  check "a plain reset, reset_through_app answering $app_rc: exit 0, nothing said about the key, its line and the keychain unchanged, and no delete" \
+    eval '[ "$rc" -eq 0 ] && ! printf "%s" "$out" | grep -qF "still in your keychain" && grep -qxF "keychain:generic:$LOCAL" "$INSTALLED"
+          && cmp -s "$INSTALLED" "$HOME/installed.state" && cmp -s "$KEYSTORE" "$HOME/keystore.state" && ! grep -q "^security delete" "$HOME/calls.log"'
+done
 
 # ======================================================================== the record never removes a meeting folder
 
@@ -1284,6 +1459,7 @@ check "uninstall with two keys it could not remove ends with one line for each, 
 SCRATCH="$(cd "$HOME" && pwd -P)"
 safe_rm() {
   local a real
+  case "$SCRATCH" in /?*/?*) ;; *) printf 'no scratch home\n' >> "$HOME/rm-refused"; return 1 ;; esac
   for a in "$@"; do
     case "$a" in -*) continue ;; esac
     [ -e "$a" ] || [ -L "$a" ] || continue
@@ -1297,12 +1473,16 @@ for level in tools all; do
   fresh_setup; reset_run; fake_node; rm -f "$HOME/rm-refused"
   base="$HOME/Documents/Meetings"; m="$base/2026-11-10_1754"
   rm -rf "$HOME/Documents" "$HOME/Meetings2"
-  mkdir -p "$m" "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/.minutes.a" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" "$SRC_DIR/plain"
+  mkdir -p "$m" "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/.minutes.a" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" \
+           "$SRC_DIR/plain" "$SRC_DIR/x2"
   printf 'aac' > "$m/audio.m4a"
-  for f in "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" "$SRC_DIR/plain"; do : > "$f/keep"; done
+  for f in "$HOME/Meetings2" "$SRC_DIR/x" "$SRC_DIR/keep-empty" "$SRC_DIR/keep-dot" "$SRC_DIR/keep-slash" "$SRC_DIR/plain" "$SRC_DIR/x2"; do
+    : > "$f/keep"
+  done
+  # x2 is a plain folder: only the final . or .. part refuses x2/. and x2/..
   refused=("$m" "$base" "$HOME/Documents" "$HOME" "$HOME/" "$HOME//" "//" "${HOME%/*}" "$SRC_DIR/../../../Meetings2"
            "$SRC_DIR/.minutes./../.." "$SRC_DIR/.minutes.a/../x" "$SRC_DIR//keep-empty" "$SRC_DIR/./keep-dot" "$SRC_DIR/keep-slash/"
-           "relative/path" "$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')")
+           "relative/path" "$(printf '%s' "$m" | tr '[:upper:]' '[:lower:]')" "$SRC_DIR/x2/." "$SRC_DIR/x2/..")
   printf '%s\n' "${refused[@]}" "$SRC_DIR/plain" >> "$INSTALLED"
   out="$( (BASE_DIR="$base"; rm() { safe_rm "$@"; }; refuse_while_busy() { return 0; }; adopt_own_app() { :; }; quit_app() { return 0; }
            reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }; brew() { return 1; }
@@ -1318,7 +1498,7 @@ for level in tools all; do
   [ -z "$missing" ] || printf '%s\n' "$missing"
   check "reset_cmd $level: the meeting folder and its audio, and every folder those lines reach, are still there, and a plain recorded path is removed" \
     eval '[ -f "$m/audio.m4a" ] && [ -f "$HOME/Meetings2/keep" ] && [ -f "$SRC_DIR/x/keep" ] && [ -f "$SRC_DIR/keep-empty/keep" ]
-          && [ -f "$SRC_DIR/keep-dot/keep" ] && [ -f "$SRC_DIR/keep-slash/keep" ] && [ ! -e "$SRC_DIR/plain" ]
+          && [ -f "$SRC_DIR/keep-dot/keep" ] && [ -f "$SRC_DIR/keep-slash/keep" ] && [ -f "$SRC_DIR/x2/keep" ] && [ ! -e "$SRC_DIR/plain" ]
           && ! grep -qxF "$SRC_DIR/plain" "$INSTALLED" && [ ! -e "$HOME/rm-refused" ]'
 done
 rm -rf "$HOME/Documents" "$HOME/Meetings2"
@@ -1336,6 +1516,65 @@ for p in "${above[@]}"; do
 done
 check "with BASE_DIR on another disk, HOME and the folders above it are still refused, with a warning, and their lines kept" \
   eval '[ -z "$missing" ] && [ -d "$HOME/.meetingbox" ] && [ ! -e "$HOME/rm-refused" ]'
+: > "$INSTALLED"
+
+# The guard compares folders, by device and inode, not spellings. For each way of naming BASE_DIR, a
+# meeting in it, HOME or a folder above them by another spelling: a link, /private added or taken
+# off, the Data volume's own path, NFD against NFC, a relative BASE_DIR, and a BASE_DIR that is a link.
+# Each line is refused with the warning and kept, every meeting's audio is still there, and the plain
+# recorded paths (MINUTES_DIR, NODE_FILE and a folder of setup's) are removed.
+case "$HOME" in /private/*) other_home="${HOME#/private}" ;; *) other_home="/private$HOME" ;; esac
+DATA_HOME="/System/Volumes/Data$SCRATCH"
+NFC=$'R\xc3\xa9unions'; NFD=$'Re\xcc\x81unions'
+spellings_case() {   # $1: name; $2: BASE_DIR as reset sees it (from $HOME); $3: the real meetings folder; then the lines
+  local name="$1" base="$2" real="$3" level p
+  shift 3
+  for level in tools all; do
+    fresh_setup; reset_run; fake_node; record_install "$MINUTES_DIR"; rm -f "$HOME/rm-refused"
+    rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink"
+    mkdir -p "$real/m1" "$SRC_DIR/plain"; printf 'aac' > "$real/m1/audio.m4a"; : > "$SRC_DIR/plain/keep"
+    case "$name" in "a BASE_DIR that is a link"*) ln -s "$HOME/elsewhere/Real" "$HOME/MeetingsLink" ;; esac
+    ln -s "$real" "$SRC_DIR/link"
+    printf '%s\n' "$@" "$SRC_DIR/plain" >> "$INSTALLED"
+    out="$( (cd "$HOME"; BASE_DIR="$base"; DATA_VOLUME="${SPELL_DATA:-$DATA_VOLUME}"; rm() { safe_rm "$@"; }
+             refuse_while_busy() { return 0; }; adopt_own_app() { :; }
+             quit_app() { return 0; }; reset_through_app() { return 1; }; stop_recorders() { :; }; remove_signing_identity() { :; }
+             brew() { return 1; }; reset_cmd "$level") 2>&1 )"
+    missing=""
+    for p in "$@"; do
+      grep -qxF -- "$p" "$INSTALLED" || missing="$missing [$p: its line is gone]"
+      printf '%s' "$out" | grep -qF -- "refusing to remove '$p'" || missing="$missing [$p: no warning]"
+    done
+    check "reset_cmd $level, $name: each line naming BASE_DIR, a meeting in it, HOME or a folder above them by another spelling is refused with a warning and kept; the audio stays, and the plain recorded paths go" \
+      eval '[ -z "$missing" ] && [ -f "$real/m1/audio.m4a" ] && [ ! -e "$MINUTES_DIR" ] && [ ! -e "$NODE_FILE" ] && [ ! -e "$SRC_DIR/plain" ]
+            && ! grep -qxF "$SRC_DIR/plain" "$INSTALLED" && [ ! -e "$HOME/rm-refused" ]'
+    [ -z "$missing" ] || printf '%s\n' "$missing"
+  done
+}
+spellings_case "a link, /private and the Data volume" "$HOME/m" "$HOME/m" \
+  "$SRC_DIR/link/m1" "$other_home/m/m1" "$DATA_HOME/m/m1" "$DATA_HOME" "/System/Volumes/Data" "$SRC_DIR/link"
+spellings_case "NFD against NFC" "$HOME/$NFC" "$HOME/$NFC" "$HOME/$NFD/m1" "$HOME/$NFD"
+spellings_case "a relative BASE_DIR" "m" "$HOME/m" "$HOME/m/m1" "$HOME/m"
+spellings_case "a BASE_DIR that is a link" "$HOME/MeetingsLink" "$HOME/elsewhere/Real" \
+  "$HOME/elsewhere/Real" "$HOME/elsewhere/Real/m1" "$HOME/elsewhere"
+# again with no Data volume (another disk, an older macOS), so only the physical path names its parent
+SPELL_DATA="$HOME/no-data-volume" spellings_case "a BASE_DIR that is a link, with no Data volume" "$HOME/MeetingsLink" \
+  "$HOME/elsewhere/Real" "$HOME/elsewhere/Real" "$HOME/elsewhere/Real/m1" "$HOME/elsewhere"
+rm -rf "$HOME/m" "$HOME/elsewhere" "$HOME/$NFC" "$SRC_DIR/link" "$HOME/MeetingsLink"; : > "$INSTALLED"
+# Fail safe: when the path, or a folder the guard protects, cannot be examined (stat fails), the line is
+# refused and kept.
+fresh_setup; rm -f "$HOME/rm-refused"; mkdir -p "$SRC_DIR/plain3"; record_install "$SRC_DIR/plain3"
+want="refusing to remove '$SRC_DIR/plain3'"
+# (functions of their own: bash 3.2 cannot parse a case statement inside $( ))
+stat_fails_on_plain3() { case "$*" in *plain3*) return 1 ;; esac; command stat "$@"; }
+stat_fails_on_root() { case " $* " in *" / "*) return 1 ;; esac; command stat "$@"; }
+out1="$( (stat() { stat_fails_on_plain3 "$@"; }; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc1=$?
+out2="$( (stat() { stat_fails_on_root "$@"; }; rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"; rc2=$?
+check "when stat fails on the path, or on the folders the guard protects, the line is refused with the warning and kept" \
+  eval '[ "$rc1" -ne 0 ] && [ "$rc2" -ne 0 ] && printf "%s" "$out1" | grep -qF "$want" && printf "%s" "$out2" | grep -qF "$want"
+        && [ -d "$SRC_DIR/plain3" ] && installed_by_us "$SRC_DIR/plain3" && [ ! -e "$HOME/rm-refused" ]'
+out3="$( (rm() { safe_rm "$@"; }; remove_installed "$SRC_DIR/plain3") 2>&1 )"
+check "with stat working, the same plain line is removed" eval '[ ! -e "$SRC_DIR/plain3" ] && ! installed_by_us "$SRC_DIR/plain3"'
 : > "$INSTALLED"
 
 # The leftover sweep takes only the names mktemp makes: .minutes. or .minutes-old. and six letters or

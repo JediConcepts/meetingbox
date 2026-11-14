@@ -472,7 +472,7 @@ test("finishReason length, max_tokens and model_context_window_exceeded pass thr
 });
 
 test("finishReason is passed on only from the known set, and null otherwise", async () => {
-  for (const finish of ["stop", "length", "tool_calls", "content_filter"]) {
+  for (const finish of ["stop", "length", "tool_calls", "function_call", "content_filter"]) {
     useFetch(() => standardReply(MINUTES, { finish }));
     assert.equal((await run("complete", req())).output.finishReason, finish);
   }
@@ -1064,4 +1064,27 @@ test("BAD_PORTS is the Fetch standard's list, and the real fetch refuses every o
     dc.unsubscribe("undici:client:beforeConnect", before);
   }
   assert.deepEqual(seen, []);
+});
+
+// --- round 3 --------------------------------------------------------------------------------------
+
+test("guarded subscribes to both channels for the call, and leaves neither with a subscriber after it", async () => {
+  const names = ["undici:client:connected", "undici:client:connectError"];
+  let during = null;
+  useFetch(() => { during = names.map((n) => dc.channel(n).hasSubscribers); return standardReply(MINUTES); });
+  await run("complete", req());
+  assert.deepEqual(during, [true, true], "subscribed while the call runs");
+  globalThis.fetch = realFetch;
+  // one that connects, one refused, one to a bad port, all with the real fetch
+  const s = await server((rq, rs) => { rq.resume(); rq.on("end", () => { rs.writeHead(500); rs.end("{}"); }); });
+  const closed = await server(() => {});
+  const port = closed.port;
+  await closed.close();
+  try {
+    assert.equal((await run("complete", req({ address: `${s.url}/v1` }))).output.error.sent, true);
+    assert.equal((await run("complete", req({ address: `http://127.0.0.1:${port}/v1` }))).output.error.sent, false);
+    assert.equal((await run("complete", req({ address: "http://127.0.0.1:6000/v1" }))).output.error.sent, false);
+    assert.equal((await run("list", { kind: "standard", address: `http://127.0.0.1:${port}/v1` })).output.error.type, "connect");
+  } finally { await s.close(); }
+  for (const n of names) assert.equal(dc.channel(n).hasSubscribers, false, n);
 });
