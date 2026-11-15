@@ -8931,7 +8931,7 @@ func t11WriterJSON(_ w: OutsideWriter) -> [String: String] { ["kind": w.kind.raw
 MainActor.assumeIsolated {
     let r = T11Rig()
     r.app.beginAddSource()
-    check(r.app.sourceDraft == SourceDraft(index: nil, kind: .claude, address: "https://api.anthropic.com", problem: nil) && r.app.preferencesSheet == .source,
+    check(r.app.sourceDraft == SourceDraft(editing: nil, kind: .claude, address: "https://api.anthropic.com", problem: nil) && r.app.preferencesSheet == .source,
           "T11 sources: Add… starts at the Claude API, with https://api.anthropic.com filled in")
     r.app.updateSourceDraft { $0.kind = .standard }
     check(r.app.sourceDraft?.address == "", "T11 sources: choosing Standard empties the filled-in Claude address")
@@ -8995,7 +8995,7 @@ MainActor.assumeIsolated {
     r.answer(["key", "remove", "--address", t11Ollama], 0, "none\n")
     check(r.app.minutesProblem == nil, "T11 sources: a key removed for an old address says nothing")
     r.app.beginEditSource(at: 1)
-    check(r.app.sourceDraft == SourceDraft(index: 1, kind: .claude, address: t11Bridge, problem: nil), "T11 sources: Edit… starts at the source as it is")
+    check(r.app.sourceDraft == SourceDraft(editing: t11Bridge, kind: .claude, address: t11Bridge, problem: nil), "T11 sources: Edit… starts at the source as it is")
     r.app.updateSourceDraft { $0.kind = .standard }
     r.app.saveSourceDraft()
     check(r.app.sourceDraft == nil && r.source(1) == Source(kind: .standard, address: t11Bridge, agreed: false), "T11 sources: and saves through updateSource")
@@ -9068,7 +9068,7 @@ MainActor.assumeIsolated {
     check(r.app.keyDraft == nil, "T11 key: Cancel closes the sheet")
     r.answer(["key", "status", "--address", b], 0, "none\n")
 
-    r.app.removeKey(for: 0)
+    r.app.removeKey(for: a)
     check(r.calls(["key", "remove"]).map(\.arguments) == [["key", "remove", "--address", a]], "T11 keys: Remove runs key remove --address A")
     r.answer(["key", "remove", "--address", a], 1, "The key could not be removed from the keychain.\n")
     check(r.app.keys[a] == true && r.app.keyProblems[a] == "The key could not be removed from the keychain. It may still be there.",
@@ -9076,7 +9076,7 @@ MainActor.assumeIsolated {
     check(r.calls(["key", "status", "--address", a]).count == statusBefore + 2, "T11 keys: Remove refreshes keys with key status")
     r.answer(["key", "status", "--address", a], 0, "set\n")
     check(r.app.keyProblems[a] != nil, "T11 keys: the status read after it does not hide that it was not removed")
-    r.app.removeKey(for: 0)
+    r.app.removeKey(for: a)
     check(r.app.keyProblems[a] == nil, "T11 keys: trying again clears the old line")
     r.answer(["key", "remove", "--address", a], 0, "none\n")
     check(r.app.keys[a] == false, "T11 keys: a key removed is none")
@@ -9450,13 +9450,15 @@ for (label, status, answer) in [("none", Int32(0), "none\n"), ("set", Int32(0), 
 MainActor.assumeIsolated {
     let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false)])
     r.app.launch()
+    r.app.preferencesOpened() // its own key read is not answered yet (round 2: Preferences choices need the window open)
     r.app.chooseWriter(t11Sonnet)
-    check(r.calls(["key", "status"]).count == 1 && r.app.consent == nil && r.app.writerNotice == nil,
+    check(r.calls(["key", "status"]).count == 2 && r.app.consent == nil && r.app.writerNotice == nil,
           "T11R1 key first: in Preferences too, with the key not known yet, key status is read before deciding")
     r.answer(["key", "status", "--address", t11Anthropic], 0, "none\n")
     check(r.app.consent == nil && r.app.writerNotice == "Set a key for this source first." && r.prefs.minutesWriter == nil,
           "T11R1 key first: and with no key, Preferences says Set a key for this source first.")
     let fresh = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false)])
+    fresh.app.preferencesOpened()
     fresh.app.chooseWriter(t11Sonnet)
     fresh.app.chooseWriter(nil)
     fresh.answer(["key", "status", "--address", t11Anthropic], 0, "set\n")
@@ -9619,6 +9621,259 @@ MainActor.assumeIsolated {
     lib.cancelRedo()
     _ = settle({ false }, timeout: 0.3)
     check(!lib.redoChecking && lib.redoing == nil && r.runner.calls.count == 1, "T11R1 check: Cancel during a check ends it, and nothing is queued")
+    r.finish()
+}
+
+// MARK: - Sources and consent, round 2 (Stage 3, Task 11)
+
+/// Answers every engine command so far that begins with these words and has not been answered yet, in order.
+@MainActor func t11AnswerAll(_ r: T11Rig, _ head: [String], _ status: Int32, _ output: String, after: Int = 0) {
+    for i in r.engine.calls.indices where i >= after && r.engine.calls[i].arguments.starts(with: head) { r.engine.answer(i, status, output) }
+}
+
+// 1. An open agreement sheet never changes host: Redo overtakes a choice still waiting on its key read, also
+// when it returns at once to ask for agreement, and a waiting choice never replaces a request already shown.
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false), Source(kind: .standard, address: t11Bridge, agreed: false)])
+    r.app.launch()
+    let lib = r.app.library
+    let m = r.done("2026-11-14_0900") { $0.writer = .outside(t11BridgeModel) }
+    check(r.open(m), "T11R2 host: (a meeting whose own writer is not agreed)")
+    lib.perform(.redoMinutes)
+    lib.setRedoWriter(.outside(t11Sonnet)) // waits on its key read
+    lib.commitRedo() // asks for the sheet's own writer at once
+    check(r.app.consent == ConsentRequest(writer: t11BridgeModel, origin: .redo) && r.app.redoConsentShown,
+          "T11R2 host: Redo asks for the sheet's own writer, at bridge.example")
+    r.answer(["key", "status", "--address", t11Anthropic], 0, "set\n")
+    check(r.app.consent == ConsentRequest(writer: t11BridgeModel, origin: .redo) && r.app.redoConsentShown,
+          "T11R2 host: the key read answering afterwards leaves the request shown as it was, with its host")
+    r.app.agree()
+    check(r.source(1)?.agreed == true && r.source(0)?.agreed == false && lib.redoing?.writer == .outside(t11BridgeModel),
+          "T11R2 host: and agreeing applies to the request shown")
+    r.finish()
+}
+MainActor.assumeIsolated {
+    // Redo's early return overtakes the waiting choice by itself: the request it asked for is cancelled before the read answers.
+    let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false), Source(kind: .standard, address: t11Bridge, agreed: false)])
+    r.app.launch()
+    let lib = r.app.library
+    let m = r.done("2026-11-14_0900") { $0.writer = .outside(t11BridgeModel) }
+    check(r.open(m), "T11R2 overtaken: (a meeting whose own writer is not agreed)")
+    lib.perform(.redoMinutes)
+    lib.setRedoWriter(.outside(t11Sonnet))
+    lib.commitRedo()
+    r.app.cancelConsent()
+    r.answer(["key", "status", "--address", t11Anthropic], 0, "set\n")
+    check(r.app.consent == nil && lib.redoing?.writer == .outside(t11BridgeModel),
+          "T11R2 overtaken: a Redo click that returns at once to ask overtakes a choice still waiting on its key read")
+    r.finish()
+}
+MainActor.assumeIsolated {
+    // And so does the Redo click that starts the check (the re-reviewer's RR-1 (a)).
+    let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false), Source(kind: .standard, address: t11Ollama, agreed: true)],
+                   writer: t11Llama)
+    r.app.launch()
+    let lib = r.app.library
+    let m = r.done("2026-11-14_0900")
+    check(r.open(m), "T11R2 overtaken: (a meeting)")
+    lib.perform(.redoMinutes)
+    lib.setRedoWriter(.outside(t11Sonnet))
+    lib.commitRedo()
+    r.answer(["key", "status", "--address", t11Anthropic], 0, "set\n")
+    check(r.app.consent == nil && lib.redoChecking, "T11R2 overtaken: and the Redo click that starts the check, so nothing is asked over it")
+    _ = settle { r.runner.calls.count == 1 }
+    r.finish()
+}
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false), Source(kind: .standard, address: t11Ollama, agreed: false)])
+    r.app.launch()
+    let m = r.done("2026-11-14_0900")
+    check(r.open(m), "T11R2 host: (a meeting)")
+    r.app.library.perform(.redoMinutes)
+    r.app.library.setRedoWriter(.outside(t11Sonnet)) // waits on its key read, in the meetingbox window
+    r.app.preferencesOpened()
+    r.app.chooseWriter(t11Llama) // asked at once, in Preferences
+    check(r.app.consent == ConsentRequest(writer: t11Llama, origin: .preferences), "T11R2 host: (agreement asked in Preferences)")
+    r.answer(["key", "status", "--address", t11Anthropic], 0, "set\n")
+    check(r.app.consent == ConsentRequest(writer: t11Llama, origin: .preferences),
+          "T11R2 host: a waiting choice decided afterwards never replaces a request already shown")
+    r.finish()
+}
+
+// 2. A choice waiting on its key read goes when its source changes or goes (decision 8), from a redo sheet and
+// from Preferences, so changing it and back, or removing it and adding it again, asks nothing for the old choice.
+for (origin, sequence) in [(ConsentOrigin.redo, "changed and back"), (.redo, "removed and added again"),
+                           (.preferences, "changed and back"), (.preferences, "removed and added again")] {
+    MainActor.assumeIsolated {
+        let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: false)])
+        r.app.launch()
+        if origin == .redo {
+            let m = r.done("2026-11-14_0900")
+            _ = r.open(m)
+            r.app.library.perform(.redoMinutes)
+            r.app.library.setRedoWriter(.outside(t11Sonnet))
+        } else {
+            r.app.preferencesOpened()
+            r.app.chooseWriter(t11Sonnet)
+        }
+        if sequence == "changed and back" {
+            _ = r.app.updateSource(at: 0, Source(kind: .standard, address: t11Anthropic, agreed: false))
+            _ = r.app.updateSource(at: 0, Source(kind: .claude, address: t11Anthropic, agreed: false))
+        } else {
+            r.app.removeSource(at: 0)
+            _ = r.app.addSource(Source(kind: .claude, address: t11Anthropic, agreed: false))
+        }
+        t11AnswerAll(r, ["key", "remove"], 0, "none\n")
+        t11AnswerAll(r, ["key", "status"], 0, "set\n")
+        check(r.calls(["key", "status"]).count >= 2 && r.app.consent == nil && r.prefs.minutesWriter == nil && !r.app.redoConsentShown,
+              "T11R2 waiting: a \(origin == .redo ? "redo sheet's" : "Preferences") choice waiting on its key read, its source \(sequence), asks nothing")
+        r.finish()
+    }
+}
+
+// 3. A Preferences choice decided late asks nothing out of place: not once the window has closed, and not over
+// the key sheet or the source sheet. The choice is dropped, and the writer stays as it was.
+MainActor.assumeIsolated {
+    let a = t11Anthropic
+    let unreadable = "The keychain could not be read.\n"
+    let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false)])
+    r.app.launch()
+    r.app.preferencesOpened()
+    r.answer(["key", "status", "--address", a], 1, unreadable) // the key state stays unknown
+    r.app.chooseWriter(t11Sonnet)
+    r.app.preferencesClosed()
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.consent == nil && r.prefs.minutesWriter == nil && r.app.writerNotice == nil,
+          "T11R2 window: a read answering after the Preferences window closed asks nothing, and the writer stays as it was")
+    r.app.preferencesOpened()
+    check(r.app.preferencesSheet == nil && r.app.consent == nil, "T11R2 window: and nothing shows when Preferences next opens")
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    r.app.chooseWriter(t11Sonnet)
+    r.app.beginKey(at: 0)
+    r.app.keyText("sk-ant-typed")
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.preferencesSheet == .key && r.app.consent == nil && r.app.keyDraft?.text == "sk-ant-typed",
+          "T11R2 window: a read answering while the key sheet is open does not replace it")
+    r.app.cancelKey()
+    r.app.chooseWriter(t11Sonnet)
+    r.app.beginAddSource()
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.preferencesSheet == .source && r.app.consent == nil, "T11R2 window: nor the source sheet")
+    r.app.cancelSourceDraft()
+    r.app.chooseWriter(t11Sonnet)
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.consent == ConsentRequest(writer: t11Sonnet, origin: .preferences) && r.app.preferencesSheet == .consent,
+          "T11R2 window: with the window open and nothing over it, it asks (the keychain unreadable is not none)")
+    r.app.preferencesClosed()
+    check(r.app.consent == nil, "T11R2 window: and a request in Preferences goes when the window closes")
+    r.finish()
+}
+
+// 4. A waiter runs once; beginRedo drops a check still running, so a late check never closes a new sheet; an
+// agreed source's model is taken at once, with no key read.
+MainActor.assumeIsolated {
+    let a = t11Anthropic
+    let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false)])
+    r.app.launch()
+    r.app.preferencesOpened()
+    r.app.chooseWriter(t11Sonnet)
+    r.answer(["key", "status", "--address", a], 0, "none\n")
+    check(r.app.writerNotice == "Set a key for this source first." && r.app.consent == nil, "T11R2 once: (no key: Set a key for this source first.)")
+    r.app.beginKey(at: 0)
+    r.app.keyText("sk-ant-api03-stored")
+    r.app.saveKey(r.app.keyDraft?.text ?? "", for: a)
+    r.answer(["key", "set"], 0, "set\n")
+    r.answer(["key", "status", "--address", a], 0, "set\n")
+    check(r.app.keys[a] == true && r.app.consent == nil && r.app.preferencesSheet == nil,
+          "T11R2 once: a waiter runs once: storing the key afterwards raises no agreement sheet on its own")
+    r.finish()
+}
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .standard, address: t11Ollama, agreed: true)], writer: t11Llama)
+    r.app.launch()
+    let lib = r.app.library
+    let m = r.done("2026-11-14_0900")
+    check(r.open(m), "T11R2 new sheet: (a meeting)")
+    lib.perform(.redoMinutes)
+    lib.commitRedo()
+    check(lib.redoChecking, "T11R2 new sheet: (Redo's check runs)")
+    lib.beginRedo(lib.selectedMeeting!, kind: .transcribe)
+    check(!lib.redoChecking && lib.redoing?.kind == .transcribe, "T11R2 new sheet: another redo begun meanwhile is not checking")
+    _ = settle({ false }, timeout: 0.5)
+    check(lib.redoing?.kind == .transcribe && r.runner.calls.isEmpty && MeetingStore.record(in: m)?.state == .done,
+          "T11R2 new sheet: the earlier sheet's check comes back without closing the new sheet or queueing the earlier draft")
+    r.finish()
+}
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .claude, address: t11Anthropic, agreed: true)])
+    r.app.launch()
+    r.app.preferencesOpened()
+    let reads = r.calls(["key", "status"]).count
+    r.app.chooseWriter(t11Sonnet)
+    check(r.prefs.minutesWriter == t11Sonnet && r.app.consent == nil && r.calls(["key", "status"]).count == reads,
+          "T11R2 agreed: an agreed Claude API source's model is taken at once in Preferences, with no key read")
+    let m = r.done("2026-11-14_0900")
+    check(r.open(m), "T11R2 agreed: (a meeting)")
+    r.app.library.perform(.redoMinutes)
+    r.app.library.setRedoWriter(.outside(OutsideWriter(kind: .claude, address: t11Anthropic, model: "claude-haiku-4-5")))
+    check(r.app.library.redoing?.writer == .outside(OutsideWriter(kind: .claude, address: t11Anthropic, model: "claude-haiku-4-5"))
+          && r.calls(["key", "status"]).count == reads, "T11R2 agreed: and in a redo sheet")
+    r.finish()
+}
+
+// 5. A key stored after its source went is removed at once.
+MainActor.assumeIsolated {
+    let a = t11Anthropic
+    let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false)])
+    var keychain = Set<String>() // a stand-in for the keychain: what each answered command did, in the order answered
+    r.app.beginKey(at: 0)
+    r.app.keyText("sk-ant-api03-probe")
+    r.app.saveKey(r.app.keyDraft?.text ?? "", for: a)
+    r.app.cancelKey()
+    r.app.removeSource(at: 0)
+    check(r.engine.calls.map(\.arguments) == [["key", "set", "--address", a], ["key", "remove", "--address", a]],
+          "T11R2 late key: (key set still running when the source is removed)")
+    r.answer(["key", "remove", "--address", a], 0, "none\n")
+    keychain.remove(a)
+    r.answer(["key", "set"], 0, "set\n") // it was stored after the remove
+    keychain.insert(a)
+    let late = Array(r.engine.calls.indices.filter { r.engine.calls[$0].arguments == ["key", "remove", "--address", a] }.dropFirst())
+    check(late.count == 1 && late.first == r.engine.calls.count - 1 && r.engine.calls.last?.stdin == nil,
+          "T11R2 late key: a key stored for an address no source has is removed at once (key remove --address)")
+    for i in late { // only what the app sent changes the stand-in
+        r.engine.answer(i, 0, "none\n")
+        keychain.remove(a)
+    }
+    check(keychain.isEmpty && r.app.minutesProblem == nil && r.app.keys[a] == nil, "T11R2 late key: and the keychain ends without it")
+    r.finish()
+}
+
+// 6. The Edit… sheet and Remove key pick their source by address, not by index.
+MainActor.assumeIsolated {
+    let changed = "https://bridge2.example/v1"
+    let r = T11Rig(sources: [Source(kind: .standard, address: t11Ollama, agreed: true), Source(kind: .standard, address: t11Bridge, agreed: true),
+                             Source(kind: .standard, address: t11Other, agreed: true)])
+    r.app.beginEditSource(at: 1)
+    r.app.updateSourceDraft { $0.address = changed }
+    r.app.removeSource(at: 0) // the list shifts under the open sheet
+    r.app.saveSourceDraft()
+    check(r.prefs.sources == [Source(kind: .standard, address: changed, agreed: false), Source(kind: .standard, address: t11Other, agreed: true)]
+          && r.calls(["key", "remove"]).map(\.arguments) == [["key", "remove", "--address", t11Ollama], ["key", "remove", "--address", t11Bridge]]
+          && r.app.sourceDraft == nil,
+          "T11R2 address: the Edit… sheet changes the source it was opened for, though the list shifted, and the other keeps its agreement and key")
+    r.app.beginEditSource(at: 1)
+    r.app.updateSourceDraft { $0.address = "https://other2.example/v1" }
+    r.app.removeSource(at: 1)
+    let before = r.engine.calls.count
+    let left = r.prefs.sources
+    r.app.saveSourceDraft()
+    check(r.prefs.sources == left && r.engine.calls.count == before && r.app.sourceDraft == nil,
+          "T11R2 address: when no source has the sheet's address, Save changes nothing, sends nothing and closes the sheet")
+    let removes = r.calls(["key", "remove"]).count
+    r.app.removeKey(for: t11Other)
+    check(r.calls(["key", "remove"]).count == removes, "T11R2 address: Remove key for an address no source has sends nothing")
+    r.app.removeKey(for: changed)
+    check(r.calls(["key", "remove"]).last?.arguments == ["key", "remove", "--address", changed], "T11R2 address: Remove key acts on the source with that address")
     r.finish()
 }
 

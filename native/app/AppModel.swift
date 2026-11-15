@@ -417,12 +417,20 @@ final class AppModel: ObservableObject {
     /// read afresh. No source is contacted: its models are listed only on Check, on opening the picker,
     /// or on saving it.
     func preferencesOpened() {
+        preferencesOpen = true
         clearFolderProblem()
         writerNotice = nil
         minutesProblem = nil
         refreshMicrophones()
         refreshEngines()
         preferences.sources.forEach { refreshKey($0.address) }
+    }
+
+    /// The Preferences window has closed (PreferencesWindow hears it): a choice made there and still
+    /// waiting on its key read asks nothing now, and an agreement asked there goes with the window.
+    func preferencesClosed() {
+        preferencesOpen = false
+        if consent?.origin == .preferences { consent = nil }
     }
 
     // MARK: transcripts: the transcriber, tidying and the user's voice
@@ -756,6 +764,8 @@ final class AppModel: ObservableObject {
     private var preferencesChoice = 0
     /// The redo sheet a `.redo` agreement was asked from (`LibraryModel.openRedo`).
     private var consentSheet: Int?
+    /// The Preferences window is open: from `preferencesOpened` until `preferencesClosed`.
+    private var preferencesOpen = false
 
     /// A source's key line problem: what Set… or Remove said, else what `key status` said.
     var keyProblems: [String: String] { keyStatusProblems.merging(keyActionProblems) { _, action in action } }
@@ -838,10 +848,12 @@ final class AppModel: ObservableObject {
         removeOldKey(gone.address)
     }
 
-    /// A source as it was is gone: its listing (and any still being made), and any agreement asked for it.
+    /// A source as it was is gone: its listing (and any still being made), any agreement asked for it, and
+    /// any choice of it still waiting on its key read.
     private func forget(_ source: Source) {
         listings[source.address] = nil
         latestListing[source.address] = nil
+        keyWaiters[source.address] = nil
         if let asked = consent?.writer, asked.kind == source.kind, asked.address == source.address { consent = nil }
     }
 
@@ -866,13 +878,14 @@ final class AppModel: ObservableObject {
 
     /// Add…: the Claude API, at its own address.
     func beginAddSource() {
-        sourceDraft = SourceDraft(index: nil, kind: .claude, address: PreferencesPresentation.claudeAddress, problem: nil)
+        sourceDraft = SourceDraft(editing: nil, kind: .claude, address: PreferencesPresentation.claudeAddress, problem: nil)
     }
 
-    /// Edit…: the source as it is.
+    /// Edit…: the source as it is, kept by its address (`SourceDraft.editing`), so Save changes that
+    /// source wherever it is in the list then.
     func beginEditSource(at index: Int) {
         guard let source = source(at: index) else { return }
-        sourceDraft = SourceDraft(index: index, kind: source.kind, address: source.address, problem: nil)
+        sourceDraft = SourceDraft(editing: source.address, kind: source.kind, address: source.address, problem: nil)
     }
 
     /// The sheet's kind and address, as its controls change them. The address filled in for one kind
@@ -890,12 +903,22 @@ final class AppModel: ObservableObject {
 
     func cancelSourceDraft() { sourceDraft = nil }
 
-    /// Add or Save: the sheet closes once the source is taken, and says why when it is not.
+    /// Add or Save: the sheet closes once the source is taken, and says why when it is not. Save changes
+    /// the source the sheet was opened for, found by its address; when no source has that address any
+    /// more, nothing is changed or sent and the sheet closes.
     func saveSourceDraft() {
         guard let draft = sourceDraft else { return }
         let source = Source(kind: draft.kind, address: draft.address, agreed: false)
         let problem: String?
-        if let index = draft.index { problem = updateSource(at: index, source) } else { problem = addSource(source) }
+        if let editing = draft.editing {
+            guard let index = preferences.sources.firstIndex(where: { $0.address == editing }) else {
+                sourceDraft = nil
+                return
+            }
+            problem = updateSource(at: index, source)
+        } else {
+            problem = addSource(source)
+        }
         if let problem = problem { sourceDraft?.problem = problem } else { sourceDraft = nil }
     }
 
@@ -935,7 +958,7 @@ final class AppModel: ObservableObject {
     /// Set…: the key sheet for that source.
     func beginKey(at index: Int) {
         guard let source = source(at: index) else { return }
-        keyDraft = KeyDraft(index: index, address: source.address, text: "", problem: nil, saving: false)
+        keyDraft = KeyDraft(address: source.address, text: "", problem: nil, saving: false)
     }
 
     func keyText(_ text: String) {
@@ -951,7 +974,8 @@ final class AppModel: ObservableObject {
     /// has that address any more, nothing is sent and the sheet closes. One the key rule refuses never
     /// reaches the engine.
     /// The sheet waits for the answer: it closes once stored, and otherwise says why in the engine's
-    /// words. Then `keys` is read again.
+    /// words. Then `keys` is read again. A key stored after its source went (Cancel, then Remove, while
+    /// `key set` still ran) is removed at once.
     func saveKey(_ key: String, for address: String) {
         guard hasSource(address) else { // no source has the sheet's address any more: nothing is sent
             if keyDraft?.address == address { keyDraft = nil }
@@ -975,7 +999,11 @@ final class AppModel: ObservableObject {
                 let waiting = self.keyDraft?.address == address && self.keyDraft?.saving == true
                 if status == 0 && PreferencesPresentation.firstLine(output) == "set" {
                     if waiting { self.keyDraft = nil }
-                    if self.hasSource(address) { self.keys[address] = true }
+                    if self.hasSource(address) {
+                        self.keys[address] = true
+                    } else {
+                        self.removeOldKey(address) // no source has that address now: no key is left behind for it
+                    }
                 } else {
                     let problem = PreferencesPresentation.engineProblem(status: status, output: output)
                     if waiting {
@@ -990,11 +1018,11 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Remove: `key remove --address A`. One it could not remove may still be there: that is said, and
-    /// `keys` keeps what it had until `key status`, read again after, says otherwise.
-    func removeKey(for index: Int) {
-        guard let source = source(at: index) else { return }
-        let address = source.address
+    /// Remove, on the row of the source with this address: `key remove --address A`. Nothing is sent when no
+    /// source has that address. One it could not remove may still be there: that is said, and `keys` keeps
+    /// what it had until `key status`, read again after, says otherwise.
+    func removeKey(for address: String) {
+        guard hasSource(address) else { return }
         keyActionProblems[address] = nil
         engine.run(["key", "remove", "--address", address], stdin: nil, timeout: 60) { [weak self] status, output in
             MainActor.assumeIsolated {
@@ -1089,9 +1117,12 @@ final class AppModel: ObservableObject {
     /// agreed. Otherwise agreement is asked for (`consent`), except for a Claude API model whose source
     /// has no key, which says "Set a key for this source first." instead. When it is not known yet whether
     /// that source has a key, `key status` (the keychain only: no Node, no network) is read first and the
-    /// choice decided once it answers, if it is still the latest choice made there and, for a redo sheet,
-    /// the sheet is still open. A keychain that cannot be read is not "none": agreement is asked for. A
-    /// name the engine would refuse, or a source that has gone or changed, is said and nothing is taken.
+    /// choice decided once it answers, if it is still live: the latest choice made there; for a redo sheet,
+    /// that sheet still open; for Preferences, the window still open with no sheet over it; and in either,
+    /// no agreement request already shown, which it never replaces. Otherwise it is dropped and the writer
+    /// stays as it was. A waiting choice also goes when its source changes or goes (`forget`). A keychain
+    /// that cannot be read is not "none": agreement is asked for. A name the engine would refuse, or a
+    /// source that has gone or changed, is said and nothing is taken.
     private func ask(_ writer: OutsideWriter, origin: ConsentOrigin, keyRead: Bool = false) {
         let notice: String?
         if let problem = PreferencesPresentation.modelNameProblem(writer.model) {
@@ -1105,9 +1136,14 @@ final class AppModel: ObservableObject {
                 let choice = origin == .preferences ? preferencesChoice : library.redoChoice
                 keyWaiters[writer.address, default: []].append { [weak self] in
                     guard let self = self else { return }
-                    let latest = origin == .preferences ? self.preferencesChoice == choice
-                        : self.library.redoChoice == choice && self.library.openRedo != nil
-                    if latest { self.ask(writer, origin: origin, keyRead: true) }
+                    let live: Bool
+                    switch origin {
+                    case .preferences:
+                        live = self.preferencesChoice == choice && self.preferencesOpen && self.preferencesSheet == nil
+                    case .redo:
+                        live = self.library.redoChoice == choice && self.library.openRedo != nil
+                    }
+                    if live && self.consent == nil { self.ask(writer, origin: origin, keyRead: true) }
                 }
                 refreshKey(writer.address)
                 return
@@ -1315,10 +1351,10 @@ struct ConsentRequest: Equatable {
     let origin: ConsentOrigin
 }
 
-/// The source sheet: a new source (`index` nil) or the one at `index`, its kind and address as typed,
-/// and why it was not taken.
+/// The source sheet: a new source (`editing` nil) or the one with the address `editing`, its kind and
+/// address as typed, and why it was not taken.
 struct SourceDraft: Equatable {
-    let index: Int?
+    let editing: String?
     var kind: SourceKind
     var address: String
     var problem: String?
@@ -1327,7 +1363,6 @@ struct SourceDraft: Equatable {
 /// The key sheet for one source: the key as typed, why it was not stored, and whether the engine is
 /// storing it now.
 struct KeyDraft: Equatable {
-    let index: Int
     let address: String
     var text: String
     var problem: String?

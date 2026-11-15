@@ -501,12 +501,12 @@ final class LibraryModel: ObservableObject {
     /// and until then its choices stay as they are (`redoChecking`).
     func commitRedo() {
         guard let draft = redoing, !redoChecking else { return }
+        redoChoice += 1 // every Redo click overtakes a choice still waiting on its key read
         if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) {
             requestConsent?(writer)
             return
         }
         redoChecking = true
-        redoChoice += 1 // a choice still waiting on its key read is overtaken by Redo
         redoToken += 1
         let token = redoToken
         let ps = self.ps

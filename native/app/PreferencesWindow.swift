@@ -11,6 +11,7 @@ import SwiftUI
 final class PreferencesWindow: NSObject {
     private let model: AppModel
     private let window: NSWindow
+    private var observers: [NSObjectProtocol] = []
 
     init(model: AppModel) {
         self.model = model
@@ -22,7 +23,14 @@ final class PreferencesWindow: NSObject {
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.center()
+        // The model hears the window close, as it hears a redo sheet close: a choice still waiting there
+        // then asks nothing. No queue: told on the thread that closes it (the main one).
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: nil) { [weak model] _ in
+            MainActor.assumeIsolated { model?.preferencesClosed() }
+        })
     }
+
+    deinit { observers.forEach(NotificationCenter.default.removeObserver) }
 
     /// In front, with the microphones and the engine's status read afresh (a microphone may have been
     /// plugged in since, or setup run) and no complaint left over from last time.
@@ -215,7 +223,7 @@ struct SourceRow: View {
                 }
                 Button(PreferencesPresentation.setKeyTitle) { app.beginKey(at: index) }
                     .controlSize(.small)
-                Button(PreferencesPresentation.removeTitle) { app.removeKey(for: index) }
+                Button(PreferencesPresentation.removeTitle) { app.removeKey(for: source.address) }
                     .controlSize(.small)
                     .disabled(known == false)
             }
@@ -366,7 +374,7 @@ struct SourceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let draft = app.sourceDraft {
-                Text(PreferencesPresentation.sourceSheetTitle(adding: draft.index == nil)).font(.headline)
+                Text(PreferencesPresentation.sourceSheetTitle(adding: draft.editing == nil)).font(.headline)
                 Picker(PreferencesPresentation.kindLabel, selection: Binding(get: { app.sourceDraft?.kind ?? .claude },
                                                                              set: { kind in app.updateSourceDraft { $0.kind = kind } })) {
                     ForEach(PreferencesPresentation.kinds, id: \.self) { kind in
@@ -383,7 +391,7 @@ struct SourceSheet: View {
                     Spacer()
                     Button(PreferencesPresentation.cancelTitle) { app.cancelSourceDraft() }
                         .keyboardShortcut(.cancelAction)
-                    Button(PreferencesPresentation.sourceSheetButton(adding: draft.index == nil)) { app.saveSourceDraft() }
+                    Button(PreferencesPresentation.sourceSheetButton(adding: draft.editing == nil)) { app.saveSourceDraft() }
                         .keyboardShortcut(.defaultAction)
                 }
             }

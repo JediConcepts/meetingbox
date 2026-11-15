@@ -314,8 +314,11 @@ Preferences, under Minutes, add a source, then pick one of its models in "Write
 the minutes with": that choice is for new recordings, and for any meeting
 without a writer of its own. Redo minutes… and Transcribe again… have the same
 choice for one meeting, and that meeting keeps it, for that run and every later
-one (Try again, another redo), whatever Preferences says, until a later sheet
-changes it. There are two kinds of source:
+one (Try again, another redo), whatever the Preferences choice says, until a
+later sheet changes it, for as long as its source is still there, unchanged and
+agreed. Removing or changing that source in Preferences sets the meeting's writer
+aside at its next run, as "When a source is contacted" below explains. There are
+two kinds of source:
 
 - **Claude API**: Anthropic's Messages interface, at `https://api.anthropic.com`
   unless you change it. It always needs a key.
