@@ -1366,6 +1366,83 @@
   - **Rollback** is as at Gate A, after `meetingbox key remove --address <url>` for each key.
   - Continue only on the user's say-so.
 
+### Task 11A: Speakers and timestamps for a single recording
+
+Added at Gate B by the user, on 15 November 2026. A meeting whose side files are gone (trimmed, or deleted) was transcribed as one block of text, with no speakers or times. The user decided:
+- it goes into 2.1.0, before Task 12;
+- the person recording is "Me" from the voice print;
+- everyone else is "Speaker 1", "Speaker 2" and so on.
+
+**Scope.** A single recording is any one file that meetingbox transcribes without the `mic.m4a` and `call.m4a` pair:
+- `process` of a meeting folder holding `audio.m4a` but not both sides;
+- `process` of any other recording;
+- `redo` (Transcribe again) of a meeting folder holding `audio.m4a` but not both sides.
+
+Two-sided meetings are unchanged.
+
+**Files:**
+- Modify:
+  - `meetingbox`:
+    - the single-recording path of `process` and `redo`;
+    - `--people N`;
+    - `LABEL_INSTRUCTIONS`;
+    - `TRANSCRIPTION_FILES`;
+    - usage.
+  - `native/transcript/main.swift` and `Transcript.swift`: the `--one` mode.
+  - `native/app`: the Transcribe again sheet's counts, and the arguments.
+  - `README.md`: what a single recording gets.
+- Test:
+  - `tests/test_pipeline.sh`;
+  - `tests/test_redo.sh`;
+  - the mb-transcript tests;
+  - `native/tests/app/main.swift`.
+
+**Interfaces:**
+- **Engine option `--people N`.** It takes 1 to 6 people in the recording, the user included. It applies to a single recording on `process` and `redo`. A value outside 1 to 6 is refused with `--people takes a number of people from 1 to 6`. Without it, the number is worked out. On a two-sided meeting, `--people` is ignored with an info line, as are `--room` and `--call` on a single recording.
+- **`mb-transcript --one FILE [--one-speakers FILE] [--one-count N] [--voice FILE] [--plain]`.**
+  - It prints `[hh:mm:ss] Label: text` lines, as the two-sided transcript does, tidied unless `--plain`.
+  - The labels are:
+    - `Me` when the voice print, usable as Task 5 defines it, matches a speaker;
+    - otherwise `Speaker 1` to `Speaker N`, numbered by first kept word with no gaps;
+    - `Unknown` for words no speaker covers.
+  - With no `--one-speakers`, every line is `Unknown`, with its time.
+  - `--one-count 1` makes every line `Me` when the print matches, else `Speaker 1`.
+  - `--one` cannot be combined with `--mic`, `--call`, `--learn` or the side options. Any such combination prints the usage and exits 1.
+- **Words file.** The single recording's words go to `words.json` beside its transcript. `TRANSCRIPTION_FILES` gains `words.json`, so every run keeps what it replaces in `earlier/`.
+- **No voice learning.** A single recording never adds to the voice print: no `--learn`, on `process` or `redo`.
+- **The speaker finder.** It runs on the whole file with the people count, as `find_speakers` does for a side. If it cannot run, the warning is `could not find speakers in the recording, carrying on without labels` and the lines say `Unknown`.
+- **`LABEL_INSTRUCTIONS`.** It gains, after the sentence about "Them", this sentence: `"Speaker 1", "Speaker 2" and so on are people in a recording kept as one file, numbered in the order they first spoke; they may be in the same room or on a call.`
+- **The app.**
+  - When the meeting folder lacks the `mic.m4a` and `call.m4a` pair, the Transcribe again sheet shows one count, `People in the recording`, set to Automatic or 1 to 6, in place of the room and call counts.
+  - Its job runs `redo <dir> --people N`, or no count for Automatic.
+  - The transcript view shows `Speaker N` and `Unknown` lines as it shows any label.
+
+- [ ] **Step 1: Tests.**
+  - **mb-transcript:**
+    - `--one` with a speakers fixture and a matching print gives Me and Speaker 1 lines with times;
+    - with no print, Speaker 1 and Speaker 2;
+    - with no speakers file, every line is Unknown with its time;
+    - `--one-count 1` gives one label;
+    - `--plain` starts a new line at every change of label;
+    - each refused combination exits 1.
+  - **Engine:**
+    - `process` of a folder with only `audio.m4a` writes a labelled, timed `transcript.txt` and a `words.json`, with no `--learn`;
+    - `process` of another recording does the same beside it;
+    - `redo` with only `audio.m4a` passes `--people`, or nothing for Automatic, through to the speaker finder and `--one-count`;
+    - a two-sided meeting is unchanged, word for word, against the existing fixtures;
+    - `--people 0` and `--people 7` are refused;
+    - a speaker finder that fails gives Unknown lines and the warning;
+    - `earlier/` keeps the replaced `words.json`;
+    - the label sentence is in the minutes prompts and in what an outside writer is sent.
+  - **App:**
+    - the sheet shows the single count for a folder without both sides, and the two counts for one with both;
+    - the job's arguments are `--people N` or none.
+- [ ] **Step 2: Run.** Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `bash tests/run.sh`. Expected: every suite passes, and `node --test` is run, not skipped.
+- [ ] **Step 5: Commit** `Speakers and timestamps for a single recording`.
+- **Acceptance at Gate C:** Transcribe again on a meeting that has only `audio.m4a` gives Me and Speaker lines with their times.
+
 ### Task 12: Release 2.1.0
 
 **Files:**
