@@ -386,6 +386,8 @@ struct RedoSheet: View {
                         Text(notice).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                // Fixed while Redo's check runs, so the job runs with what the sheet shows.
+                .disabled(model.redoChecking)
                 if draft.kind == .transcribe {
                     Form {
                         Picker(LibraryPresentation.transcriberLabel, selection: Binding(
@@ -413,6 +415,7 @@ struct RedoSheet: View {
                             get: { model.redoing?.tidy ?? true },
                             set: { on in model.updateRedo { $0.tidy = on } }))
                     }
+                    .disabled(model.redoChecking)
                 }
                 HStack {
                     Spacer()
@@ -420,13 +423,14 @@ struct RedoSheet: View {
                         .keyboardShortcut(.cancelAction)
                     Button(LibraryPresentation.redoTitle(draft.kind)) { model.commitRedo() }
                         .keyboardShortcut(.defaultAction)
+                        .disabled(model.redoChecking)
                 }
             }
         }
         .padding(20)
         .frame(width: 520)
-        // Agreement asked for from this sheet: "Send transcripts to <host>?".
-        .sheet(isPresented: Binding(get: { app.consent?.origin == .redo }, set: { if !$0 { app.cancelConsent() } })) {
+        // Agreement asked for from this sheet, and only over it: "Send transcripts to <host>?".
+        .sheet(isPresented: Binding(get: { app.redoConsentShown }, set: { if !$0 { app.cancelConsent() } })) {
             ConsentSheet(app: app)
         }
     }

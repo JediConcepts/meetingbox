@@ -631,10 +631,20 @@ extension PreferencesPresentation {
     /// What `engines --kind K --address A` answered, as the source's listing: its `outside` lines; past
     /// the app's limit, that; otherwise the engine's own first line, or that it gave no listing.
     static func listing(status: Int32, output: String) -> SourceListing {
-        if let found = parseEngines(output).outside { return found }
+        if let found = parseEngines(wholeLines(output)).outside { return found }
         if status == ScriptEngineCommands.timedOut { return SourceListing(models: [], error: listingTimedOut) }
         if status != 0 { return SourceListing(models: [], error: engineProblem(status: status, output: output)) }
         return SourceListing(models: [], error: unexpectedAnswer)
+    }
+
+    /// An engine command's output without its last line when that line was cut off: output that reached
+    /// the 64 KB the app keeps (`ScriptEngineCommands.outputLimit`) and does not end with a newline. So a
+    /// listing cut short never offers part of an id as a model.
+    static func wholeLines(_ output: String) -> String {
+        let bytes = Array(output.utf8)
+        guard bytes.count >= ScriptEngineCommands.outputLimit, bytes.last != UInt8(ascii: "\n") else { return output }
+        guard let end = bytes.lastIndex(of: UInt8(ascii: "\n")) else { return "" }
+        return String(decoding: bytes[...end], as: UTF8.self)
     }
 
     /// Under a source, once it has been listed: "Found N models", "Found 1 model", or why not, with a hint

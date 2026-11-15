@@ -108,6 +108,8 @@ final class AppModel: ObservableObject {
         library.onSelectionChange = { [weak self] in self?.selectionChanged() }
         // An outside writer chosen in a redo sheet whose source is not agreed: asked about from the window.
         library.requestConsent = { [weak self] writer in self?.ask(writer, origin: .redo) }
+        // An agreement asked from a redo sheet goes with that sheet.
+        library.redoEnded = { [weak self] in self?.dropRedoConsent() }
         // A meeting always wins: every start, by any route, first stops playback and then cancels a voice
         // sample being recorded. The handler's queue is the session's tick queue, the main queue.
         handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.makeWayForRecording() } }
@@ -748,6 +750,12 @@ final class AppModel: ObservableObject {
     private var latestListing: [String: Int] = [:]
     private var keysAsked = 0
     private var latestKey: [String: Int] = [:]
+    /// Claude API choices waiting for `key status` to say whether their source has a key, by address.
+    private var keyWaiters: [String: [@MainActor () -> Void]] = [:]
+    /// Counts the writer choices made in Preferences, so one decided late can tell it is still the latest.
+    private var preferencesChoice = 0
+    /// The redo sheet a `.redo` agreement was asked from (`LibraryModel.openRedo`).
+    private var consentSheet: Int?
 
     /// A source's key line problem: what Set… or Remove said, else what `key status` said.
     var keyProblems: [String: String] { keyStatusProblems.merging(keyActionProblems) { _, action in action } }
@@ -894,23 +902,32 @@ final class AppModel: ObservableObject {
     // Keys.
 
     /// `key status --address A`: whether a key is stored, without reading it. An answer overtaken by a
-    /// newer one for that address, or for an address no source has, is dropped.
+    /// newer one for that address, or for an address no source has, is dropped. Once one is taken, the
+    /// choices waiting on it (`keyWaiters`) are decided.
     private func refreshKey(_ address: String) {
         keysAsked += 1
         let asked = keysAsked
         latestKey[address] = asked
         engine.run(["key", "status", "--address", address], stdin: nil, timeout: 10) { [weak self] status, output in
             MainActor.assumeIsolated {
-                guard let self = self, self.latestKey[address] == asked, self.hasSource(address) else { return }
+                guard let self = self else { return }
+                guard self.hasSource(address) else {
+                    self.keyWaiters[address] = nil
+                    return
+                }
+                guard self.latestKey[address] == asked else { return } // a newer read answers for it
                 switch (status, PreferencesPresentation.firstLine(output)) {
-                case (0, "set"?): self.keys[address] = true
-                case (0, "none"?): self.keys[address] = false
+                case (0, "set"?):
+                    self.keys[address] = true
+                    self.keyStatusProblems[address] = nil
+                case (0, "none"?):
+                    self.keys[address] = false
+                    self.keyStatusProblems[address] = nil
                 default:
                     self.keys[address] = nil
                     self.keyStatusProblems[address] = PreferencesPresentation.engineProblem(status: status, output: output)
-                    return
                 }
-                self.keyStatusProblems[address] = nil
+                (self.keyWaiters.removeValue(forKey: address) ?? []).forEach { $0() }
             }
         }
     }
@@ -929,13 +946,17 @@ final class AppModel: ObservableObject {
 
     func cancelKey() { keyDraft = nil }
 
-    /// Stores a key for the source at `index`: `key set --address A` with the key, without the spaces
-    /// around it, on stdin and never in the arguments. One the key rule refuses never reaches the engine.
+    /// Stores a key for the source at `address`, the one the key sheet was opened for: `key set --address
+    /// A` with the key, without the spaces around it, on stdin and never in the arguments. When no source
+    /// has that address any more, nothing is sent and the sheet closes. One the key rule refuses never
+    /// reaches the engine.
     /// The sheet waits for the answer: it closes once stored, and otherwise says why in the engine's
     /// words. Then `keys` is read again.
-    func saveKey(_ key: String, for index: Int) {
-        guard let source = source(at: index) else { return }
-        let address = source.address
+    func saveKey(_ key: String, for address: String) {
+        guard hasSource(address) else { // no source has the sheet's address any more: nothing is sent
+            if keyDraft?.address == address { keyDraft = nil }
+            return
+        }
         let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let inSheet = keyDraft?.address == address
         guard !(inSheet && keyDraft?.saving == true) else { return } // pressed again while it is being stored
@@ -1054,6 +1075,7 @@ final class AppModel: ObservableObject {
 
     /// The Preferences picker: Apple (nil) at once; an outside model through `ask`.
     func chooseWriter(_ writer: OutsideWriter?) {
+        preferencesChoice += 1
         writerNotice = nil
         guard let writer = writer else {
             objectWillChange.send()
@@ -1065,9 +1087,12 @@ final class AppModel: ObservableObject {
 
     /// An outside writer chosen in Preferences or in a redo sheet. Taken at once when its source is
     /// agreed. Otherwise agreement is asked for (`consent`), except for a Claude API model whose source
-    /// has no key, which says "Set a key for this source first." instead. A name the engine would refuse,
-    /// or a source that has gone or changed, is said and nothing is taken.
-    private func ask(_ writer: OutsideWriter, origin: ConsentOrigin) {
+    /// has no key, which says "Set a key for this source first." instead. When it is not known yet whether
+    /// that source has a key, `key status` (the keychain only: no Node, no network) is read first and the
+    /// choice decided once it answers, if it is still the latest choice made there and, for a redo sheet,
+    /// the sheet is still open. A keychain that cannot be read is not "none": agreement is asked for. A
+    /// name the engine would refuse, or a source that has gone or changed, is said and nothing is taken.
+    private func ask(_ writer: OutsideWriter, origin: ConsentOrigin, keyRead: Bool = false) {
         let notice: String?
         if let problem = PreferencesPresentation.modelNameProblem(writer.model) {
             notice = problem
@@ -1076,10 +1101,22 @@ final class AppModel: ObservableObject {
                 take(writer, origin)
                 return
             }
+            if writer.kind == .claude && keys[writer.address] == nil && !keyRead {
+                let choice = origin == .preferences ? preferencesChoice : library.redoChoice
+                keyWaiters[writer.address, default: []].append { [weak self] in
+                    guard let self = self else { return }
+                    let latest = origin == .preferences ? self.preferencesChoice == choice
+                        : self.library.redoChoice == choice && self.library.openRedo != nil
+                    if latest { self.ask(writer, origin: origin, keyRead: true) }
+                }
+                refreshKey(writer.address)
+                return
+            }
             if writer.kind == .claude && keys[writer.address] == false {
                 notice = PreferencesPresentation.setKeyFirst
             } else {
                 consent = ConsentRequest(writer: writer, origin: origin)
+                consentSheet = origin == .redo ? library.openRedo : nil
                 return
             }
         } else {
@@ -1103,10 +1140,12 @@ final class AppModel: ObservableObject {
     }
 
     /// "Send transcripts to <host>": the source is marked agreed, then the writer is taken where it was
-    /// chosen. Nothing, if the source has changed or gone since.
+    /// chosen. Nothing, if the source has changed or gone since, or for a redo sheet's request once that
+    /// sheet is no longer the one open.
     func agree() {
         guard let request = consent else { return }
         consent = nil
+        if request.origin == .redo, library.openRedo == nil || consentSheet != library.openRedo { return }
         guard let index = sourceOf(request.writer) else { return }
         var sources = preferences.sources
         sources[index].agreed = true
@@ -1117,6 +1156,16 @@ final class AppModel: ObservableObject {
 
     /// Cancel: nothing else changes.
     func cancelConsent() { consent = nil }
+
+    /// The redo sheet an agreement was asked from has closed, or another has begun: the request goes.
+    private func dropRedoConsent() {
+        if consent?.origin == .redo { consent = nil }
+    }
+
+    /// The library window shows the agreement only over the redo sheet that asked for it.
+    var redoConsentShown: Bool {
+        consent?.origin == .redo && library.openRedo != nil && consentSheet == library.openRedo
+    }
 
     func setModelName(_ name: String, for address: String) { modelNames[address] = name }
 

@@ -124,6 +124,19 @@ final class LibraryModel: ObservableObject {
     /// Why the writer just chosen in the redo sheet was not taken ("Set a key for this source first."),
     /// until the next choice or the sheet closes.
     @Published private(set) var writerNotice: String?
+    /// Redo's check is running (`commitRedo` until it is back): the sheet's choices stay as they are, so
+    /// the job runs with what the sheet shows.
+    @Published private(set) var redoChecking = false
+    /// Told when a redo sheet closes (Cancel, from outside, or once its check has queued it or found it
+    /// busy) and when another one begins: an agreement asked from it goes with it.
+    var redoEnded: (@MainActor () -> Void)?
+    /// Each redo sheet's number, given by `beginRedo`.
+    private(set) var redoSerial = 0
+    /// Counts the writer choices made in redo sheets, a new sheet and Redo itself, so an answer that comes
+    /// late (the key read for a choice) can tell whether that choice is still the latest.
+    private(set) var redoChoice = 0
+    /// The number of the redo sheet now open, or nil when none is.
+    var openRedo: Int? { redoing == nil ? nil : redoSerial }
     /// Told when `select` or `show` changes which meeting is selected, and not otherwise.
     var onSelectionChange: (() -> Void)?
     /// What tells whether a lock's owner is alive (`ProcessingLock.owner`), for a meeting's folder and for
@@ -429,23 +442,31 @@ final class LibraryModel: ObservableObject {
         guard kind != .process else { return }
         let settings = self.settings()
         let record = meeting.record
+        redoToken += 1 // a check still running for an earlier sheet is dropped
+        redoChecking = false
         writerNotice = nil
+        redoEnded?()
+        redoSerial += 1
+        redoChoice += 1
         redoing = RedoDraft(folder: meeting.folder.url, id: record?.id, kind: kind, transcriber: settings.transcriber, room: record?.people.room,
                             call: record?.people.call, tidy: settings.tidy, writer: record?.writer ?? settings.preferredWriter)
     }
 
-    /// The sheet's choices, as its controls change them. The writer goes through `setRedoWriter`.
+    /// The sheet's choices, as its controls change them, except while Redo's check runs. The writer goes
+    /// through `setRedoWriter`.
     func updateRedo(_ change: (inout RedoDraft) -> Void) {
-        guard var draft = redoing else { return }
+        guard var draft = redoing, !redoChecking else { return }
         change(&draft)
         redoing = draft
     }
 
     /// "Write the minutes with" in a redo sheet: Apple, or an outside writer whose source Preferences
     /// have agreed (`RunSettings.agrees`), is the sheet's writer at once. Any other is not: the draft stays
-    /// as it was and `requestConsent` asks for agreement, whose `agree()` then sets it here.
+    /// as it was and `requestConsent` asks for agreement, whose `agree()` then sets it here. Nothing while
+    /// Redo's check runs.
     func setRedoWriter(_ writer: MeetingWriter) {
-        guard redoing != nil else { return }
+        guard redoing != nil, !redoChecking else { return }
+        redoChoice += 1
         writerNotice = nil
         if case .outside(let outside) = writer, !settings().agrees(to: outside) {
             requestConsent?(outside)
@@ -460,11 +481,14 @@ final class LibraryModel: ObservableObject {
         writerNotice = text
     }
 
-    /// Closes the sheet and queues nothing; a check already under way is dropped.
+    /// Closes the sheet and queues nothing; a check already under way is dropped, and so is any agreement
+    /// asked from the sheet.
     func cancelRedo() {
         redoToken += 1
+        redoChecking = false
         redoing = nil
         writerNotice = nil
+        redoEnded?()
     }
 
     /// Queues the sheet's redo. An outside writer is taken only when Preferences have agreed to its
@@ -473,13 +497,16 @@ final class LibraryModel: ObservableObject {
     /// the main queue: its record as it is on the disk (still the same meeting's id, and its state), and
     /// the live lock a `meetingbox` run in Terminal would hold. Back on this queue, with the session and
     /// the queue's job, it is queued only if it is still that meeting, still free, and the queue takes it;
-    /// otherwise "That meeting is busy" is shown under the actions. The sheet closes once the check is done.
+    /// otherwise "That meeting is busy" is shown under the actions. The sheet closes once the check is done,
+    /// and until then its choices stay as they are (`redoChecking`).
     func commitRedo() {
-        guard let draft = redoing else { return }
+        guard let draft = redoing, !redoChecking else { return }
         if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) {
             requestConsent?(writer)
             return
         }
+        redoChecking = true
+        redoChoice += 1 // a choice still waiting on its key read is overtaken by Redo
         redoToken += 1
         let token = redoToken
         let ps = self.ps
@@ -492,6 +519,7 @@ final class LibraryModel: ObservableObject {
 
     private func redoChecked(_ draft: RedoDraft, token: Int, recorded: MeetingState?, id: String?, lock: ProcessingLock.Owner) {
         guard token == redoToken, redoing != nil else { return }
+        redoChecking = false
         // Its source removed or changed while the check ran: as at the click, nothing goes into meeting.json.
         if case .outside(let writer) = draft.writer, !settings().agrees(to: writer) {
             requestConsent?(writer)
@@ -499,6 +527,7 @@ final class LibraryModel: ObservableObject {
         }
         redoing = nil
         writerNotice = nil
+        redoEnded?()
         let options = draft.kind == .transcribe
             ? JobOptions(transcriber: draft.transcriber, room: draft.room, call: draft.call, tidy: draft.tidy, writer: draft.writer)
             : JobOptions(writer: draft.writer)

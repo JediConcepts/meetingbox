@@ -1,8 +1,9 @@
 # meetingbox
 
 One key. Press it, have the meeting, press it again. You get the recording, a
-transcript and a set of minutes. Unless you choose otherwise, none of it leaves
-the Mac.
+transcript and a set of minutes, all on the Mac. The recording never leaves it.
+A transcript leaves only if you choose an outside model to write the minutes,
+and agree to send it there.
 
 No account. No API key and no upload unless you choose an outside model for the
 minutes. No per seat fee. Works on a plane.
@@ -310,8 +311,11 @@ record out, transcript kept.
 
 Apple's on device model writes the minutes unless you choose another. In
 Preferences, under Minutes, add a source, then pick one of its models in "Write
-the minutes with". Redo minutes… and Transcribe again… have the same choice, for
-that one meeting. There are two kinds of source:
+the minutes with": that choice is for new recordings, and for any meeting
+without a writer of its own. Redo minutes… and Transcribe again… have the same
+choice for one meeting, and that meeting keeps it, for that run and every later
+one (Try again, another redo), whatever Preferences says, until a later sheet
+changes it. There are two kinds of source:
 
 - **Claude API**: Anthropic's Messages interface, at `https://api.anthropic.com`
   unless you change it. It always needs a key.
@@ -319,19 +323,23 @@ that one meeting. There are two kinds of source:
   interface, `<address>/chat/completions`, with its models from `<address>/models`.
 
 **Agreement first.** The first time you choose a model from a source, meetingbox
-asks "Send transcripts to <host>?" and says what that means, including that the
-transcript holds what other people said. Nothing is sent until you agree. Every
-outside source counts as leaving the Mac, even one at `127.0.0.1`, because a
-program there may pass the transcript on. Changing a source's kind or address,
-or removing it, withdraws the agreement. The line under the picker says, in
-amber, when transcripts are being sent, and to which host. Switch back to
-"Apple, on this Mac" at any time.
+asks `Send transcripts to <host>?` and says what that means, including that the
+transcript holds what other people said. No transcript is sent until you agree.
+Every outside source counts as leaving the Mac, even one at `127.0.0.1`, because
+a program there may pass the transcript on. Changing a source's kind or address,
+or removing it, withdraws the agreement. The line under the picker is about the
+Preferences choice: it says, in amber, when that choice sends transcripts, and
+to which host. Switch back to "Apple, on this Mac" at any time.
 
-**When a source is contacted.** Only when you press Check, open the picker, or
-save a source: never at launch, and never just because Preferences opened.
-Processing sends a transcript only when the run was told to use an outside
-model, and only if its source is still there, unchanged and agreed. Otherwise
-Apple's model writes the minutes, and the meeting's `.process-log` says why.
+**When a source is contacted.** Listing a source's models contacts it, with its
+key when it has one, and sends no transcript. That happens only when you press
+Check, open the picker, or save a source: never at launch, and never just
+because Preferences opened. A transcript is sent only by a run told to use an
+outside model, and whether that model's source is still there, unchanged and
+agreed is checked at the start of each run. If it is not, Apple's model writes
+the minutes, and `.process-log` in the meeting's folder (meetingbox's log of
+each run) says why. A run already under way keeps the writer it started with,
+even if its source is then removed.
 
 **Keys.** Set… stores a source's key in your login keychain, and only there. The
 engine reads it back through `security` and hands it to meetingbox's script on
@@ -344,14 +352,15 @@ or removing the source, removes its key; `meetingbox reset --tools` and
 `meetingbox key remove --address <url>` and `meetingbox key status --address <url>`.
 
 **Node.** Outside models need Node 20 or later, and nothing else in meetingbox
-does: transcription, speakers and Apple's minutes never use it. Setup's
-"Outside models (optional)" step looks for Node on the PATH, then in Homebrew's
-folders, then for the newest version in nvm, and offers to install it with
-Homebrew if there is none. It then installs the AI Execution Router, pinned at 1.1.1, which
-meetingbox's own small script, `minutes/writer.mjs`, calls. The script runs with
-an empty environment and follows no redirects. If Node goes or moves (an nvm
-switch, say), Preferences says "Outside models need Node 20 or later. Run
-meetingbox setup." and Apple's model writes the minutes until you do.
+does: transcription, speakers and Apple's minutes never use it. Setup's outside
+models step looks for Node on the PATH, then in Homebrew's folders, then for the
+newest version in nvm, and offers to install it with Homebrew if there is none.
+It keeps the path of the Node it found, and then installs the AI Execution
+Router, pinned at 1.1.1, which meetingbox's own small script,
+`minutes/writer.mjs`, calls. The script runs with an empty environment and
+follows no redirects. If that Node goes (the nvm version it found is removed,
+say), Preferences says "Outside models need Node 20 or later. Run meetingbox
+setup." and Apple's model writes the minutes until you do.
 
 **Standard sources** must answer streamed requests (`stream: true`), as Ollama
 and LM Studio do. meetingbox always streams, so the connection stays alive for
@@ -369,8 +378,9 @@ Start it with a window big enough for a long meeting, then add the source
 OLLAMA_CONTEXT_LENGTH=65536 ollama serve
 ```
 
-A model whose name ends in `cloud` runs on Ollama's servers, not on this Mac;
-the picker marks it "(runs online)".
+The picker marks a model whose name ends in `-cloud` or `:cloud` "(runs
+online)": that is meetingbox's own rule. Ollama's cloud models are named that
+way, and run on Ollama's servers, not on this Mac.
 
 **A bridge to Claude Code**, such as the Local CLI Bridge, is a Standard source
 on this Mac that hands the transcript to Claude under your account. Use one only

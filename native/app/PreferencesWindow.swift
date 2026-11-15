@@ -340,7 +340,7 @@ struct KeySheet: View {
                 Text(PreferencesPresentation.keySheetTitle(host: PreferencesPresentation.shownHost(draft.address))).font(.headline)
                 SecureField(PreferencesPresentation.keyLabel, text: Binding(get: { app.keyDraft?.text ?? "" }, set: { app.keyText($0) }))
                     .disabled(draft.saving)
-                    .onSubmit { app.saveKey(app.keyDraft?.text ?? "", for: draft.index) }
+                    .onSubmit { app.saveKey(app.keyDraft?.text ?? "", for: draft.address) }
                 if let problem = draft.problem {
                     Text(problem).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
@@ -348,7 +348,7 @@ struct KeySheet: View {
                     Spacer()
                     Button(PreferencesPresentation.cancelTitle) { app.cancelKey() }
                         .keyboardShortcut(.cancelAction)
-                    Button(PreferencesPresentation.setKeyButton) { app.saveKey(app.keyDraft?.text ?? "", for: draft.index) }
+                    Button(PreferencesPresentation.setKeyButton) { app.saveKey(app.keyDraft?.text ?? "", for: draft.address) }
                         .keyboardShortcut(.defaultAction)
                         .disabled(draft.saving)
                 }
