@@ -455,10 +455,17 @@ enum LibraryPresentation {
         }
     }
 
-    /// Inline markdown (bold, italic, code, links) with the line breaks and spaces kept, so the notes
-    /// read as the file does; plain text when it will not parse.
+    /// Inline markdown (bold, italic, code) with the line breaks and spaces kept, so the notes read as the
+    /// file does; plain text when it will not parse. Links are shown as plain text, never as links to
+    /// click: a model wrote them, from a transcript others spoke into (spec 6.5). A link's own
+    /// words stay; where it pointed is not shown.
     static func minutes(_ text: String) -> AttributedString {
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        var shown = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        for range in shown.runs.filter({ $0.link != nil || $0.imageURL != nil }).map(\.range) {
+            shown[range].link = nil
+            shown[range].imageURL = nil
+        }
+        return shown
     }
 }

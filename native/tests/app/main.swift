@@ -8654,6 +8654,765 @@ MainActor.assumeIsolated {
     try? fm.removeItem(at: state)
 }
 
+// MARK: - Sources, the minutes writer and agreement (Stage 3, Task 11)
+
+let t11Anthropic = "https://api.anthropic.com"
+let t11Ollama = "http://127.0.0.1:11434/v1"
+let t11Bridge = "https://bridge.example/v1"
+let t11Other = "https://other.example/v1"
+let t11Llama = OutsideWriter(kind: .standard, address: t11Ollama, model: "llama3")
+let t11Sonnet = OutsideWriter(kind: .claude, address: t11Anthropic, model: "claude-sonnet-4-5")
+let t11BridgeModel = OutsideWriter(kind: .standard, address: t11Bridge, model: "claude")
+
+/// The shared address table, read where it is in the repository (found from this test's own source
+/// file, never copied): each case, whether the rule allows it, and its line.
+func t11AddressCases() -> (cases: [(allow: Bool, address: String, line: Int)], odd: [Int]) {
+    let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+    guard let text = try? String(contentsOf: repo.appendingPathComponent("tests/fixtures/addresses.txt"), encoding: .utf8) else { return ([], [-1]) }
+    var cases: [(allow: Bool, address: String, line: Int)] = []
+    var odd: [Int] = []
+    for (n, line) in text.components(separatedBy: "\n").enumerated() where !line.isEmpty && !line.hasPrefix("#") {
+        guard let space = line.firstIndex(of: " "), line[..<space] == "allow" || line[..<space] == "refuse" else { odd.append(n + 1); continue }
+        cases.append((line[..<space] == "allow", t11Unescape(String(line[line.index(after: space)...])), n + 1))
+    }
+    return (cases, odd)
+}
+/// The table's four escapes: \n, \r, \t and \\.
+func t11Unescape(_ s: String) -> String {
+    let escapes: [Character: Character] = ["n": "\n", "r": "\r", "t": "\t", "\\": "\\"]
+    var out = ""
+    var chars = s.makeIterator()
+    while let c = chars.next() {
+        guard c == "\\" else { out.append(c); continue }
+        guard let next = chars.next() else { out.append(c); break }
+        if let e = escapes[next] { out.append(e) } else { out.append(c); out.append(next) }
+    }
+    return out
+}
+
+// The address rule, against every line of the shared table, and the host it parses.
+do {
+    let (cases, odd) = t11AddressCases()
+    let wrong = cases.filter {
+        (PreferencesPresentation.host(of: $0.address) != nil) != $0.allow || (PreferencesPresentation.addressProblem($0.address) == nil) != $0.allow
+    }
+    check(cases.count >= 120 && cases.filter(\.allow).count >= 30 && odd.isEmpty && wrong.isEmpty,
+          "T11 address rule: every case in tests/fixtures/addresses.txt (\(cases.count), read in place) agrees with the Swift rule (wrong: \(wrong.map { "line \($0.line) \($0.address.debugDescription)" }), odd lines: \(odd))")
+    check(cases.contains { !$0.allow && $0.address.contains("\n") } && cases.contains { !$0.allow && $0.address == " https://api.anthropic.com" }
+          && cases.contains { !$0.allow && $0.address == "https://example.com/a\\b" },
+          "T11 address rule: the table's escapes and its leading space are read as written")
+    let base = "https://a.example/"
+    let longest = base + String(repeating: "a", count: 2048 - base.count)
+    check(PreferencesPresentation.host(of: longest) == "a.example" && PreferencesPresentation.host(of: longest + "a") == nil,
+          "T11 address rule: 2048 characters are accepted, 2049 refused")
+    check(PreferencesPresentation.host(of: "https://API.anthropic.com") == nil && PreferencesPresentation.host(of: "https://api.Anthropic.com/v1") == nil
+          && PreferencesPresentation.host(of: "https://example.COM") == nil && PreferencesPresentation.host(of: "http://LOCALHOST:11434") == nil,
+          "T11 address rule: an upper-case host is refused")
+    check(PreferencesPresentation.host(of: "https://1.2.3.4/v1") == nil && PreferencesPresentation.host(of: "https://10.0.0.1") == nil
+          && PreferencesPresentation.host(of: "https://192.168.1.10:8443/v1") == nil && PreferencesPresentation.host(of: "https://0x7f000001") == nil,
+          "T11 address rule: https to an IPv4 literal, in any spelling, is refused")
+    check(PreferencesPresentation.host(of: t11Anthropic) == "api.anthropic.com" && PreferencesPresentation.host(of: "http://[::1]:8080/v1") == "[::1]"
+          && PreferencesPresentation.host(of: "https://[2001:db8::1]:8443") == "[2001:db8::1]" && PreferencesPresentation.host(of: "http://localhost:1234/v1") == "localhost"
+          && PreferencesPresentation.host(of: "https://my-gateway.example.co.uk:8443/openai/v1") == "my-gateway.example.co.uk"
+          && PreferencesPresentation.host(of: t11Ollama) == "127.0.0.1",
+          "T11 host: the host as the rule parses it, an IPv6 literal with its brackets")
+    check(PreferencesPresentation.addressProblem(t11Ollama) == nil && PreferencesPresentation.addressProblem("http://192.168.1.10:1234/v1") == PreferencesPresentation.addressRefused
+          && PreferencesPresentation.addressRefused.hasPrefix("That address is not one meetingbox accepts.") && PreferencesPresentation.addressRefused.contains("[2001:db8::1]"),
+          "T11 address rule: a refusal says so, and how an IPv6 address must be written")
+    check(ScriptRunner.setAsideLine(OutsideWriter(kind: .standard, address: "http://[::1]:8080/v1", model: "m"))
+          == "The minutes writer m at [::1] was set aside because its source was removed, changed or not agreed. Apple's model writes the minutes.",
+          "T11 set-aside line: the host as the address rule parses it")
+}
+
+// Preferences: sources and minutesWriter in UserDefaults, and the run settings they give.
+do {
+    let home = URL(fileURLWithPath: "/Users/someone", isDirectory: true)
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: home)
+    check(p.sources.isEmpty && p.minutesWriter == nil && p.runSettings == .defaults, "T11 Preferences: no sources and Apple writing, by default")
+    let claude = Source(kind: .claude, address: t11Anthropic, agreed: true)
+    let local = Source(kind: .standard, address: t11Ollama, agreed: false)
+    p.sources = [claude, local]
+    let llama = OutsideWriter(kind: .standard, address: t11Ollama, model: "llama3.1:8b")
+    p.minutesWriter = llama
+    let q = Preferences(defaults: d, home: home)
+    let stored = d.array(forKey: "sources") as? [[String: Any]]
+    check(q.sources == [claude, local] && stored?.count == 2 && stored?[0].count == 3 && stored?[0]["kind"] as? String == "claude"
+          && stored?[0]["address"] as? String == t11Anthropic && stored?[0]["agreed"] as? Bool == true && stored?[1]["agreed"] as? Bool == false,
+          "T11 Preferences: sources persist as a list of {kind, address, agreed}")
+    let w = d.dictionary(forKey: "minutesWriter")
+    check(q.minutesWriter == llama && w?.count == 3 && w?["kind"] as? String == "standard" && w?["address"] as? String == t11Ollama
+          && w?["model"] as? String == "llama3.1:8b",
+          "T11 Preferences: minutesWriter round-trips through UserDefaults with its kind, address and model")
+    check(q.runSettings == RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .outside(llama), agreed: [claude]),
+          "T11 Preferences: runSettings puts minutesWriter in preferredWriter, and only the agreed sources in agreed")
+    q.minutesWriter = nil
+    check(d.object(forKey: "minutesWriter") == nil && Preferences(defaults: d, home: home).runSettings.preferredWriter == .apple,
+          "T11 Preferences: Apple is minutesWriter absent")
+    d.set([["kind": "gemini", "address": "https://g.example", "agreed": true], ["kind": "claude", "agreed": true],
+           ["kind": "standard", "address": "https://s.example", "agreed": "yes"], "junk"], forKey: "sources")
+    d.set(["kind": "gemini", "address": "https://g.example", "model": "g"], forKey: "minutesWriter")
+    check(q.sources == [Source(kind: .standard, address: "https://s.example", agreed: false)] && q.minutesWriter == nil && q.runSettings.agreed.isEmpty,
+          "T11 Preferences: an entry it cannot read is skipped, and only a true Bool is agreed")
+}
+
+// What the Minutes section says: the engine's source lines, the choice of writer, the Model name field,
+// the Node line, and the fixed words.
+do {
+    let both = PreferencesPresentation.parseEngines("parakeet ready\napple ready\nvoice none\noutside-runtime ready\noutside model llama3.1:8b\n"
+        + "outside model qwen3:30b-cloud\noutside model has space\noutside model \(String(repeating: "m", count: 201))\noutside model org/model@v1+x\n")
+    check(both.outside == SourceListing(models: ["llama3.1:8b", "qwen3:30b-cloud", "org/model@v1+x"], error: nil) && both.parakeet == .ready
+          && both.outsideRuntime == .ready && both.voice == VoiceState.none,
+          "T11 engines: outside model lines beside the others, an id outside the model rule dropped (\(String(describing: both.outside)))")
+    check(PreferencesPresentation.parseEngines("outside-runtime ready\noutside none\n").outside == SourceListing(models: [], error: nil),
+          "T11 engines: outside none is a listing with no models")
+    let unset = PreferencesPresentation.parseEngines("outside-runtime unavailable no Node 20 or later\noutside error outside models are not set up\n")
+    check(unset.outside == SourceListing(models: [], error: "outside models are not set up") && unset.outsideRuntime == .unavailable("no Node 20 or later"),
+          "T11 engines: outside error <reason>, the reason as given")
+    check(PreferencesPresentation.parseEngines("outside error it asked for a key").outside?.error == "it asked for a key"
+          && PreferencesPresentation.parseEngines("outside error its address is not one meetingbox accepts\n").outside?.error == "its address is not one meetingbox accepts",
+          "T11 engines: every reason is taken as given")
+    check(PreferencesPresentation.parseEngines("parakeet ready\napple ready\n").outside == nil
+          && PreferencesPresentation.parseEngines("outside maybe\noutside\n").outside == nil,
+          "T11 engines: no outside line, or one it cannot read, is no listing")
+    check(PreferencesPresentation.listing(status: 0, output: "outside-runtime ready\noutside model a\n") == SourceListing(models: ["a"], error: nil)
+          && PreferencesPresentation.listing(status: 124, output: "") == SourceListing(models: [], error: "it did not answer within 10 seconds")
+          && PreferencesPresentation.listing(status: 1, output: "meetingbox is not installed; run meetingbox setup")
+              == SourceListing(models: [], error: "meetingbox is not installed; run meetingbox setup")
+          && PreferencesPresentation.listing(status: 0, output: "parakeet ready\n") == SourceListing(models: [], error: "it gave an unexpected answer"),
+          "T11 listing: the models, the limit, the engine's own refusal, and an answer with no outside line")
+
+    let sources = [Source(kind: .claude, address: t11Anthropic, agreed: true), Source(kind: .standard, address: t11Ollama, agreed: false),
+                   Source(kind: .standard, address: t11Bridge, agreed: false)]
+    let listings = [t11Anthropic: SourceListing(models: ["claude-sonnet-4-5"], error: nil),
+                    t11Ollama: SourceListing(models: ["llama3", "gpt-oss:120b-cloud", "glm-4.6:cloud", "my-cloud-model", "cloudy"], error: nil)]
+    let options = PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: nil)
+    check(options.map(\.title) == ["Apple, on this Mac", "claude-sonnet-4-5 at api.anthropic.com", "llama3 at 127.0.0.1",
+                                   "gpt-oss:120b-cloud at 127.0.0.1 (runs online)", "glm-4.6:cloud at 127.0.0.1 (runs online)",
+                                   "my-cloud-model at 127.0.0.1", "cloudy at 127.0.0.1"]
+          && options.allSatisfy(\.available) && options.first?.writer == nil
+          && options.dropFirst(1).first?.writer == OutsideWriter(kind: .claude, address: t11Anthropic, model: "claude-sonnet-4-5")
+          && options.dropFirst(2).first?.writer == OutsideWriter(kind: .standard, address: t11Ollama, model: "llama3"),
+          "T11 choice: Apple, on this Mac, then every listed model as <model> at <host>, -cloud and :cloud ids (runs online) (\(options.map(\.title)))")
+    let mistral = OutsideWriter(kind: .standard, address: t11Ollama, model: "mistral")
+    let gone = PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: mistral)
+    check(gone.count == options.count + 1 && gone.last == WriterOption(writer: mistral, title: "mistral at 127.0.0.1 (not available)", available: false),
+          "T11 choice: a saved model its source no longer lists stays, as (not available)")
+    check(options.count > 2 && PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: options[2].writer) == options,
+          "T11 choice: a saved model that is listed is not added again")
+    let typed = OutsideWriter(kind: .standard, address: t11Bridge, model: "claude")
+    check(PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: typed).last
+          == WriterOption(writer: typed, title: "claude at bridge.example", available: true)
+          && PreferencesPresentation.writerChoice(sources: sources, listings: [t11Bridge: SourceListing(models: [], error: "it asked for a key")], saved: typed).last
+          == WriterOption(writer: typed, title: "claude at bridge.example", available: true),
+          "T11 choice: a saved model of a source not listed yet, or that cannot list its models, shows plainly")
+    let removed = OutsideWriter(kind: .standard, address: t11Other, model: "m-cloud")
+    let changed = OutsideWriter(kind: .claude, address: t11Ollama, model: "llama3")
+    check(PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: removed).last?.title == "m-cloud at other.example (runs online) (not available)"
+          && PreferencesPresentation.writerChoice(sources: sources, listings: listings, saved: changed).last
+          == WriterOption(writer: changed, title: "llama3 at 127.0.0.1 (not available)", available: false),
+          "T11 choice: a saved model whose source was removed, or changed kind, is not available")
+    check(!PreferencesPresentation.showsModelField(nil) && PreferencesPresentation.showsModelField(SourceListing(models: [], error: nil))
+          && PreferencesPresentation.showsModelField(SourceListing(models: [], error: "it refused the key"))
+          && !PreferencesPresentation.showsModelField(SourceListing(models: ["m"], error: nil)),
+          "T11 Model name: a field for an empty list and for a listing error; none before a listing, nor once it lists models")
+    check(PreferencesPresentation.outsideRuntimeLine(EngineStatus(outsideRuntime: .unavailable("no Node 20 or later was found")))
+          == "Outside models need Node 20 or later. Run meetingbox setup."
+          && PreferencesPresentation.outsideRuntimeLine(EngineStatus(outsideRuntime: .ready)) == nil
+          && PreferencesPresentation.outsideRuntimeLine(EngineStatus()) == nil,
+          "T11 Node: Outside models need Node 20 or later. Run meetingbox setup. when outside-runtime is unavailable, and only then")
+    check(PreferencesPresentation.listingLine(SourceListing(models: ["a", "b", "c"], error: nil)) == "Found 3 models"
+          && PreferencesPresentation.listingLine(SourceListing(models: ["a"], error: nil)) == "Found 1 model"
+          && PreferencesPresentation.listingLine(SourceListing(models: [], error: nil)) == "Found 0 models"
+          && PreferencesPresentation.listingLine(SourceListing(models: [], error: "it refused the key")) == "Could not list its models: it refused the key."
+          && PreferencesPresentation.listingLine(SourceListing(models: [], error: "it asked for a key"))
+          == "Could not list its models: it asked for a key. Set a key for this source."
+          && PreferencesPresentation.listingLine(nil) == nil,
+          "T11 Check: Found N models, Found 1 model, or why not, with a hint when a keyless source asked for a key")
+
+    let noSources = "To use another model, add a source: the Claude API with your key, or a standard address such as Ollama (http://127.0.0.1:11434/v1) or the Local CLI Bridge."
+    check(PreferencesPresentation.noSources == noSources, "T11 copy: the no-sources line")
+    let stays = PreferencesPresentation.privacyLine(writer: nil)
+    let sent = PreferencesPresentation.privacyLine(writer: t11Llama)
+    check(stays.text == "Transcripts stay on this Mac." && !stays.amber
+          && sent.text == "Transcripts are sent to 127.0.0.1 to write the minutes. Recordings stay on this Mac. This applies to every meeting processed, including new recordings."
+          && sent.amber && PreferencesPresentation.privacyLine(writer: OutsideWriter(kind: .standard, address: "http://[::1]:8080/v1", model: "m")).text
+          .hasPrefix("Transcripts are sent to [::1] to write"),
+          "T11 copy: both privacy lines, the second in amber")
+    check(PreferencesPresentation.consentTitle(host: "127.0.0.1") == "Send transcripts to 127.0.0.1?"
+          && PreferencesPresentation.consentText(address: t11Ollama) == "To write the minutes, meetingbox will send each meeting's full transcript, with its date, time and length, to http://127.0.0.1:11434/v1. If that is a program on this Mac, it may pass it on: the Local CLI Bridge sends it to Claude or Codex under your account, and an Ollama model whose name ends in 'cloud' runs on Ollama's servers. The transcript includes what other people said, so make sure they are happy with that. Recordings stay on this Mac. You can switch back to Apple at any time."
+          && PreferencesPresentation.consentButton(host: "127.0.0.1") == "Send transcripts to 127.0.0.1" && PreferencesPresentation.consentCancel == "Cancel",
+          "T11 copy: the consent title, text and buttons")
+    check(PreferencesPresentation.writerLabel == "Write the minutes with" && PreferencesPresentation.appleWriter == "Apple, on this Mac"
+          && PreferencesPresentation.modelNameLabel == "Model name" && PreferencesPresentation.kindTitle(.claude) == "Claude API"
+          && PreferencesPresentation.kindTitle(.standard) == "Standard (Ollama, LM Studio, Local CLI Bridge)"
+          && PreferencesPresentation.addSourceTitle == "Add…" && PreferencesPresentation.removeTitle == "Remove" && PreferencesPresentation.setKeyTitle == "Set…"
+          && PreferencesPresentation.keyLine(true) == "Key: set" && PreferencesPresentation.keyLine(false) == "Key: none" && PreferencesPresentation.keyLine(nil) == nil
+          && PreferencesPresentation.setKeyFirst == "Set a key for this source first."
+          && PreferencesPresentation.defaultAddress(.claude) == "https://api.anthropic.com" && PreferencesPresentation.defaultAddress(.standard) == "",
+          "T11 copy: the writer picker, the kinds, the source and key buttons and lines, word for word")
+    check(PreferencesPresentation.keyRefused == "That key is not one meetingbox accepts: a key is 1 to 4096 letters, digits and . _ ~ + / = -"
+          && PreferencesPresentation.keyOK("sk-ant-api03-AZaz09._~+/=-") && !PreferencesPresentation.keyOK("") && !PreferencesPresentation.keyOK("a b")
+          && !PreferencesPresentation.keyOK("a\"b") && !PreferencesPresentation.keyOK(String(repeating: "k", count: 4097))
+          && PreferencesPresentation.keyOK(String(repeating: "k", count: 4096)),
+          "T11 key rule: 1 to 4096 of A-Za-z0-9._~+/=-, refused in the engine's words")
+    check(PreferencesPresentation.modelNameProblem("llama3.1:8b") == nil && PreferencesPresentation.modelNameProblem("org/m@v1+x_y-z") == nil
+          && PreferencesPresentation.modelNameProblem("has space") != nil && PreferencesPresentation.modelNameProblem("") != nil
+          && PreferencesPresentation.modelNameProblem(String(repeating: "m", count: 201)) != nil,
+          "T11 model name: 1 to 200 of A-Za-z0-9._:/+@-, as the engine accepts")
+}
+
+// The minutes view shows links as plain text.
+do {
+    let m = LibraryPresentation.minutes("See [the plan](https://evil.example/x), <https://other.example/y> and **this**.")
+    let text = String(m.characters)
+    check(!m.runs.contains { $0.link != nil } && text.contains("the plan") && text.contains("https://other.example/y") && !text.contains("evil.example")
+          && m.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) ?? false },
+          "T11 minutes: links are shown as plain text: no run is a link, the words stay, and bold is still bold (\(text))")
+}
+
+/// An AppModel over a fake engine and a fake runner, with its Preferences in a scratch suite.
+@MainActor
+final class T11Rig {
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs: Preferences
+    let engine = FakeEngine()
+    let runner = FakeRunner()
+    let app: AppModel
+    init(sources: [Source] = [], writer: OutsideWriter? = nil) {
+        prefs = Preferences(defaults: testDefaults(), home: root)
+        prefs.meetingsFolder = root
+        prefs.sounds = false
+        prefs.openMinutes = false
+        prefs.sources = sources
+        prefs.minutesWriter = writer
+        app = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: runner, freeBytes: { _ in 50 * GB }, engine: engine)
+    }
+    /// The engine commands so far that begin with these words.
+    func calls(_ head: [String]) -> [FakeEngine.Call] { engine.calls.filter { $0.arguments.starts(with: head) } }
+    /// Every listing of a source asked for so far (`engines --kind K --address A`).
+    var listed: [[String]] { engine.calls.map(\.arguments).filter { $0.starts(with: ["engines", "--kind"]) } }
+    /// Answers the last command that begins with these words.
+    func answer(_ head: [String], _ status: Int32, _ output: String) {
+        guard let i = engine.calls.lastIndex(where: { $0.arguments.starts(with: head) }) else {
+            check(false, "T11: there is no \(head) to answer")
+            return
+        }
+        engine.answer(i, status, output)
+    }
+    /// A finished meeting in the meetings folder, with its audio, a transcript and the minutes.
+    func done(_ name: String, _ change: @escaping (inout MeetingRecord) -> Void = { _ in }) -> URL {
+        let dir = make(root, name, files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello\n", "notes.md": "minutes\n"])
+        try! app.store.update(dir) { $0.state = .done; change(&$0) }
+        age(dir)
+        return dir
+    }
+    /// Selects the meeting in the window, once its folder has been read.
+    func open(_ dir: URL) -> Bool {
+        let key = LibraryPresentation.key(dir)
+        app.library.reload()
+        guard settle({ self.app.library.meetings.contains { LibraryPresentation.key($0.folder.url) == key } }) else { return false }
+        app.library.select(key)
+        return settle { self.app.library.shownContent?.key == key && self.app.library.shownContent?.files.transcript == true }
+    }
+    func raw(_ dir: URL) -> Data? { try? Data(contentsOf: dir.appendingPathComponent("meeting.json")) }
+    /// The source at `i` in Preferences, if there is one.
+    func source(_ i: Int) -> Source? { prefs.sources.indices.contains(i) ? prefs.sources[i] : nil }
+    func finish() {
+        app.shutDown()
+        try? fm.removeItem(at: state)
+    }
+}
+func t11WriterJSON(_ w: OutsideWriter) -> [String: String] { ["kind": w.kind.rawValue, "address": w.address, "model": w.model] }
+
+// Adding, changing and removing sources.
+MainActor.assumeIsolated {
+    let r = T11Rig()
+    r.app.beginAddSource()
+    check(r.app.sourceDraft == SourceDraft(index: nil, kind: .claude, address: "https://api.anthropic.com", problem: nil) && r.app.preferencesSheet == .source,
+          "T11 sources: Add… starts at the Claude API, with https://api.anthropic.com filled in")
+    r.app.updateSourceDraft { $0.kind = .standard }
+    check(r.app.sourceDraft?.address == "", "T11 sources: choosing Standard empties the filled-in Claude address")
+    r.app.updateSourceDraft { $0.kind = .claude }
+    check(r.app.sourceDraft?.address == t11Anthropic, "T11 sources: and choosing the Claude API again fills it")
+    r.app.updateSourceDraft { $0.kind = .standard; $0.address = t11Ollama }
+    r.app.updateSourceDraft { $0.kind = .claude }
+    check(r.app.sourceDraft?.address == t11Ollama, "T11 sources: an address typed is kept when the kind changes")
+    r.app.cancelSourceDraft()
+    check(r.app.sourceDraft == nil && r.prefs.sources.isEmpty && r.engine.calls.isEmpty && r.app.preferencesSheet == nil,
+          "T11 sources: Cancel adds nothing and runs nothing")
+    r.app.beginAddSource()
+    r.app.saveSourceDraft()
+    check(r.app.sourceDraft == nil && r.prefs.sources == [Source(kind: .claude, address: t11Anthropic, agreed: false)],
+          "T11 sources: adding the Claude API source Add… filled in stores https://api.anthropic.com, not agreed")
+    check(r.listed == [["engines", "--kind", "claude", "--address", t11Anthropic]] && r.calls(["engines", "--kind"]).first?.timeout == 10
+          && r.calls(["engines", "--kind"]).first?.stdin == nil
+          && r.calls(["key", "status"]).map(\.arguments) == [["key", "status", "--address", t11Anthropic]],
+          "T11 sources: saving a source lists its models, with a 10 s limit, and reads whether it has a key (\(r.engine.calls.map(\.arguments)))")
+    let count = r.engine.calls.count
+    check(r.app.addSource(Source(kind: .standard, address: t11Anthropic, agreed: false)) == PreferencesPresentation.addressTaken
+          && r.app.addSource(Source(kind: .standard, address: t11Anthropic + "/", agreed: false)) == PreferencesPresentation.addressTaken
+          && r.prefs.sources.count == 1 && r.engine.calls.count == count,
+          "T11 sources: two sources with one address are refused (a trailing / too), and nothing runs")
+    r.app.beginAddSource()
+    r.app.updateSourceDraft { $0.kind = .standard; $0.address = "http://192.168.1.10:1234/v1" }
+    r.app.saveSourceDraft()
+    check(r.app.sourceDraft?.problem == PreferencesPresentation.addressRefused && r.prefs.sources.count == 1 && r.engine.calls.count == count,
+          "T11 sources: an address the rule refuses is not added, the sheet says why, and nothing runs")
+    r.app.updateSourceDraft { $0.address = " \(t11Ollama)\n" }
+    r.app.saveSourceDraft()
+    check(r.app.sourceDraft == nil && r.prefs.sources == [Source(kind: .claude, address: t11Anthropic, agreed: false), Source(kind: .standard, address: t11Ollama, agreed: false)],
+          "T11 sources: the address is taken without the spaces around it")
+    check(r.app.addSource(Source(kind: .claude, address: "", agreed: true)) == PreferencesPresentation.addressTaken,
+          "T11 sources: a Claude API source with no address is the default one, already there")
+    r.prefs.sources = r.prefs.sources.map { var s = $0; s.agreed = true; return s }
+
+    // a new kind only
+    let removesBefore = r.calls(["key", "remove"]).count
+    check(r.app.updateSource(at: 1, Source(kind: .claude, address: t11Ollama, agreed: true)) == nil
+          && r.prefs.sources == [Source(kind: .claude, address: t11Anthropic, agreed: true), Source(kind: .claude, address: t11Ollama, agreed: false)],
+          "T11 sources: changing only a source's kind clears its agreement, and no other's")
+    check(r.calls(["key", "remove"]).count == removesBefore && r.listed.last == ["engines", "--kind", "claude", "--address", t11Ollama],
+          "T11 sources: changing only its kind removes no key, and lists it afresh")
+    r.prefs.sources = r.prefs.sources.map { var s = $0; s.agreed = true; return s }
+    check(r.app.updateSource(at: 1, Source(kind: .claude, address: t11Ollama, agreed: false)) == nil && r.source(1)?.agreed == true,
+          "T11 sources: saving a source unchanged keeps its agreement")
+
+    // a new address
+    check(r.app.updateSource(at: 1, Source(kind: .claude, address: t11Bridge, agreed: true)) == nil
+          && r.source(1) == Source(kind: .claude, address: t11Bridge, agreed: false),
+          "T11 sources: changing a source's address clears its agreement")
+    check(r.calls(["key", "remove"]).map(\.arguments) == [["key", "remove", "--address", t11Ollama]] && r.calls(["key", "remove"]).first?.stdin == nil,
+          "T11 sources: changing its address runs key remove --address <old> through the engine")
+    check(r.calls(["key", "status", "--address", t11Bridge]).count == 1 && r.listed.last == ["engines", "--kind", "claude", "--address", t11Bridge],
+          "T11 sources: and reads the new address's key and lists it")
+    check(r.app.updateSource(at: 1, Source(kind: .standard, address: t11Anthropic, agreed: false)) == PreferencesPresentation.addressTaken
+          && r.source(1)?.address == t11Bridge
+          && r.app.updateSource(at: 1, Source(kind: .standard, address: "ftp://x", agreed: false)) == PreferencesPresentation.addressRefused,
+          "T11 sources: a source cannot take another's address, nor one the rule refuses")
+    r.answer(["key", "remove", "--address", t11Ollama], 0, "none\n")
+    check(r.app.minutesProblem == nil, "T11 sources: a key removed for an old address says nothing")
+    r.app.beginEditSource(at: 1)
+    check(r.app.sourceDraft == SourceDraft(index: 1, kind: .claude, address: t11Bridge, problem: nil), "T11 sources: Edit… starts at the source as it is")
+    r.app.updateSourceDraft { $0.kind = .standard }
+    r.app.saveSourceDraft()
+    check(r.app.sourceDraft == nil && r.source(1) == Source(kind: .standard, address: t11Bridge, agreed: false), "T11 sources: and saves through updateSource")
+
+    // removing
+    r.app.removeSource(at: 0)
+    check(r.prefs.sources.map(\.address) == [t11Bridge] && r.calls(["key", "remove", "--address", t11Anthropic]).count == 1 && r.prefs.runSettings.agreed.isEmpty,
+          "T11 sources: removing a source runs key remove for it, and withdraws its agreement")
+    r.answer(["key", "remove", "--address", t11Anthropic], 1, "The key could not be removed from the keychain.\n")
+    check(r.app.minutesProblem == "The key for https://api.anthropic.com could not be removed from the keychain. It may still be there.",
+          "T11 sources: a key that could not be removed with its source may still be there, and that is said (\(r.app.minutesProblem ?? "-"))")
+    r.finish()
+}
+
+// Keys: read when Preferences opens, without a listing; Set… and Remove; the key only ever on stdin.
+MainActor.assumeIsolated {
+    let a = t11Anthropic, b = t11Ollama
+    let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false), Source(kind: .standard, address: b, agreed: false)])
+    r.app.launch()
+    check(r.engine.calls.isEmpty, "T11 keys: nothing runs at launch with sources saved")
+    r.app.preferencesOpened()
+    check(r.calls(["key", "status"]).map(\.arguments) == [["key", "status", "--address", a], ["key", "status", "--address", b]]
+          && r.calls(["key", "status"]).allSatisfy { $0.stdin == nil } && r.listed.isEmpty && r.engine.count(["engines"]) == 1,
+          "T11 keys: opening Preferences runs key status --address A once per source, engines once, and no engines --kind (\(r.engine.calls.map(\.arguments)))")
+    check(r.app.keys.isEmpty, "T11 keys: nothing is said until key status answers")
+    r.answer(["key", "status", "--address", a], 0, "set\n")
+    r.answer(["key", "status", "--address", b], 0, "none\n")
+    check(r.app.keys == [a: true, b: false], "T11 keys: set and none, by address")
+    r.app.preferencesOpened()
+    r.answer(["key", "status", "--address", a], 1, "The keychain could not be read.\n")
+    check(r.app.keys[a] == nil && r.app.keyProblems[a] == "The keychain could not be read." && r.app.keys[b] == false
+          && PreferencesPresentation.keyLine(r.app.keys[a]) == nil,
+          "T11 keys: a keychain that could not be read is neither set nor none, and is said as a keychain problem")
+    r.app.preferencesOpened()
+    r.answer(["key", "status", "--address", a], 0, "set\n")
+    r.answer(["key", "status", "--address", b], 0, "none\n")
+    check(r.app.keys[a] == true && r.app.keyProblems[a] == nil, "T11 keys: a later answer clears it")
+
+    r.app.beginKey(at: 0)
+    check(r.app.keyDraft?.address == a && r.app.preferencesSheet == .key, "T11 key: Set… opens the key sheet for that source")
+    let key = "sk-ant-api03-abc_DEF.ghi~jkl+mno/pqr=stu-v"
+    r.app.keyText(" \(key) \n")
+    r.app.saveKey(r.app.keyDraft?.text ?? "", for: 0)
+    let sets = r.calls(["key", "set"])
+    check(sets.count == 1 && sets[0].arguments == ["key", "set", "--address", a] && sets[0].stdin == Data(key.utf8)
+          && !r.engine.calls.contains { $0.arguments.contains { $0.contains("sk-ant") } },
+          "T11 key: saveKey runs key set --address A with the key on stdin, never in the arguments")
+    check(r.app.keyDraft?.saving == true, "T11 key: the sheet waits for the answer")
+    r.app.saveKey(key, for: 0)
+    check(r.calls(["key", "set"]).count == 1, "T11 key: Set pressed again while the key is being stored runs nothing more")
+    let statusBefore = r.calls(["key", "status", "--address", a]).count
+    r.answer(["key", "set"], 0, "set\n")
+    check(r.app.keyDraft == nil && r.calls(["key", "status", "--address", a]).count == statusBefore + 1,
+          "T11 keys: once stored the sheet closes, and Set… refreshes keys with key status")
+    r.answer(["key", "status", "--address", a], 0, "set\n")
+    check(r.app.keys[a] == true, "T11 keys: and keys says set")
+
+    let before = r.engine.calls.count
+    r.app.beginKey(at: 1)
+    r.app.keyText("has space")
+    r.app.saveKey(r.app.keyDraft?.text ?? "", for: 1)
+    check(r.engine.calls.count == before && r.app.keyDraft?.problem == PreferencesPresentation.keyRefused,
+          "T11 key: a key the rule refuses is said in the sheet, and never reaches the engine")
+    r.app.keyText("good-key")
+    r.app.saveKey(r.app.keyDraft?.text ?? "", for: 1)
+    r.answer(["key", "set"], 1, "The key could not be stored in the keychain.\n")
+    check(r.app.keyDraft?.problem == "The key could not be stored in the keychain." && r.app.keyDraft?.saving == false,
+          "T11 key: a refusal stays in the sheet, in the engine's words")
+    r.app.cancelKey()
+    check(r.app.keyDraft == nil, "T11 key: Cancel closes the sheet")
+    r.answer(["key", "status", "--address", b], 0, "none\n")
+
+    r.app.removeKey(for: 0)
+    check(r.calls(["key", "remove"]).map(\.arguments) == [["key", "remove", "--address", a]], "T11 keys: Remove runs key remove --address A")
+    r.answer(["key", "remove", "--address", a], 1, "The key could not be removed from the keychain.\n")
+    check(r.app.keys[a] == true && r.app.keyProblems[a] == "The key could not be removed from the keychain. It may still be there.",
+          "T11 keys: a key that could not be removed may still be there: said so, and keys keeps it as it was")
+    check(r.calls(["key", "status", "--address", a]).count == statusBefore + 2, "T11 keys: Remove refreshes keys with key status")
+    r.answer(["key", "status", "--address", a], 0, "set\n")
+    check(r.app.keyProblems[a] != nil, "T11 keys: the status read after it does not hide that it was not removed")
+    r.app.removeKey(for: 0)
+    check(r.app.keyProblems[a] == nil, "T11 keys: trying again clears the old line")
+    r.answer(["key", "remove", "--address", a], 0, "none\n")
+    check(r.app.keys[a] == false, "T11 keys: a key removed is none")
+    r.answer(["key", "status", "--address", a], 0, "none\n")
+
+    // A Claude API model for a source with no key: the key line instead of agreement, from Preferences and from a redo sheet.
+    r.app.chooseWriter(t11Sonnet)
+    check(r.app.consent == nil && r.app.writerNotice == "Set a key for this source first." && r.prefs.minutesWriter == nil,
+          "T11 key first: a Claude API model for a source with no key shows Set a key for this source first. and sets no consent, in Preferences")
+    let m = r.done("2026-11-14_0900")
+    check(r.open(m), "T11 key first: (a meeting is shown)")
+    r.app.library.perform(.redoMinutes)
+    r.app.library.setRedoWriter(.outside(t11Sonnet))
+    check(r.app.consent == nil && r.app.library.writerNotice == "Set a key for this source first." && r.app.library.redoing?.writer == .apple,
+          "T11 key first: and from a redo sheet, leaving the sheet's writer as it was")
+    r.app.library.cancelRedo()
+    check(r.app.library.writerNotice == nil, "T11 key first: closing the sheet clears its line")
+    r.finish()
+}
+
+// When sources are contacted: only on Check, on opening the picker, or on saving a source; never at launch
+// or because Preferences opened. A listing has a 10 s limit, and one overtaken is dropped.
+MainActor.assumeIsolated {
+    let a = t11Anthropic, l = t11Ollama
+    let r = T11Rig(sources: [Source(kind: .standard, address: l, agreed: true), Source(kind: .claude, address: a, agreed: false)])
+    r.app.launch()
+    r.app.preferencesOpened()
+    r.app.preferencesOpened()
+    check(r.listed.isEmpty, "T11 contact: opening Preferences, twice, with saved sources and Apple chosen starts no listing with a source")
+    r.prefs.minutesWriter = t11Llama
+    r.app.preferencesOpened()
+    check(r.listed.isEmpty, "T11 contact: nor with an outside model chosen")
+    r.app.refreshListing(at: 0)
+    check(r.listed == [["engines", "--kind", "standard", "--address", l]] && r.calls(["engines", "--kind"]).last?.timeout == 10
+          && r.calls(["engines", "--kind"]).last?.stdin == nil && r.app.listings[l] == nil,
+          "T11 contact: Check lists that source's models with a 10 s limit, and nothing is shown until it answers")
+    r.answer(["engines", "--kind"], 0, "parakeet ready\napple ready\nvoice none\noutside-runtime ready\noutside model llama3\noutside model qwen3\n")
+    check(r.app.listings[l] == SourceListing(models: ["llama3", "qwen3"], error: nil) && PreferencesPresentation.listingLine(r.app.listings[l]) == "Found 2 models",
+          "T11 contact: its answer is the source's listing")
+    check(r.app.writerOptions.map(\.title) == ["Apple, on this Mac", "llama3 at 127.0.0.1", "qwen3 at 127.0.0.1"] && r.app.writerSelection == 1,
+          "T11 contact: the picker offers the models listed, at the choice saved")
+    r.app.writerPickerOpened()
+    check(r.listed.count == 3 && r.listed[1] == ["engines", "--kind", "standard", "--address", l] && r.listed[2] == ["engines", "--kind", "claude", "--address", a],
+          "T11 contact: opening the picker lists every source")
+    r.app.refreshListing(at: 0)
+    let pending = r.engine.calls.indices.filter { r.engine.calls[$0].arguments == ["engines", "--kind", "standard", "--address", l] }
+    if pending.count == 3 {
+        r.engine.answer(pending[2], 0, "outside model newest\n")
+        r.engine.answer(pending[1], 0, "outside model older\n")
+    }
+    check(pending.count == 3 && r.app.listings[l]?.models == ["newest"], "T11 contact: a listing overtaken by a newer one is dropped")
+    r.answer(["engines", "--kind", "claude"], 1, "outside error the Claude API needs a key\n")
+    check(r.app.listings[a] == SourceListing(models: [], error: "the Claude API needs a key"), "T11 contact: a listing error is kept as given")
+    r.app.refreshListing(at: 1)
+    r.answer(["engines", "--kind", "claude"], 124, "")
+    check(r.app.listings[a]?.error == "it did not answer within 10 seconds", "T11 contact: a listing past its limit says so")
+    r.app.refreshListing(at: 0)
+    let stale = r.engine.calls.lastIndex { $0.arguments == ["engines", "--kind", "standard", "--address", l] }
+    check(r.app.updateSource(at: 0, Source(kind: .standard, address: "http://localhost:11434/v1", agreed: false)) == nil, "T11 contact: (the source's address changes)")
+    if let stale = stale { r.engine.answer(stale, 0, "outside model stale\n") }
+    check(stale != nil && r.app.listings[l] == nil && r.app.listings["http://localhost:11434/v1"] == nil,
+          "T11 contact: a listing for an address since changed is dropped, and the old listing goes")
+    r.finish()
+}
+
+// Agreement in Preferences: consent before anything leaves the Mac.
+MainActor.assumeIsolated {
+    let l = t11Ollama
+    let r = T11Rig(sources: [Source(kind: .standard, address: l, agreed: false)])
+    let before = r.prefs.runSettings
+    r.app.chooseWriter(t11Llama)
+    check(r.app.consent == ConsentRequest(writer: t11Llama, origin: .preferences) && r.prefs.runSettings == before && r.prefs.minutesWriter == nil,
+          "T11 agreement: choosing a model from an unagreed source sets consent (origin preferences), and Preferences.runSettings is unchanged")
+    check(r.app.preferencesSheet == .consent && r.app.privacy.text == "Transcripts stay on this Mac." && !r.app.privacy.amber,
+          "T11 agreement: the Preferences window shows the consent sheet, and transcripts still stay on this Mac")
+    r.app.cancelConsent()
+    check(r.app.consent == nil && r.prefs.runSettings == before && r.prefs.minutesWriter == nil && r.source(0)?.agreed == false && r.app.writerSelection == 0,
+          "T11 agreement: cancelConsent() keeps Apple")
+    r.app.chooseWriter(t11Llama)
+    r.app.closePreferencesSheet()
+    check(r.app.consent == nil && r.prefs.runSettings == before && r.app.preferencesSheet == nil,
+          "T11 agreement: the consent sheet closed from outside (Escape) is Cancel")
+    r.app.chooseWriter(t11Llama)
+    r.app.agree()
+    check(r.app.consent == nil && r.source(0)?.agreed == true && r.prefs.minutesWriter == t11Llama && r.prefs.runSettings.preferredWriter == .outside(t11Llama)
+          && r.prefs.runSettings.agrees(to: t11Llama),
+          "T11 agreement: agree() marks the source agreed, then sets minutesWriter")
+    check(r.app.privacy.text == PreferencesPresentation.privacyLine(writer: t11Llama).text && r.app.privacy.amber,
+          "T11 privacy: the amber line while an agreed outside model writes")
+    let qwen = OutsideWriter(kind: .standard, address: l, model: "qwen3")
+    r.app.chooseWriter(qwen)
+    check(r.app.consent == nil && r.prefs.minutesWriter == qwen, "T11 agreement: another model of an agreed source needs no new agreement")
+    r.app.chooseWriter(nil)
+    check(r.prefs.minutesWriter == nil && r.prefs.runSettings.preferredWriter == .apple && !r.app.privacy.amber,
+          "T11 agreement: Apple, on this Mac, is minutesWriter absent")
+    r.app.setModelName(" my-model:latest ", for: l)
+    r.app.useModelName(for: l, origin: .preferences)
+    check(r.prefs.minutesWriter == OutsideWriter(kind: .standard, address: l, model: "my-model:latest") && r.app.writerNotice == nil,
+          "T11 Model name: a name typed for a source is chosen as its model")
+    r.app.setModelName("bad name", for: l)
+    r.app.useModelName(for: l, origin: .preferences)
+    check(r.prefs.minutesWriter?.model == "my-model:latest" && r.app.writerNotice == PreferencesPresentation.modelNameProblem("bad name"),
+          "T11 Model name: one the engine would refuse is not chosen, and is said")
+    r.app.chooseWriter(qwen)
+    _ = r.app.updateSource(at: 0, Source(kind: .claude, address: l, agreed: true))
+    check(r.source(0)?.agreed == false && r.prefs.minutesWriter == qwen && !r.app.privacy.amber
+          && r.app.writerOptions.last == WriterOption(writer: qwen, title: "qwen3 at 127.0.0.1 (not available)", available: false)
+          && r.app.writerSelection == r.app.writerOptions.count - 1,
+          "T11 agreement: a changed kind withdraws agreement: the saved choice stays, not available, and transcripts stay on this Mac")
+    _ = r.app.updateSource(at: 0, Source(kind: .standard, address: l, agreed: false))
+    r.app.chooseWriter(t11Llama)
+    check(r.app.consent?.writer == t11Llama, "T11 agreement: (asked again)")
+    _ = r.app.updateSource(at: 0, Source(kind: .standard, address: "http://localhost:11434/v1", agreed: false))
+    r.app.agree()
+    check(!r.prefs.sources.contains { $0.agreed } && r.prefs.minutesWriter == qwen && r.app.consent == nil,
+          "T11 agreement: agreeing after the source changed agrees to nothing and chooses nothing")
+    r.finish()
+}
+
+// The redo sheets: the writer picker, agreement from there, and what reaches meeting.json.
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .standard, address: t11Ollama, agreed: true), Source(kind: .claude, address: t11Anthropic, agreed: false),
+                             Source(kind: .standard, address: t11Bridge, agreed: false), Source(kind: .standard, address: t11Other, agreed: false)],
+                   writer: t11Llama)
+    let otherModel = OutsideWriter(kind: .standard, address: t11Other, model: "o1")
+    r.app.launch()
+    let lib = r.app.library
+    check(lib.requestConsent != nil, "T11 redo: AppModel sets the window's requestConsent")
+    let mA = r.done("2026-11-14_0900") { $0.writer = .outside(t11BridgeModel) }
+    let mB = r.done("2026-11-14_1000")
+    let mC = r.done("2026-11-14_1100")
+    let mD = r.done("2026-11-14_1200")
+    let mE = r.done("2026-11-14_1300")
+    let mF = r.done("2026-11-14_1400")
+
+    check(r.open(mA), "T11 redo: (meeting A)")
+    lib.perform(.redoMinutes)
+    check(lib.redoing?.writer == .outside(t11BridgeModel), "T11 redo: the writer picker starts at the meeting's writer")
+    check(r.app.redoWriterOptions.last == WriterOption(writer: t11BridgeModel, title: "claude at bridge.example", available: true)
+          && r.app.redoWriterSelection == r.app.redoWriterOptions.count - 1,
+          "T11 redo: the sheet's picker offers and shows the draft's writer")
+    let bytesA = r.raw(mA)
+    lib.commitRedo()
+    check(r.app.consent == ConsentRequest(writer: t11BridgeModel, origin: .redo) && lib.redoing != nil,
+          "T11 redo: Redo with a writer not agreed asks at the click, before any check runs")
+    _ = settle({ false }, timeout: 0.3)
+    check(r.runner.calls.isEmpty && r.raw(mA) == bytesA && lib.redoing != nil && r.app.consent == ConsentRequest(writer: t11BridgeModel, origin: .redo),
+          "T11 redo: Redo with a writer not agreed asks for agreement, queues nothing and leaves meeting.json byte-identical")
+    r.app.cancelConsent()
+    lib.cancelRedo()
+
+    check(r.open(mB), "T11 redo: (meeting B)")
+    lib.perform(.redoMinutes)
+    check(lib.redoing?.writer == .outside(t11Llama), "T11 redo: else the picker starts at the Preferences choice")
+    lib.setRedoWriter(.outside(t11Sonnet))
+    check(r.app.consent == ConsentRequest(writer: t11Sonnet, origin: .redo) && lib.redoing?.writer == .outside(t11Llama),
+          "T11 redo: an unagreed choice sets consent with origin redo and leaves the draft's writer as it was")
+    check(r.app.preferencesSheet == nil, "T11 redo: the Preferences window does not show it (the library window does)")
+    r.app.agree()
+    check(lib.redoing?.writer == .outside(t11Sonnet) && r.source(1)?.agreed == true && r.prefs.minutesWriter == t11Llama,
+          "T11 redo: agree() then sets the draft's writer, and leaves the Preferences choice")
+    lib.commitRedo()
+    check(settle { r.runner.calls.count == 1 } && recordJSON(mB)["writer"] as? [String: String] == t11WriterJSON(t11Sonnet)
+          && argsAre(r.runner.calls.first?.arguments, "notes", mB, ["--writer", "outside", "--kind", "claude", "--address", t11Anthropic,
+                                                                    "--writer-model", "claude-sonnet-4-5"]),
+          "T11 redo: commitRedo stores it as the meeting's writer, and the job carries --writer outside --kind --address --writer-model (\(r.runner.calls.first?.arguments ?? []))")
+    r.runner.finishNotes(0, 0)
+    check(settle { MeetingStore.record(in: mB)?.state == .done }, "T11 redo: (B done)")
+
+    check(r.open(mC), "T11 redo: (meeting C)")
+    lib.perform(.transcribeAgain)
+    lib.setRedoWriter(.outside(t11BridgeModel))
+    check(r.app.consent?.origin == .redo, "T11 redo: (asked)")
+    r.app.cancelConsent()
+    check(lib.redoing?.writer == .outside(t11Llama) && r.source(2)?.agreed == false, "T11 redo: cancelConsent() leaves the draft's earlier writer")
+    lib.commitRedo()
+    check(settle { r.runner.calls.count == 2 } && recordJSON(mC)["writer"] as? [String: String] == t11WriterJSON(t11Llama),
+          "T11 redo: and commitRedo stores that one")
+    r.runner.finish(1, 0)
+    check(settle { MeetingStore.record(in: mC)?.state == .done }, "T11 redo: (C done)")
+
+    // Whatever the order of calls, an unagreed outside writer never reaches meeting.json.
+    check(r.open(mD), "T11 redo: (meeting D)")
+    lib.perform(.redoMinutes)
+    lib.setRedoWriter(.outside(otherModel))
+    lib.commitRedo() // before agreeing: the draft still holds the earlier, agreed writer
+    check(settle { r.runner.calls.count == 3 } && recordJSON(mD)["writer"] as? [String: String] == t11WriterJSON(t11Llama),
+          "T11 redo: committed while agreement is still asked for, the earlier writer is stored, not the one asked about")
+    r.app.agree()
+    check(recordJSON(mD)["writer"] as? [String: String] == t11WriterJSON(t11Llama) && lib.redoing == nil,
+          "T11 redo: agreeing after the sheet has gone changes no meeting")
+    r.runner.finishNotes(2, 0)
+    check(settle { MeetingStore.record(in: mD)?.state == .done }, "T11 redo: (D done)")
+    r.prefs.sources = r.prefs.sources.map { var s = $0; if s.address == t11Other { s.agreed = false }; return s } // not agreed again
+    check(r.open(mE), "T11 redo: (meeting E)")
+    lib.perform(.redoMinutes)
+    lib.updateRedo { $0.writer = .outside(otherModel) } // past setRedoWriter
+    let bytesE = r.raw(mE)
+    lib.commitRedo()
+    _ = settle({ false }, timeout: 0.3)
+    check(r.runner.calls.count == 3 && r.raw(mE) == bytesE && r.app.consent?.writer == otherModel,
+          "T11 redo: a writer put in the draft past setRedoWriter is still refused at Redo, and asked about")
+    r.app.cancelConsent()
+    lib.setRedoWriter(.apple)
+    check(lib.redoing?.writer == .apple && r.app.consent == nil, "T11 redo: Apple is taken at once")
+    lib.commitRedo()
+    check(settle { r.runner.calls.count == 4 } && recordJSON(mE)["writer"] as? String == "apple"
+          && argsAre(r.runner.calls.last?.arguments, "notes", mE, ["--writer", "apple"]),
+          "T11 redo: the choice, Apple included, is stored as the meeting's writer")
+    r.runner.finishNotes(3, 0)
+    check(settle { MeetingStore.record(in: mE)?.state == .done }, "T11 redo: (E done)")
+    check(r.open(mF), "T11 redo: (meeting F)")
+    lib.perform(.redoMinutes)
+    let phi = OutsideWriter(kind: .standard, address: t11Ollama, model: "phi4")
+    r.app.setModelName(" phi4 ", for: t11Ollama)
+    r.app.useModelName(for: t11Ollama, origin: .redo)
+    check(lib.redoing?.writer == .outside(phi) && r.prefs.minutesWriter == t11Llama, "T11 redo: a Model name typed in the sheet is the sheet's writer, not Preferences'")
+    r.app.setModelName("bad name", for: t11Ollama)
+    r.app.useModelName(for: t11Ollama, origin: .redo)
+    check(lib.redoing?.writer == .outside(phi) && lib.writerNotice == PreferencesPresentation.modelNameRefused,
+          "T11 redo: a Model name the engine would refuse is said in the sheet, and not taken")
+    lib.setRedoWriter(.outside(t11Llama))
+    check(lib.redoing?.writer == .outside(t11Llama) && lib.writerNotice == nil, "T11 redo: an agreed source's model is taken at once")
+    let bytesF = r.raw(mF)
+    lib.commitRedo() // agreed now: the check runs off the main queue
+    r.app.removeSource(at: 0) // and its source goes before the check comes back
+    _ = settle { lib.writerNotice != nil || r.runner.calls.count > 4 }
+    check(r.runner.calls.count == 4 && r.raw(mF) == bytesF && lib.redoing != nil && r.app.consent == nil
+          && lib.writerNotice == PreferencesPresentation.writerGone(t11Llama),
+          "T11 redo: a source removed while Redo's check runs: nothing is queued or written, the sheet stays and says why (\(lib.writerNotice ?? "-"))")
+    r.finish()
+}
+
+// Writers at launch: an agreed outside writer in Preferences, Apple chosen in the sheet, and a relaunch.
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let prefs = Preferences(defaults: testDefaults(), home: r.root)
+    prefs.sources = [Source(kind: .standard, address: t11Ollama, agreed: true)]
+    prefs.minutesWriter = t11Llama
+    let runner = FakeRunner()
+    let queue = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil, settings: { prefs.runSettings })
+    let model = LibraryModel(store: r.store, session: session, queue: queue, settings: { prefs.runSettings })
+    let m = make(r.store.root, "2026-11-14_0900", files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello\n", "notes.md": "minutes\n"])
+    try! r.store.update(m) { $0.state = .done }
+    age(m)
+    model.reload()
+    check(settle { model.meetings.count == 1 }, "T11 launch: (the meeting is read)")
+    model.select(LibraryPresentation.key(m))
+    check(settle { model.shownContent?.files.transcript == true }, "T11 launch: (and shown)")
+    model.perform(.redoMinutes)
+    check(model.redoing?.writer == .outside(t11Llama), "T11 launch: the sheet starts at the agreed Preferences writer")
+    model.setRedoWriter(.apple)
+    model.commitRedo()
+    check(settle { runner.calls.count == 1 } && argsAre(runner.calls[0].arguments, "notes", m, ["--writer", "apple"]) && r.json(m)["writer"] as? String == "apple",
+          "T11 launch: with an agreed outside writer in Preferences, a Redo minutes with Apple chosen in the sheet launches notes <dir> --writer apple (\(runner.calls.first?.arguments ?? []))")
+    // The app quits while it runs, and opens again with Preferences as they were.
+    let again = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil, settings: { prefs.runSettings })
+    again.resume()
+    check(runner.calls.count == 2 && runner.calls[1].job.kind == .minutes && argsAre(runner.calls[1].arguments, "notes", m, ["--writer", "apple"]),
+          "T11 launch: and after a simulated relaunch, still notes <dir> --writer apple (\(runner.calls.last?.arguments ?? []))")
+    runner.finishNotes(1, 0)
+}
+
+// Writers at launch: a Transcribe again queued with an agreed outside writer whose source is then removed or
+// changed (the app quits first), runs with --writer apple, the set-aside line the last line of .process-log.
+for variant in ["removed", "kind changed", "kind changed and agreed again", "address changed"] {
+    MainActor.assumeIsolated {
+        let r = Rig()
+        let session = r.make()
+        let prefs = Preferences(defaults: testDefaults(), home: r.root)
+        prefs.sources = [Source(kind: .standard, address: t11Ollama, agreed: true)]
+        prefs.minutesWriter = t11Llama
+        let runner = FakeRunner()
+        let first = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil, settings: { prefs.runSettings })
+        let model = LibraryModel(store: r.store, session: session, queue: first, settings: { prefs.runSettings })
+        let busy = make(r.store.root, "2026-11-14_0800", files: ["audio.m4a": "a"])
+        try! r.store.update(busy) { $0.state = .queued }
+        first.enqueue(busy)
+        let m = make(r.store.root, "2026-11-14_0900", files: ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello\n", "notes.md": "minutes\n",
+                                                            ".process-log": "an earlier run\n"])
+        try! r.store.update(m) { $0.state = .done }
+        age(m)
+        model.reload()
+        _ = settle { model.meetings.count == 2 }
+        model.select(LibraryPresentation.key(m))
+        _ = settle { model.shownContent?.files.transcript == true }
+        model.perform(.transcribeAgain)
+        model.commitRedo()
+        check(settle { r.stateOf(m) == "queued" } && runner.calls.count == 1 && r.json(m)["writer"] as? [String: String] == t11WriterJSON(t11Llama),
+              "T11 launch (\(variant)): a Transcribe again with the agreed writer is queued behind another job, that writer kept for the meeting")
+        switch variant {
+        case "removed": prefs.sources = []
+        case "kind changed": prefs.sources = [Source(kind: .claude, address: t11Ollama, agreed: false)]
+        case "kind changed and agreed again": prefs.sources = [Source(kind: .claude, address: t11Ollama, agreed: true)]
+        default: prefs.sources = [Source(kind: .standard, address: "http://localhost:11434/v1", agreed: false)]
+        }
+        let runs = runner.calls.count
+        let next = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil, settings: { prefs.runSettings })
+        next.resume()
+        runner.finish(runs, 0) // the other job, taken up again first, ends
+        let run = runner.calls.last
+        check(runner.calls.count == runs + 2 && run?.job.kind == .transcribe && run.map { Array($0.arguments.suffix(2)) } == ["--writer", "apple"]
+              && run?.logAtRun == "an earlier run\n" + ScriptRunner.setAsideLine(t11Llama) + "\n",
+              "T11 launch (\(variant)): resumed, it launches --writer apple, the set-aside line the last line of .process-log before the engine starts (\(run?.arguments ?? []), \(run?.logAtRun ?? "-"))")
+        if runner.calls.count == runs + 2 { runner.finish(runs + 1, 0) }
+    }
+}
+
+// Writers at launch: a meeting's own outside writer whose source was removed; and the arguments of an agreed one.
+do {
+    let r = QRig()
+    let prefs = Preferences(defaults: testDefaults(), home: r.root)
+    prefs.sources = [Source(kind: .standard, address: t11Ollama, agreed: true)]
+    prefs.minutesWriter = t11Llama
+    let q = r.make(settings: { prefs.runSettings })
+    let a = r.meeting("2026-11-14_0900", files: ["audio.m4a": "a"], queued)
+    q.enqueue(a)
+    check(r.runner.calls.first?.arguments == ["process", a.appendingPathComponent("audio.m4a").path, "--parakeet", "--tidy", "--writer", "outside",
+                                              "--kind", "standard", "--address", t11Ollama, "--writer-model", "llama3"],
+          "T11 arguments: a job with an agreed writer in Preferences carries --writer outside --kind K --address A --writer-model M")
+    r.runner.finish(0, 0)
+    prefs.minutesWriter = nil
+    let own = t8Done(r, "2026-11-14_1000", notes: false) { $0.writer = .outside(t11BridgeModel) }
+    try! "an earlier run\n".write(to: own.appendingPathComponent(".process-log"), atomically: true, encoding: .utf8)
+    prefs.sources = [Source(kind: .standard, address: t11Ollama, agreed: true), Source(kind: .standard, address: t11Bridge, agreed: true)]
+    check(ScriptRunner.writer(meeting: .outside(t11BridgeModel), settings: prefs.runSettings).use == t11BridgeModel, "T11 launch: (its source agreed)")
+    prefs.sources = [Source(kind: .standard, address: t11Ollama, agreed: true)] // and then removed
+    q.retry(own)
+    let run = r.runner.calls.last
+    check(r.runner.calls.count == 2 && run.map { Array($0.arguments.suffix(2)) } == ["--writer", "apple"]
+          && run?.logAtRun == "an earlier run\n" + ScriptRunner.setAsideLine(t11BridgeModel) + "\n",
+          "T11 launch: a meeting's own outside writer whose source was removed: --writer apple, the set-aside line last in .process-log (\(run?.arguments ?? []))")
+    r.runner.finish(1, 0)
+}
+
 try? fm.removeItem(at: scratch)
 if failures > 0 {
     print("\(failures) failure(s)")

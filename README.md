@@ -1,9 +1,17 @@
 # meetingbox
 
 One key. Press it, have the meeting, press it again. You get the recording, a
-transcript and a set of minutes. None of it leaves the Mac.
+transcript and a set of minutes. Unless you choose otherwise, none of it leaves
+the Mac.
 
-No account. No API key. No upload. No per seat fee. Works on a plane.
+No account. No API key and no upload unless you choose an outside model for the
+minutes. No per seat fee. Works on a plane.
+
+## Privacy
+
+Recordings never leave the Mac. Transcripts and minutes stay on it too unless you choose an outside model for the minutes. Then each meeting's transcript, with its date, time and length, is sent to the source you chose, and on to wherever that service sends it.
+
+See Outside models for the minutes, below, for how a source is chosen and agreed to.
 
 ## Install
 
@@ -297,6 +305,90 @@ Three properties fall out of that:
 
 The probabilistic bit sits between two deterministic ones: audio in, structured
 record out, transcript kept.
+
+## Outside models for the minutes (optional)
+
+Apple's on device model writes the minutes unless you choose another. In
+Preferences, under Minutes, add a source, then pick one of its models in "Write
+the minutes with". Redo minutes… and Transcribe again… have the same choice, for
+that one meeting. There are two kinds of source:
+
+- **Claude API**: Anthropic's Messages interface, at `https://api.anthropic.com`
+  unless you change it. It always needs a key.
+- **Standard (Ollama, LM Studio, Local CLI Bridge)**: the OpenAI-style chat
+  interface, `<address>/chat/completions`, with its models from `<address>/models`.
+
+**Agreement first.** The first time you choose a model from a source, meetingbox
+asks "Send transcripts to <host>?" and says what that means, including that the
+transcript holds what other people said. Nothing is sent until you agree. Every
+outside source counts as leaving the Mac, even one at `127.0.0.1`, because a
+program there may pass the transcript on. Changing a source's kind or address,
+or removing it, withdraws the agreement. The line under the picker says, in
+amber, when transcripts are being sent, and to which host. Switch back to
+"Apple, on this Mac" at any time.
+
+**When a source is contacted.** Only when you press Check, open the picker, or
+save a source: never at launch, and never just because Preferences opened.
+Processing sends a transcript only when the run was told to use an outside
+model, and only if its source is still there, unchanged and agreed. Otherwise
+Apple's model writes the minutes, and the meeting's `.process-log` says why.
+
+**Keys.** Set… stores a source's key in your login keychain, and only there. The
+engine reads it back through `security` and hands it to meetingbox's script on
+standard input, which sends it to that source alone. It is never on a command
+line, in a file, a log or the environment. Preferences
+shows whether a key is stored without reading it. Changing a source's address,
+or removing the source, removes its key; `meetingbox reset --tools` and
+`meetingbox uninstall` remove stored keys too. From the terminal:
+`meetingbox key set --address <url>` (the key on standard input),
+`meetingbox key remove --address <url>` and `meetingbox key status --address <url>`.
+
+**Node.** Outside models need Node 20 or later, and nothing else in meetingbox
+does: transcription, speakers and Apple's minutes never use it. Setup's
+"Outside models (optional)" step looks for Node on the PATH, then in Homebrew's
+folders, then for the newest version in nvm, and offers to install it with
+Homebrew if there is none. It then installs the AI Execution Router, pinned at 1.1.1, which
+meetingbox's own small script, `minutes/writer.mjs`, calls. The script runs with
+an empty environment and follows no redirects. If Node goes or moves (an nvm
+switch, say), Preferences says "Outside models need Node 20 or later. Run
+meetingbox setup." and Apple's model writes the minutes until you do.
+
+**Standard sources** must answer streamed requests (`stream: true`), as Ollama
+and LM Studio do. meetingbox always streams, so the connection stays alive for
+the whole of a long meeting's minutes, up to 15 minutes. A source that cannot
+stream fails every time, and Apple's model writes those minutes instead. A
+Standard source needs no key unless it asks for one: without a key it is sent no
+`Authorization` header at all. If Check says "it asked for a key", set one with
+Set….
+
+**Ollama** cuts a transcript longer than its context window without saying so.
+Start it with a window big enough for a long meeting, then add the source
+`http://127.0.0.1:11434/v1`:
+
+```bash
+OLLAMA_CONTEXT_LENGTH=65536 ollama serve
+```
+
+A model whose name ends in `cloud` runs on Ollama's servers, not on this Mac;
+the picker marks it "(runs online)".
+
+**A bridge to Claude Code**, such as the Local CLI Bridge, is a Standard source
+on this Mac that hands the transcript to Claude under your account. Use one only
+if it does all of these:
+
+- starts Claude Code with `--safe-mode`, `--tools ""` and
+  `--no-session-persistence`, so nothing said in a meeting can make it use a
+  tool, and the transcript is not kept as a session;
+- removes `ANTHROPIC_BASE_URL` from the environment it starts Claude Code in, so
+  the request goes to Anthropic and nowhere else;
+- answers `stream: true` with an event stream, as every Standard source must.
+
+**If an outside model fails**, for any reason (no connection, an error, a spent
+quota, a reply cut short or empty, a transcript too long for the model), Apple's
+model writes the minutes, and `notes.md` starts with a note saying why and
+whether the transcript was sent. Choose Redo minutes to try again. Every
+`notes.md` ends by naming who wrote it. The minutes view shows links as plain
+text, never as links to click.
 
 ## Commands
 

@@ -45,6 +45,8 @@ final class Preferences {
         static let floatingY = "floatingY"
         static let transcriber = "transcriber"
         static let tidyLines = "tidyLines"
+        static let sources = "sources"
+        static let minutesWriter = "minutesWriter"
     }
 
     private func bool(_ key: String, _ fallback: Bool) -> Bool {
@@ -146,10 +148,44 @@ final class Preferences {
         set { defaults.set(newValue, forKey: Key.tidyLines) }
     }
 
-    /// What a job launched now runs with: the transcriber and tidying chosen here, Apple writing the
-    /// minutes, and no outside source agreed (Task 11 fills the writer fields).
+    /// The outside sources, in the order they were added, each `{"kind", "address", "agreed"}`. An entry
+    /// it cannot read (a kind it does not know, no address) is skipped, and only a true Bool is agreed.
+    /// `AppModel` keeps the rules: no two share an address, and a new or changed one is not agreed.
+    var sources: [Source] {
+        get {
+            (defaults.array(forKey: Key.sources) ?? []).compactMap { entry in
+                guard let fields = entry as? [String: Any], let kind = (fields["kind"] as? String).flatMap(SourceKind.init(rawValue:)),
+                      let address = fields["address"] as? String, !address.isEmpty else { return nil }
+                return Source(kind: kind, address: address, agreed: (fields["agreed"] as? Bool) == true)
+            }
+        }
+        set { defaults.set(newValue.map { ["kind": $0.kind.rawValue, "address": $0.address, "agreed": $0.agreed] as [String: Any] }, forKey: Key.sources) }
+    }
+
+    /// The model chosen to write the minutes, `{"kind", "address", "model"}` as `meeting.json`'s `writer`
+    /// has it; absent, or one it cannot read, is Apple's (nil). Used only while its source is agreed.
+    var minutesWriter: OutsideWriter? {
+        get {
+            guard let fields = defaults.dictionary(forKey: Key.minutesWriter),
+                  let kind = (fields["kind"] as? String).flatMap(SourceKind.init(rawValue:)),
+                  let address = fields["address"] as? String, let model = fields["model"] as? String,
+                  !address.isEmpty, !model.isEmpty else { return nil }
+            return OutsideWriter(kind: kind, address: address, model: model)
+        }
+        set {
+            if let w = newValue {
+                defaults.set(["kind": w.kind.rawValue, "address": w.address, "model": w.model], forKey: Key.minutesWriter)
+            } else {
+                defaults.removeObject(forKey: Key.minutesWriter)
+            }
+        }
+    }
+
+    /// What a job launched now runs with: the transcriber and tidying chosen here, `minutesWriter` (else
+    /// Apple's), and the sources agreed to, which are the only ones an outside writer may use.
     var runSettings: RunSettings {
-        RunSettings(transcriber: transcriber, tidy: tidyLines, preferredWriter: .apple, agreed: [])
+        RunSettings(transcriber: transcriber, tidy: tidyLines, preferredWriter: minutesWriter.map(MeetingWriter.outside) ?? .apple,
+                    agreed: sources.filter(\.agreed))
     }
 
     /// Recorded time as the timer shows it: `mm:ss` under an hour, then `h:mm:ss`.

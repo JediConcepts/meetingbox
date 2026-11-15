@@ -58,7 +58,7 @@ struct LibraryView: View {
             // The redo sheet hangs here, so that it and the rename sheet are on different views.
             LibraryDetail(model: model, app: app)
                 .sheet(isPresented: Binding(get: { model.redoing != nil }, set: { if !$0 { model.cancelRedo() } })) {
-                    RedoSheet(model: model)
+                    RedoSheet(model: model, app: app)
                 }
         }
         .frame(minWidth: 720, minHeight: 420)
@@ -362,15 +362,30 @@ struct RenameSheet: View {
 // MARK: redo
 
 /// Redo minutes and Transcribe again. Transcribe again chooses the transcriber, the two counts and
-/// tidying for this meeting; Redo minutes only confirms. Each control binds to `LibraryModel.redoing`;
-/// the button queues it after the model's check, and a refusal is said under the meeting's actions.
+/// tidying for this meeting; both choose who writes the minutes, starting at the meeting's own writer,
+/// else the Preferences one. Each control binds to `LibraryModel.redoing`; the writer goes through
+/// `setRedoWriter`, so an outside one whose source is not agreed asks first, in a sheet over this one.
+/// The button queues it after the model's check, and a refusal is said under the meeting's actions.
 struct RedoSheet: View {
     @ObservedObject var model: LibraryModel
+    @ObservedObject var app: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let draft = model.redoing {
                 Text(LibraryPresentation.redoTitle(draft.kind)).font(.headline)
+                let options = app.redoWriterOptions
+                Form {
+                    LabeledContent(PreferencesPresentation.writerLabel) {
+                        WriterPopUp(options: options, selected: app.redoWriterSelection, opened: { app.writerPickerOpened() }, chose: { index in
+                            if options.indices.contains(index) { model.setRedoWriter(options[index].writer.map(MeetingWriter.outside) ?? .apple) }
+                        })
+                    }
+                    ModelNameFields(app: app, origin: .redo)
+                    if let notice = model.writerNotice {
+                        Text(notice).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 if draft.kind == .transcribe {
                     Form {
                         Picker(LibraryPresentation.transcriberLabel, selection: Binding(
@@ -409,6 +424,10 @@ struct RedoSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 460)
+        .frame(width: 520)
+        // Agreement asked for from this sheet: "Send transcripts to <host>?".
+        .sheet(isPresented: Binding(get: { app.consent?.origin == .redo }, set: { if !$0 { app.cancelConsent() } })) {
+            ConsentSheet(app: app)
+        }
     }
 }

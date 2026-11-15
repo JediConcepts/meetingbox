@@ -106,6 +106,8 @@ final class AppModel: ObservableObject {
         // The window's Pause, Resume and Stop take the path the menu's do.
         library.control = { [weak self] action in self?.perform(action) }
         library.onSelectionChange = { [weak self] in self?.selectionChanged() }
+        // An outside writer chosen in a redo sheet whose source is not agreed: asked about from the window.
+        library.requestConsent = { [weak self] writer in self?.ask(writer, origin: .redo) }
         // A meeting always wins: every start, by any route, first stops playback and then cancels a voice
         // sample being recorded. The handler's queue is the session's tick queue, the main queue.
         handler.willStart = { [weak self] in MainActor.assumeIsolated { self?.makeWayForRecording() } }
@@ -408,12 +410,17 @@ final class AppModel: ObservableObject {
         if folderProblem != nil { folderProblem = nil }
     }
 
-    /// The Preferences window is opening: no complaint left from last time, and the microphones and
-    /// the engine's status read afresh.
+    /// The Preferences window is opening: no complaint left from last time, and the microphones, the
+    /// engine's status and whether each source has a key (`key status`, which reads the keychain only)
+    /// read afresh. No source is contacted: its models are listed only on Check, on opening the picker,
+    /// or on saving it.
     func preferencesOpened() {
         clearFolderProblem()
+        writerNotice = nil
+        minutesProblem = nil
         refreshMicrophones()
         refreshEngines()
+        preferences.sources.forEach { refreshKey($0.address) }
     }
 
     // MARK: transcripts: the transcriber, tidying and the user's voice
@@ -709,6 +716,448 @@ final class AppModel: ObservableObject {
         if session.unconfirmed { makeWayForRecording() }
     }
 
+    // MARK: minutes: the outside sources, their keys and models, the writer, and agreement
+
+    // Every command here goes through `engine`, off the main queue, and its answer comes back on it. A
+    // source is contacted (`engines --kind K --address A`) only on Check, on opening the picker, or on
+    // saving it; `key` commands touch only the keychain. A key travels on stdin, never in the arguments.
+
+    /// The source being added (index nil) or changed in its sheet.
+    @Published private(set) var sourceDraft: SourceDraft?
+    /// The key being typed in its sheet, for one source.
+    @Published private(set) var keyDraft: KeyDraft?
+    /// Each source's models, or why they could not be listed, by address.
+    @Published private(set) var listings: [String: SourceListing] = [:]
+    /// Whether each source has a key stored, by address, from `key status` (and the answers of Set… and
+    /// Remove); absent while not known, as when the keychain could not be read, which is never "none".
+    @Published private(set) var keys: [String: Bool] = [:]
+    /// Why `key status` could not say set or none, by address.
+    @Published private var keyStatusProblems: [String: String] = [:]
+    /// Why Set… or Remove did not work, by address, until it is tried again.
+    @Published private var keyActionProblems: [String: String] = [:]
+    /// The agreement being asked for: the Preferences window shows it for `.preferences`, the meetingbox
+    /// window, over its redo sheet, for `.redo`.
+    @Published private(set) var consent: ConsentRequest?
+    /// Why the writer just chosen in Preferences was not taken, until the next choice.
+    @Published private(set) var writerNotice: String?
+    /// A key that could not be removed with its source, until Preferences opens again or a source changes.
+    @Published private(set) var minutesProblem: String?
+    /// What is typed in each source's Model name field, by address.
+    @Published private(set) var modelNames: [String: String] = [:]
+    private var listingsAsked = 0
+    private var latestListing: [String: Int] = [:]
+    private var keysAsked = 0
+    private var latestKey: [String: Int] = [:]
+
+    /// A source's key line problem: what Set… or Remove said, else what `key status` said.
+    var keyProblems: [String: String] { keyStatusProblems.merging(keyActionProblems) { _, action in action } }
+
+    private func source(at index: Int) -> Source? {
+        let sources = preferences.sources
+        return sources.indices.contains(index) ? sources[index] : nil
+    }
+
+    private func hasSource(_ address: String) -> Bool { preferences.sources.contains { $0.address == address } }
+
+    private func sourceOf(_ writer: OutsideWriter) -> Int? {
+        preferences.sources.firstIndex { $0.kind == writer.kind && $0.address == writer.address }
+    }
+
+    /// The address as it is kept: without spaces around it, and the Claude API's own when none is given.
+    private static func normalised(_ source: Source) -> Source {
+        let address = source.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Source(kind: source.kind, address: address.isEmpty ? PreferencesPresentation.defaultAddress(source.kind) : address,
+                      agreed: source.agreed)
+    }
+
+    /// Why this address cannot be a source beside `others`: the rule refuses it, or one of them has it.
+    private static func sourceProblem(_ address: String, among others: [Source]) -> String? {
+        if let problem = PreferencesPresentation.addressProblem(address) { return problem }
+        return others.contains { PreferencesPresentation.sameAddress($0.address, address) } ? PreferencesPresentation.addressTaken : nil
+    }
+
+    /// Adds a source, never agreed. Refused, with why and with nothing run, when the rule refuses its
+    /// address or another source has it. Once saved, its models are listed and its key is read.
+    @discardableResult
+    func addSource(_ source: Source) -> String? {
+        let new = Source(kind: source.kind, address: AppModel.normalised(source).address, agreed: false)
+        var sources = preferences.sources
+        if let problem = AppModel.sourceProblem(new.address, among: sources) { return problem }
+        sources.append(new)
+        objectWillChange.send()
+        preferences.sources = sources
+        minutesProblem = nil
+        refreshKey(new.address)
+        list(new)
+        return nil
+    }
+
+    /// Changes the source at `index`. A new kind or address withdraws its agreement (it is never given
+    /// here: only `agree()` gives it), and its listing goes; a new address also has the key stored for the
+    /// old one removed (`key remove --address <old>`). Refused as `addSource` is. Once saved, its models are
+    /// listed and its key is read.
+    @discardableResult
+    func updateSource(at index: Int, _ source: Source) -> String? {
+        var sources = preferences.sources
+        guard sources.indices.contains(index) else { return nil }
+        let old = sources[index]
+        let address = AppModel.normalised(source).address
+        var others = sources
+        others.remove(at: index)
+        if let problem = AppModel.sourceProblem(address, among: others) { return problem }
+        let same = source.kind == old.kind && address == old.address
+        sources[index] = Source(kind: source.kind, address: address, agreed: same && old.agreed)
+        objectWillChange.send()
+        preferences.sources = sources
+        minutesProblem = nil
+        if !same { forget(old) }
+        if address != old.address { removeOldKey(old.address) }
+        refreshKey(address)
+        list(sources[index])
+        return nil
+    }
+
+    /// Removes the source at `index`, which withdraws its agreement, and removes its key.
+    func removeSource(at index: Int) {
+        var sources = preferences.sources
+        guard sources.indices.contains(index) else { return }
+        let gone = sources.remove(at: index)
+        objectWillChange.send()
+        preferences.sources = sources
+        minutesProblem = nil
+        forget(gone)
+        modelNames[gone.address] = nil
+        removeOldKey(gone.address)
+    }
+
+    /// A source as it was is gone: its listing (and any still being made), and any agreement asked for it.
+    private func forget(_ source: Source) {
+        listings[source.address] = nil
+        latestListing[source.address] = nil
+        if let asked = consent?.writer, asked.kind == source.kind, asked.address == source.address { consent = nil }
+    }
+
+    /// The key stored for an address no source has now: removed, and said when it could not be.
+    private func removeOldKey(_ address: String) {
+        keys[address] = nil
+        latestKey[address] = nil
+        keyStatusProblems[address] = nil
+        keyActionProblems[address] = nil
+        engine.run(["key", "remove", "--address", address], stdin: nil, timeout: 60) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                if !(status == 0 && PreferencesPresentation.firstLine(output) == "none") {
+                    self.minutesProblem = PreferencesPresentation.oldKeyLeft(address: address)
+                }
+                if self.hasSource(address) { self.refreshKey(address) } // a source has that address again since
+            }
+        }
+    }
+
+    // The source sheet (Add… and Edit…).
+
+    /// Add…: the Claude API, at its own address.
+    func beginAddSource() {
+        sourceDraft = SourceDraft(index: nil, kind: .claude, address: PreferencesPresentation.claudeAddress, problem: nil)
+    }
+
+    /// Edit…: the source as it is.
+    func beginEditSource(at index: Int) {
+        guard let source = source(at: index) else { return }
+        sourceDraft = SourceDraft(index: index, kind: source.kind, address: source.address, problem: nil)
+    }
+
+    /// The sheet's kind and address, as its controls change them. The address filled in for one kind
+    /// (or none) follows a new kind; one typed stays.
+    func updateSourceDraft(_ change: (inout SourceDraft) -> Void) {
+        guard var draft = sourceDraft else { return }
+        let kind = draft.kind
+        change(&draft)
+        if draft.kind != kind, draft.address.isEmpty || draft.address == PreferencesPresentation.defaultAddress(kind) {
+            draft.address = PreferencesPresentation.defaultAddress(draft.kind)
+        }
+        draft.problem = nil
+        sourceDraft = draft
+    }
+
+    func cancelSourceDraft() { sourceDraft = nil }
+
+    /// Add or Save: the sheet closes once the source is taken, and says why when it is not.
+    func saveSourceDraft() {
+        guard let draft = sourceDraft else { return }
+        let source = Source(kind: draft.kind, address: draft.address, agreed: false)
+        let problem: String?
+        if let index = draft.index { problem = updateSource(at: index, source) } else { problem = addSource(source) }
+        if let problem = problem { sourceDraft?.problem = problem } else { sourceDraft = nil }
+    }
+
+    // Keys.
+
+    /// `key status --address A`: whether a key is stored, without reading it. An answer overtaken by a
+    /// newer one for that address, or for an address no source has, is dropped.
+    private func refreshKey(_ address: String) {
+        keysAsked += 1
+        let asked = keysAsked
+        latestKey[address] = asked
+        engine.run(["key", "status", "--address", address], stdin: nil, timeout: 10) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self, self.latestKey[address] == asked, self.hasSource(address) else { return }
+                switch (status, PreferencesPresentation.firstLine(output)) {
+                case (0, "set"?): self.keys[address] = true
+                case (0, "none"?): self.keys[address] = false
+                default:
+                    self.keys[address] = nil
+                    self.keyStatusProblems[address] = PreferencesPresentation.engineProblem(status: status, output: output)
+                    return
+                }
+                self.keyStatusProblems[address] = nil
+            }
+        }
+    }
+
+    /// Set…: the key sheet for that source.
+    func beginKey(at index: Int) {
+        guard let source = source(at: index) else { return }
+        keyDraft = KeyDraft(index: index, address: source.address, text: "", problem: nil, saving: false)
+    }
+
+    func keyText(_ text: String) {
+        guard keyDraft?.saving == false else { return }
+        keyDraft?.text = text
+        keyDraft?.problem = nil
+    }
+
+    func cancelKey() { keyDraft = nil }
+
+    /// Stores a key for the source at `index`: `key set --address A` with the key, without the spaces
+    /// around it, on stdin and never in the arguments. One the key rule refuses never reaches the engine.
+    /// The sheet waits for the answer: it closes once stored, and otherwise says why in the engine's
+    /// words. Then `keys` is read again.
+    func saveKey(_ key: String, for index: Int) {
+        guard let source = source(at: index) else { return }
+        let address = source.address
+        let key = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let inSheet = keyDraft?.address == address
+        guard !(inSheet && keyDraft?.saving == true) else { return } // pressed again while it is being stored
+        guard PreferencesPresentation.keyOK(key) else {
+            if inSheet { keyDraft?.problem = PreferencesPresentation.keyRefused } else { keyActionProblems[address] = PreferencesPresentation.keyRefused }
+            return
+        }
+        keyActionProblems[address] = nil
+        if inSheet {
+            keyDraft?.problem = nil
+            keyDraft?.saving = true
+        }
+        engine.run(["key", "set", "--address", address], stdin: Data(key.utf8), timeout: 60) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                let waiting = self.keyDraft?.address == address && self.keyDraft?.saving == true
+                if status == 0 && PreferencesPresentation.firstLine(output) == "set" {
+                    if waiting { self.keyDraft = nil }
+                    if self.hasSource(address) { self.keys[address] = true }
+                } else {
+                    let problem = PreferencesPresentation.engineProblem(status: status, output: output)
+                    if waiting {
+                        self.keyDraft?.problem = problem
+                        self.keyDraft?.saving = false
+                    } else {
+                        self.keyActionProblems[address] = problem
+                    }
+                }
+                if self.hasSource(address) { self.refreshKey(address) }
+            }
+        }
+    }
+
+    /// Remove: `key remove --address A`. One it could not remove may still be there: that is said, and
+    /// `keys` keeps what it had until `key status`, read again after, says otherwise.
+    func removeKey(for index: Int) {
+        guard let source = source(at: index) else { return }
+        let address = source.address
+        keyActionProblems[address] = nil
+        engine.run(["key", "remove", "--address", address], stdin: nil, timeout: 60) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self, self.hasSource(address) else { return }
+                if status == 0 && PreferencesPresentation.firstLine(output) == "none" {
+                    self.keys[address] = false
+                } else {
+                    self.keyActionProblems[address] = PreferencesPresentation.keyNotRemoved(PreferencesPresentation.engineProblem(status: status, output: output))
+                }
+                self.refreshKey(address)
+            }
+        }
+    }
+
+    // Listings.
+
+    /// Check: lists that source's models.
+    func refreshListing(at index: Int) {
+        if let source = source(at: index) { list(source) }
+    }
+
+    /// The writer picker is opening, in Preferences or a redo sheet: every source's models are listed.
+    func writerPickerOpened() {
+        preferences.sources.forEach { list($0) }
+    }
+
+    /// `engines --kind K --address A` with a 10 s limit. An answer overtaken by a newer one for that
+    /// address, or for a source since changed or removed, is dropped.
+    private func list(_ source: Source) {
+        listingsAsked += 1
+        let asked = listingsAsked
+        latestListing[source.address] = asked
+        engine.run(["engines", "--kind", source.kind.rawValue, "--address", source.address], stdin: nil, timeout: 10) { [weak self] status, output in
+            MainActor.assumeIsolated {
+                guard let self = self, self.latestListing[source.address] == asked,
+                      self.preferences.sources.contains(where: { $0.kind == source.kind && $0.address == source.address }) else { return }
+                self.listings[source.address] = PreferencesPresentation.listing(status: status, output: output)
+            }
+        }
+    }
+
+    // The writer and agreement.
+
+    /// "Write the minutes with" in Preferences, at the saved choice.
+    var writerOptions: [WriterOption] {
+        PreferencesPresentation.writerChoice(sources: preferences.sources, listings: listings, saved: preferences.minutesWriter)
+    }
+
+    var writerSelection: Int {
+        let saved = preferences.minutesWriter
+        return writerOptions.firstIndex { $0.writer == saved } ?? 0
+    }
+
+    /// The redo sheet's own writer, when it is an outside one.
+    private var redoWriter: OutsideWriter? {
+        if case .outside(let writer)? = library.redoing?.writer { return writer }
+        return nil
+    }
+
+    /// "Write the minutes with" in a redo sheet, at the sheet's writer.
+    var redoWriterOptions: [WriterOption] {
+        PreferencesPresentation.writerChoice(sources: preferences.sources, listings: listings, saved: redoWriter)
+    }
+
+    var redoWriterSelection: Int {
+        let saved = redoWriter
+        return redoWriterOptions.firstIndex { $0.writer == saved } ?? 0
+    }
+
+    /// The line under the Preferences picker, for the writer a job would use now: an outside one only
+    /// while its source is agreed (`ScriptRunner.writer`, the launch-time rule).
+    var privacy: (text: String, amber: Bool) {
+        PreferencesPresentation.privacyLine(writer: ScriptRunner.writer(meeting: nil, settings: preferences.runSettings).use)
+    }
+
+    /// "Outside models need Node 20 or later. Run meetingbox setup." while the engine says so.
+    var outsideRuntimeLine: String? { PreferencesPresentation.outsideRuntimeLine(engineStatus) }
+
+    /// The Preferences picker: Apple (nil) at once; an outside model through `ask`.
+    func chooseWriter(_ writer: OutsideWriter?) {
+        writerNotice = nil
+        guard let writer = writer else {
+            objectWillChange.send()
+            preferences.minutesWriter = nil
+            return
+        }
+        ask(writer, origin: .preferences)
+    }
+
+    /// An outside writer chosen in Preferences or in a redo sheet. Taken at once when its source is
+    /// agreed. Otherwise agreement is asked for (`consent`), except for a Claude API model whose source
+    /// has no key, which says "Set a key for this source first." instead. A name the engine would refuse,
+    /// or a source that has gone or changed, is said and nothing is taken.
+    private func ask(_ writer: OutsideWriter, origin: ConsentOrigin) {
+        let notice: String?
+        if let problem = PreferencesPresentation.modelNameProblem(writer.model) {
+            notice = problem
+        } else if let index = sourceOf(writer) {
+            if preferences.sources[index].agreed {
+                take(writer, origin)
+                return
+            }
+            if writer.kind == .claude && keys[writer.address] == false {
+                notice = PreferencesPresentation.setKeyFirst
+            } else {
+                consent = ConsentRequest(writer: writer, origin: origin)
+                return
+            }
+        } else {
+            notice = PreferencesPresentation.writerGone(writer)
+        }
+        switch origin {
+        case .preferences: writerNotice = notice
+        case .redo: library.showWriterNotice(notice)
+        }
+    }
+
+    /// An agreed writer becomes Preferences' choice, or the redo sheet's.
+    private func take(_ writer: OutsideWriter, _ origin: ConsentOrigin) {
+        switch origin {
+        case .preferences:
+            objectWillChange.send()
+            preferences.minutesWriter = writer
+        case .redo:
+            library.setRedoWriter(.outside(writer))
+        }
+    }
+
+    /// "Send transcripts to <host>": the source is marked agreed, then the writer is taken where it was
+    /// chosen. Nothing, if the source has changed or gone since.
+    func agree() {
+        guard let request = consent else { return }
+        consent = nil
+        guard let index = sourceOf(request.writer) else { return }
+        var sources = preferences.sources
+        sources[index].agreed = true
+        objectWillChange.send()
+        preferences.sources = sources
+        take(request.writer, request.origin)
+    }
+
+    /// Cancel: nothing else changes.
+    func cancelConsent() { consent = nil }
+
+    func setModelName(_ name: String, for address: String) { modelNames[address] = name }
+
+    /// Use, or Return in a source's Model name field: that name, as the source's model, chosen where the
+    /// field is.
+    func useModelName(for address: String, origin: ConsentOrigin) {
+        guard let source = preferences.sources.first(where: { $0.address == address }) else { return }
+        let writer = OutsideWriter(kind: source.kind, address: address,
+                                   model: (modelNames[address] ?? "").trimmingCharacters(in: .whitespacesAndNewlines))
+        switch origin {
+        case .preferences:
+            chooseWriter(writer)
+        case .redo:
+            if let problem = PreferencesPresentation.modelNameProblem(writer.model) {
+                library.showWriterNotice(problem)
+            } else {
+                library.setRedoWriter(.outside(writer))
+            }
+        }
+    }
+
+    /// The one sheet the Preferences window shows, if any.
+    var preferencesSheet: PreferencesSheet? {
+        if sample != .idle { return .sample }
+        if consent?.origin == .preferences { return .consent }
+        if keyDraft != nil { return .key }
+        if sourceDraft != nil { return .source }
+        return nil
+    }
+
+    /// The sheet closed from outside (Escape): as its Cancel, or Done for the voice sample.
+    func closePreferencesSheet() {
+        switch preferencesSheet {
+        case .sample?: closeSample()
+        case .consent?: cancelConsent()
+        case .key?: cancelKey()
+        case .source?: cancelSourceDraft()
+        case nil: break
+        }
+    }
+
     // MARK: recording entries (the Dock menu, the main menu's Recording menu, New meeting)
 
     /// The menu bar item's recording entries that apply now (`PreferencesPresentation.recordingEntries`).
@@ -807,3 +1256,34 @@ final class AppModel: ObservableObject {
         return (attrs?[.systemFreeSize] as? NSNumber)?.int64Value
     }
 }
+
+/// Where an outside writer was chosen: in Preferences, or in a redo sheet.
+enum ConsentOrigin: Equatable { case preferences, redo }
+
+/// The agreement asked for before transcripts may go to a source: "Send transcripts to <host>?".
+struct ConsentRequest: Equatable {
+    let writer: OutsideWriter
+    let origin: ConsentOrigin
+}
+
+/// The source sheet: a new source (`index` nil) or the one at `index`, its kind and address as typed,
+/// and why it was not taken.
+struct SourceDraft: Equatable {
+    let index: Int?
+    var kind: SourceKind
+    var address: String
+    var problem: String?
+}
+
+/// The key sheet for one source: the key as typed, why it was not stored, and whether the engine is
+/// storing it now.
+struct KeyDraft: Equatable {
+    let index: Int
+    let address: String
+    var text: String
+    var problem: String?
+    var saving: Bool
+}
+
+/// The sheet the Preferences window shows: the voice sample, agreement, a key, or a source.
+enum PreferencesSheet: Equatable { case sample, consent, key, source }

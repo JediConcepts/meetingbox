@@ -87,6 +87,7 @@ struct PreferencesView: View {
                     Toggle("Play sounds", isOn: Binding(get: { app.preferences.sounds }, set: { app.setSounds($0) }))
                 }
                 TranscriptsSection(app: app)
+                MinutesSection(app: app)
                 Section {
                     Picker("Microphone:", selection: Binding(get: { microphone.selected }, set: { index in
                         if microphone.options.indices.contains(index) { app.setMicrophone(microphone.options[index].name) }
@@ -124,11 +125,271 @@ struct PreferencesView: View {
             }
         }
         .padding(20)
-        .frame(width: 480)
-        // The voice sample's sheet, shown while a sample is under way or has an outcome to read.
-        .sheet(isPresented: Binding(get: { app.sample != .idle }, set: { if !$0 { app.closeSample() } })) {
-            VoiceSampleSheet(app: app)
+        .frame(width: 520)
+        // One sheet at a time, as `AppModel.preferencesSheet` says: the voice sample (while it is under way
+        // or has an outcome to read), agreement to send transcripts, a source's key, or a source.
+        .sheet(isPresented: Binding(get: { app.preferencesSheet != nil }, set: { if !$0 { app.closePreferencesSheet() } })) {
+            switch app.preferencesSheet {
+            case .sample?: VoiceSampleSheet(app: app)
+            case .consent?: ConsentSheet(app: app)
+            case .key?: KeySheet(app: app)
+            case .source?: SourceSheet(app: app)
+            case nil: EmptyView()
+            }
         }
+    }
+}
+
+/// "Minutes": who writes them, the line under that, and the outside sources with their keys and models.
+/// The words and the rules are `PreferencesPresentation`'s and `AppModel`'s; a source is contacted only on
+/// Check, on opening the picker, or on saving it.
+struct MinutesSection: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        let options = app.writerOptions
+        let sources = app.preferences.sources
+        let privacy = app.privacy
+        Section("Minutes") {
+            LabeledContent(PreferencesPresentation.writerLabel) {
+                WriterPopUp(options: options, selected: app.writerSelection, opened: { app.writerPickerOpened() }, chose: { index in
+                    if options.indices.contains(index) { app.chooseWriter(options[index].writer) }
+                })
+            }
+            ModelNameFields(app: app, origin: .preferences)
+            if let notice = app.writerNotice {
+                Text(notice).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            Text(privacy.text)
+                .font(.caption)
+                .foregroundStyle(privacy.amber ? Color.orange : Color.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let line = app.outsideRuntimeLine {
+                Text(line).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if sources.isEmpty {
+                Text(PreferencesPresentation.noSources)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            ForEach(Array(sources.enumerated()), id: \.element.address) { entry in
+                SourceRow(app: app, index: entry.offset, source: entry.element)
+            }
+            Button(PreferencesPresentation.addSourceTitle) { app.beginAddSource() }
+            if let problem = app.minutesProblem {
+                Text(problem).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// One source: its kind and address, Check, Edit… and Remove; whether it has a key, with Set… and
+/// Remove; and what Check last found.
+struct SourceRow: View {
+    @ObservedObject var app: AppModel
+    let index: Int
+    let source: Source
+
+    var body: some View {
+        let known = app.keys[source.address]
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(PreferencesPresentation.kindTitle(source.kind))
+                    Text(source.address)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                }
+                Spacer()
+                Button(PreferencesPresentation.checkTitle) { app.refreshListing(at: index) }
+                Button(PreferencesPresentation.editSourceTitle) { app.beginEditSource(at: index) }
+                Button(PreferencesPresentation.removeTitle) { app.removeSource(at: index) }
+            }
+            HStack {
+                if let line = PreferencesPresentation.keyLine(known) {
+                    Text(line).font(.caption)
+                }
+                Button(PreferencesPresentation.setKeyTitle) { app.beginKey(at: index) }
+                    .controlSize(.small)
+                Button(PreferencesPresentation.removeTitle) { app.removeKey(for: index) }
+                    .controlSize(.small)
+                    .disabled(known == false)
+            }
+            if let problem = app.keyProblems[source.address] {
+                Text(problem).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            if let found = PreferencesPresentation.listingLine(app.listings[source.address]) {
+                Text(found).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// A Model name field, "at <host>" and Use, for each source that lists no models or cannot list them.
+/// The name is chosen where the field is: in Preferences, or in a redo sheet.
+struct ModelNameFields: View {
+    @ObservedObject var app: AppModel
+    let origin: ConsentOrigin
+
+    var body: some View {
+        ForEach(app.preferences.sources.filter { PreferencesPresentation.showsModelField(app.listings[$0.address]) }, id: \.address) { source in
+            HStack {
+                TextField(PreferencesPresentation.modelNameLabel, text: Binding(get: { app.modelNames[source.address] ?? "" },
+                                                                                set: { app.setModelName($0, for: source.address) }))
+                    .onSubmit { app.useModelName(for: source.address, origin: origin) }
+                Text(PreferencesPresentation.atHost(source.address)).foregroundStyle(.secondary)
+                Button(PreferencesPresentation.useModelTitle) { app.useModelName(for: source.address, origin: origin) }
+            }
+        }
+    }
+}
+
+/// "Write the minutes with" as an AppKit pop-up button, so the app is told the moment its menu opens
+/// (`NSPopUpButton.willPopUpNotification`): opening the picker is one of the three times sources are
+/// listed, and a SwiftUI Picker does not say when it opens. Its items are the options, disabled where
+/// they cannot be chosen; choosing one hands its index back.
+struct WriterPopUp: NSViewRepresentable {
+    let options: [WriterOption]
+    let selected: Int
+    let opened: () -> Void
+    let chose: (Int) -> Void
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var opened: () -> Void = {}
+        var chose: (Int) -> Void = { _ in }
+        var observer: NSObjectProtocol?
+
+        @objc func choose(_ sender: NSPopUpButton) { chose(sender.indexOfSelectedItem) }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSPopUpButton {
+        let button = NSPopUpButton(frame: .zero, pullsDown: false)
+        button.autoenablesItems = false
+        let coordinator = context.coordinator
+        button.target = coordinator
+        button.action = #selector(Coordinator.choose(_:))
+        coordinator.observer = NotificationCenter.default.addObserver(forName: NSPopUpButton.willPopUpNotification, object: button,
+                                                                      queue: nil) { [weak coordinator] _ in
+            MainActor.assumeIsolated { coordinator?.opened() }
+        }
+        return button
+    }
+
+    func updateNSView(_ button: NSPopUpButton, context: Context) {
+        context.coordinator.opened = opened
+        context.coordinator.chose = chose
+        let shown = button.itemArray.map { "\($0.isEnabled ? 1 : 0)\($0.title)" }
+        if shown != options.map({ "\($0.available ? 1 : 0)\($0.title)" }) {
+            button.removeAllItems()
+            for option in options {
+                // Added to the menu, not with addItem(withTitle:), which drops an item of the same title.
+                let item = NSMenuItem(title: option.title, action: nil, keyEquivalent: "")
+                item.isEnabled = option.available
+                button.menu?.addItem(item)
+            }
+        }
+        if options.indices.contains(selected), button.indexOfSelectedItem != selected { button.selectItem(at: selected) }
+    }
+
+    static func dismantleNSView(_ button: NSPopUpButton, coordinator: Coordinator) {
+        if let observer = coordinator.observer { NotificationCenter.default.removeObserver(observer) }
+        coordinator.observer = nil
+    }
+}
+
+/// Agreement before anything leaves the Mac, from Preferences or (over the redo sheet) from the window:
+/// the title, the text, Cancel and "Send transcripts to <host>".
+struct ConsentSheet: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let request = app.consent {
+                let host = PreferencesPresentation.shownHost(request.writer.address)
+                Text(PreferencesPresentation.consentTitle(host: host)).font(.headline)
+                Text(PreferencesPresentation.consentText(address: request.writer.address))
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Spacer()
+                    Button(PreferencesPresentation.consentCancel) { app.cancelConsent() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(PreferencesPresentation.consentButton(host: host)) { app.agree() }
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+}
+
+/// Set…: a key for one source, typed out of sight and handed to the engine on stdin. The sheet waits
+/// while the engine stores it, and says why when it could not.
+struct KeySheet: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let draft = app.keyDraft {
+                Text(PreferencesPresentation.keySheetTitle(host: PreferencesPresentation.shownHost(draft.address))).font(.headline)
+                SecureField(PreferencesPresentation.keyLabel, text: Binding(get: { app.keyDraft?.text ?? "" }, set: { app.keyText($0) }))
+                    .disabled(draft.saving)
+                    .onSubmit { app.saveKey(app.keyDraft?.text ?? "", for: draft.index) }
+                if let problem = draft.problem {
+                    Text(problem).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Spacer()
+                    Button(PreferencesPresentation.cancelTitle) { app.cancelKey() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(PreferencesPresentation.setKeyButton) { app.saveKey(app.keyDraft?.text ?? "", for: draft.index) }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(draft.saving)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 400)
+    }
+}
+
+/// Add… and Edit…: a source's kind and address. Add… starts at the Claude API's own address.
+struct SourceSheet: View {
+    @ObservedObject var app: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if let draft = app.sourceDraft {
+                Text(PreferencesPresentation.sourceSheetTitle(adding: draft.index == nil)).font(.headline)
+                Picker(PreferencesPresentation.kindLabel, selection: Binding(get: { app.sourceDraft?.kind ?? .claude },
+                                                                             set: { kind in app.updateSourceDraft { $0.kind = kind } })) {
+                    ForEach(PreferencesPresentation.kinds, id: \.self) { kind in
+                        Text(PreferencesPresentation.kindTitle(kind)).tag(kind)
+                    }
+                }
+                TextField(PreferencesPresentation.addressLabel, text: Binding(get: { app.sourceDraft?.address ?? "" },
+                                                                              set: { text in app.updateSourceDraft { $0.address = text } }))
+                    .onSubmit { app.saveSourceDraft() }
+                if let problem = draft.problem {
+                    Text(problem).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Spacer()
+                    Button(PreferencesPresentation.cancelTitle) { app.cancelSourceDraft() }
+                        .keyboardShortcut(.cancelAction)
+                    Button(PreferencesPresentation.sourceSheetButton(adding: draft.index == nil)) { app.saveSourceDraft() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
     }
 }
 

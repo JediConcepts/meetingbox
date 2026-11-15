@@ -139,9 +139,10 @@ final class ScriptRunner: PipelineRunner {
         return settings.agrees(to: wanted) ? (wanted, nil) : (nil, wanted)
     }
 
-    /// The line `.process-log` gets when an outside writer is set aside at launch.
+    /// The line `.process-log` gets when an outside writer is set aside at launch, naming the host as
+    /// the address rule parses it (the host shown everywhere else).
     static func setAsideLine(_ writer: OutsideWriter) -> String {
-        let host = URL(string: writer.address)?.host ?? writer.address
+        let host = PreferencesPresentation.shownHost(writer.address)
         return "The minutes writer \(writer.model) at \(host) was set aside because its source was removed, changed or not agreed. "
             + "Apple's model writes the minutes."
     }
