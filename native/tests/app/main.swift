@@ -9877,6 +9877,80 @@ MainActor.assumeIsolated {
     r.finish()
 }
 
+// MARK: - Sources and consent, round 3 (Stage 3, Task 11)
+
+// 1. Closing Preferences overtakes a choice made there that is still waiting on its key read: whichever read
+// answers afterwards, before or after the window opens again, asks nothing, and the writer stays as it was.
+for order in ["A1", "A2", "A3", "A4"] {
+    MainActor.assumeIsolated {
+        let a = t11Anthropic
+        let unreadable = "The keychain could not be read.\n"
+        let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false), Source(kind: .standard, address: t11Ollama, agreed: true)],
+                       writer: t11Llama)
+        r.app.launch()
+        r.app.preferencesOpened()
+        r.answer(["key", "status", "--address", a], 1, unreadable) // R1: the key state stays unknown
+        r.app.chooseWriter(t11Sonnet) // R2 starts: the choice waits on it
+        r.app.preferencesClosed()
+        r.app.preferencesOpened() // R3 starts
+        let reads = r.engine.calls.indices.filter { r.engine.calls[$0].arguments == ["key", "status", "--address", a] }
+        check(reads.count == 3 && r.app.consent == nil, "T11R3 closed (\(order)): (R2 waits, the window closed and opened again, R3 starts)")
+        guard reads.count == 3 else { r.finish(); return }
+        switch order {
+        case "A1": // R2 answers first, after the window has opened again, then R3
+            r.engine.answer(reads[1], 1, unreadable)
+            r.engine.answer(reads[2], 1, unreadable)
+        case "A3": // the reopen's own read decides, with set; R2 afterwards
+            r.engine.answer(reads[2], 0, "set\n")
+            r.engine.answer(reads[1], 0, "set\n")
+        case "A4": // the reopen's own read decides, with none
+            r.engine.answer(reads[2], 0, "none\n")
+        default: // A2: with set, then an attempt to agree
+            r.engine.answer(reads[2], 0, "set\n")
+            r.app.agree()
+        }
+        check(r.app.consent == nil && r.app.preferencesSheet == nil && r.app.writerNotice == nil && r.prefs.minutesWriter == t11Llama
+              && r.source(0)?.agreed == false,
+              "T11R3 closed (\(order)): the choice made before the window closed asks nothing, says nothing, and the writer stays as it was\(order == "A2" ? ", and agreeing is impossible" : "")")
+        r.finish()
+    }
+}
+
+// 2. While the Choose… folder panel is open over Preferences, it counts as a sheet there.
+MainActor.assumeIsolated {
+    let a = t11Anthropic
+    let unreadable = "The keychain could not be read.\n"
+    let r = T11Rig(sources: [Source(kind: .claude, address: a, agreed: false)])
+    r.app.launch()
+    r.app.preferencesOpened()
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    r.app.chooseWriter(t11Sonnet)
+    r.app.folderPanelOpened()
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.consent == nil && r.prefs.minutesWriter == nil && r.app.preferencesSheet == nil,
+          "T11R3 panel: a Preferences choice decided while the folder panel is open asks nothing, and the writer stays as it was")
+    r.app.folderPanelClosed()
+    check(r.app.consent == nil, "T11R3 panel: and nothing shows once the panel closes")
+    r.app.chooseWriter(t11Sonnet)
+    r.answer(["key", "status", "--address", a], 1, unreadable)
+    check(r.app.consent == ConsentRequest(writer: t11Sonnet, origin: .preferences), "T11R3 panel: with the panel closed, a choice asks as before")
+    r.finish()
+}
+
+// 3. Remove key for the second of two sources acts on that source alone.
+MainActor.assumeIsolated {
+    let r = T11Rig(sources: [Source(kind: .standard, address: t11Ollama, agreed: true), Source(kind: .standard, address: t11Bridge, agreed: true)])
+    r.app.preferencesOpened()
+    r.answer(["key", "status", "--address", t11Ollama], 0, "set\n")
+    r.answer(["key", "status", "--address", t11Bridge], 0, "set\n")
+    r.app.removeKey(for: t11Bridge)
+    check(r.calls(["key", "remove"]).map(\.arguments) == [["key", "remove", "--address", t11Bridge]],
+          "T11R3 second: Remove key for the second source sends key remove --address with its address, and none for the first")
+    r.answer(["key", "remove", "--address", t11Bridge], 0, "none\n")
+    check(r.app.keys[t11Bridge] == false && r.app.keys[t11Ollama] == true, "T11R3 second: and leaves the first source's key alone")
+    r.finish()
+}
+
 try? fm.removeItem(at: scratch)
 if failures > 0 {
     print("\(failures) failure(s)")

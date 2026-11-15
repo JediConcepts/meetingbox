@@ -48,7 +48,8 @@ final class PreferencesWindow: NSObject {
     }
 
     /// Choose…: a folder panel as a sheet on this window (nothing waits on it); the model checks the
-    /// folder and applies it, or says why not.
+    /// folder and applies it, or says why not. The model is told while the panel is open, so it counts it
+    /// as a sheet over Preferences.
     private func chooseFolder() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -58,9 +59,13 @@ final class PreferencesWindow: NSObject {
         panel.directoryURL = model.preferences.meetingsFolder
         panel.prompt = "Choose"
         panel.message = "Choose the folder meetingbox keeps your meetings in"
+        model.folderPanelOpened()
         panel.beginSheetModal(for: window) { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
-            MainActor.assumeIsolated { self?.model.setMeetingsFolder(url) }
+            MainActor.assumeIsolated {
+                self?.model.folderPanelClosed()
+                guard response == .OK, let url = panel.url else { return }
+                self?.model.setMeetingsFolder(url)
+            }
         }
     }
 }

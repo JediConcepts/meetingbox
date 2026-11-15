@@ -427,11 +427,21 @@ final class AppModel: ObservableObject {
     }
 
     /// The Preferences window has closed (PreferencesWindow hears it): a choice made there and still
-    /// waiting on its key read asks nothing now, and an agreement asked there goes with the window.
+    /// waiting on its key read is overtaken, as a new redo sheet overtakes a redo one, so it asks nothing
+    /// whenever its read answers, the window opened again or not; and an agreement asked there goes with
+    /// the window.
     func preferencesClosed() {
         preferencesOpen = false
+        preferencesChoice += 1
+        folderPanelOpen = false
         if consent?.origin == .preferences { consent = nil }
     }
+
+    /// The Choose… folder panel is open over the Preferences window (PreferencesWindow says so): it counts
+    /// as a sheet there, so a choice decided meanwhile asks nothing.
+    func folderPanelOpened() { folderPanelOpen = true }
+
+    func folderPanelClosed() { folderPanelOpen = false }
 
     // MARK: transcripts: the transcriber, tidying and the user's voice
 
@@ -766,6 +776,8 @@ final class AppModel: ObservableObject {
     private var consentSheet: Int?
     /// The Preferences window is open: from `preferencesOpened` until `preferencesClosed`.
     private var preferencesOpen = false
+    /// The Choose… folder panel is open over it, an AppKit sheet `preferencesSheet` does not show.
+    private var folderPanelOpen = false
 
     /// A source's key line problem: what Set… or Remove said, else what `key status` said.
     var keyProblems: [String: String] { keyStatusProblems.merging(keyActionProblems) { _, action in action } }
@@ -1139,7 +1151,7 @@ final class AppModel: ObservableObject {
                     let live: Bool
                     switch origin {
                     case .preferences:
-                        live = self.preferencesChoice == choice && self.preferencesOpen && self.preferencesSheet == nil
+                        live = self.preferencesChoice == choice && self.preferencesOpen && self.preferencesSheet == nil && !self.folderPanelOpen
                     case .redo:
                         live = self.library.redoChoice == choice && self.library.openRedo != nil
                     }
