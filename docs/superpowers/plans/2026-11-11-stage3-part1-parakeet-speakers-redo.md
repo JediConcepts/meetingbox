@@ -1443,6 +1443,70 @@ Two-sided meetings are unchanged.
 - [ ] **Step 5: Commit** `Speakers and timestamps for a single recording`.
 - **Acceptance at Gate C:** Transcribe again on a meeting that has only `audio.m4a` gives Me and Speaker lines with their times.
 
+### Task 11B: Your name in place of "Me"
+
+The user added this task at Gate B, on 16 November 2026. When the voice print identifies the person recording, the transcript and the minutes use that person's own name, not "Me". The rest of the People work (naming each speaker, a list of regulars, guesses, source changes) is for the next release.
+
+**Files:**
+- Modify:
+  - `native/app`:
+    - Preferences: the "Your name" field;
+    - the arguments of every `process` and `redo` job.
+  - `meetingbox`:
+    - the `--name NAME` option;
+    - passing it to mb-transcript;
+    - `LABEL_INSTRUCTIONS`;
+    - the usage text.
+  - `native/transcript`: the `--me-name NAME` option.
+  - `README.md`.
+- Test:
+  - the mb-transcript tests;
+  - `tests/test_pipeline.sh`;
+  - `tests/test_redo.sh`;
+  - `native/tests/app/main.swift`.
+
+**Interfaces:**
+- **Preferences.**
+  - A text field labelled `Your name`, stored in UserDefaults as `userName`.
+  - Empty, the default, means "Me".
+  - A name is accepted when, trimmed, it is 1 to 40 characters of letters (any script), spaces, hyphens and apostrophes. It must start with a letter.
+  - A name that breaks this rule shows `Use letters, spaces, hyphens and apostrophes, up to 40 characters.` and is not saved.
+  - The name is also refused when it is one of the reserved labels: `Me`, `Them`, `Unknown`, `Room N`, `Them N` or `Speaker N`, in any case. The message for this is `That name is used as a label. Choose another.`
+- **The engine.**
+  - `process` and `redo` take `--name NAME`. The app passes it only when the user has set a name.
+  - The engine checks the name by the same rule. A name that fails is refused with `--name takes a name of letters, spaces, hyphens and apostrophes, up to 40 characters`.
+  - The engine passes the name to mb-transcript as `--me-name NAME`, in both the two-sided and the single-recording paths.
+  - `notes` (Redo minutes) never re-labels a transcript.
+- **mb-transcript.**
+  - `--me-name NAME` replaces the label `Me` with NAME on every line that would say Me. Nothing else changes: the voice-print rules and the other labels stay as they are.
+  - `--voice-sample` refuses `--me-name`.
+- **`LABEL_INSTRUCTIONS`.** When a name is set, the first sentence reads `"<NAME>" is the person who recorded the meeting.` in place of `"Me" is the person who recorded the meeting.`. Everything after it is unchanged. Without a name, the text is unchanged.
+- **Unchanged.**
+  - Existing transcripts change only when they are redone.
+  - The voice print and its learning are unchanged.
+  - Fixtures and tests use a neutral name such as `Sam`, never a real contact's name, because the repository is public.
+
+- [ ] **Step 1: Tests.**
+  - **mb-transcript:**
+    - `--me-name Sam` gives `Sam:` lines where Me would be;
+    - other labels are unchanged;
+    - with no `--me-name`, the output is unchanged, byte for byte;
+    - the refused combination exits 1.
+  - **Engine:**
+    - `--name` reaches mb-transcript on `process` and `redo`, two-sided and single;
+    - a refused name dies with the message;
+    - the prompts carry the name sentence, and what an outside writer is sent does too;
+    - `notes` is unchanged.
+  - **App:**
+    - the field saves a valid name;
+    - it refuses invalid names and reserved labels, with the messages;
+    - jobs carry `--name` only when a name is set.
+- [ ] **Step 2: Run.** Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** `bash tests/run.sh`. Expected: every suite passes, and `node --test` is run.
+- [ ] **Step 5: Commit** `Your name in place of Me`.
+- **Acceptance at Gate C:** with the name set, Transcribe again gives the name's lines where Me was.
+
 ### Task 12: Release 2.1.0
 
 **Files:**
