@@ -47,6 +47,7 @@ final class Preferences {
         static let tidyLines = "tidyLines"
         static let sources = "sources"
         static let minutesWriter = "minutesWriter"
+        static let userName = "userName"
     }
 
     private func bool(_ key: String, _ fallback: Bool) -> Bool {
@@ -181,11 +182,50 @@ final class Preferences {
         }
     }
 
+    /// Your name, said in place of Me in transcripts and minutes, or nil (the default) for Me. A stored
+    /// value the rule refuses, set by hand, counts as none.
+    var userName: String? {
+        guard let stored = defaults.string(forKey: Key.userName) else { return nil }
+        let name = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || Preferences.nameProblem(name) != nil ? nil : name
+    }
+
+    /// Saves `text` as your name, trimmed, and gives nil; an empty one removes it, so Me again. A name the
+    /// rule refuses is not saved, and its message is given instead.
+    @discardableResult
+    func setUserName(_ text: String) -> String? {
+        let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty {
+            defaults.removeObject(forKey: Key.userName)
+            return nil
+        }
+        if let problem = Preferences.nameProblem(name) { return problem }
+        defaults.set(name, forKey: Key.userName)
+        return nil
+    }
+
+    /// The rule for your name, as the engine's `--name` has it: trimmed, 1 to 40 letters (any script),
+    /// spaces, hyphens and apostrophes, starting with a letter; and not a label (Me, Them, Unknown, Room N,
+    /// Them N or Speaker N, in any case). Nil when it is fine, else the message to show.
+    static func nameProblem(_ text: String) -> String? {
+        let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = name.lowercased()
+        let numbered = ["room ", "them ", "speaker "].contains { prefix in
+            lower.hasPrefix(prefix) && lower.count > prefix.count && lower.dropFirst(prefix.count).allSatisfy { $0.isASCII && $0.isNumber }
+        }
+        if ["me", "them", "unknown"].contains(lower) || numbered { return PreferencesPresentation.nameReserved }
+        guard let first = name.first, first.isLetter, name.count <= 40,
+              name.allSatisfy({ $0.isLetter || $0 == " " || $0 == "-" || $0 == "'" || $0 == "\u{2019}" }) else {
+            return PreferencesPresentation.nameInvalid
+        }
+        return nil
+    }
+
     /// What a job launched now runs with: the transcriber and tidying chosen here, `minutesWriter` (else
-    /// Apple's), and the sources agreed to, which are the only ones an outside writer may use.
+    /// Apple's), the sources agreed to, which are the only ones an outside writer may use, and your name.
     var runSettings: RunSettings {
         RunSettings(transcriber: transcriber, tidy: tidyLines, preferredWriter: minutesWriter.map(MeetingWriter.outside) ?? .apple,
-                    agreed: sources.filter(\.agreed))
+                    agreed: sources.filter(\.agreed), name: userName)
     }
 
     /// Recorded time as the timer shows it: `mm:ss` under an hour, then `h:mm:ss`.

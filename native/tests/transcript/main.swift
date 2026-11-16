@@ -1406,5 +1406,30 @@ do { try savePrint(usable, at: lVoice, lockWait: 0.3) } catch { linkRefused = tr
 check(linkRefused && !exists(elsewhere) && contents(lVoice) == beforeLink, "lock: a link at the lock's path is not followed: the save fails and changes nothing")
 try? FileManager.default.removeItem(at: lockFolder)
 
+// --- --me-name NAME: the label Me becomes the user's name, and nothing else changes (Task 11B) ---
+do {
+    var l = LabelledWords()
+    l.mic = said("So we should go.", from: 0) + said("Fine.", from: 6)
+    l.micLabels = ["Me", "Me", "Me", "Me", "Room 1"]
+    l.call = [w(1.0, 1.2, "yeah")] + said("Later then.", from: 9)
+    l.callLabels = ["Them 1", "Unknown", "Unknown"]
+    l.log = ["a log line"]
+    let named = renameMe(l, to: "Sam")
+    check(named.micLabels == ["Sam", "Sam", "Sam", "Sam", "Room 1"] && named.callLabels == l.callLabels,
+          "renameMe: every Me is Sam, and Room 1, Them 1 and Unknown stay as they are")
+    check(named.mic.map(\.text) == l.mic.map(\.text) && named.call.map(\.text) == l.call.map(\.text) && named.log == l.log,
+          "renameMe: the words and the log are unchanged")
+    let lines = render(transcriptLines(named, plain: false))
+    check(lines.contains("Sam: So we should") && !lines.contains("Me:") && lines.contains("(Them 1: yeah)"),
+          "renameMe: the lines say Sam where they said Me, short replies too (\(lines))")
+    check(render(transcriptLines(renameMe(l, to: nil), plain: false)) == render(transcriptLines(l, plain: false))
+          && render(transcriptLines(renameMe(l, to: nil), plain: true)) == render(transcriptLines(l, plain: true)),
+          "renameMe: with no name the lines are unchanged, tidied or plain")
+    var me = LabelledWords()
+    me.call = said("Hello there.", from: 0)
+    me.callLabels = ["Me", "Me"]
+    check(renameMe(me, to: "Sam").callLabels == ["Sam", "Sam"], "renameMe: a Me on the call side is Sam too")
+}
+
 if failures > 0 { print("\(failures) failed"); exit(1) }
 print("all passed")

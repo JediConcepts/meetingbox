@@ -446,6 +446,7 @@ if [ "$(mode_of "$d/words.json")" = 600 ] && [ "$(mode_of "$e/words.json")" = 60
    && [ "$(cat "$e/transcript.txt")" = "[00:00:01] Unknown: the old transcript" ] && ! mbt_args | grep -q -- '--learn' && same "$VOICE_FILE" "$HOME/solo2.voice" && [ ! -e "$VOICE_FILE.tmp" ]; then
   pass "Transcribe again on a single recording never learns the voice, though the print is on the record; words.json is 0600, and its copy"
 else fail "Transcribe again on a single recording never learns the voice, though the print is on the record; words.json is 0600, and its copy: [$(mbt_args)] $out"; fi
+
 # process too, on the same folder: a single recording never learns, and the earlier words.json is kept again
 reset_run; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; command cp "$d/words.json" "$HOME/solo2.words2"; STAMP="2026-11-13 1500"
 engine process "$d"
@@ -455,6 +456,60 @@ if [ "$rc" -eq 0 ] && same "$d/earlier/2026-11-13 1500/words.json" "$HOME/solo2.
   pass "process of a single recording keeps the words.json it replaces too, and never learns the voice"
 else fail "process of a single recording keeps the words.json it replaces too, and never learns the voice (rc $rc): [$(mbt_args)] $out"; fi
 rm -f "$VOICE_FILE" "$INSTALLED"
+
+# --- redo --name NAME: the name reaches mb-transcript, single and two-sided; notes never re-labels (Task 11B) ---
+SAM_SENTENCE='Speaker labels: "Sam" is the person who recorded the meeting. '
+ME_SENTENCE='Speaker labels: "Me" is the person who recorded the meeting. '
+told() { printf '%s\n' "$MAP_INSTRUCTIONS" "$REDUCE_INSTRUCTIONS" "$FINAL_INSTRUCTIONS" "$OUTSIDE_INSTRUCTIONS" >> "$HOME/told.txt"; }
+reset_run; single named1; : > "$HOME/told.txt"; fm_hook() { told; }
+engine cli redo "$d" --name Sam
+if [ "$rc" -eq 0 ] && case "$(mbt_args)" in "mb-transcript --one "*" --me-name Sam"*) true ;; *) false ;; esac \
+   && [ "$(cat "$d/transcript.txt")" = "$(printf '%s' "$ONE_ME" | sed 's/^\(\[[0-9:]*\]\) Me: /\1 Sam: /')" ]; then
+  pass "redo --name Sam on a single recording passes --me-name Sam, and Transcribe again gives Sam's lines where Me was"
+else fail "redo --name Sam on a single recording passes --me-name Sam, and Transcribe again gives Sam's lines where Me was (rc $rc): [$(mbt_args)] $(cat "$d/transcript.txt") $out"; fi
+if [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt"; then
+  pass "redo --name Sam: every prompt, the outside writer's too, says \"Sam\" is the person who recorded the meeting"
+else fail "redo --name Sam: every prompt, the outside writer's too, says \"Sam\" is the person who recorded the meeting: $(head -c 300 "$HOME/told.txt")"; fi
+reset_run; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; finished nm2
+engine cli redo "$d" --name Sam
+if [ "$rc" -eq 0 ] && case "$(mbt_args)" in "mb-transcript --mic "*" --me-name Sam"*) true ;; *) false ;; esac \
+   && grep -q '] Sam: ' "$d/transcript.txt" && ! grep -q '] Me: ' "$d/transcript.txt"; then
+  pass "redo --name Sam on a two-sided meeting passes --me-name Sam, and its lines say Sam where they said Me"
+else fail "redo --name Sam on a two-sided meeting passes --me-name Sam, and its lines say Sam where they said Me (rc $rc): [$(mbt_args)] $(cat "$d/transcript.txt") $out"; fi
+# notes never re-labels: --name there is not used, the transcript stays byte for byte and the prompts say Me
+command cp "$d/transcript.txt" "$HOME/nm2.transcript"
+reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
+engine cli notes "$d" --name Sam
+if [ "$rc" -eq 0 ] && [ "$(calls mb-transcript)" = 0 ] && same "$d/transcript.txt" "$HOME/nm2.transcript" \
+   && grep -qF "$ME_SENTENCE" "$HOME/told.txt" && ! grep -qF "$SAM_SENTENCE" "$HOME/told.txt"; then
+  pass "notes never re-labels: given --name it runs no mb-transcript, keeps the transcript byte for byte, and the prompts are unchanged"
+else fail "notes never re-labels: given --name it runs no mb-transcript, keeps the transcript byte for byte, and the prompts are unchanged (rc $rc): $out"; fi
+# with no name the prompts are word for word as before
+reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
+engine cli notes "$d"
+if [ "$rc" -eq 0 ] && [ "$(grep -cF "$ME_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$SAM_SENTENCE" "$HOME/told.txt"; then
+  pass "with no --name, every prompt still says \"Me\" is the person who recorded the meeting"
+else fail "with no --name, every prompt still says \"Me\" is the person who recorded the meeting: $out"; fi
+fm_hook() { :; }
+
+# --- parse_args --name: a name by the rule, trimmed; anything else, or a label, is refused ---
+named_ok=1
+for n in Sam 'Sam O'\''Neil' 'Anne-Marie' '  Sam  ' 'Zoë' 'Søren Ørsted' 'Sam’s' "$(printf 'a%.0s' $(seq 1 40))"; do
+  got="$( (parse_args redo "$HOME/x" --name "$n"; printf '%s' "$ME_NAME") 2>&1 )" || { named_ok=0; echo "  refused: [$n] $got"; continue; }
+  trimmed="$(printf '%s' "$n" | sed 's/^ *//; s/ *$//')"
+  [ "$got" = "$trimmed" ] || { named_ok=0; echo "  [$n] gave [$got]"; }
+done
+[ "$named_ok" = 1 ] && pass "parse_args --name takes a name of letters (any script), spaces, hyphens and apostrophes, trimmed, up to 40" \
+  || fail "parse_args --name takes a name of letters (any script), spaces, hyphens and apostrophes, trimmed, up to 40"
+refused_ok=1
+for n in '' '   ' 'Sam1' '-Sam' "'Sam" 'Sam!' 'Sam/Jo' "$(printf 'a%.0s' $(seq 1 41))" 'Me' 'me' 'THEM' 'Unknown' 'Room 1' 'room 12' 'Them 2' 'Speaker 3' ' Me '; do
+  got="$( (parse_args redo "$HOME/x" --name "$n") 2>&1 )" && { refused_ok=0; echo "  accepted: [$n]"; continue; }
+  case "$got" in *"--name takes a name of letters, spaces, hyphens and apostrophes, up to 40 characters"*) ;; *) refused_ok=0; echo "  [$n]: $got" ;; esac
+done
+got="$( (parse_args redo "$HOME/x" --name) 2>&1 )" && refused_ok=0
+case "$got" in *"--name takes a name of letters, spaces, hyphens and apostrophes, up to 40 characters"*) ;; *) refused_ok=0 ;; esac
+[ "$refused_ok" = 1 ] && pass "parse_args refuses a name that breaks the rule, a label such as Me, Them 2 or Speaker 3, or none, with the message" \
+  || fail "parse_args refuses a name that breaks the rule, a label such as Me, Them 2 or Speaker 3, or none, with the message"
 
 # ======================================================================== failures change nothing
 

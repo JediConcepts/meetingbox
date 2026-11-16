@@ -406,7 +406,7 @@ struct SourceSheet: View {
     }
 }
 
-/// "Transcripts": the transcriber, tidying, and the user's voice, between the minutes toggles and the
+/// "Transcripts": the transcriber, tidying, your name in place of Me, and the user's voice, between the minutes toggles and the
 /// microphone. The words and the rules are `PreferencesPresentation`'s.
 struct TranscriptsSection: View {
     @ObservedObject var app: AppModel
@@ -428,6 +428,10 @@ struct TranscriptsSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Toggle(PreferencesPresentation.tidyTitle, isOn: Binding(get: { app.preferences.tidyLines }, set: { app.setTidyLines($0) }))
+            TextField(PreferencesPresentation.yourNameLabel, text: Binding(get: { app.userNameText }, set: { app.setUserName($0) }))
+            if let problem = app.userNameProblem {
+                Text(problem).foregroundStyle(.red)
+            }
             if !app.voiceStatus.isEmpty {
                 Text(app.voiceStatus)
                     .fixedSize(horizontal: false, vertical: true)

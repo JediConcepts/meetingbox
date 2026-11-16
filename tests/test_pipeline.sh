@@ -998,6 +998,30 @@ n_tidy="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/long.words.json" --call "$HOME/tid
 if [ "$n_plain" = 2 ] && [ "$n_tidy" = 2 ]; then pass "mb-transcript caps word ends at 1.2 s with --plain and without"
 else fail "mb-transcript caps word ends at 1.2 s with --plain and without (plain $n_plain lines, tidy $n_tidy)"; fi
 
+# --- mb-transcript --me-name NAME: Sam where Me would be, the other labels as they are (Task 11B) ---
+named="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" --me-name Sam 2>&1)"
+if [ "$named" = "[00:00:00] Sam: So we should (Them: yeah) go to the park." ]; then
+  pass "mb-transcript --me-name Sam says Sam where it said Me, and Them stays"
+else fail "mb-transcript --me-name Sam says Sam where it said Me, and Them stays: $named"; fi
+named="$("$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" --plain --me-name 'Sam O'\''Neil' 2>&1)"
+if [ "$named" = "$(printf '[00:00:00] Sam O'\''Neil: So um we should\n[00:00:01] Them: yeah\n[00:00:01] Sam O'\''Neil: go to the park.')" ]; then
+  pass "mb-transcript --me-name with --plain names every line that was Me"
+else fail "mb-transcript --me-name with --plain names every line that was Me: $named"; fi
+"$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" > "$HOME/tidy/before.txt" 2>&1
+if [ "$(cat "$HOME/tidy/before.txt")" = "$tidied" ]; then pass "mb-transcript with no --me-name is unchanged, byte for byte"
+else fail "mb-transcript with no --me-name is unchanged, byte for byte: $(cat "$HOME/tidy/before.txt")"; fi
+printf '%s' '{"engine": "parakeet-ultra", "words": [{"start": 0.0, "end": 0.3, "text": "Hello.", "confidence": 0.9}]}' > "$HOME/tidy/one.words.json"
+named="$("$TRANSCRIPT_BIN" --one "$HOME/tidy/one.words.json" --me-name Sam 2>/dev/null)"
+if [ "$named" = "[00:00:00] Unknown: Hello." ]; then pass "mb-transcript --one takes --me-name, and Unknown stays Unknown"
+else fail "mb-transcript --one takes --me-name, and Unknown stays Unknown: $named"; fi
+printf 'x' > "$HOME/tidy/sample.json"
+"$TRANSCRIPT_BIN" --voice-sample "$HOME/tidy/sample.json" --voice "$HOME/tidy/voice.json" --me-name Sam > /dev/null 2>&1; rc=$?
+if [ "$rc" = 1 ] && [ ! -e "$HOME/tidy/voice.json" ]; then pass "mb-transcript --voice-sample refuses --me-name: exit 1, nothing written"
+else fail "mb-transcript --voice-sample refuses --me-name: exit 1, nothing written (rc $rc)"; fi
+"$TRANSCRIPT_BIN" --mic "$HOME/tidy/mic.words.json" --call "$HOME/tidy/call.words.json" --me-name > /dev/null 2>&1; rc=$?
+if [ "$rc" = 1 ]; then pass "mb-transcript --me-name with no name exits 1"
+else fail "mb-transcript --me-name with no name exits 1 (rc $rc)"; fi
+
 # --- the engine passes --plain only when tidying is off: a flag, else the app's preference ---
 # A stand-in mb-transcript that logs its arguments, then runs the real one.
 REAL_TRANSCRIPT_BIN="$TRANSCRIPT_BIN"
@@ -1393,6 +1417,45 @@ if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Me: Speaking 
 [00:00:04] Them: Parakeet heard them too." ] && ! printf '%s' "$out" | grep -q -- '--people'; then
   pass "a two-sided meeting whose finder found nobody is Me and Them, word for word as before"
 else fail "a two-sided meeting whose finder found nobody is Me and Them, word for word as before (rc $rc): $out"; fi
+
+# --- process --name NAME: the name reaches mb-transcript, two-sided and single, and the prompts (Task 11B) ---
+ME_SENTENCE='Speaker labels: "Me" is the person who recorded the meeting. '
+SAM_SENTENCE='Speaker labels: "Sam" is the person who recorded the meeting. '
+one_reset; one_meeting named1; one_print; : > "$HOME/fm-input.txt"; : > "$HOME/fm-instr-named.txt"
+# fm as above, also keeping the instructions of each minutes call
+fm_told() {
+  case "$1" in
+    count-tokens) cat >/dev/null; echo 100 ;;
+    respond) case " $* " in
+               *" --schema "*) cat >/dev/null; echo '{"summary": "the brief"}' ;;
+               *) printf '%s\n' "${3:-}" >> "$HOME/fm-instr-named.txt"; cat >> "$HOME/fm-input.txt"; echo "the minutes" ;;
+             esac ;;
+    schema) echo '{}' ;;
+    *) return 1 ;;
+  esac
+}
+out="$( (fm() { fm_told "$@"; }; parse_args process "$d" --name Sam; process "$argfile") 2>&1 )"; rc=$?
+args="$(mbt_line)"
+if [ "$rc" -eq 0 ] && case "$args" in "mb-transcript --one "*" --me-name Sam"|"mb-transcript --one "*" --me-name Sam "*) true ;; *) false ;; esac \
+   && [ "$(cat "$d/transcript.txt")" = "$(printf '%s' "$ONE_ME" | sed 's/^\(\[[0-9:]*\]\) Me: /\1 Sam: /')" ] && grep -q '^Sam: Right, so the plan' "$HOME/fm-input.txt"; then
+  pass "process --name Sam of a single recording passes --me-name Sam, and the lines and the minutes' input say Sam"
+else fail "process --name Sam of a single recording passes --me-name Sam, and the lines and the minutes' input say Sam (rc $rc): [$args] $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+if grep -qF "$SAM_SENTENCE" "$HOME/fm-instr-named.txt" && ! grep -qF "$ME_SENTENCE" "$HOME/fm-instr-named.txt"; then
+  pass "with --name Sam, Apple's model is told \"Sam\" is the person who recorded the meeting"
+else fail "with --name Sam, Apple's model is told \"Sam\" is the person who recorded the meeting: $(head -c 300 "$HOME/fm-instr-named.txt")"; fi
+one_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+d="$(meeting named2 audio.m4a mic.m4a call.m4a)"
+out="$( (parse_args process "$d/audio.m4a" --name 'Sam O'\''Neil'; process "$argfile") 2>&1 )"; rc=$?
+args="$(mbt_line)"
+if [ "$rc" -eq 0 ] && case "$args" in "mb-transcript --mic "*" --me-name Sam O'Neil"*) true ;; *) false ;; esac \
+   && [ "$(cat "$d/transcript.txt")" = "$(printf '%s' "$TWO_LABELLED" | sed "s/^\(\[[0-9:]*\]\) Me: /\1 Sam O'Neil: /")" ]; then
+  pass "process --name of a two-sided meeting passes --me-name, and only the Me lines change"
+else fail "process --name of a two-sided meeting passes --me-name, and only the Me lines change (rc $rc): [$args] $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+one_reset; d="$(meeting named3 audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && ! mbt_line | grep -q -- '--me-name'; then pass "with no --name, mb-transcript gets no --me-name"
+else fail "with no --name, mb-transcript gets no --me-name (rc $rc): $(mbt_line)"; fi
+one_reset
 
 # --- --people: 1 to 6, refused otherwise; on a single recording it reaches the finder and mb-transcript ---
 got="$( (PEOPLE_COUNT=""; ENGINE=auto; TIDY=auto; WRITER=""; parse_args redo X --native --people 4 --no-tidy --writer apple

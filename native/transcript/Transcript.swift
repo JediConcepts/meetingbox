@@ -879,6 +879,17 @@ func labelWords(mic micIn: [Word], call callIn: [Word], micSpeakers: SideSpeaker
     return result
 }
 
+/// `mb-transcript --me-name NAME`: every word labelled Me is labelled NAME instead, on either side, after the
+/// labels are worked out, so the voice-print rules and every other label stay as they are. With no name,
+/// the words come back unchanged.
+func renameMe(_ labelled: LabelledWords, to name: String?) -> LabelledWords {
+    guard let name = name else { return labelled }
+    var renamed = labelled
+    renamed.micLabels = labelled.micLabels.map { $0 == "Me" ? name : $0 }
+    renamed.callLabels = labelled.callLabels.map { $0 == "Me" ? name : $0 }
+    return renamed
+}
+
 /// The transcript's lines from labelled words: joinLines over one stream per label, or with tidying off
 /// (`plain`), mergeTurns over the same streams, so a line starts at every change of label. Labels come
 /// in the order they are first used, the microphone side's first.

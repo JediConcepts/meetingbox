@@ -287,6 +287,17 @@ replaces in `earlier/`. A recording kept as one file never teaches meetingbox yo
 voice. Transcribe again asks for the number of people in the recording, you
 included, or works it out; on the command line that is `--people N`, 1 to 6.
 
+### Your name in place of Me
+
+Put your name in Preferences, under Your name, and the lines the voice print says
+are yours carry it instead of "Me", in the transcript and in the minutes. Empty, the
+default, keeps "Me". A name is letters (any script), spaces, hyphens and
+apostrophes, up to 40 characters, starting with a letter, and it cannot be one of
+the labels: Me, Them, Unknown, Room N, Them N or Speaker N. On the command line
+that is `--name NAME`, for `process` and `redo`. Transcripts already written keep
+"Me" until you transcribe them again; Redo minutes (`notes`) never changes a
+transcript's labels. Nothing about the voice print changes.
+
 ## How it captures both sides without a virtual audio driver
 
 This is the part that normally defeats people. A meeting has two sides, and macOS

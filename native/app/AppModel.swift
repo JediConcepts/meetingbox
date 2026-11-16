@@ -86,6 +86,7 @@ final class AppModel: ObservableObject {
         self.sampler = sampler
         self.stateDir = stateDir
         self.preferences = preferences
+        self.userNameText = preferences.userName ?? ""
         // The other folders recordings were started in are read from the setting each time they are looked in.
         let store = MeetingStore(root: preferences.meetingsFolder, otherRoots: { [preferences] in
             preferences.otherRoots.map { URL(fileURLWithPath: $0, isDirectory: true) }
@@ -455,6 +456,17 @@ final class AppModel: ObservableObject {
     func setTidyLines(_ on: Bool) {
         objectWillChange.send()
         preferences.tidyLines = on
+    }
+
+    /// The Your name field as typed, and the message for a name the rule refuses (which is not saved).
+    @Published private(set) var userNameText: String = ""
+    @Published private(set) var userNameProblem: String?
+
+    /// The Your name field: a name the rule takes is saved (empty is Me again); one it refuses stays in
+    /// the field with its message, and the name saved before is kept.
+    func setUserName(_ text: String) {
+        userNameText = text
+        userNameProblem = preferences.setUserName(text)
     }
 
     /// "Parakeet is not set up, …" while Parakeet is chosen and the engine says it cannot be used.

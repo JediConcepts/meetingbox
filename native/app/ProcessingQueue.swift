@@ -63,6 +63,8 @@ struct RunSettings: Equatable {
     var tidy: Bool
     var preferredWriter: MeetingWriter
     var agreed: [Source]
+    /// Your name in place of Me, passed as `--name` to process and redo; nil is Me.
+    var name: String? = nil
 
     static let defaults = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
 
@@ -117,21 +119,23 @@ final class ScriptRunner: PipelineRunner {
     /// - minutes: `notes <dir> <writer>`;
     /// - transcribe: `redo <dir> --parakeet|--native [--room N] [--call N] [--people N] --tidy|--no-tidy <writer>`,
     ///   where `--people` is the count of a recording kept as one file (`recording`).
+    /// Process and redo take `--name NAME` before `<writer>` when your name is set; notes never does.
     static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, recording: Int? = nil,
-                          tidy: Bool, writer: OutsideWriter?) -> [String] {
+                          tidy: Bool, writer: OutsideWriter?, name: String? = nil) -> [String] {
         let engine = transcriber == .parakeet ? "--parakeet" : "--native"
         let lines = tidy ? "--tidy" : "--no-tidy"
         let writes = writer.map { ["--writer", "outside", "--kind", $0.kind.rawValue, "--address", $0.address, "--writer-model", $0.model] }
             ?? ["--writer", "apple"]
+        let named = name.map { $0.isEmpty ? [] : ["--name", $0] } ?? []
         switch kind {
         case .process:
-            return ["process", folder.appendingPathComponent("audio.m4a").path, engine, lines] + writes
+            return ["process", folder.appendingPathComponent("audio.m4a").path, engine, lines] + named + writes
         case .minutes:
             return ["notes", folder.path] + writes
         case .transcribe:
             let counts = (room.map { ["--room", String($0)] } ?? []) + (call.map { ["--call", String($0)] } ?? [])
                 + (recording.map { ["--people", String($0)] } ?? [])
-            return ["redo", folder.path, engine] + counts + [lines] + writes
+            return ["redo", folder.path, engine] + counts + [lines] + named + writes
         }
     }
 
@@ -993,7 +997,7 @@ final class ProcessingQueue {
         let arguments = ScriptRunner.arguments(kind: kind, folder: dir, transcriber: own?.jobTranscriber ?? settings.transcriber,
                                                room: sides ? own?.people.room : nil, call: sides ? own?.people.call : nil,
                                                recording: sides ? nil : own?.people.recording, tidy: own?.jobTidy ?? settings.tidy,
-                                               writer: writer.use)
+                                               writer: writer.use, name: settings.name)
         _ = runner.run(PipelineJob(kind: kind, folder: dir, arguments: arguments), progress: progress, attempt: attempt) { [weak self] status, line in
             self?.onQueue { self?.ended(mine, dir, status, line) }
         }

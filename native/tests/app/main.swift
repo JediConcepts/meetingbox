@@ -10087,6 +10087,63 @@ MainActor.assumeIsolated {
           "T11A words: People in the recording, Work it out or 1 to 6")
 }
 
+// Your name (Task 11B): the rule, the messages, the stored value, and --name on process and redo jobs only.
+do {
+    let invalid = "Use letters, spaces, hyphens and apostrophes, up to 40 characters."
+    let reserved = "That name is used as a label. Choose another."
+    check(PreferencesPresentation.yourNameLabel == "Your name" && PreferencesPresentation.nameInvalid == invalid
+          && PreferencesPresentation.nameReserved == reserved, "T11B words: Your name, and the two refusals, word for word")
+    let fine = ["Sam", "Sam O'Neil", "Anne-Marie", "  Sam  ", "Zoë", "Søren Ørsted", "Sam’s", String(repeating: "a", count: 40)]
+    check(fine.allSatisfy { Preferences.nameProblem($0) == nil }, "T11B rule: letters of any script, spaces, hyphens and apostrophes, trimmed, up to 40")
+    let broken = ["Sam1", "-Sam", "'Sam", "Sam!", "Sam/Jo", String(repeating: "a", count: 41), "Sam\nJo"]
+    check(broken.allSatisfy { Preferences.nameProblem($0) == invalid }, "T11B rule: anything else is refused with the letters message")
+    let labels = ["Me", "me", "THEM", "Unknown", "Room 1", "room 12", "Them 2", "Speaker 3", " Me "]
+    check(labels.allSatisfy { Preferences.nameProblem($0) == reserved }, "T11B rule: Me, Them, Unknown, Room N, Them N and Speaker N, in any case, are labels")
+
+    let d = testDefaults()
+    let p = Preferences(defaults: d, home: URL(fileURLWithPath: "/Users/someone", isDirectory: true))
+    check(p.userName == nil && p.runSettings.name == nil && d.object(forKey: "userName") == nil, "T11B Preferences: no name by default, so Me")
+    check(p.setUserName("  Sam  ") == nil && p.userName == "Sam" && d.string(forKey: "userName") == "Sam" && p.runSettings.name == "Sam",
+          "T11B Preferences: a valid name is saved trimmed, under userName, and runs carry it")
+    check(p.setUserName("Them") == reserved && p.setUserName("Sam2") == invalid && d.string(forKey: "userName") == "Sam",
+          "T11B Preferences: a label or a broken name is refused with its message and not saved")
+    check(p.setUserName("   ") == nil && p.userName == nil && d.object(forKey: "userName") == nil, "T11B Preferences: an empty name removes it, so Me again")
+    d.set("Room 2", forKey: "userName")
+    check(p.userName == nil, "T11B Preferences: a stored name that breaks the rule, set by hand, counts as none")
+
+    let dir = URL(fileURLWithPath: "/Users/someone/Meetings/2026-11-16 0900 Named", isDirectory: true)
+    func args(_ kind: JobKind, _ name: String?) -> [String] {
+        ScriptRunner.arguments(kind: kind, folder: dir, transcriber: .parakeet, room: 2, call: nil, tidy: true, writer: nil, name: name)
+    }
+    check(args(.process, "Sam") == ["process", dir.appendingPathComponent("audio.m4a").path, "--parakeet", "--tidy", "--name", "Sam", "--writer", "apple"],
+          "T11B arguments: process carries --name Sam")
+    check(args(.transcribe, "Sam O'Neil") == ["redo", dir.path, "--parakeet", "--room", "2", "--tidy", "--name", "Sam O'Neil", "--writer", "apple"],
+          "T11B arguments: redo carries --name as one argument")
+    check(args(.minutes, "Sam") == ["notes", dir.path, "--writer", "apple"], "T11B arguments: notes never carries --name")
+    check(args(.process, nil) == ["process", dir.appendingPathComponent("audio.m4a").path, "--parakeet", "--tidy", "--writer", "apple"]
+          && args(.transcribe, nil) == ["redo", dir.path, "--parakeet", "--room", "2", "--tidy", "--writer", "apple"],
+          "T11B arguments: with no name set, no --name")
+    check(!args(.process, "").contains("--name"), "T11B arguments: an empty name is no name")
+}
+MainActor.assumeIsolated {
+    let invalid = PreferencesPresentation.nameInvalid, reserved = PreferencesPresentation.nameReserved
+    let state = shortTemp()
+    let root = freshRoot()
+    let prefs = Preferences(defaults: testDefaults(), home: root)
+    let model = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: FakeRunner(), freeBytes: { _ in 50 * GB },
+                         engine: FakeEngine(), sampler: FakeSampler())
+    check(model.userNameText == "" && model.userNameProblem == nil, "T11B app: the field starts empty, with no message")
+    model.setUserName("Sam")
+    check(prefs.userName == "Sam" && model.userNameText == "Sam" && model.userNameProblem == nil, "T11B app: the field saves a valid name")
+    model.setUserName("Speaker 1")
+    check(prefs.userName == "Sam" && model.userNameText == "Speaker 1" && model.userNameProblem == reserved,
+          "T11B app: a label stays in the field with its message, and is not saved")
+    model.setUserName("Sam#")
+    check(prefs.userName == "Sam" && model.userNameProblem == invalid, "T11B app: a broken name shows the letters message, and is not saved")
+    model.setUserName("")
+    check(prefs.userName == nil && model.userNameProblem == nil, "T11B app: clearing the field goes back to Me")
+}
+
 try? fm.removeItem(at: scratch)
 if failures > 0 {
     print("\(failures) failure(s)")
