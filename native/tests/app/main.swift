@@ -10119,7 +10119,8 @@ do {
           "T11B arguments: process carries --name Sam")
     check(args(.transcribe, "Sam O'Neil") == ["redo", dir.path, "--parakeet", "--room", "2", "--tidy", "--name", "Sam O'Neil", "--writer", "apple"],
           "T11B arguments: redo carries --name as one argument")
-    check(args(.minutes, "Sam") == ["notes", dir.path, "--writer", "apple"], "T11B arguments: notes never carries --name")
+    check(args(.minutes, "Sam") == ["notes", dir.path, "--name", "Sam", "--writer", "apple"]
+          && args(.minutes, nil) == ["notes", dir.path, "--writer", "apple"], "T11B arguments: notes carries --name only when a name is set")
     check(args(.process, nil) == ["process", dir.appendingPathComponent("audio.m4a").path, "--parakeet", "--tidy", "--writer", "apple"]
           && args(.transcribe, nil) == ["redo", dir.path, "--parakeet", "--room", "2", "--tidy", "--writer", "apple"],
           "T11B arguments: with no name set, no --name")
@@ -10133,15 +10134,22 @@ MainActor.assumeIsolated {
     let model = AppModel(stateDir: state, preferences: prefs, recorder: FakeRecorder(), runner: FakeRunner(), freeBytes: { _ in 50 * GB },
                          engine: FakeEngine(), sampler: FakeSampler())
     check(model.userNameText == "" && model.userNameProblem == nil, "T11B app: the field starts empty, with no message")
-    model.setUserName("Sam")
-    check(prefs.userName == "Sam" && model.userNameText == "Sam" && model.userNameProblem == nil, "T11B app: the field saves a valid name")
-    model.setUserName("Speaker 1")
-    check(prefs.userName == "Sam" && model.userNameText == "Speaker 1" && model.userNameProblem == reserved,
-          "T11B app: a label stays in the field with its message, and is not saved")
-    model.setUserName("Sam#")
-    check(prefs.userName == "Sam" && model.userNameProblem == invalid, "T11B app: a broken name shows the letters message, and is not saved")
-    model.setUserName("")
-    check(prefs.userName == nil && model.userNameProblem == nil, "T11B app: clearing the field goes back to Me")
+    model.editUserName("S"); model.editUserName("Sa"); model.editUserName("Sam")
+    check(prefs.userName == nil && model.userNameText == "Sam" && model.userNameProblem == nil, "T11B app: typing saves nothing")
+    model.commitUserName()
+    check(prefs.userName == "Sam" && model.userNameProblem == nil, "T11B app: committing (Return or leaving the field) saves a valid name")
+    for typed in ["T", "Th", "The", "Them"] { model.editUserName(typed) }
+    check(prefs.userName == "Sam" && model.userNameProblem == nil, "T11B app: typing Them saves no prefix such as The")
+    model.commitUserName()
+    check(prefs.userName == "Sam" && model.userNameText == "Them" && model.userNameProblem == reserved,
+          "T11B app: committing Them keeps the earlier name, Sam, and shows the label message")
+    model.editUserName("Sam#")
+    check(model.userNameProblem == nil, "T11B app: editing again clears the message until the next commit")
+    model.commitUserName()
+    check(prefs.userName == "Sam" && model.userNameProblem == invalid, "T11B app: committing a broken name shows the letters message, and is not saved")
+    model.editUserName("")
+    model.commitUserName()
+    check(prefs.userName == nil && model.userNameProblem == nil, "T11B app: committing an empty field goes back to Me")
 }
 
 try? fm.removeItem(at: scratch)

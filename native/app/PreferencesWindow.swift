@@ -428,7 +428,9 @@ struct TranscriptsSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Toggle(PreferencesPresentation.tidyTitle, isOn: Binding(get: { app.preferences.tidyLines }, set: { app.setTidyLines($0) }))
-            TextField(PreferencesPresentation.yourNameLabel, text: Binding(get: { app.userNameText }, set: { app.setUserName($0) }))
+            // Saved only on commit: Return, or the field losing focus (the end of editing).
+            TextField(PreferencesPresentation.yourNameLabel, text: Binding(get: { app.userNameText }, set: { app.editUserName($0) }),
+                      onEditingChanged: { editing in if !editing { app.commitUserName() } }, onCommit: { app.commitUserName() })
             if let problem = app.userNameProblem {
                 Text(problem).foregroundStyle(.red)
             }

@@ -294,9 +294,11 @@ are yours carry it instead of "Me", in the transcript and in the minutes. Empty,
 default, keeps "Me". A name is letters (any script), spaces, hyphens and
 apostrophes, up to 40 characters, starting with a letter, and it cannot be one of
 the labels: Me, Them, Unknown, Room N, Them N or Speaker N. On the command line
-that is `--name NAME`, for `process` and `redo`. Transcripts already written keep
-"Me" until you transcribe them again; Redo minutes (`notes`) never changes a
-transcript's labels. Nothing about the voice print changes.
+that is `--name NAME`, for `process` and `redo`. The name is saved when you press
+Return or leave the field. Transcripts already written keep "Me" until you
+transcribe them again. Redo minutes (`notes`) also takes `--name`, so the minutes
+name you as the person who recorded, but it never changes a transcript's labels.
+Nothing about the voice print changes.
 
 ## How it captures both sides without a virtual audio driver
 

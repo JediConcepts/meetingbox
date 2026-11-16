@@ -33,7 +33,7 @@ TIDY="auto"                              # auto | 1 | 0: tidy transcript lines; 
 ROOM_COUNT=""                            # people in the room, 1 to 6; empty works it out
 CALL_COUNT=""                            # people on the other end of the call, 1 to 6; empty works it out
 PEOPLE_COUNT=""                          # people in a recording kept as one file, you included, 1 to 6; empty works it out
-ME_NAME=""                               # your name in place of Me, for process and redo; empty is Me
+ME_NAME=""                               # your name in place of Me, for process, redo and notes; empty is Me
 WRITER="apple"                           # who writes the minutes: apple, or outside (only from --writer, per run)
 OUTSIDE_KIND=""                          # the outside source's kind, claude or standard (--kind)
 OUTSIDE_ADDRESS=""                       # its address, as entered (--address)
@@ -4184,8 +4184,9 @@ Options
                          for redo; without them it works them out
   --people N             people in a recording kept as one file (you included), 1 to 6,
                          for process and redo; without it the number is worked out
-  --name NAME            your name, in place of Me in the transcript and the minutes,
-                         for process and redo: letters, spaces, hyphens and apostrophes
+  --name NAME            your name, in place of Me in the transcript and the minutes, for
+                         process and redo; notes uses it in the minutes only: letters,
+                         spaces, hyphens and apostrophes
   --model <path>         whisper ggml model            (MB_WHISPER_MODEL)
   --no-keep-audio        bin the m4a files once processed (notes and redo never do)
   --writer apple         Apple's model writes the minutes, on this Mac (the default)
@@ -4283,11 +4284,12 @@ parse_args() {
   if [ "$WRITER" = outside ] && { [ -z "$OUTSIDE_KIND" ] || [ -z "$OUTSIDE_ADDRESS" ] || [ -z "$OUTSIDE_MODEL" ]; }; then
     die "--writer outside takes --kind, --address and --writer-model"
   fi
-  # Your name is for the commands that transcribe: notes never re-labels a transcript, so its prompts keep Me.
+  # Your name: process and redo pass it to mb-transcript and name you in the prompts; notes names you in
+  # the prompts only, and never re-labels a transcript (it runs no mb-transcript).
   if [ -n "$ME_NAME" ]; then
     case "$cmd" in
-      process|redo) name_the_recorder "$ME_NAME" ;;
-      *) info "--name is for process and redo, so it is not used for $cmd"; ME_NAME="" ;;
+      process|redo|notes) name_the_recorder "$ME_NAME" ;;
+      *) info "--name is for process, redo and notes, so it is not used for $cmd"; ME_NAME="" ;;
     esac
   fi
 }

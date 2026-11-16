@@ -63,7 +63,7 @@ struct RunSettings: Equatable {
     var tidy: Bool
     var preferredWriter: MeetingWriter
     var agreed: [Source]
-    /// Your name in place of Me, passed as `--name` to process and redo; nil is Me.
+    /// Your name in place of Me, passed as `--name` to every job; nil is Me.
     var name: String? = nil
 
     static let defaults = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
@@ -119,7 +119,8 @@ final class ScriptRunner: PipelineRunner {
     /// - minutes: `notes <dir> <writer>`;
     /// - transcribe: `redo <dir> --parakeet|--native [--room N] [--call N] [--people N] --tidy|--no-tidy <writer>`,
     ///   where `--people` is the count of a recording kept as one file (`recording`).
-    /// Process and redo take `--name NAME` before `<writer>` when your name is set; notes never does.
+    /// Every kind takes `--name NAME` before `<writer>` when your name is set: process and redo label your
+    /// lines with it, and notes names you in the minutes' prompts only.
     static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, recording: Int? = nil,
                           tidy: Bool, writer: OutsideWriter?, name: String? = nil) -> [String] {
         let engine = transcriber == .parakeet ? "--parakeet" : "--native"
@@ -131,7 +132,7 @@ final class ScriptRunner: PipelineRunner {
         case .process:
             return ["process", folder.appendingPathComponent("audio.m4a").path, engine, lines] + named + writes
         case .minutes:
-            return ["notes", folder.path] + writes
+            return ["notes", folder.path] + named + writes
         case .transcribe:
             let counts = (room.map { ["--room", String($0)] } ?? []) + (call.map { ["--call", String($0)] } ?? [])
                 + (recording.map { ["--people", String($0)] } ?? [])

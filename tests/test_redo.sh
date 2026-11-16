@@ -476,14 +476,16 @@ if [ "$rc" -eq 0 ] && case "$(mbt_args)" in "mb-transcript --mic "*" --me-name S
    && grep -q '] Sam: ' "$d/transcript.txt" && ! grep -q '] Me: ' "$d/transcript.txt"; then
   pass "redo --name Sam on a two-sided meeting passes --me-name Sam, and its lines say Sam where they said Me"
 else fail "redo --name Sam on a two-sided meeting passes --me-name Sam, and its lines say Sam where they said Me (rc $rc): [$(mbt_args)] $(cat "$d/transcript.txt") $out"; fi
-# notes never re-labels: --name there is not used, the transcript stays byte for byte and the prompts say Me
+# notes uses the name in its prompts but never re-labels: no mb-transcript, and the transcript byte for byte,
+# here one that still says Me
+printf '[00:00:01] Me: an older transcript\n[00:00:04] Them: still labelled Me\n' > "$d/transcript.txt"
 command cp "$d/transcript.txt" "$HOME/nm2.transcript"
 reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
 engine cli notes "$d" --name Sam
 if [ "$rc" -eq 0 ] && [ "$(calls mb-transcript)" = 0 ] && same "$d/transcript.txt" "$HOME/nm2.transcript" \
-   && grep -qF "$ME_SENTENCE" "$HOME/told.txt" && ! grep -qF "$SAM_SENTENCE" "$HOME/told.txt"; then
-  pass "notes never re-labels: given --name it runs no mb-transcript, keeps the transcript byte for byte, and the prompts are unchanged"
-else fail "notes never re-labels: given --name it runs no mb-transcript, keeps the transcript byte for byte, and the prompts are unchanged (rc $rc): $out"; fi
+   && [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt"; then
+  pass "notes --name Sam says \"Sam\" recorded the meeting in every prompt, runs no mb-transcript and keeps the transcript byte for byte"
+else fail "notes --name Sam says \"Sam\" recorded the meeting in every prompt, runs no mb-transcript and keeps the transcript byte for byte (rc $rc): $out"; fi
 # with no name the prompts are word for word as before
 reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
 engine cli notes "$d"

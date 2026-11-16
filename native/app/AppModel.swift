@@ -462,11 +462,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var userNameText: String = ""
     @Published private(set) var userNameProblem: String?
 
-    /// The Your name field: a name the rule takes is saved (empty is Me again); one it refuses stays in
-    /// the field with its message, and the name saved before is kept.
-    func setUserName(_ text: String) {
+    /// Typing in the Your name field: nothing is saved, and any message goes until the next commit.
+    func editUserName(_ text: String) {
         userNameText = text
-        userNameProblem = preferences.setUserName(text)
+        userNameProblem = nil
+    }
+
+    /// Return in the Your name field, or leaving it: a name the rule takes is saved (empty is Me again); one
+    /// it refuses stays in the field with its message, and the name saved before editing began is kept.
+    func commitUserName() {
+        userNameProblem = preferences.setUserName(userNameText)
     }
 
     /// "Parakeet is not set up, …" while Parakeet is chosen and the engine says it cannot be used.
