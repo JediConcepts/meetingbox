@@ -7,8 +7,8 @@
 // Warnings go to stderr with an "mb-transcript: " prefix; the meeting's log lines go there without one.
 //
 // mb-transcript --one FILE [--one-speakers FILE] [--one-count N] [--voice FILE] [--plain]
-// prints the transcript of a recording kept as one file, in the same timed lines, labelled Me (a speaker
-// the voice print matches), Speaker 1, Speaker 2 and so on (everyone else, in the order they first spoke)
+// prints the transcript of a recording kept as one file, in the same timed lines, labelled Me (by the
+// microphone side's rules: a print match with 10 s of talk), Speaker 1, Speaker 2 and so on (everyone else, in the order they first spoke)
 // or Unknown (words no speaker covers, or every word with no speakers file). --one-count 1 gives every line
 // one label. It never learns the voice, and takes none of the options for two sides or a sample.
 //
@@ -143,7 +143,8 @@ if let url = voiceURL, let state = fileState(at: url) {
 
 // A recording kept as one file: its labels and lines, and nothing learnt.
 if onePath != nil {
-    let labelled = labelOne(one, speakers: oneSpeakers, print: voice, onePerson: oneCount == 1)
+    let labelled = labelOne(one, speakers: oneSpeakers, print: voice, onePerson: oneCount == 1,
+                            counted: (oneCount ?? 0) >= 2)
     labelled.log.forEach(log)
     let turns = transcriptLines(labelled, plain: plain)
     if turns.isEmpty { fail("no speech found in the recording") }

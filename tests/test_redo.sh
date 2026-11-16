@@ -48,7 +48,9 @@ case "\$1" in
     [ -e "$HOME/pk-labelled" ] && { cp "$FIX/labelled-\$side.json" "\$4"; exit 0; }
     cp "$FIX/pk-\$side.json" "\$4" ;;
   speakers)
-    [ -e "$HOME/sp-fixture" ] && { cp "$FIX/speakers-\$side.json" "\$4"; exit 0; }
+    # a recording kept as one file (any other WAV) gets speakers-one.json, its first speaker with 30 s of talk
+    case "\$(basename "\$3")" in mic*|call*) sps=\$side ;; *) sps=one ;; esac
+    [ -e "$HOME/sp-fixture" ] && { cp "$FIX/speakers-\$sps.json" "\$4"; exit 0; }
     printf '{"model": "FluidInference/speaker-diarization-coreml@x", "segments": [], "speakers": []}\n' > "\$4" ;;
   *) exit 1 ;;
 esac

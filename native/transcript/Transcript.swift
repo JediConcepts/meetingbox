@@ -895,36 +895,31 @@ func transcriptLines(_ labelled: LabelledWords, plain: Bool) -> [Turn] {
 
 // ====================================================================== a recording kept as one file
 
-/// Names in a recording kept as one file (`mb-transcript --one`). `print` is the usable print, or nil.
-/// A speaker the print matches (a cosine of 0.60 or more) is Me. The others that keep a word are Speaker 1,
-/// Speaker 2 and so on, numbered by their first kept word with no gaps; one that keeps none gets no number
-/// and is Unknown. With `onePerson` (a count of 1), everyone found is the same person: Me when the print
-/// matches any of them, else Speaker 1.
+/// Names in a recording kept as one file (`mb-transcript --one`), by the microphone side's own rules
+/// (`nameMic`, as for a room recording: no call, no echo): a print match of 0.60 or more with 10 s or more
+/// of talk is Me, so two such clusters are both Me; a cosine of 0.45 or more with the print that is not Me
+/// is Unknown, as is, without a count, a speaker under 5% of the kept words; the rest are numbered by
+/// their first kept word with no gaps, and are Speaker 1, Speaker 2 where a room has Room 1, Room 2; one
+/// that keeps no word is Unknown. `print` is the usable print, or nil. With `onePerson` (a count of 1),
+/// everyone found is the same person: Me when any of them is Me by those rules, else Speaker 1.
 func nameOne(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [String: Double], print: VoicePrint?,
-             onePerson: Bool) -> [String: String] {
-    func matches(_ s: SpeakerInfo) -> Bool { likeness(s, print).map { atLeast($0, Rule.printMatch) } == true }
-    var names: [String: String] = [:]
+             onePerson: Bool, counted: Bool = false) -> [String: String] {
+    let room = nameMic(speakers, keptWords: keptWords, firstWord: firstWord, echo: [], unknown: [], print: print, isCall: false,
+                       counted: counted)
     if onePerson {
-        let label = speakers.contains(where: matches) ? "Me" : "Speaker 1"
-        for s in speakers { names[s.id] = label }
-        return names
+        let label = room.values.contains("Me") ? "Me" : "Speaker 1"
+        return room.mapValues { _ in label }
     }
-    var rest: [SpeakerInfo] = []
-    for s in speakers {
-        if matches(s) { names[s.id] = "Me" } else { rest.append(s) }
-    }
-    let (numbered, unnumbered) = byFirstWord(rest, keptWords, firstWord)
-    for (k, s) in numbered.enumerated() { names[s.id] = "Speaker \(k + 1)" }
-    for s in unnumbered { names[s.id] = "Unknown" }
-    return names
+    return room.mapValues { $0.hasPrefix("Room ") ? "Speaker " + $0.dropFirst("Room ".count) : $0 }
 }
 
 /// A recording kept as one file, its words labelled (`mb-transcript --one`), as `LabelledWords` with the
 /// words in `mic` and no call side, so `transcriptLines` makes its lines as it does for two sides. Each
 /// word's candidates, its label and smoothing are as on a side (`candidates`, `resolve`, `smooth`); a word
 /// no speaker covers, whose sentence gives no label either, is Unknown. With no speakers file every word is
-/// Unknown; with `onePerson` every word takes the one person's label. Nothing here learns the voice.
-func labelOne(_ wordsIn: [Word], speakers: SideSpeakers?, print: VoicePrint?, onePerson: Bool = false) -> LabelledWords {
+/// Unknown; with `onePerson` every word takes the one person's label. `counted` (a count of 2 to 6) turns
+/// off the 5% share test, as a count does on a side. Nothing here learns the voice.
+func labelOne(_ wordsIn: [Word], speakers: SideSpeakers?, print: VoicePrint?, onePerson: Bool = false, counted: Bool = false) -> LabelledWords {
     let words = inTimeOrder(wordsIn)
     var result = LabelledWords()
     result.mic = words
@@ -936,7 +931,8 @@ func labelOne(_ wordsIn: [Word], speakers: SideSpeakers?, print: VoicePrint?, on
     let usable = usablePrint(print, model: found.model)
     let wordCandidates = candidates(words, found.segments)
     let counts = keptCounts(words, wordCandidates)
-    let names = nameOne(found.speakers, keptWords: counts.counts, firstWord: counts.first, print: usable, onePerson: onePerson)
+    let names = nameOne(found.speakers, keptWords: counts.counts, firstWord: counts.first, print: usable, onePerson: onePerson,
+                        counted: counted)
     if onePerson {
         let label = names.values.first ?? "Speaker 1"
         result.micLabels = words.map { _ in label }

@@ -560,7 +560,9 @@ case "\$1" in
       echo "mb-speech: the diariser could not run" >&2; exit 1
     fi
     [ -e "$HOME/sp-garbled-\$side" ] && { printf '{"model": "FluidInference/speaker-diarization-coreml@x", "segm' > "\$4"; exit 0; }
-    [ -e "$HOME/sp-fixture" ] && { cp "$FIX/speakers-\$side.json" "\$4"; exit 0; }
+    # a recording kept as one file (any other WAV) gets speakers-one.json, its first speaker with 30 s of talk
+    case "\$(basename "\$3")" in mic*|call*) sps=\$side ;; *) sps=one ;; esac
+    [ -e "$HOME/sp-fixture" ] && { cp "$FIX/speakers-\$sps.json" "\$4"; exit 0; }
     printf '{"model": "FluidInference/speaker-diarization-coreml@x", "segments": [], "speakers": []}\n' > "\$4" ;;
   *) exit 1 ;;
 esac
@@ -1250,21 +1252,27 @@ ONE_NO_PRINT="[00:00:00] Speaker 1: Right, so the plan for today is simple. We r
 
 # --- mb-transcript --one itself ---
 one_cli() { "$REAL_TRANSCRIPT_BIN" --one "$FIX/labelled-mic.json" "$@" 2>/dev/null; }
-got="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json")"
+got="$(one_cli --one-speakers "$FIX/speakers-one.json" --voice "$FIX/voice-old.json")"
 if [ "$got" = "$ONE_ME" ]; then pass "mb-transcript --one with a speakers file and a matching print: Me and Speaker 1 lines with their times"
 else fail "mb-transcript --one with a speakers file and a matching print: Me and Speaker 1 lines with their times: [$got]"; fi
-got="$(one_cli --one-speakers "$FIX/speakers-mic.json")"
+# speakers-mic.json's first speaker matches the print as well, but has only 9.2 s of talk: by the microphone
+# side's rules that is too short to be Me and too near the print to be anyone else, so Unknown
+got="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json")"
+if [ "$got" = "[00:00:00] Unknown: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Speaker 1: what about the budget?" ]; then pass "mb-transcript --one: a print match with under 10 s of talk is Unknown, never Me"
+else fail "mb-transcript --one: a print match with under 10 s of talk is Unknown, never Me: [$got]"; fi
+got="$(one_cli --one-speakers "$FIX/speakers-one.json")"
 if [ "$got" = "$ONE_NO_PRINT" ]; then pass "mb-transcript --one with no print: Speaker 1 and Speaker 2, in the order they first spoke"
 else fail "mb-transcript --one with no print: Speaker 1 and Speaker 2, in the order they first spoke: [$got]"; fi
 got="$(one_cli --voice "$FIX/voice-old.json")"
 if [ "$got" = "[00:00:00] Unknown: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round. what about the budget?" ]; then
   pass "mb-transcript --one with no speakers file: every line Unknown, with its time"
 else fail "mb-transcript --one with no speakers file: every line Unknown, with its time: [$got]"; fi
-got_me="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
-got_s1="$(one_cli --one-speakers "$FIX/speakers-mic.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
+got_me="$(one_cli --one-speakers "$FIX/speakers-one.json" --voice "$FIX/voice-old.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
+got_s1="$(one_cli --one-speakers "$FIX/speakers-one.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
 if [ "$got_me" = Me ] && [ "$got_s1" = "Speaker 1" ]; then pass "mb-transcript --one-count 1 gives one label: Me with a matching print, else Speaker 1"
 else fail "mb-transcript --one-count 1 gives one label: Me with a matching print, else Speaker 1: [$got_me] [$got_s1]"; fi
-got="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json" --plain)"
+got="$(one_cli --one-speakers "$FIX/speakers-one.json" --voice "$FIX/voice-old.json" --plain)"
 if [ "$got" = "[00:00:00] Me: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
 [00:00:10] Speaker 1: Um, what about the budget?" ]; then pass "mb-transcript --one --plain keeps 'Um' and starts a line at every change of label"
 else fail "mb-transcript --one --plain keeps 'Um' and starts a line at every change of label: [$got]"; fi
@@ -1346,7 +1354,12 @@ else fail "Apple's minutes read the Me and Speaker 1 lines, without their times:
 # --- process of any other recording: the same, beside it ---
 one_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
 d="$HOME/loose"; mkdir -p "$d"; printf 'mp3' > "$d/talk.mp3"
+printf '{"mine": "a words.json of my own"}\n' > "$d/words.json"; cp "$d/words.json" "$HOME/loose-own.json"
 out="$( (process "$d/talk.mp3") 2>&1 )"; rc=$?
+kept_own="$(find "$d/earlier" -name words.json 2>/dev/null)"
+if [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$kept_own" | grep -c .)" = 1 ] && cmp -s "$kept_own" "$HOME/loose-own.json"; then
+  pass "a words.json of the user's own beside a loose recording is moved into earlier/ byte for byte, never deleted"
+else fail "a words.json of the user's own beside a loose recording is moved into earlier/ byte for byte, never deleted (rc $rc): [$kept_own] $out"; fi
 if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "$ONE_NO_PRINT" ] && cmp -s "$d/words.json" "$FIX/labelled-mic.json" \
    && mbt_line | grep -q '^mb-transcript --one ' && ! mbt_line | grep -q -- '--learn' && [ -s "$d/talk.mp3" ] \
    && grep -q '^mb-speech speakers .* wav=\.stage\.[^/ ]*/\.work\.[^/ ]*/talk\.wav ' "$HOME/calls.log"; then

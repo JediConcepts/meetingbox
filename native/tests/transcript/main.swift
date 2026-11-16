@@ -996,11 +996,27 @@ check(nameOne([oneU, oneB, oneA, oneX], keptWords: oneKept, firstWord: oneFirst,
 check(nameOne([oneU, oneB, oneA, oneX], keptWords: oneKept, firstWord: oneFirst, print: nil, onePerson: false)
       == ["U": "Speaker 1", "B": "Speaker 2", "A": "Speaker 3", "X": "Unknown"],
       "nameOne: with no usable print, nobody is Me and everyone who keeps a word is numbered from Speaker 1")
-check(nameOne([sp("U", seconds: 5, vector: at(0.6)), oneB], keptWords: ["U": 3, "B": 4], firstWord: ["U": 0, "B": 10], print: usable, onePerson: false)
-      == ["U": "Me", "B": "Speaker 1"]
-      && nameOne([sp("U", seconds: 30, vector: at(0.59)), oneB], keptWords: ["U": 3, "B": 4], firstWord: ["U": 0, "B": 10], print: usable, onePerson: false)
-      == ["U": "Speaker 1", "B": "Speaker 2"],
-      "nameOne: a print match is a cosine of 0.60 or more (Rule.printMatch), short talk included; 0.59 is someone else")
+func named(_ u: SpeakerInfo) -> String? {
+    nameOne([u, oneB], keptWords: ["U": 30, "B": 30], firstWord: ["U": 0, "B": 10], print: usable, onePerson: false)["U"]
+}
+check(named(sp("U", seconds: 3, vector: at(0.62))) == "Unknown" && named(sp("U", seconds: 9, vector: at(0.62))) == "Unknown",
+      "nameOne: a print match of 0.62 with 3 s, or 9 s, of talk is Unknown, never Me (the microphone side's 10 s rule)")
+check(named(sp("U", seconds: 10, vector: at(0.62))) == "Me" && named(sp("U", seconds: 10, vector: at(0.6))) == "Me",
+      "nameOne: a print match of 0.62, or 0.60, with 10 s of talk is Me")
+check(named(sp("U", seconds: 30, vector: at(0.5))) == "Unknown" && named(sp("U", seconds: 30, vector: at(0.59))) == "Unknown"
+      && named(sp("U", seconds: 30, vector: at(0.44))) == "Speaker 1",
+      "nameOne: a cosine of 0.45 to 0.59 with the print is too near to be anyone else: Unknown; 0.44 is someone else")
+check(nameOne([sp("U", seconds: 30, vector: at(0.9)), sp("V", seconds: 12, vector: at(0.7)), oneB], keptWords: ["U": 20, "V": 10, "B": 20],
+              firstWord: ["U": 0, "V": 5, "B": 10], print: usable, onePerson: false) == ["U": "Me", "V": "Me", "B": "Speaker 1"],
+      "nameOne: two clusters that are both print matches with 10 s or more are both Me, as on the microphone side")
+check(nameOne([oneU, oneB, sp("T", seconds: 30, vector: e2)], keptWords: ["U": 60, "B": 37, "T": 3], firstWord: ["U": 0, "B": 10, "T": 20],
+              print: usable, onePerson: false) == ["U": "Me", "B": "Speaker 1", "T": "Unknown"]
+      && nameOne([oneU, oneB, sp("T", seconds: 30, vector: e2)], keptWords: ["U": 60, "B": 37, "T": 3], firstWord: ["U": 0, "B": 10, "T": 20],
+                 print: usable, onePerson: false, counted: true) == ["U": "Me", "B": "Speaker 1", "T": "Speaker 2"],
+      "nameOne: without a count, a speaker under 5% of the kept words is Unknown; a count turns that test off, as on a side")
+check(nameOne([sp("U", seconds: 5, vector: at(0.9)), oneB], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: true)
+      == ["U": "Speaker 1", "B": "Speaker 1"],
+      "nameOne: one person whose only print match has 5 s of talk is Speaker 1, not Me")
 check(nameOne([oneB, oneX, oneU], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: true) == ["B": "Me", "X": "Me", "U": "Me"]
       && nameOne([oneB, oneA], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: true) == ["B": "Speaker 1", "A": "Speaker 1"]
       && nameOne([oneB, oneU], keptWords: oneKept, firstWord: oneFirst, print: nil, onePerson: true) == ["B": "Speaker 1", "U": "Speaker 1"],
@@ -1019,9 +1035,9 @@ let oneUnusable = labelOne(oneWords, speakers: oneSide, print: vp(meetings: 1))
 check(transcriptLines(oneUnusable, plain: false).map(\.label) == ["Speaker 1", "Speaker 2", "Speaker 3", "Unknown"],
       "labelOne: a print that is not usable (one meeting, no sample) makes nobody Me")
 let oneNotMe = labelOne(oneWords, speakers: side(oneSegments, [sp("U", seconds: 30, vector: at(0.5)), oneB, oneA, oneX]), print: usable)
-check(transcriptLines(oneNotMe, plain: false).map(\.label) == ["Speaker 1", "Speaker 2", "Speaker 3", "Unknown"]
+check(transcriptLines(oneNotMe, plain: false).map(\.label) == ["Unknown", "Speaker 1", "Speaker 2", "Unknown"]
       && oneNotMe.log == ["Your voice was not recognised in this recording (best match 0.50)"],
-      "labelOne: a usable print matching nobody logs 'not recognised' with the best match (\(oneNotMe.log))")
+      "labelOne: a usable print matching nobody logs 'not recognised' with the best match; at 0.50 that voice is Unknown (\(oneNotMe.log))")
 let oneBare = labelOne(oneWords, speakers: nil, print: usable)
 let oneBareLines = render(transcriptLines(oneBare, plain: false))
 check(oneBare.micLabels.allSatisfy { $0 == "Unknown" } && oneBare.micLabels.count == oneWords.count && oneBare.call.isEmpty && oneBare.log.isEmpty
