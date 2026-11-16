@@ -389,14 +389,70 @@ if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'this recording was not finis
   pass "redo on an unfinished recording stops with the recover message and changes nothing"
 else fail "redo on an unfinished recording stops with the recover message and changes nothing (rc $rc): $out"; fi
 
-# --- redo on a folder with only audio.m4a: a new plain transcript and no words files ---
+# --- redo on a folder with only audio.m4a: a new timed, labelled transcript and its words.json, no side files ---
 reset_run; d="$HOME/a4"; mkdir -p "$d"; printf 'aac mix' > "$d/audio.m4a"
 printf 'an old plain transcript\n' > "$d/transcript.txt"; printf 'old\n' > "$d/notes.md"; printf 'old\n' > "$d/notes-raw.md"
 engine redo_cmd "$d"
-if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] && [ ! -e "$d/mic.words.json" ] \
-   && [ ! -e "$d/call.words.json" ] && [ "$(cat "$d/earlier/$STAMP/transcript.txt")" = "an old plain transcript" ] && no_stage "$d"; then
-  pass "redo on a folder with only audio.m4a writes a new plain transcript and no words files"
-else fail "redo on a folder with only audio.m4a writes a new plain transcript and no words files (rc $rc): $(ls -A "$d") $out"; fi
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Speaking from this desk." ] && same "$d/words.json" "$FIX/pk-mic.json" \
+   && [ ! -e "$d/mic.words.json" ] && [ ! -e "$d/call.words.json" ] && [ "$(cat "$d/earlier/$STAMP/transcript.txt")" = "an old plain transcript" ] \
+   && [ ! -e "$d/earlier/$STAMP/words.json" ] && no_stage "$d"; then
+  pass "redo on a folder with only audio.m4a writes a new timed transcript and words.json, and no side words files"
+else fail "redo on a folder with only audio.m4a writes a new timed transcript and words.json, and no side words files (rc $rc): $(ls -A "$d") $out"; fi
+
+# --- Transcribe again on a single recording: the people count, words.json kept in earlier/, nothing learnt (Task 11A) ---
+# The stand-in helper gives the labelled fixture's words and its speakers; voice-old.json is a usable print of
+# the first speaker, on the install record, so a run that learnt would change it.
+ONE_ME="[00:00:00] Me: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Speaker 1: what about the budget?"
+mkdir -p "$STATE_DIR"
+single() {   # a single recording processed once before: its audio, an old transcript, old words and old minutes
+  d="$HOME/$1"; mkdir -p "$d"; printf 'aac mix' > "$d/audio.m4a"
+  printf '{"id": "%s", "state": "done"}\n' "$1" > "$d/meeting.json"
+  printf '[00:00:01] Unknown: the old transcript\n' > "$d/transcript.txt"; command cp "$FIX/sa-mic.json" "$d/words.json"
+  printf 'the old minutes\n' > "$d/notes.md"; printf 'the old notes\n' > "$d/notes-raw.md"
+  command cp "$d/words.json" "$HOME/$1.words"
+  touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+  command cp "$FIX/voice-old.json" "$VOICE_FILE"; record_install "$VOICE_FILE"; command cp "$VOICE_FILE" "$HOME/$1.voice"
+}
+for people in "" 1 3 6; do
+  reset_run; single "solo1$people"
+  if [ -n "$people" ]; then engine cli redo "$d" --people "$people"; else engine cli redo "$d"; fi
+  args="$(mbt_args)"; sp="$(grep '^mb-speech speakers ' "$HOME/calls.log")"
+  case "$people" in
+    "") want_sp="more="; want_one="" ;;
+    1)  want_sp="more="; want_one=" --one-count 1" ;;   # one person: the finder still runs, so the print can be matched
+    *)  want_sp="more=--count $people"; want_one=" --one-count $people" ;;
+  esac
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s\n' "$sp" | grep -c .)" = 1 ] && [ "${sp##* out=*one.speakers.json }" = "$want_sp" ] \
+     && case "$args" in "mb-transcript --one .stage."??????"/words.json --one-speakers .stage."??????"/.work."??????"/one.speakers.json --voice $VOICE_FILE$want_one") true ;; *) false ;; esac; then
+    pass "redo ${people:+--people $people }on a single recording: the finder gets [${want_sp#more=}], mb-transcript [${want_one# }]"
+  else fail "redo ${people:+--people $people }on a single recording: the finder gets [${want_sp#more=}], mb-transcript [${want_one# }] (rc $rc): [$sp] [$args] $out"; fi
+  # one person: every line takes the one label, the print's
+  if [ "$people" = 1 ]; then
+    if [ "$rc" -eq 0 ] && [ "$(sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' "$d/transcript.txt" | sort -u)" = Me ]; then
+      pass "redo --people 1 on a single recording: every line is Me when the print matches the one person"
+    else fail "redo --people 1 on a single recording: every line is Me when the print matches the one person (rc $rc): $(cat "$d/transcript.txt") $out"; fi
+  fi
+done
+reset_run; single solo2
+engine redo_cmd "$d"
+e="$d/earlier/$STAMP"
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "$ONE_ME" ] && same "$e/words.json" "$HOME/solo2.words" && same "$d/words.json" "$FIX/labelled-mic.json"; then
+  pass "Transcribe again on a single recording keeps the words.json it replaces in earlier/, byte for byte"
+else fail "Transcribe again on a single recording keeps the words.json it replaces in earlier/, byte for byte (rc $rc): $(ls -A "$d" "$e" 2>&1) $out"; fi
+if [ "$(mode_of "$d/words.json")" = 600 ] && [ "$(mode_of "$e/words.json")" = 600 ] \
+   && [ "$(cat "$e/transcript.txt")" = "[00:00:01] Unknown: the old transcript" ] && ! mbt_args | grep -q -- '--learn' && same "$VOICE_FILE" "$HOME/solo2.voice" && [ ! -e "$VOICE_FILE.tmp" ]; then
+  pass "Transcribe again on a single recording never learns the voice, though the print is on the record; words.json is 0600, and its copy"
+else fail "Transcribe again on a single recording never learns the voice, though the print is on the record; words.json is 0600, and its copy: [$(mbt_args)] $out"; fi
+# process too, on the same folder: a single recording never learns, and the earlier words.json is kept again
+reset_run; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; command cp "$d/words.json" "$HOME/solo2.words2"; STAMP="2026-11-13 1500"
+engine process "$d"
+STAMP="2026-11-13 1452"
+if [ "$rc" -eq 0 ] && same "$d/earlier/2026-11-13 1500/words.json" "$HOME/solo2.words2" && ! mbt_args | grep -q -- '--learn' \
+   && same "$VOICE_FILE" "$HOME/solo2.voice"; then
+  pass "process of a single recording keeps the words.json it replaces too, and never learns the voice"
+else fail "process of a single recording keeps the words.json it replaces too, and never learns the voice (rc $rc): [$(mbt_args)] $out"; fi
+rm -f "$VOICE_FILE" "$INSTALLED"
 
 # ======================================================================== failures change nothing
 
@@ -840,7 +896,7 @@ for rec in talk.mp3 TALK.M4A; do
   reset_run; d="$HOME/r2-$rec"; mkdir -p "$d"; printf 'audio' > "$d/$rec"
   engine process "$d/$rec"
   if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 1 ] && grep -qF "afconvert -f WAVE -d LEI16@16000 -c 1 ./$rec " "$HOME/calls.log" \
-     && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ]; then
+     && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Speaking from this desk." ]; then
     pass "process takes $rec as a recording, and it reaches the transcriber"
   else fail "process takes $rec as a recording, and it reaches the transcriber (rc $rc): $out"; fi
 done
@@ -894,8 +950,9 @@ else fail "a .swap whose earlier folder has gone is finished: displaced files go
 # --- 9: a loose recording whose name starts with a dash reaches Parakeet ---
 reset_run; d="$HOME/dash"; mkdir -p "$d"; printf 'aac' > "$d/-rec one.m4a"
 engine process "$d/-rec one.m4a"
-if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] && [ "$(calls 'mb-speech transcribe')" = 1 ] \
-   && grep -q '^afconvert .* \./-rec one\.m4a ' "$HOME/calls.log" && ! printf '%s' "$out" | grep -q 'illegal option'; then
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Speaking from this desk." ] && [ "$(calls 'mb-speech transcribe')" = 1 ] \
+   && grep -q '^afconvert .* \./-rec one\.m4a ' "$HOME/calls.log" && grep -q '^mb-speech speakers .* wav=\.stage\.[^/ ]*/\.work\.[^/ ]*/-rec one\.wav ' "$HOME/calls.log" \
+   && ! printf '%s' "$out" | grep -q 'illegal option'; then
   pass "a loose recording whose name starts with a dash reaches Parakeet"
 else fail "a loose recording whose name starts with a dash reaches Parakeet (rc $rc): $(grep '^afconvert' "$HOME/calls.log") $out"; fi
 
@@ -1050,9 +1107,10 @@ before_a="$(snap_of "$d" audio.m4a mic.m4a call.m4a)"
 engine process "$d/talk.mp3"
 KEEP_AUDIO=1
 if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 1 ] && grep -qF 'afconvert -f WAVE -d LEI16@16000 -c 1 ./talk.mp3 ' "$HOME/calls.log" \
-   && [ "$(calls 'mb-speech speakers')" = 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] \
+   && [ "$(calls 'mb-speech speakers')" = 1 ] && grep -q '^mb-speech speakers .* wav=\.stage\.[^/ ]*/\.work\.[^/ ]*/talk\.wav ' "$HOME/calls.log" \
+   && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Speaking from this desk." ] && same "$d/words.json" "$FIX/pk-mic.json" \
    && [ ! -e "$d/talk.mp3" ] && [ "$(snap_of "$d" audio.m4a mic.m4a call.m4a)" = "$before_a" ]; then
-  pass "process <meeting>/talk.mp3 transcribes talk.mp3 itself, and --no-keep-audio removes only it"
+  pass "process <meeting>/talk.mp3 transcribes talk.mp3 itself, finds its speakers in it alone, and --no-keep-audio removes only it"
 else fail "process <meeting>/talk.mp3 transcribes talk.mp3 itself, and --no-keep-audio removes only it (rc $rc): $(ls "$d") $(grep '^afconvert\|^mb-speech' "$HOME/calls.log")"; fi
 reset_run; finished n6b; printf 'mp3 audio' > "$d/talk.mp3"; KEEP_AUDIO=0
 engine process "$d"
@@ -1062,6 +1120,23 @@ if [ "$rc" -eq 0 ] && [ "$(calls 'mb-speech transcribe')" = 2 ] && [ ! -e "$d/au
   pass "process <meeting> uses both sides, and --no-keep-audio removes the meeting's three files and nothing else"
 else fail "process <meeting> uses both sides, and --no-keep-audio removes the meeting's three files and nothing else (rc $rc): $(ls "$d")"; fi
 
+# --- Task 11A: a single recording's redo killed in its swap: .swap names words.json, and the next redo finishes it ---
+reset_run; single solo3
+LISTED_TWO="$LISTED"; LISTED="$LISTED words.json"   # kill_mv counts the single recording's words.json too
+KILL_AT=2; kill_mv; killed_run redo_cmd "$d"; rc1=$rc; unset -f mv
+LISTED="$LISTED_TWO"
+swap_words=0; grep -qx 'move words.json' "$d/.swap" 2>/dev/null && swap_words=1
+old_words=0; same "$d/words.json" "$HOME/solo3.words" && old_words=1   # killed at its rename: the old one is still there
+: > "$HOME/calls.log"
+engine redo_cmd "$d"
+if [ "$rc1" = 137 ] && [ "$swap_words" = 1 ] && [ "$old_words" = 1 ] && [ "$rc" -eq 0 ] && same "$d/words.json" "$FIX/labelled-mic.json" \
+   && same "$d/earlier/$STAMP/words.json" "$HOME/solo3.words" && [ "$(cat "$d/transcript.txt")" = "$ONE_ME" ] && no_stage "$d" \
+   && printf '%s' "$out" | grep -q 'finishing the swap an interrupted run began' && ! printf '%s' "$out" | grep -q 'it is removed' \
+   && [ ! -e "$d/earlier/$STAMP-2" ] && [ "$(calls 'mb-speech')" = 0 ]; then
+  pass "a single recording's redo killed in its swap: .swap names words.json, and the next redo finishes it, the old words kept"
+else fail "a single recording's redo killed in its swap: .swap names words.json, and the next redo finishes it, the old words kept ($rc1, $swap_words, $old_words, $rc): $(cat "$d/.swap" 2>/dev/null) $out"; fi
+rm -f "$VOICE_FILE" "$INSTALLED"
+
 # ======================================================================== the command line
 
 out="$(bash "$ROOT/meetingbox" notes 2>&1)"; rc1=$?
@@ -1070,8 +1145,9 @@ help="$(bash "$ROOT/meetingbox" help 2>&1)"
 if [ "$rc1" -eq 1 ] && printf '%s' "$out" | grep -q 'usage: meetingbox notes <folder>' && [ "$rc2" -eq 1 ] \
    && printf '%s' "$out2" | grep -q 'usage: meetingbox redo <folder>' \
    && printf '%s' "$help" | grep -q 'meetingbox notes <folder>' && printf '%s' "$help" | grep -q 'meetingbox redo <folder>' \
-   && printf '%s' "$help" | grep -q -- '--room' && printf '%s' "$help" | grep -q 'earlier/'; then
-  pass "meetingbox notes and redo need a folder, and help lists them, --room and --call, and earlier/"
+   && printf '%s' "$help" | grep -q -- '--room' && printf '%s' "$help" | grep -q 'earlier/' \
+   && printf '%s' "$help" | grep -q -- '--people N  *people in a recording kept as one file' && printf '%s' "$help" | grep -q 'words.json'; then
+  pass "meetingbox notes and redo need a folder, and help lists them, --room and --call, --people, words.json and earlier/"
 else fail "meetingbox notes and redo need a folder, and help lists them, --room and --call, and earlier/ ($rc1 $rc2): $out $out2"; fi
 
 reset_run

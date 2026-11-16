@@ -45,9 +45,13 @@ final class LibraryModel: ObservableObject {
         let id: String?
         let kind: JobKind
         var transcriber: Transcriber
-        /// The counts; nil is Work it out.
+        /// The counts; nil is Work it out. The sheet shows `room` and `call` for a meeting with both sides
+        /// (`bothSides`), else `recording`, the one count of a recording kept as one file; each keeps its own.
         var room: Int?
         var call: Int?
+        var recording: Int?
+        /// The folder held `mic.m4a` and `call.m4a` when the window last read it (`MeetingFiles.bothSides`).
+        let bothSides: Bool
         var tidy: Bool
         var writer: MeetingWriter
     }
@@ -437,7 +441,8 @@ final class LibraryModel: ObservableObject {
 
     /// Opens a redo sheet. It starts at the transcriber and tidying chosen in Preferences (never those of
     /// the meeting's last redo), at the meeting's saved counts, and at the meeting's own writer, else the
-    /// Preferences one.
+    /// Preferences one. The counts it shows follow the folder as the window last read it: the room and the
+    /// call with both sides, else the one count of a recording kept as one file.
     func beginRedo(_ meeting: Meeting, kind: JobKind) {
         guard kind != .process else { return }
         let settings = self.settings()
@@ -449,7 +454,8 @@ final class LibraryModel: ObservableObject {
         redoSerial += 1
         redoChoice += 1
         redoing = RedoDraft(folder: meeting.folder.url, id: record?.id, kind: kind, transcriber: settings.transcriber, room: record?.people.room,
-                            call: record?.people.call, tidy: settings.tidy, writer: record?.writer ?? settings.preferredWriter)
+                            call: record?.people.call, recording: record?.people.recording, bothSides: files(of: meeting).bothSides,
+                            tidy: settings.tidy, writer: record?.writer ?? settings.preferredWriter)
     }
 
     /// The sheet's choices, as its controls change them, except while Redo's check runs. The writer goes
@@ -529,7 +535,8 @@ final class LibraryModel: ObservableObject {
         writerNotice = nil
         redoEnded?()
         let options = draft.kind == .transcribe
-            ? JobOptions(transcriber: draft.transcriber, room: draft.room, call: draft.call, tidy: draft.tidy, writer: draft.writer)
+            ? JobOptions(transcriber: draft.transcriber, room: draft.room, call: draft.call, recording: draft.recording, tidy: draft.tidy,
+                         writer: draft.writer)
             : JobOptions(writer: draft.writer)
         // Another meeting at the path (the folders were swapped or renamed in Finder) is not this one.
         let free = id == draft.id && lock == .gone

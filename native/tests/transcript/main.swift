@@ -978,6 +978,76 @@ let fxTidy = transcriptLines(fxRun, plain: false)
 check(fxTidy.map(\.label) == ["Me", "Room 1", "Them"] && fxTidy[1].text == "what (Them: yeah) about the budget?",
       "tidied, the speaker fixtures give Me, Room 1 and Them lines (\(fxTidy))")
 
+// --- a recording kept as one file (mb-transcript --one, Task 11A) ---
+// U is the user (0.9 with the print). B and A are two other people: A's first segment (5 s) holds no words, so
+// by first segment or by id A would come first, but B says the first kept word. X's one segment lies inside a
+// word of A's, so X keeps no word of its own. "anyway." at 40 s is more than 1.0 s from every segment.
+let oneU = sp("U", seconds: 30, vector: at(0.9)), oneB = sp("B", seconds: 30, vector: e3)
+let oneA = sp("A", seconds: 30, vector: e4, first: 5), oneX = sp("X", seconds: 2, vector: e2, first: 21)
+let oneWords = said("Right, so the plan is simple.", from: 0) + said("what about the budget?", from: 10)
+    + said("I have the numbers here.", from: 20) + [w(40, 40.3, "anyway.")]
+let oneSegments = [Segment(speaker: "U", start: 0, end: 3), Segment(speaker: "A", start: 5, end: 6), Segment(speaker: "B", start: 10, end: 12),
+                   Segment(speaker: "A", start: 20, end: 22), Segment(speaker: "X", start: 21.0, end: 21.5)]
+let oneSide = side(oneSegments, [oneU, oneB, oneA, oneX])
+let oneKept: [String: Int] = ["U": 6, "B": 4, "A": 4], oneFirst: [String: Double] = ["U": 0, "B": 10, "A": 20]
+check(nameOne([oneU, oneB, oneA, oneX], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: false)
+      == ["U": "Me", "B": "Speaker 1", "A": "Speaker 2", "X": "Unknown"],
+      "nameOne: the print's match is Me; the others are Speaker 1 and 2 by first kept word, with no gap for one that keeps none")
+check(nameOne([oneU, oneB, oneA, oneX], keptWords: oneKept, firstWord: oneFirst, print: nil, onePerson: false)
+      == ["U": "Speaker 1", "B": "Speaker 2", "A": "Speaker 3", "X": "Unknown"],
+      "nameOne: with no usable print, nobody is Me and everyone who keeps a word is numbered from Speaker 1")
+check(nameOne([sp("U", seconds: 5, vector: at(0.6)), oneB], keptWords: ["U": 3, "B": 4], firstWord: ["U": 0, "B": 10], print: usable, onePerson: false)
+      == ["U": "Me", "B": "Speaker 1"]
+      && nameOne([sp("U", seconds: 30, vector: at(0.59)), oneB], keptWords: ["U": 3, "B": 4], firstWord: ["U": 0, "B": 10], print: usable, onePerson: false)
+      == ["U": "Speaker 1", "B": "Speaker 2"],
+      "nameOne: a print match is a cosine of 0.60 or more (Rule.printMatch), short talk included; 0.59 is someone else")
+check(nameOne([oneB, oneX, oneU], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: true) == ["B": "Me", "X": "Me", "U": "Me"]
+      && nameOne([oneB, oneA], keptWords: oneKept, firstWord: oneFirst, print: usable, onePerson: true) == ["B": "Speaker 1", "A": "Speaker 1"]
+      && nameOne([oneB, oneU], keptWords: oneKept, firstWord: oneFirst, print: nil, onePerson: true) == ["B": "Speaker 1", "U": "Speaker 1"],
+      "nameOne: with one person, everyone found is Me when the print matches any of them, else Speaker 1")
+
+let oneMe = labelOne(oneWords, speakers: oneSide, print: usable)
+let oneMeLines = render(transcriptLines(oneMe, plain: false))
+check(oneMeLines == "[00:00:00] Me: Right, so the plan is simple.\n[00:00:10] Speaker 1: what about the budget?\n"
+      + "[00:00:20] Speaker 2: I have the numbers here.\n[00:00:40] Unknown: anyway.\n" && oneMe.log.isEmpty,
+      "labelOne: with a matching print, Me and Speaker lines with their times, and a word no speaker covers is Unknown with its own time (\(oneMeLines))")
+let oneNoPrint = labelOne(oneWords, speakers: oneSide, print: nil)
+check(transcriptLines(oneNoPrint, plain: false).map(\.label) == ["Speaker 1", "Speaker 2", "Speaker 3", "Unknown"]
+      && oneNoPrint.log == ["Your voice is not learnt yet, so nobody in this recording is labelled Me"],
+      "labelOne: with no print, Speaker 1, 2 and 3, and the log says the voice is not learnt yet (\(oneNoPrint.log))")
+let oneUnusable = labelOne(oneWords, speakers: oneSide, print: vp(meetings: 1))
+check(transcriptLines(oneUnusable, plain: false).map(\.label) == ["Speaker 1", "Speaker 2", "Speaker 3", "Unknown"],
+      "labelOne: a print that is not usable (one meeting, no sample) makes nobody Me")
+let oneNotMe = labelOne(oneWords, speakers: side(oneSegments, [sp("U", seconds: 30, vector: at(0.5)), oneB, oneA, oneX]), print: usable)
+check(transcriptLines(oneNotMe, plain: false).map(\.label) == ["Speaker 1", "Speaker 2", "Speaker 3", "Unknown"]
+      && oneNotMe.log == ["Your voice was not recognised in this recording (best match 0.50)"],
+      "labelOne: a usable print matching nobody logs 'not recognised' with the best match (\(oneNotMe.log))")
+let oneBare = labelOne(oneWords, speakers: nil, print: usable)
+let oneBareLines = render(transcriptLines(oneBare, plain: false))
+check(oneBare.micLabels.allSatisfy { $0 == "Unknown" } && oneBare.micLabels.count == oneWords.count && oneBare.call.isEmpty && oneBare.log.isEmpty
+      && oneBareLines == "[00:00:00] Unknown: Right, so the plan is simple.\n[00:00:10] Unknown: what about the budget?\n"
+      + "[00:00:20] Unknown: I have the numbers here.\n[00:00:40] Unknown: anyway.\n",
+      "labelOne: with no speakers file every word is Unknown, and every line keeps its time (\(oneBareLines))")
+let oneOne = labelOne(oneWords, speakers: oneSide, print: usable, onePerson: true)
+let oneOneOff = labelOne(oneWords, speakers: oneSide, print: nil, onePerson: true)
+check(oneOne.micLabels.count == oneWords.count && oneOne.micLabels.allSatisfy { $0 == "Me" }
+      && oneOneOff.micLabels.allSatisfy { $0 == "Speaker 1" } && transcriptLines(oneOneOff, plain: false).map(\.start) == [0, 10, 20, 40],
+      "labelOne: one person gives one label to every word, covered or not: Me with a matching print, else Speaker 1, with each line's time")
+let oneOneBare = labelOne(oneWords, speakers: nil, print: usable, onePerson: true).micLabels
+check(oneOneBare.count == oneWords.count && oneOneBare.allSatisfy { $0 == "Unknown" },
+      "labelOne: one person with no speakers file is still Unknown: nobody's voice was heard to match")
+let oneOneNobody = labelOne(oneWords, speakers: side([], []), print: usable, onePerson: true).micLabels
+check(oneOneNobody.count == oneWords.count && oneOneNobody.allSatisfy { $0 == "Speaker 1" },
+      "labelOne: one person, the finder having found nobody: Speaker 1, since no voice matched the print")
+// An acknowledgement between two of the user's sentences: inline when tidied, a line of its own at every change of label with --plain.
+let replyWords = said("so we should.", from: 0) + [w(1.3, 1.5, "yeah")] + said("go now.", from: 1.7)
+let replySide = side([Segment(speaker: "U", start: 0, end: 1.2), Segment(speaker: "B", start: 1.25, end: 1.55), Segment(speaker: "U", start: 1.6, end: 3)],
+                     [oneU, oneB])
+let replyRun = labelOne(replyWords, speakers: replySide, print: usable)
+check(render(transcriptLines(replyRun, plain: false)) == "[00:00:00] Me: so we should. (Speaker 1: yeah) go now.\n"
+      && render(transcriptLines(replyRun, plain: true)) == "[00:00:00] Me: so we should.\n[00:00:01] Speaker 1: yeah\n[00:00:01] Me: go now.\n",
+      "labelOne: tidied, a short reply goes inline; with --plain a new line starts at every change of label (\(transcriptLines(replyRun, plain: true)))")
+
 // --- learning the voice from calls ---
 let now = Date(timeIntervalSince1970: 1_800_000_000)
 let stamp = ISO8601DateFormatter().string(from: now)

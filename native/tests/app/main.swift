@@ -5875,10 +5875,11 @@ func recordJSON(_ dir: URL) -> [String: Any] {
 }
 let t8Local = OutsideWriter(kind: .standard, address: "http://127.0.0.1:11434/v1", model: "llama")
 let t8Claude = OutsideWriter(kind: .claude, address: "https://api.anthropic.com", model: "claude-model")
-/// A meeting a job has finished: its audio, a transcript and, unless `notes` is false (then it failed), the
-/// minutes, all an hour old, with these meeting.json fields.
+/// A meeting a job has finished: its audio (both sides, so Transcribe again takes the room and call counts),
+/// a transcript and, unless `notes` is false (then it failed), the minutes, all an hour old, with these
+/// meeting.json fields.
 func t8Done(_ r: QRig, _ name: String, notes: Bool = true, _ change: ((inout MeetingRecord) -> Void)? = nil) -> URL {
-    var files = ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello\n"]
+    var files = ["audio.m4a": "a", "mic.m4a": "m", "call.m4a": "c", "transcript.txt": "[00:00:01] Me: hello\n"]
     if notes { files["notes.md"] = "the old minutes\n" }
     let dir = r.meeting(name, files: files) {
         $0.state = notes ? .done : .failed
@@ -9949,6 +9950,141 @@ MainActor.assumeIsolated {
     r.answer(["key", "remove", "--address", t11Bridge], 0, "none\n")
     check(r.app.keys[t11Bridge] == false && r.app.keys[t11Ollama] == true, "T11R3 second: and leaves the first source's key alone")
     r.finish()
+}
+
+// MARK: - A recording kept as one file (Stage 3, Task 11A)
+
+// Which counts a folder takes: both mic.m4a and call.m4a as files, as the engine's own [ -f ] check reads them.
+do {
+    let root = freshRoot()
+    let both = make(root, "2026-11-15_0900", files: ["audio.m4a": "a", "mic.m4a": "m", "call.m4a": "c"])
+    let micOnly = make(root, "2026-11-15_1000", files: ["audio.m4a": "a", "mic.m4a": "m"])
+    let alone = make(root, "2026-11-15_1100", files: ["audio.m4a": "a"])
+    let oddCall = make(root, "2026-11-15_1200", files: ["audio.m4a": "a", "mic.m4a": "m"])
+    try! fm.createDirectory(at: oddCall.appendingPathComponent("call.m4a"), withIntermediateDirectories: true)
+    check(MeetingFolder.hasBothSides(both) && !MeetingFolder.hasBothSides(micOnly) && !MeetingFolder.hasBothSides(alone)
+          && !MeetingFolder.hasBothSides(oddCall),
+          "T11A sides: both sides only when mic.m4a and call.m4a are both files; one alone, neither, or a folder named call.m4a is a single recording")
+    check(MeetingFiles.read(MeetingFolder.parse(both)!).bothSides && !MeetingFiles.read(MeetingFolder.parse(micOnly)!).bothSides
+          && !MeetingFiles.read(MeetingFolder.parse(alone)!).bothSides && !MeetingFiles().bothSides,
+          "T11A sides: MeetingFiles.read says whether the folder has both sides, off the main queue as it reads the rest")
+}
+
+// The record: the single count is people.recording, beside room and call, and kept like them.
+do {
+    let r = QRig()
+    let dir = r.meeting("2026-11-15_0900", files: ["audio.m4a": "a"]) { $0.state = .done; $0.people = MeetingRecord.People(room: 2, call: 3, recording: 4) }
+    let people = r.json(dir)["people"] as? [String: Any]
+    check((people?["recording"] as? NSNumber)?.intValue == 4 && (people?["room"] as? NSNumber)?.intValue == 2
+          && (people?["call"] as? NSNumber)?.intValue == 3 && MeetingStore.record(in: dir)?.people == MeetingRecord.People(room: 2, call: 3, recording: 4),
+          "T11A record: people.recording is written and read back beside room and call (\(String(describing: people)))")
+    try! #"{"id": "odd", "started": "2026-11-15T09:00:00Z", "state": "done", "people": {"recording": 9, "room": 2, "other": 1}}"#
+        .write(to: dir.appendingPathComponent("meeting.json"), atomically: true, encoding: .utf8)
+    check(MeetingStore.record(in: dir)?.people == MeetingRecord.People(room: 2, call: nil, recording: nil),
+          "T11A record: a count outside 1 to 6 reads as Work it out")
+    try! r.store.update(dir) { $0.title = "kept" }
+    let kept = r.json(dir)["people"] as? [String: Any]
+    check((kept?["recording"] as? NSNumber)?.intValue == 9 && (kept?["other"] as? NSNumber)?.intValue == 1,
+          "T11A record: and is left as it is in the file until a sheet sets it (\(String(describing: kept)))")
+    try! r.store.update(dir) { $0.people.recording = 1 }
+    let set = r.json(dir)["people"] as? [String: Any]
+    check((set?["recording"] as? NSNumber)?.intValue == 1 && (set?["room"] as? NSNumber)?.intValue == 2 && (set?["other"] as? NSNumber)?.intValue == 1,
+          "T11A record: setting it changes only people.recording (\(String(describing: set)))")
+}
+
+// The arguments: --people N for a recording kept as one file, nothing for Work it out; only Transcribe again takes it.
+do {
+    let dir = URL(fileURLWithPath: "/Users/someone/Meetings/2026-11-15 0900 Trimmed", isDirectory: true)
+    func args(_ kind: JobKind, room: Int? = nil, call: Int? = nil, recording: Int?) -> [String] {
+        ScriptRunner.arguments(kind: kind, folder: dir, transcriber: .apple, room: room, call: call, recording: recording, tidy: false, writer: nil)
+    }
+    check(args(.transcribe, recording: 3) == ["redo", dir.path, "--native", "--people", "3", "--no-tidy", "--writer", "apple"],
+          "T11A arguments: a single recording's job is redo <dir> --native --people 3 --no-tidy --writer apple")
+    check(args(.transcribe, recording: nil) == ["redo", dir.path, "--native", "--no-tidy", "--writer", "apple"],
+          "T11A arguments: Work it out passes no count")
+    check(args(.process, recording: 3) == ["process", dir.appendingPathComponent("audio.m4a").path, "--native", "--no-tidy", "--writer", "apple"]
+          && args(.minutes, recording: 3) == ["notes", dir.path, "--writer", "apple"],
+          "T11A arguments: a process or a minutes job takes no count")
+}
+
+// The queue decides at launch, from the folder, which counts a Transcribe again job takes, as the engine will.
+do {
+    let r = QRig()
+    let q = r.make()
+    let files = ["audio.m4a": "a", "transcript.txt": "[00:00:01] Unknown: hello\n", "notes.md": "n"]
+    let single = r.meeting("2026-11-15_0900", files: files) { $0.state = .done; $0.people = MeetingRecord.People(room: 2, call: 3) }
+    check(q.redo(single, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, call: 3, recording: 4, tidy: false, writer: .apple)),
+          "T11A queue: Transcribe again on a single recording is queued")
+    let people = r.json(single)["people"] as? [String: Any]
+    check((people?["recording"] as? NSNumber)?.intValue == 4 && (people?["room"] as? NSNumber)?.intValue == 2 && (people?["call"] as? NSNumber)?.intValue == 3,
+          "T11A queue: the sheet's single count is written as people.recording before it runs, the two counts kept (\(String(describing: people)))")
+    check(argsAre(r.runner.calls.last?.arguments, "redo", single, ["--native", "--people", "4", "--no-tidy", "--writer", "apple"]),
+          "T11A queue: a folder without both sides runs redo <dir> --people 4, with no --room or --call (\(r.runner.calls.last?.arguments ?? []))")
+    r.runner.finish(0, 0)
+    check((r.json(single)["people"] as? [String: Any]).map { ($0["recording"] as? NSNumber)?.intValue == 4 } == true && r.state(single) == "done",
+          "T11A queue: the count is kept once the job is done, for the next sheet")
+
+    let two = t8Done(r, "2026-11-15_1000") { $0.people = MeetingRecord.People(room: 2, call: 3, recording: 4) }
+    _ = q.redo(two, kind: .transcribe, options: JobOptions(transcriber: .apple, room: 2, call: 3, recording: 4, tidy: false, writer: .apple))
+    check(argsAre(r.runner.calls.last?.arguments, "redo", two, ["--native", "--room", "2", "--call", "3", "--no-tidy", "--writer", "apple"]),
+          "T11A queue: a folder with both sides runs --room and --call, never --people (\(r.runner.calls.last?.arguments ?? []))")
+    r.runner.finish(1, 0)
+
+    let auto = r.meeting("2026-11-15_1100", files: files.merging(["mic.m4a": "m"]) { $1 }) { $0.state = .done; $0.people = MeetingRecord.People(room: 2) }
+    _ = q.redo(auto, kind: .transcribe, options: JobOptions(transcriber: .parakeet, room: 2, tidy: true, writer: .apple))
+    check(argsAre(r.runner.calls.last?.arguments, "redo", auto, ["--parakeet", "--tidy", "--writer", "apple"]),
+          "T11A queue: one side alone is a single recording, and Work it out passes no count at all (\(r.runner.calls.last?.arguments ?? []))")
+    r.runner.finish(2, 0)
+}
+
+// The Transcribe again sheet: one count for a folder without both sides, the two counts for one with both.
+MainActor.assumeIsolated {
+    let r = Rig()
+    let session = r.make()
+    let runner = FakeRunner()
+    let queue = ProcessingQueue(store: r.store, runner: runner, tickQueue: nil)
+    let settings = RunSettings(transcriber: .parakeet, tidy: true, preferredWriter: .apple, agreed: [])
+    let model = LibraryModel(store: r.store, session: session, queue: queue, settings: { settings })
+    let root = r.store.root
+    func done(_ name: String, sides: Bool, _ change: @escaping (inout MeetingRecord) -> Void = { _ in }) -> URL {
+        var files = ["audio.m4a": "a", "transcript.txt": "[00:00:01] Me: hello", "notes.md": "minutes"]
+        if sides { files["mic.m4a"] = "m"; files["call.m4a"] = "c" }
+        let dir = make(root, name, files: files)
+        try! r.store.update(dir) { $0.state = .done; change(&$0) }
+        return dir
+    }
+    let single = done("2026-11-15_0900", sides: false) { $0.people = MeetingRecord.People(room: 3, call: 2, recording: 5) }
+    let two = done("2026-11-15_1000", sides: true) { $0.people = MeetingRecord.People(room: 3, call: 2, recording: 5) }
+    model.reload()
+    check(settle { model.meetings.count == 2 }, "T11A sheet: the meetings are read")
+    @MainActor func open(_ dir: URL) -> Bool {
+        model.select(LibraryPresentation.key(dir))
+        return settle { model.shownContent?.key == LibraryPresentation.key(dir) && model.shownContent?.files.transcript == true }
+    }
+    check(open(single) && model.actions(for: model.selectedMeeting!).contains(.transcribeAgain), "T11A sheet: a single recording offers Transcribe again")
+    model.perform(.transcribeAgain)
+    check(model.redoing?.bothSides == false && model.redoing?.recording == 5 && model.redoing?.room == 3 && model.redoing?.call == 2,
+          "T11A sheet: without both sides, the sheet shows the one count, at the meeting's saved count (\(String(describing: model.redoing)))")
+    model.updateRedo { $0.recording = 2 }
+    model.commitRedo()
+    check(settle { runner.calls.count == 1 } && argsAre(runner.calls.first?.arguments, "redo", single, ["--parakeet", "--people", "2", "--tidy", "--writer", "apple"])
+          && (r.json(single)["people"] as? [String: Any]).map { ($0["recording"] as? NSNumber)?.intValue == 2 && ($0["room"] as? NSNumber)?.intValue == 3 } == true,
+          "T11A sheet: Redo runs redo <dir> --people 2, the count kept and the two counts left as they were (\(runner.calls.first?.arguments ?? []))")
+    runner.finish(0, 0)
+
+    check(open(two), "T11A sheet: a meeting with both sides")
+    model.perform(.transcribeAgain)
+    check(model.redoing?.bothSides == true && model.redoing?.room == 3 && model.redoing?.call == 2,
+          "T11A sheet: with both sides, the sheet shows the room and call counts (\(String(describing: model.redoing)))")
+    model.updateRedo { $0.room = nil }
+    model.commitRedo()
+    check(settle { runner.calls.count == 2 } && argsAre(runner.calls.last?.arguments, "redo", two, ["--parakeet", "--call", "2", "--tidy", "--writer", "apple"]),
+          "T11A sheet: and runs --call 2 with the room worked out, never --people (\(runner.calls.last?.arguments ?? []))")
+    runner.finish(1, 0)
+
+    check(LibraryPresentation.recordingLabel == "People in the recording"
+          && LibraryPresentation.countChoices.map(LibraryPresentation.recordingChoice) == ["Work it out", "1", "2", "3", "4", "5", "6"],
+          "T11A words: People in the recording, Work it out or 1 to 6")
 }
 
 try? fm.removeItem(at: scratch)

@@ -12,11 +12,13 @@ enum JobKind: String {
 
 /// What a redo's sheet chose, written into `meeting.json` by `ProcessingQueue.redo` before it runs. The
 /// transcriber and tidying are for Transcribe again only. For Transcribe again the counts replace the
-/// meeting's (nil is Work it out); Redo minutes leaves them as they are. A nil writer leaves the meeting's.
+/// meeting's (nil is Work it out): `room` and `call` for its two sides, `recording` for a recording kept as
+/// one file; Redo minutes leaves them as they are. A nil writer leaves the meeting's.
 struct JobOptions: Equatable {
     var transcriber: Transcriber?
     var room: Int?
     var call: Int?
+    var recording: Int?
     var tidy: Bool?
     var writer: MeetingWriter?
 }
@@ -113,9 +115,10 @@ final class ScriptRunner: PipelineRunner {
     /// `--writer apple`, or `--writer outside --kind K --address A --writer-model M` for `writer`:
     /// - process: `process <dir>/audio.m4a --parakeet|--native --tidy|--no-tidy <writer>`, no counts;
     /// - minutes: `notes <dir> <writer>`;
-    /// - transcribe: `redo <dir> --parakeet|--native [--room N] [--call N] --tidy|--no-tidy <writer>`.
-    static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, tidy: Bool,
-                          writer: OutsideWriter?) -> [String] {
+    /// - transcribe: `redo <dir> --parakeet|--native [--room N] [--call N] [--people N] --tidy|--no-tidy <writer>`,
+    ///   where `--people` is the count of a recording kept as one file (`recording`).
+    static func arguments(kind: JobKind, folder: URL, transcriber: Transcriber, room: Int?, call: Int?, recording: Int? = nil,
+                          tidy: Bool, writer: OutsideWriter?) -> [String] {
         let engine = transcriber == .parakeet ? "--parakeet" : "--native"
         let lines = tidy ? "--tidy" : "--no-tidy"
         let writes = writer.map { ["--writer", "outside", "--kind", $0.kind.rawValue, "--address", $0.address, "--writer-model", $0.model] }
@@ -127,6 +130,7 @@ final class ScriptRunner: PipelineRunner {
             return ["notes", folder.path] + writes
         case .transcribe:
             let counts = (room.map { ["--room", String($0)] } ?? []) + (call.map { ["--call", String($0)] } ?? [])
+                + (recording.map { ["--people", String($0)] } ?? [])
             return ["redo", folder.path, engine] + counts + [lines] + writes
         }
     }
@@ -703,7 +707,7 @@ final class ProcessingQueue {
                 if kind == .transcribe {
                     $0.jobTranscriber = options.transcriber
                     $0.jobTidy = options.tidy
-                    $0.people = MeetingRecord.People(room: options.room, call: options.call)
+                    $0.people = MeetingRecord.People(room: options.room, call: options.call, recording: options.recording)
                 } else {
                     $0.jobTranscriber = nil
                     $0.jobTidy = nil
@@ -983,8 +987,12 @@ final class ProcessingQueue {
         let writer = ScriptRunner.writer(meeting: record?.writer, settings: settings)
         if let aside = writer.setAside { ProcessingQueue.appendLog(dir, ScriptRunner.setAsideLine(aside)) }
         let own = kind == .transcribe ? record : nil // only Transcribe again carries its own choices
+        // Its counts as the engine will take them, from the folder as it is now: the room and the call for a
+        // meeting with both sides, else the one count of a recording kept as one file.
+        let sides = own != nil && MeetingFolder.hasBothSides(dir)
         let arguments = ScriptRunner.arguments(kind: kind, folder: dir, transcriber: own?.jobTranscriber ?? settings.transcriber,
-                                               room: own?.people.room, call: own?.people.call, tidy: own?.jobTidy ?? settings.tidy,
+                                               room: sides ? own?.people.room : nil, call: sides ? own?.people.call : nil,
+                                               recording: sides ? nil : own?.people.recording, tidy: own?.jobTidy ?? settings.tidy,
                                                writer: writer.use)
         _ = runner.run(PipelineJob(kind: kind, folder: dir, arguments: arguments), progress: progress, attempt: attempt) { [weak self] status, line in
             self?.onQueue { self?.ended(mine, dir, status, line) }

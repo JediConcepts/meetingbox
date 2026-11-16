@@ -29,6 +29,7 @@ speech-analyzer() {
         *call.m4a) [ "$SA_FAIL" = both ] || [ "$SA_FAIL" = call ] && return 1
                    if [ "$SA_FAIL" = garbled ]; then printf '{"words":[{"start":1'; return 0; fi
                    cat "$FIX/sa-call.json" ;;
+        *audio.m4a) [ "$SA_FAIL" = both ] && return 1; cat "$FIX/sa-mic.json" ;;
         *) return 1 ;;
       esac ;;
     *) echo "a plain transcript of the whole mix" ;;
@@ -128,15 +129,17 @@ else fail "Apple's transcriber failing on both sides falls back to whisper (rc $
 SA_FAIL=""
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
 
-# --- only audio.m4a: the v1.2 path, one plain speech-analyzer call ---
+# --- only audio.m4a: a recording kept as one file, its words with their times from Apple's (Task 11A) ---
 d="$(meeting m4 audio.m4a)"
 : > "$HOME/calls.log"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
 n="$(grep -c '^speech-analyzer ' "$HOME/calls.log")"
-if [ "$rc" -eq 0 ] && [ "$n" = 1 ] && ! grep -q -- '-f json' "$HOME/calls.log" \
-   && grep -q 'plain transcript' "$d/transcript.txt"; then
-  pass "audio.m4a alone takes the old path"
-else fail "audio.m4a alone takes the old path (rc $rc, $n calls): $out"; fi
+if [ "$rc" -eq 0 ] && [ "$n" = 1 ] && grep -q '^speech-analyzer .*-f json .*audio\.m4a$' "$HOME/calls.log" \
+   && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Hi everyone can you hear me sounds good" ] \
+   && cmp -s "$d/words.json" "$FIX/sa-mic.json" && [ ! -e "$d/mic.words.json" ] \
+   && printf '%s' "$out" | grep -q 'Parakeet is not set up, so speakers are not told apart: the transcript says Unknown'; then
+  pass "audio.m4a alone: Apple's words with their times, Unknown lines (no speech helper), and words.json kept"
+else fail "audio.m4a alone: Apple's words with their times, Unknown lines (no speech helper), and words.json kept (rc $rc, $n calls): $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
 
 # --- --no-keep-audio bins all three m4a files ---
 d="$(meeting m5 audio.m4a mic.m4a call.m4a)"
@@ -669,14 +672,14 @@ if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Parakeet is not set up' && [
   pass "an unusable helper: Apple's transcriber, and the log says Parakeet is not set up"
 else fail "an unusable helper: Apple's transcriber, and the log says Parakeet is not set up (rc $rc): $out"; fi
 
-# --- a v1.2 meeting with one file: Parakeet's plain text ---
+# --- a meeting with one file: Parakeet's words with their times, in labelled lines (Task 11A) ---
 pk_reset
 d="$(meeting pk10 audio.m4a)"
 out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
-if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "Speaking from this desk." ] && [ "$(pk_calls speech-analyzer)" = 0 ] \
-   && ! ls -a "$d" | grep -q '^\.work'; then
-  pass "a single-file meeting gets Parakeet's plain text"
-else fail "a single-file meeting gets Parakeet's plain text (rc $rc): $out"; fi
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Speaking from this desk." ] && [ "$(pk_calls speech-analyzer)" = 0 ] \
+   && cmp -s "$d/words.json" "$FIX/pk-mic.json" && [ "$(mode_of "$d/words.json")" = 600 ] && ! ls -a "$d" | grep -q '^\.work\|^\.stage'; then
+  pass "a single-file meeting gets Parakeet's words with their times (the finder found nobody: Unknown), and words.json, 0600"
+else fail "a single-file meeting gets Parakeet's words with their times (the finder found nobody: Unknown), and words.json, 0600 (rc $rc): $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
 
 # --- a flag beats the app's preference ---
 pk_reset; ENGINE=parakeet
@@ -720,6 +723,9 @@ if printf '%s' "$out" | grep -q 'Parakeet could not transcribe audio.m4a, trying
    && ! printf '%s' "$out" | grep -q "trying Apple's"; then
   pass "a single file: Parakeet failing with no Apple's transcriber says whisper is tried"
 else fail "a single file: Parakeet failing with no Apple's transcriber says whisper is tried: $out"; fi
+if [ "$(cat "$d/transcript.txt" 2>/dev/null)" = "[00:00:00] Unknown: Hello there thanks for coming" ] && cmp -s "$d/words.json" "$FIX/whisper.json"; then
+  pass "a single file transcribed by whisper still gets its words' times, and its words.json"
+else fail "a single file transcribed by whisper still gets its words' times, and its words.json: $(cat "$d/transcript.txt" 2>/dev/null) $out"; fi
 have() { case "$1" in speech-analyzer|fm) return 0 ;; *) return 1 ;; esac; }
 
 # --- the helper failing without a reason: the log still gives one ---
@@ -1041,7 +1047,9 @@ TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
 pk_reset
 
 # --- the minutes writers are told what the labels mean, and the final pass how to name an owner ---
-LABELS='Speaker labels: "Me" is the person who recorded the meeting. "Room 1", "Room 2" and so on are people in the same room, numbered in the order they first spoke; if no line is labelled "Me", the person who recorded was not recognised and may be one of them. "Them", or "Them 1", "Them 2", are people on the other end of a call; a plain "Them" next to numbered ones is someone on the call who could not be told apart. "Unknown" means the speaker could not be told. Text in brackets such as "(Them: yeah)" is a short reply made during or just after someone else'\''s turn; it may be that person'\''s answer to a question. Keep these labels exactly as written and never guess a real name for a label.'
+# Task 11A adds the Speaker sentence after the one about "Them".
+ONE_SENTENCE='"Speaker 1", "Speaker 2" and so on are people in a recording kept as one file, numbered in the order they first spoke; they may be in the same room or on a call.'
+LABELS='Speaker labels: "Me" is the person who recorded the meeting. "Room 1", "Room 2" and so on are people in the same room, numbered in the order they first spoke; if no line is labelled "Me", the person who recorded was not recognised and may be one of them. "Them", or "Them 1", "Them 2", are people on the other end of a call; a plain "Them" next to numbered ones is someone on the call who could not be told apart. "Speaker 1", "Speaker 2" and so on are people in a recording kept as one file, numbered in the order they first spoke; they may be in the same room or on a call. "Unknown" means the speaker could not be told. Text in brackets such as "(Them: yeah)" is a short reply made during or just after someone else'\''s turn; it may be that person'\''s answer to a question. Keep these labels exactly as written and never guess a real name for a label.'
 mkdir -p "$HOME/labels"
 printf '[00:00:01] Room 1: we start now (Them 2: yeah)\n[00:00:05] Them: fine\n' > "$HOME/labels/transcript.txt"
 : > "$HOME/fm-instructions.txt"
@@ -1074,6 +1082,25 @@ if [ "$final_first" = 1 ] \
    && ! printf '%s' "$final" | grep -qF '(a name, Me or Them)'; then
   pass "the final pass gets the label sentence first, and the new owner wording"
 else fail "the final pass gets the label sentence first, and the new owner wording: [$final]"; fi
+if [ "$(grep -cF "$ONE_SENTENCE" "$HOME/fm-instructions.txt")" -ge 3 ] && [ "$(grep -cF "$ONE_SENTENCE" "$ROOT/meetingbox")" = 1 ]; then
+  pass "Apple's minutes passes are told who Speaker 1, Speaker 2 are, from the one label explanation"
+else fail "Apple's minutes passes are told who Speaker 1, Speaker 2 are, from the one label explanation"; fi
+# and an outside writer: the system message it is sent opens with the same explanation, the sentence in it
+rm -f "$HOME/node.stdin.complete" "$HOME/node.log"
+mkdir -p "$HOME/labels-out"
+printf '[00:00:01] Speaker 1: we start now\n[00:00:05] Speaker 2: fine\n' > "$HOME/labels-out/transcript.txt"
+(
+  security() { echo "security $*" >> "$HOME/calls.log"; return 44; }   # no key stored for this source
+  fake_node
+  WRITER=outside; OUTSIDE_KIND=standard; OUTSIDE_ADDRESS="http://127.0.0.1:11434/v1"; OUTSIDE_MODEL=llama3
+  summarise "$HOME/labels-out/transcript.txt" "$HOME/labels-out"
+) >"$HOME/labels-out.log" 2>&1
+sent="$(jq -r .system "$HOME/node.stdin.complete" 2>/dev/null)"
+case "$sent" in "$LABELS "*) sent_ok=1 ;; *) sent_ok=0 ;; esac
+if [ "$sent_ok" = 1 ] && printf '%s' "$sent" | grep -qF "$ONE_SENTENCE"; then
+  pass "an outside writer is sent the label explanation first, Speaker 1 and Speaker 2 explained in it"
+else fail "an outside writer is sent the label explanation first, Speaker 1 and Speaker 2 explained in it: [$sent] $(cat "$HOME/labels-out.log")"; fi
+rm -f "$HOME/node.stdin.complete" "$HOME/node.log" "$NODE_FILE"
 
 # === Labels and the voice print: the speakers files, --voice and --learn reach mb-transcript (6.2) ===
 
@@ -1211,5 +1238,216 @@ else fail "a count of 1 leaves that side unlabelled (all Me, or all Them), and a
 lb_reset
 TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
 if [ "$PK_CURL" = 0 ]; then pass "no curl in any labelling run"; else fail "no curl in any labelling run"; fi
+
+# === A recording kept as one file: its words' times, its speakers found in the whole file (Task 11A) ===
+
+# The labelled fixture as one recording: S1 (0 to 9.2 s, the voice print's) says the first two sentences,
+# S2 (10.3 to 14.8 s) "Um, what about the budget?". voice-old.json is a usable print of S1's voice.
+ONE_ME="[00:00:00] Me: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Speaker 1: what about the budget?"
+ONE_NO_PRINT="[00:00:00] Speaker 1: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Speaker 2: what about the budget?"
+
+# --- mb-transcript --one itself ---
+one_cli() { "$REAL_TRANSCRIPT_BIN" --one "$FIX/labelled-mic.json" "$@" 2>/dev/null; }
+got="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json")"
+if [ "$got" = "$ONE_ME" ]; then pass "mb-transcript --one with a speakers file and a matching print: Me and Speaker 1 lines with their times"
+else fail "mb-transcript --one with a speakers file and a matching print: Me and Speaker 1 lines with their times: [$got]"; fi
+got="$(one_cli --one-speakers "$FIX/speakers-mic.json")"
+if [ "$got" = "$ONE_NO_PRINT" ]; then pass "mb-transcript --one with no print: Speaker 1 and Speaker 2, in the order they first spoke"
+else fail "mb-transcript --one with no print: Speaker 1 and Speaker 2, in the order they first spoke: [$got]"; fi
+got="$(one_cli --voice "$FIX/voice-old.json")"
+if [ "$got" = "[00:00:00] Unknown: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round. what about the budget?" ]; then
+  pass "mb-transcript --one with no speakers file: every line Unknown, with its time"
+else fail "mb-transcript --one with no speakers file: every line Unknown, with its time: [$got]"; fi
+got_me="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
+got_s1="$(one_cli --one-speakers "$FIX/speakers-mic.json" --one-count 1 | sed 's/^\[[0-9:]*\] \([^:]*\): .*/\1/' | sort -u)"
+if [ "$got_me" = Me ] && [ "$got_s1" = "Speaker 1" ]; then pass "mb-transcript --one-count 1 gives one label: Me with a matching print, else Speaker 1"
+else fail "mb-transcript --one-count 1 gives one label: Me with a matching print, else Speaker 1: [$got_me] [$got_s1]"; fi
+got="$(one_cli --one-speakers "$FIX/speakers-mic.json" --voice "$FIX/voice-old.json" --plain)"
+if [ "$got" = "[00:00:00] Me: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Speaker 1: Um, what about the budget?" ]; then pass "mb-transcript --one --plain keeps 'Um' and starts a line at every change of label"
+else fail "mb-transcript --one --plain keeps 'Um' and starts a line at every change of label: [$got]"; fi
+refused_ok=1; refused_bad=""
+for extra in "--mic $FIX/pk-mic.json" "--call $FIX/pk-call.json" "--learn ONE" "--mic-speakers $FIX/speakers-mic.json" \
+             "--call-speakers $FIX/speakers-call.json" "--mic-count 2" "--call-count 2" "--voice-sample $FIX/speakers-mic.json" \
+             "--one-count 0" "--one-count 7"; do
+  # shellcheck disable=SC2086   # the option and its value, two words
+  o="$("$REAL_TRANSCRIPT_BIN" --one "$FIX/labelled-mic.json" $extra 2>"$HOME/one-err")"; r=$?
+  [ "$r" = 1 ] && [ -z "$o" ] && grep -q 'usage: mb-transcript' "$HOME/one-err" || { refused_ok=0; refused_bad="$refused_bad [$extra]"; }
+done
+for extra in "--one-speakers $FIX/speakers-mic.json" "--one-count 2"; do
+  # shellcheck disable=SC2086
+  o="$("$REAL_TRANSCRIPT_BIN" --mic "$FIX/pk-mic.json" --call "$FIX/pk-call.json" $extra 2>"$HOME/one-err")"; r=$?
+  [ "$r" = 1 ] && [ -z "$o" ] && grep -q 'usage: mb-transcript' "$HOME/one-err" || { refused_ok=0; refused_bad="$refused_bad [sides $extra]"; }
+done
+if [ "$refused_ok" = 1 ]; then pass "mb-transcript refuses --one with any side, learning or sample option, and the --one options without --one: usage, exit 1"
+else fail "mb-transcript refuses --one with any side, learning or sample option, and the --one options without --one: usage, exit 1:$refused_bad"; fi
+
+# --- the engine: process, redo and the people count ---
+TRANSCRIPT_BIN="$HOME/mb-transcript-logged"
+# Apple's transcriber as at the top of this file, hearing the mix as it hears the microphone side; and fm
+# keeping what it reads, as at the top (a test above replaced both).
+speech-analyzer() {
+  echo "speech-analyzer $*" >> "$HOME/calls.log"
+  local a
+  for a in "$@"; do :; done
+  case "$a" in
+    *mic.m4a|*audio.m4a) [ "$SA_FAIL" = both ] && return 1; cat "$FIX/sa-mic.json" ;;
+    *call.m4a) { [ "$SA_FAIL" = both ] || [ "$SA_FAIL" = call ]; } && return 1; cat "$FIX/sa-call.json" ;;
+    *) return 1 ;;
+  esac
+}
+fm() {
+  case "$1" in
+    count-tokens) cat >/dev/null; echo 100 ;;
+    respond) case " $* " in *" --schema "*) cat >/dev/null; echo '{"summary": "the brief"}' ;; *) cat >> "$HOME/fm-input.txt"; echo "the minutes" ;; esac ;;
+    schema) echo '{}' ;;
+    *) return 1 ;;
+  esac
+}
+: > "$HOME/fm-input.txt"
+one_reset() { lb_reset; PEOPLE_COUNT=""; rm -f "$HOME"/sp-fail-* "$HOME"/sp-silent-*; }
+one_meeting() {   # a meeting folder holding only its recording, with the labelled fixture's words and speakers
+  d="$(meeting "$1" audio.m4a)"; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+}
+one_print() { cp "$FIX/voice-old.json" "$VOICE_FILE"; record_install "$VOICE_FILE"; cp "$VOICE_FILE" "$HOME/voice.before"; }
+mbt_line() { grep '^mb-transcript ' "$HOME/calls.log" | head -n 1; }
+
+# --- process of a folder with only audio.m4a: labelled, timed lines, words.json, and nothing learnt ---
+one_reset; one_meeting one1; one_print
+printf '{"id": "ONE-ONE", "state": "done"}\n' > "$d/meeting.json"
+out="$( (MB_PROGRESS_FILE="$HOME/progress-one1"; export MB_PROGRESS_FILE; process "$d") 2>&1 )"; rc=$?
+args="$(mbt_line)"
+case "$args" in
+  "mb-transcript --one .stage."??????"/words.json --one-speakers .stage."??????"/.work."??????"/one.speakers.json --voice $VOICE_FILE") args_ok=1 ;;
+  *) args_ok=0 ;;
+esac
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "$ONE_ME" ] && cmp -s "$d/words.json" "$FIX/labelled-mic.json" \
+   && [ "$(mode_of "$d/words.json")" = 600 ] && [ ! -e "$d/mic.words.json" ] && [ ! -e "$d/call.words.json" ] && [ -s "$d/notes.md" ]; then
+  pass "process of a folder with only audio.m4a writes Me and Speaker 1 lines with their times, and words.json (0600)"
+else fail "process of a folder with only audio.m4a writes Me and Speaker 1 lines with their times, and words.json (0600) (rc $rc): $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+if [ "$args_ok" = 1 ] && cmp -s "$VOICE_FILE" "$HOME/voice.before" && [ ! -e "$VOICE_FILE.tmp" ] && ! printf '%s' "$out" | grep -qi 'learnt'; then
+  pass "a single recording gets --one, its speakers file and --voice, never --learn, though the print is on the record; the print is unchanged"
+else fail "a single recording gets --one, its speakers file and --voice, never --learn, though the print is on the record; the print is unchanged: [$args] $out"; fi
+line="$(sp_line mic)"
+if [ "$(sp_calls '')" = 1 ] && printf '%s' "$line" | grep -q ' wav=\.stage\.[^/ ]*/\.work\.[^/ ]*/audio\.wav exists=yes out=\.stage\.[^/ ]*/\.work\.[^/ ]*/one\.speakers\.json more= tmp=' \
+   && printf '%s' "$out" | grep -q 'finding speakers in the recording on device (FluidAudio)' \
+   && [ -z "$(find "$d" -name '*speakers*')" ] && ! ls -a "$d" | grep -q '^\.work\|^\.stage\|\.wav$'; then
+  pass "the speaker finder runs once on the whole recording, in the run's work folder, and leaves nothing behind"
+else fail "the speaker finder runs once on the whole recording, in the run's work folder, and leaves nothing behind: $(grep '^mb-speech speakers' "$HOME/calls.log") $out"; fi
+if [ "$(tr '\n' ' ' < "$HOME/progress-one1" 2>/dev/null)" = "transcribing speakers minutes done " ]; then
+  pass "a single recording's progress is transcribing, speakers, minutes, done"
+else fail "a single recording's progress is transcribing, speakers, minutes, done: $(cat "$HOME/progress-one1" 2>/dev/null)"; fi
+if grep -q '^Me: Right, so the plan' "$HOME/fm-input.txt" && grep -q '^Speaker 1: what about the budget?' "$HOME/fm-input.txt"; then
+  pass "Apple's minutes read the Me and Speaker 1 lines, without their times"
+else fail "Apple's minutes read the Me and Speaker 1 lines, without their times: $(tail -n 3 "$HOME/fm-input.txt")"; fi
+
+# --- process of any other recording: the same, beside it ---
+one_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"
+d="$HOME/loose"; mkdir -p "$d"; printf 'mp3' > "$d/talk.mp3"
+out="$( (process "$d/talk.mp3") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "$ONE_NO_PRINT" ] && cmp -s "$d/words.json" "$FIX/labelled-mic.json" \
+   && mbt_line | grep -q '^mb-transcript --one ' && ! mbt_line | grep -q -- '--learn' && [ -s "$d/talk.mp3" ] \
+   && grep -q '^mb-speech speakers .* wav=\.stage\.[^/ ]*/\.work\.[^/ ]*/talk\.wav ' "$HOME/calls.log"; then
+  pass "process of another recording writes its labelled, timed transcript and words.json beside it"
+else fail "process of another recording writes its labelled, timed transcript and words.json beside it (rc $rc): $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+
+# --- a two-sided meeting is unchanged, word for word, and --people is ignored there with a line ---
+TWO_LABELLED="[00:00:00] Me: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round.
+[00:00:10] Room 1: what (Them: yeah) about the budget?
+[00:00:16] Them: That works for me. I will send the numbers over by Friday so we can check them."
+for people in "" 3; do
+  one_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; PEOPLE_COUNT="$people"
+  d="$(meeting "two$people" audio.m4a mic.m4a call.m4a)"
+  out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+  args="$(mbt_line)"
+  if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "$TWO_LABELLED" ] && cmp -s "$d/mic.words.json" "$FIX/labelled-mic.json" \
+     && cmp -s "$d/call.words.json" "$FIX/labelled-call.json" && [ ! -e "$d/words.json" ] \
+     && case "$args" in "mb-transcript --mic ./mic.words.json --call ./call.words.json "*|"mb-transcript --mic .stage."*) true ;; *) false ;; esac \
+     && ! printf '%s' "$args" | grep -q -- '--one' && sp_line mic | grep -q ' more= tmp=' && sp_line call | grep -q ' more= tmp=' \
+     && [ "$(sp_calls '')" = 2 ]; then
+    pass "a two-sided meeting${people:+ given --people $people} is labelled word for word as before, with no --one and no words.json"
+  else fail "a two-sided meeting${people:+ given --people $people} is labelled word for word as before, with no --one and no words.json (rc $rc): [$args] $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+done
+if printf '%s' "$out" | grep -q -- '--people is for a recording kept as one file, so it is not used for this meeting'; then
+  pass "--people on a two-sided meeting is ignored with an info line"
+else fail "--people on a two-sided meeting is ignored with an info line: $out"; fi
+one_reset
+d="$(meeting two-pk audio.m4a mic.m4a call.m4a)"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Me: Speaking from this desk.
+[00:00:04] Them: Parakeet heard them too." ] && ! printf '%s' "$out" | grep -q -- '--people'; then
+  pass "a two-sided meeting whose finder found nobody is Me and Them, word for word as before"
+else fail "a two-sided meeting whose finder found nobody is Me and Them, word for word as before (rc $rc): $out"; fi
+
+# --- --people: 1 to 6, refused otherwise; on a single recording it reaches the finder and mb-transcript ---
+got="$( (PEOPLE_COUNT=""; ENGINE=auto; TIDY=auto; WRITER=""; parse_args redo X --native --people 4 --no-tidy --writer apple
+         printf '%s|%s|%s|%s|%s|%s' "$cmd" "$argfile" "$ENGINE" "$PEOPLE_COUNT" "$TIDY" "$WRITER") 2>&1 )"
+if [ "$got" = "redo|X|native|4|0|apple" ]; then pass "parse_args: redo --native --people 4 --no-tidy --writer apple"
+else fail "parse_args: redo --native --people 4 --no-tidy --writer apple: $got"; fi
+people_ok=1
+for bad in 0 7 two ""; do
+  o="$( (parse_args process X --people $bad) 2>&1 )" && people_ok=0
+  printf '%s' "$o" | grep -q -- '--people takes a number of people from 1 to 6' || people_ok=0
+done
+if [ "$people_ok" = 1 ]; then pass "--people 0, 7, two or nothing is refused: --people takes a number of people from 1 to 6"
+else fail "--people 0, 7, two or nothing is refused: --people takes a number of people from 1 to 6"; fi
+one_reset; one_meeting one3; PEOPLE_COUNT=3
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && sp_line mic | grep -q ' more=--count 3 tmp=' && mbt_line | grep -q -- ' --one-count 3$'; then
+  pass "process --people 3 on a single recording: --count 3 to the finder, --one-count 3 to mb-transcript"
+else fail "process --people 3 on a single recording: --count 3 to the finder, --one-count 3 to mb-transcript (rc $rc): $(sp_line mic) [$(mbt_line)] $out"; fi
+one_reset; one_meeting one4; ROOM_COUNT=2; CALL_COUNT=3
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && sp_line mic | grep -q ' more= tmp=' && ! mbt_line | grep -q -- '-count' \
+   && printf '%s' "$out" | grep -q -- '--room and --call are for a meeting with both sides, so they are not used for this recording'; then
+  pass "--room and --call on a single recording are ignored with an info line"
+else fail "--room and --call on a single recording are ignored with an info line (rc $rc): $(sp_line mic) [$(mbt_line)] $out"; fi
+ROOM_COUNT=""; CALL_COUNT=""
+
+# --- a speaker finder that fails: Unknown lines with their times, and the warning ---
+one_reset; one_meeting one5; one_print; touch "$HOME/sp-fail-mic"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'warn.*could not find speakers in the recording, carrying on without labels$' \
+   && printf '%s' "$out" | grep -q 'finding speakers: the diariser could not run' \
+   && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Right, so the plan for today is simple. We record the call and then we write the minutes after it ends, and we send them round. what about the budget?" ] \
+   && ! mbt_line | grep -q -- '--one-speakers\|--voice' && [ -z "$(find "$d" -name '*speakers*')" ] && [ -s "$d/notes.md" ]; then
+  pass "a speaker finder that fails warns, leaves no partial file, and the lines say Unknown with their times"
+else fail "a speaker finder that fails warns, leaves no partial file, and the lines say Unknown with their times (rc $rc): [$(mbt_line)] $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+
+# --- Apple's words: times, and the speakers still found when the speech helper is set up ---
+one_reset; one_meeting one6; ENGINE=native
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(pk_calls speech-analyzer)" = 1 ] && [ "$(pk_calls 'mb-speech transcribe')" = 0 ] && [ "$(sp_calls '')" = 1 ] \
+   && cmp -s "$d/words.json" "$FIX/sa-mic.json" && grep -q '^\[00:00:00\] [A-Za-z][A-Za-z0-9 ]*: Hi everyone' "$d/transcript.txt"; then
+  pass "with Apple's transcriber, a single recording still gets its words' times and its speakers"
+else fail "with Apple's transcriber, a single recording still gets its words' times and its speakers (rc $rc): $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
+
+# --- no speech helper: Apple's words, Unknown lines, said once ---
+one_reset; one_meeting one7; touch "$HOME/pk-unusable"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$(sp_calls '')" = 0 ] && [ "$(printf '%s\n' "$out" | grep -ci 'speaker')" = 1 ] \
+   && [ "$(cat "$d/transcript.txt")" = "[00:00:00] Unknown: Hi everyone can you hear me sounds good" ]; then
+  pass "with no speech helper, a single recording is Apple's words in Unknown lines with their times, said in one line"
+else fail "with no speech helper, a single recording is Apple's words in Unknown lines with their times, said in one line (rc $rc): $out"; fi
+
+# --- every transcriber failing on a single recording stops the run, writing nothing ---
+one_reset; one_meeting one8; touch "$HOME/pk-fail-mic"; SA_FAIL=both
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'transcription failed. Check Speech Recognition in Privacy settings' \
+   && [ ! -e "$d/transcript.txt" ] && [ ! -e "$d/words.json" ] && [ -s "$d/audio.m4a" ] && ! ls -a "$d" | grep -q '^\.stage'; then
+  pass "every transcriber failing on a single recording stops the run with the Speech Recognition hint, writing nothing"
+else fail "every transcriber failing on a single recording stops the run with the Speech Recognition hint, writing nothing (rc $rc): $out"; fi
+one_reset; one_meeting one9; touch "$HOME/pk-empty-mic"
+out="$( (process "$d/audio.m4a") 2>&1 )"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'the transcript came out empty. Was there any sound?' && [ ! -e "$d/transcript.txt" ] \
+   && [ "$(sp_calls '')" = 0 ]; then
+  pass "a single recording with no words stops the run as before: the transcript came out empty"
+else fail "a single recording with no words stops the run as before: the transcript came out empty (rc $rc): $out"; fi
+
+one_reset
+TRANSCRIPT_BIN="$REAL_TRANSCRIPT_BIN"
+if [ "$PK_CURL" = 0 ]; then pass "no curl in any single recording run"; else fail "no curl in any single recording run"; fi
 
 finish

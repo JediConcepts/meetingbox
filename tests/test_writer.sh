@@ -42,7 +42,15 @@ fm() {
     *) return 1 ;;
   esac
 }
-speech-analyzer() { echo "speech-analyzer $*" >> "$HOME/calls.log"; echo "a plain transcript of the whole mix"; }
+speech-analyzer() {
+  echo "speech-analyzer $*" >> "$HOME/calls.log"
+  case " $* " in *" -f json "*) echo '{"words": [{"start": 0.0, "end": 0.4, "text": "hello"}]}' ;; *) echo "a plain transcript of the whole mix" ;; esac
+}
+# mb-transcript, for a redo of a recording kept as one file: a stand-in that prints one labelled line.
+mkdir -p "$HOME/fake-mbt"
+printf '#!/bin/bash\necho "mb-transcript $*" >> "%s/calls.log"\necho "[00:00:00] Unknown: hello"\n' "$HOME" > "$HOME/fake-mbt/mb-transcript"
+chmod 755 "$HOME/fake-mbt/mb-transcript"
+TRANSCRIPT_BIN="$HOME/fake-mbt/mb-transcript"
 afinfo() { echo "afinfo $*" >> "$HOME/calls.log"; printf 'File:     %s\nestimated duration: %s sec\n' "${!#}" "${AUDIO_SECONDS:-2160.5}"; }
 
 # The keychain, as a file of "<address> <key>" lines. As the real one does, security -i reads its

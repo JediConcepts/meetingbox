@@ -266,6 +266,27 @@ Your microphone also picks up the far side coming out of your speakers. That ech
 is dropped, so nothing is counted twice. The minutes name Me or Them as the owner
 of an action where no name was said.
 
+### A recording kept as one file
+
+A recording without the `mic.m4a` and `call.m4a` pair (a meeting whose side files
+were deleted, say, or any other recording you give `meetingbox process`) has no
+sides to tell apart. Its words still keep their times, from whichever transcriber
+runs, and the speakers are found in the whole file:
+
+```
+[00:00:04] Me: Shall we start with the budget?
+[00:00:09] Speaker 1: Yes, I have the numbers here.
+```
+
+You are "Me" when the voice meetingbox has learnt from your calls, or from a voice
+sample, matches one of the speakers. Everyone else is "Speaker 1", "Speaker 2" and
+so on, in the order they first spoke, and "Unknown" marks words no speaker could
+be matched to (every line, when speakers cannot be found). The words, with their
+times, go in `words.json` beside the transcript, and a later run keeps the one it
+replaces in `earlier/`. A recording kept as one file never teaches meetingbox your
+voice. Transcribe again asks for the number of people in the recording, you
+included, or works it out; on the command line that is `--people N`, 1 to 6.
+
 ## How it captures both sides without a virtual audio driver
 
 This is the part that normally defeats people. A meeting has two sides, and macOS

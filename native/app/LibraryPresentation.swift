@@ -80,13 +80,16 @@ struct MeetingFiles: Equatable {
     /// Another process may hold the folder's lock (`.processing`): `ProcessingLock.owner` finds a live
     /// owner, or cannot tell. A `meetingbox` run in Terminal, say; the window offers no redo meanwhile.
     var lockHeld = false
+    /// Both sides, `mic.m4a` and `call.m4a`, are there (`MeetingFolder.hasBothSides`): Transcribe again asks
+    /// for the room and call counts. Without them, one count for a recording kept as one file.
+    var bothSides = false
 
     /// Reads the folder; `ps` (injectable, as in the queue) is run only when there is a lock to ask about.
     /// Call it off the main queue.
     static func read(_ folder: MeetingFolder, ps: URL = URL(fileURLWithPath: "/bin/ps"), now: Date = Date()) -> MeetingFiles {
         MeetingFiles(audio: folder.audioFile, runnable: canRun(folder.url), unfinished: MeetingFolder.recordingUnfinished(folder.url),
                      transcript: FileManager.default.fileExists(atPath: folder.url.appendingPathComponent("transcript.txt").path),
-                     lockHeld: ProcessingLock.owner(folder.url, ps: ps, now: now) != .gone)
+                     lockHeld: ProcessingLock.owner(folder.url, ps: ps, now: now) != .gone, bothSides: MeetingFolder.hasBothSides(folder.url))
     }
 
     static func canRun(_ dir: URL) -> Bool {
@@ -307,6 +310,14 @@ enum LibraryPresentation {
     }
 
     static func callChoice(_ count: Int?) -> String {
+        count.map(String.init) ?? workItOut
+    }
+
+    /// The one count of a recording kept as one file (without the `mic.m4a` and `call.m4a` pair), shown in
+    /// place of the two. Its one person may be someone else, so 1 is a plain "1".
+    static let recordingLabel = "People in the recording"
+
+    static func recordingChoice(_ count: Int?) -> String {
         count.map(String.init) ?? workItOut
     }
 

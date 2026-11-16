@@ -397,18 +397,28 @@ struct RedoSheet: View {
                                 Text(PreferencesPresentation.transcriberTitle(transcriber)).tag(transcriber)
                             }
                         }
-                        Picker(LibraryPresentation.roomLabel, selection: Binding(
-                            get: { model.redoing?.room },
-                            set: { count in model.updateRedo { $0.room = count } })) {
-                            ForEach(LibraryPresentation.countChoices, id: \.self) { count in
-                                Text(LibraryPresentation.roomChoice(count)).tag(count)
+                        if draft.bothSides {
+                            Picker(LibraryPresentation.roomLabel, selection: Binding(
+                                get: { model.redoing?.room },
+                                set: { count in model.updateRedo { $0.room = count } })) {
+                                ForEach(LibraryPresentation.countChoices, id: \.self) { count in
+                                    Text(LibraryPresentation.roomChoice(count)).tag(count)
+                                }
                             }
-                        }
-                        Picker(LibraryPresentation.callLabel, selection: Binding(
-                            get: { model.redoing?.call },
-                            set: { count in model.updateRedo { $0.call = count } })) {
-                            ForEach(LibraryPresentation.countChoices, id: \.self) { count in
-                                Text(LibraryPresentation.callChoice(count)).tag(count)
+                            Picker(LibraryPresentation.callLabel, selection: Binding(
+                                get: { model.redoing?.call },
+                                set: { count in model.updateRedo { $0.call = count } })) {
+                                ForEach(LibraryPresentation.countChoices, id: \.self) { count in
+                                    Text(LibraryPresentation.callChoice(count)).tag(count)
+                                }
+                            }
+                        } else {
+                            Picker(LibraryPresentation.recordingLabel, selection: Binding(
+                                get: { model.redoing?.recording },
+                                set: { count in model.updateRedo { $0.recording = count } })) {
+                                ForEach(LibraryPresentation.countChoices, id: \.self) { count in
+                                    Text(LibraryPresentation.recordingChoice(count)).tag(count)
+                                }
                             }
                         }
                         Toggle(PreferencesPresentation.tidyTitle, isOn: Binding(

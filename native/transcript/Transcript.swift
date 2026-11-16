@@ -892,3 +892,62 @@ func transcriptLines(_ labelled: LabelledWords, plain: Bool) -> [Turn] {
     let streams = order.map { (label: $0, words: byLabel[$0] ?? []) }
     return plain ? mergeTurns(streams) : joinLines(streams)
 }
+
+// ====================================================================== a recording kept as one file
+
+/// Names in a recording kept as one file (`mb-transcript --one`). `print` is the usable print, or nil.
+/// A speaker the print matches (a cosine of 0.60 or more) is Me. The others that keep a word are Speaker 1,
+/// Speaker 2 and so on, numbered by their first kept word with no gaps; one that keeps none gets no number
+/// and is Unknown. With `onePerson` (a count of 1), everyone found is the same person: Me when the print
+/// matches any of them, else Speaker 1.
+func nameOne(_ speakers: [SpeakerInfo], keptWords: [String: Int], firstWord: [String: Double], print: VoicePrint?,
+             onePerson: Bool) -> [String: String] {
+    func matches(_ s: SpeakerInfo) -> Bool { likeness(s, print).map { atLeast($0, Rule.printMatch) } == true }
+    var names: [String: String] = [:]
+    if onePerson {
+        let label = speakers.contains(where: matches) ? "Me" : "Speaker 1"
+        for s in speakers { names[s.id] = label }
+        return names
+    }
+    var rest: [SpeakerInfo] = []
+    for s in speakers {
+        if matches(s) { names[s.id] = "Me" } else { rest.append(s) }
+    }
+    let (numbered, unnumbered) = byFirstWord(rest, keptWords, firstWord)
+    for (k, s) in numbered.enumerated() { names[s.id] = "Speaker \(k + 1)" }
+    for s in unnumbered { names[s.id] = "Unknown" }
+    return names
+}
+
+/// A recording kept as one file, its words labelled (`mb-transcript --one`), as `LabelledWords` with the
+/// words in `mic` and no call side, so `transcriptLines` makes its lines as it does for two sides. Each
+/// word's candidates, its label and smoothing are as on a side (`candidates`, `resolve`, `smooth`); a word
+/// no speaker covers, whose sentence gives no label either, is Unknown. With no speakers file every word is
+/// Unknown; with `onePerson` every word takes the one person's label. Nothing here learns the voice.
+func labelOne(_ wordsIn: [Word], speakers: SideSpeakers?, print: VoicePrint?, onePerson: Bool = false) -> LabelledWords {
+    let words = inTimeOrder(wordsIn)
+    var result = LabelledWords()
+    result.mic = words
+    guard let found = speakers else {
+        result.micLabels = words.map { _ in "Unknown" }
+        return result
+    }
+    result.model = found.model
+    let usable = usablePrint(print, model: found.model)
+    let wordCandidates = candidates(words, found.segments)
+    let counts = keptCounts(words, wordCandidates)
+    let names = nameOne(found.speakers, keptWords: counts.counts, firstWord: counts.first, print: usable, onePerson: onePerson)
+    if onePerson {
+        let label = names.values.first ?? "Speaker 1"
+        result.micLabels = words.map { _ in label }
+    } else {
+        result.micLabels = smooth(resolve(words, wordCandidates, names: names, fallback: "Unknown"), words)
+    }
+    if let p = usable, !found.speakers.isEmpty, !names.values.contains("Me") {
+        let best = found.speakers.map { cosine($0.vector, p.vector) }.max() ?? 0
+        result.log.append(String(format: "Your voice was not recognised in this recording (best match %.2f)", best))
+    } else if usable == nil, !found.speakers.isEmpty {
+        result.log.append("Your voice is not learnt yet, so nobody in this recording is labelled Me")
+    }
+    return result
+}

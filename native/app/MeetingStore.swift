@@ -25,10 +25,12 @@ struct MeetingRecord {
     /// once, when it ends; queued, processing, done and a new attempt leave it as it is.
     var stopReason: String?
 
-    /// How many people a redo is told there are on each side (1 to 6); nil is Work it out.
+    /// How many people a redo is told there are (1 to 6); nil is Work it out. `room` and `call` are a meeting's
+    /// two sides; `recording` is everyone in a recording kept as one file (no `mic.m4a` and `call.m4a` pair).
     struct People: Equatable {
         var room: Int?
         var call: Int?
+        var recording: Int?
 
         static let range = 1...6
     }
@@ -109,7 +111,8 @@ struct MeetingRecord {
         self.unreadableTidy = MeetingRecord.present(json["jobTidy"]) && jobTidy == nil
         self.writer = MeetingRecord.writer(json["writer"])
         let people = json["people"] as? [String: Any]
-        self.people = People(room: MeetingRecord.count(people?["room"]), call: MeetingRecord.count(people?["call"]))
+        self.people = People(room: MeetingRecord.count(people?["room"]), call: MeetingRecord.count(people?["call"]),
+                             recording: MeetingRecord.count(people?["recording"]))
         self.readPeople = self.people
     }
 
@@ -142,7 +145,7 @@ struct MeetingRecord {
 
     /// Writes every known field into `json`, removing keys whose value is nil; a redo's fields only when
     /// they were set (`setFields`), and a count only when it changed. Other keys are untouched, and so are
-    /// keys inside `people` other than `room` and `call`.
+    /// keys inside `people` other than `room`, `call` and `recording`.
     func apply(to json: inout [String: Any]) {
         let iso = ISO8601DateFormatter()
         func put(_ key: String, _ value: Any?) {
@@ -170,7 +173,8 @@ struct MeetingRecord {
             case nil: json.removeValue(forKey: "writer")
             }
         }
-        let changed = [("room", people.room, readPeople.room), ("call", people.call, readPeople.call)].filter { $0.1 != $0.2 }
+        let changed = [("room", people.room, readPeople.room), ("call", people.call, readPeople.call),
+                       ("recording", people.recording, readPeople.recording)].filter { $0.1 != $0.2 }
         if !changed.isEmpty {
             var counts = json["people"] as? [String: Any] ?? [:] // people that was not an object is replaced
             for (key, value, _) in changed {

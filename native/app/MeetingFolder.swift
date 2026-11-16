@@ -151,6 +151,16 @@ struct MeetingFolder {
         return Finaliser.working.contains { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
     }
 
+    /// The folder holds both sides, `mic.m4a` and `call.m4a`, each a file, as the engine's own `[ -f ]` reads
+    /// them: then Transcribe again labels each side, with the room and call counts. Without the pair, its
+    /// recording is kept as one file, with one count for everyone in it.
+    static func hasBothSides(_ dir: URL) -> Bool {
+        ["mic.m4a", "call.m4a"].allSatisfy { name in
+            var folder: ObjCBool = false
+            return FileManager.default.fileExists(atPath: dir.appendingPathComponent(name).path, isDirectory: &folder) && !folder.boolValue
+        }
+    }
+
     // MARK: audio
 
     /// `audio.m4a`, else the newest `*_meeting.m4a`, else nil.
