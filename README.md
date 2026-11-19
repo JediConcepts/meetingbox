@@ -392,7 +392,10 @@ saved. On the command line that is `--name NAME`, for `process` and `redo`. The
 name is saved when you press Return or leave the field. Transcripts already
 written keep "Me" until you transcribe them again. Redo minutes (`notes`) also
 takes `--name`, so the minutes name you as the person who recorded, but it never
-changes a transcript's labels. Nothing about the voice print changes.
+changes a transcript's labels. Nothing about the voice print changes. An outside
+model you chose for the minutes is told your name only for a meeting whose
+transcript already has a line labelled with it (or with Me); otherwise it is not
+sent your name at all.
 
 ### Known limits
 
@@ -563,6 +566,9 @@ two kinds of source:
   unless you change it. It always needs a key.
 - **Standard (Ollama, LM Studio, Local CLI Bridge)**: the OpenAI-style chat
   interface, `<address>/chat/completions`, with its models from `<address>/models`.
+  The address is the part up to `/v1`; meetingbox adds the rest. An address that
+  already ends in `/chat/completions` or `/models` says "This looks like a full
+  endpoint. Use the address up to /v1, for example http://127.0.0.1:8787/v1."
 
 **Agreement first.** The first time you choose a model from a source, meetingbox
 asks `Send transcripts to <host>?` and says what that means, including that the

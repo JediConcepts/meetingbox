@@ -997,6 +997,24 @@ for pair in "http://[::1]:8080/v1|[::1]" "https://my-gateway.example.co.uk:8443/
     eval '[ "$rc" -eq 0 ] && fell_back "$(was_sent "$host" "it answered with an error (HTTP 502)")"'
 done
 
+# --- your name goes to an outside writer only with a transcript that already says it (final review M2) ---
+# With --name, the system message names the recorder only when the transcript sent has a line, or an aside,
+# labelled with the name or Me; otherwise it is the unnamed text, word for word, and Sam is nowhere in the request.
+for m2 in "none:[00:00:01] Room 1: the plan ships in March" "me:$TLINE1" "named:[00:00:01] Sam: the plan ships in March" \
+            "aside:[00:00:01] Them 1: the plan ships in March (Sam: yes)"; do
+  reset_run; meeting "nm-${m2%%:*}"; fake_node; ok_reply
+  printf '%s\n%s\n' "${m2#*:}" "$TLINE2" > "$d/transcript.txt"
+  std --name Sam
+  if [ "${m2%%:*}" = none ]; then
+    check "M2: --name Sam on a transcript with no Sam or Me line: the outside writer is sent the unnamed instructions, and no Sam" \
+      eval '[ "$rc" -eq 0 ] && jq -e --arg s "$LABEL_INSTRUCTIONS $DATA_RULES" ".system == \$s" "$HOME/node.stdin.complete" >/dev/null
+            && ! grep -q Sam "$HOME/node.stdin.complete"'
+  else
+    check "M2: --name Sam on a transcript with a ${m2%%:*} line: the outside writer is told Sam recorded it" \
+      eval '[ "$rc" -eq 0 ] && jq -e ".system | startswith(\"Speaker labels: \\\"Sam\\\" (also written \\\"Me\\\" in older transcripts) is the person who recorded the meeting.\")" "$HOME/node.stdin.complete" >/dev/null'
+  fi
+done
+
 # --- the context line ---
 reset_run; meeting 2026-11-10_1754; fake_node; ok_reply
 rm -f "$d/meeting.json"; printf 'aac' > "$d/audio.m4a"
