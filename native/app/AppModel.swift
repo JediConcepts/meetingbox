@@ -1387,6 +1387,8 @@ struct SourceDraft: Equatable {
     var kind: SourceKind
     var address: String
     var problem: String?
+    /// A full endpoint pasted as the address, said as typed (`PreferencesPresentation.addressHint`).
+    var hint: String? { PreferencesPresentation.addressHint(address) }
 }
 
 /// The key sheet for one source: the key as typed, why it was not stored, and whether the engine is

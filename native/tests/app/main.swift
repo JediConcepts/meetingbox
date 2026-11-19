@@ -8748,6 +8748,23 @@ do {
     check(PreferencesPresentation.addressProblem(t11Ollama) == nil && PreferencesPresentation.addressProblem("http://192.168.1.10:1234/v1") == PreferencesPresentation.addressRefused
           && PreferencesPresentation.addressRefused.hasPrefix("That address is not one meetingbox accepts.") && PreferencesPresentation.addressRefused.contains("[2001:db8::1]"),
           "T11 address rule: a refusal says so, and how an IPv6 address must be written")
+    // M3: an address pasted as the full endpoint gets a hint; the rule itself is unchanged
+    let m3Hint = "This looks like a full endpoint. Use the address up to /v1, for example http://127.0.0.1:8787/v1."
+    check(PreferencesPresentation.endpointHint == m3Hint, "M3 hint: the words")
+    let m3Endpoints = ["http://127.0.0.1:8787/v1/chat/completions", "http://127.0.0.1:8787/v1/chat/completions/",
+                       "https://api.example.com/v1/models", "https://api.example.com/v1/models/",
+                       " http://127.0.0.1:11434/V1/Chat/Completions ", "http://localhost:1234/models"]
+    check(m3Endpoints.allSatisfy { PreferencesPresentation.addressHint($0) == m3Hint },
+          "M3 hint: an address ending in /chat/completions or /models, with or without a trailing slash, any case, is hinted")
+    let m3Fine = [t11Ollama, "https://api.anthropic.com", "http://127.0.0.1:8787/v1", "http://127.0.0.1:8787/v1/",
+                  "https://api.example.com/v1/models-list", "https://api.example.com/chat/completionsx",
+                  "https://models.example.com/v1", ""]
+    check(m3Fine.allSatisfy { PreferencesPresentation.addressHint($0) == nil }, "M3 hint: a base address, or a near miss, has none")
+    check(PreferencesPresentation.addressProblem("http://127.0.0.1:8787/v1/chat/completions") == nil,
+          "M3 hint: the shared address rule still takes a full endpoint")
+    check(SourceDraft(editing: nil, kind: .standard, address: "http://127.0.0.1:8787/v1/chat/completions", problem: nil).hint == m3Hint
+          && SourceDraft(editing: nil, kind: .standard, address: t11Ollama, problem: nil).hint == nil,
+          "M3 hint: the source sheet's draft carries it as typed")
     check(ScriptRunner.setAsideLine(OutsideWriter(kind: .standard, address: "http://[::1]:8080/v1", model: "m"))
           == "The minutes writer m at [::1] was set aside because its source was removed, changed or not agreed. Apple's model writes the minutes.",
           "T11 set-aside line: the host as the address rule parses it")

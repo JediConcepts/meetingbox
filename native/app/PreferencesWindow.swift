@@ -216,6 +216,9 @@ struct SourceRow: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .textSelection(.enabled)
+                    if let hint = PreferencesPresentation.addressHint(source.address) {
+                        Text(hint).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer()
                 Button(PreferencesPresentation.checkTitle) { app.refreshListing(at: index) }
@@ -389,6 +392,9 @@ struct SourceSheet: View {
                 TextField(PreferencesPresentation.addressLabel, text: Binding(get: { app.sourceDraft?.address ?? "" },
                                                                               set: { text in app.updateSourceDraft { $0.address = text } }))
                     .onSubmit { app.saveSourceDraft() }
+                if let hint = draft.hint {
+                    Text(hint).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
                 if let problem = draft.problem {
                     Text(problem).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }

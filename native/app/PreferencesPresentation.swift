@@ -559,6 +559,17 @@ extension PreferencesPresentation {
         host(of: address) == nil ? addressRefused : nil
     }
 
+    static let endpointHint = "This looks like a full endpoint. Use the address up to /v1, for example http://127.0.0.1:8787/v1."
+
+    /// A hint, not a refusal, for an address pasted as a full endpoint: one ending in `/chat/completions` or
+    /// `/models`, with or without a trailing slash, in any case. meetingbox adds those itself, so every run
+    /// would ask for `.../chat/completions/chat/completions`. The address rule is unchanged.
+    static func addressHint(_ address: String) -> String? {
+        var a = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if a.hasSuffix("/") { a.removeLast() }
+        return a.hasSuffix("/chat/completions") || a.hasSuffix("/models") ? endpointHint : nil
+    }
+
     /// The host an address shows as: the rule's, or the address itself for one it refuses (only ever a
     /// setting written by hand).
     static func shownHost(_ address: String) -> String { host(of: address) ?? address }
