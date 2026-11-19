@@ -772,7 +772,7 @@ check "every block that expands the key runs only allowed builtins, names no com
 # search cannot tell them apart, so its lines are pinned with the rest.
 KEY_VARS='key|got|STORED_KEY'
 # where a command word can start: the line, a separator, a case label's ), a backtick, or a word that takes a command
-CMD_START='(^[[:space:]]*|[;|&({!)`][[:space:]]*|(then|do|else|while|until|elif|builtin|command)[[:space:]]+)'
+CMD_START='(^[[:space:]]*|[;|&({!)`][[:space:]]*|(if|then|do|else|while|until|elif|builtin|command)[[:space:]]+)'
 DUMPERS='set|declare|typeset|local|readonly|export'
 key_lines() {
   grep -E -e '\$\{?('"$KEY_VARS"')([^A-Za-z0-9_]|$)' -e '(^|[[:space:]])('"$KEY_VARS"')\+?=' \
@@ -845,6 +845,12 @@ lines_diff="$(diff "$HOME/key-lines" "$HOME/key-lines.now")"
 check "the lines of meetingbox that handle the key are exactly the pinned ones: none added, removed or changed" \
   eval '[ -z "$lines_diff" ]'
 [ -z "$lines_diff" ] || printf '%s\n' "$lines_diff"
+# `if` takes a command as well: a dumper or trap straight after it is a key line, as after elif.
+printf '%s\n' 'if declare -p; then :; fi' 'if set; then :; fi' "if trap 'x' DEBUG; then :; fi" 'if local -p key; then :; fi' \
+  'if export; then :; fi' > "$HOME/plant-if"
+if_found="$(key_lines "$HOME/plant-if" | grep -c '^if ')"
+check "r5b M1: set, declare -p, local -p, export and trap straight after if are found as key lines, as after elif" \
+  eval '[ "$if_found" = 5 ]'
 # And key_ok whole, the one function handed the key as an argument, by whichever form it is written.
 cat > "$HOME/key-ok" <<'FN'
 key_ok() {
@@ -889,7 +895,12 @@ defined() { grep -cE "$CMD_START(function[[:space:]]+)?($1)[[:space:]]*\(\)|${CM
 once=""
 for f in key_ok run_limited stored_key outside_note outside_runtime; do [ "$(defined "$f")" = 1 ] || once="$once [$f defined $(defined "$f") times]"; done
 SHADOW='printf|echo|read|builtin|command|test|\[|eval|exec|security|tr|env|jq|cat|kill|sleep|wait|shift|return|true|set|declare|typeset|local|readonly|export|trap'
-shadowed="$(grep -nE "$CMD_START(function[[:space:]]+)?($SHADOW)[[:space:]]*\(\)|${CMD_START}function[[:space:]]+($SHADOW)([[:space:]{]|\$)" "$ROOT/meetingbox")"
+shadow_defs() { grep -nE "$CMD_START(function[[:space:]]+)?($SHADOW)[[:space:]]*\(\)|${CMD_START}function[[:space:]]+($SHADOW)([[:space:]{]|\$)" "$1"; }
+shadowed="$(shadow_defs "$ROOT/meetingbox")"
+# bash takes a definition as an if's condition (`if printf() { :; }; then`): that is a command start too
+printf '%s\n' 'if printf() { :; }; then :; fi' 'if function security { :; }; then :; fi' > "$HOME/plant-if-def"
+check "r5b M1: a shadow definition straight after if, by either form, is found" \
+  eval '[ "$(shadow_defs "$HOME/plant-if-def" | wc -l | tr -d " ")" = 2 ]'
 check "run_limited, handed the key on its input, is word for word the pinned text; it, key_ok, stored_key, outside_note and outside_runtime are defined once; and no function takes the name of a builtin or command a key line runs" \
   eval '[ -z "$rl_diff" ] && [ -z "$once" ] && [ -z "$shadowed" ]'
 [ -z "$rl_diff$once$shadowed" ] || printf '%s\n' "$rl_diff" "$once" "$shadowed"
