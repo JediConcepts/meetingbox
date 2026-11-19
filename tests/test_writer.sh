@@ -993,6 +993,15 @@ std
 check "without meeting.json, the context line comes from the folder's name and the audio's length (afinfo)" \
   eval 'jq -e --arg c "$CONTEXT" ".user | startswith(\$c + \"\\n\\n<transcript>\\n\")" "$HOME/node.stdin.complete" >/dev/null
         && grep -q "^afinfo .*audio.m4a" "$HOME/calls.log"'
+# G1: a folder named by hand with an underscore and a title gives its date and time the same way
+for g1name in "2026-11-16_2330 testaudio" "2026-11-16 2330 testaudio"; do
+  reset_run; meeting "$g1name"; fake_node; ok_reply
+  rm -f "$d/meeting.json"; printf 'aac' > "$d/audio.m4a"
+  std
+  check "G1: without meeting.json, $g1name gives the context line its date and time, and keeps its name" \
+    eval '[ "$rc" -eq 0 ] && jq -e ".user | startswith(\"Meeting recorded on Monday 16 November 2026 at 23:30, 36 minutes.\n\n<transcript>\n\")" "$HOME/node.stdin.complete" >/dev/null
+          && [ "$d" = "$HOME/$g1name" ] && [ -f "$d/audio.m4a" ]'
+done
 reset_run; meeting ctx2; fake_node; ok_reply
 printf '{"id": "x", "started": "2026-03-01T09:05:59Z", "seconds": 90, "state": "done"}\n' > "$d/meeting.json"
 std; one="$(jq -r '.user | split("\n")[0]' "$HOME/node.stdin.complete")"

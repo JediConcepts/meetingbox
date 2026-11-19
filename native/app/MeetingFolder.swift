@@ -9,7 +9,8 @@ enum RenameError: Error {
 
 /// One meeting's folder under the Meetings root. Names are `YYYY-MM-DD_HHMM`
 /// (or `_HHMMSS`, `_HHMMSS-2` on a clash) until the user gives it a title, then
-/// `YYYY-MM-DD HHMM Title`. Folder names use local time. Folders are never deleted.
+/// `YYYY-MM-DD HHMM Title`. `YYYY-MM-DD_HHMM Title` is read as titled too. Folder names use local
+/// time. Folders are never deleted.
 struct MeetingFolder {
     let url: URL
     let date: Date
@@ -19,8 +20,10 @@ struct MeetingFolder {
 
     private static let plain = try! NSRegularExpression(
         pattern: "^(\\d{4})-(\\d{2})-(\\d{2})_(\\d{2})(\\d{2})(\\d{2})?(?:-(\\d+))?$")
+    // A titled name has a space after the date; one with an underscore there and a title after the
+    // time (`2026-11-16_2330 testaudio`, named by hand) is read the same way and keeps its name.
     private static let titled = try! NSRegularExpression(
-        pattern: "^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2})(\\d{2}) (.+)$")
+        pattern: "^(\\d{4})-(\\d{2})-(\\d{2})[ _](\\d{2})(\\d{2}) (.+)$")
 
     private static func group(_ m: NSTextCheckingResult, _ i: Int, in s: String) -> String? {
         let r = m.range(at: i)

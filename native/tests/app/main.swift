@@ -60,6 +60,28 @@ do {
     check(MeetingFolder.parse(root.appendingPathComponent(".DS_Store")) == nil, "parse rejects .DS_Store")
     check(a!.displayTitle == "28 October 2026, 15:08", "displayTitle of untitled folder")
     check(c!.displayTitle == "Standup", "displayTitle of titled folder")
+    // G1: a folder named with an underscore, four digits, one space and a title is a titled meeting, title as written
+    let g1url = root.appendingPathComponent("2026-11-16_2330 testaudio")
+    let g1 = MeetingFolder.parse(g1url)
+    check(g1 != nil && g1!.title == "testaudio" && g1!.date == local(2026, 11, 16, 23, 30) && g1!.url == g1url
+          && g1!.displayTitle == "testaudio",
+          "G1: 2026-11-16_2330 testaudio is a titled meeting at 23:30 on 16 November 2026, its name and title as written")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-11-16_2330 Budget  review v2"))?.title == "Budget  review v2",
+          "G1: the title after the underscore form is kept exactly, spaces and all")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-11-16_2330testaudio")) == nil,
+          "G1: an underscore form with no space before the title is still refused")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-11-16_233 testaudio")) == nil,
+          "G1: an underscore form with three digits is still refused")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-11-16_2330 ")) == nil,
+          "G1: an underscore form with an empty title is still refused")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-11-16_233012 testaudio")) == nil
+          && MeetingFolder.parse(root.appendingPathComponent("2026-11-16_2330-2 testaudio")) == nil,
+          "G1: seconds or a clash number before a title are still refused")
+    check(MeetingFolder.parse(root.appendingPathComponent("2026-02-31_1000 Board")) == nil
+          && MeetingFolder.parse(root.appendingPathComponent("2026-10-28_2460 Board")) == nil,
+          "G1: an impossible date or time in the underscore form is still refused")
+    check(a!.title == nil && b!.title == nil && d2!.title == nil && c!.title == "Standup",
+          "G1: the plain and the spaced titled forms read as before")
     // C4: a time the clocks skip (01:30 on 29 March 2026 in London) is still a meeting; impossible dates are not
     var london = Calendar(identifier: .gregorian)
     london.timeZone = TimeZone(identifier: "Europe/London")!
@@ -242,6 +264,11 @@ do {
     let badNone = make(root, "2026-10-20_1200", files: ["meeting.json": "{oops"])
     try! store.update(badNotes) { $0.title = "T" }
     try! store.update(badNone) { $0.title = "T" }
+    // G1: the window lists a folder named with an underscore and a title, and the listing leaves its name alone
+    let g1 = make(root, "2026-11-16_2330 testaudio", files: ["audio.m4a": "a", "notes.md": "n"])
+    let g1Listed = store.scan().first { $0.folder.url.lastPathComponent == "2026-11-16_2330 testaudio" }
+    check(g1Listed?.folder.title == "testaudio" && fm.fileExists(atPath: g1.path),
+          "G1: the store lists 2026-11-16_2330 testaudio as the meeting testaudio, and nothing renames it")
     check(state(badNotes) == "done" && scanned(badNotes) == .done, "undecodable meeting.json with notes.md becomes done")
     check(state(badNone) == "unprocessed" && scanned(badNone) == .unprocessed, "undecodable meeting.json without notes.md becomes unprocessed")
     check(names(badNotes).contains { $0.hasPrefix("meeting.json.bad-") } && names(badNone).contains { $0.hasPrefix("meeting.json.bad-") }, "backups kept")
