@@ -14,6 +14,30 @@ Recordings never leave the Mac. Transcripts and minutes stay on it too unless yo
 
 See Outside models for the minutes, below, for how a source is chosen and agreed to.
 
+## New in 2.1.0
+
+- **Parakeet.** Transcripts come from Parakeet, a more accurate model that runs
+  on the Mac, unless you choose Apple's transcriber in Preferences. If Parakeet
+  is not set up, Apple's is used and the meeting's log says why.
+- **Speaker labels.** Each side of a call is split into its speakers: you are
+  "Me", people in the room with you "Room 1", "Room 2", people on the call
+  "Them 1", "Them 2". A recording kept as one file gets "Speaker 1", "Speaker 2".
+  See What you get.
+- **Your voice.** meetingbox learns your voice from your video calls, or from a
+  90 second voice sample you record in Preferences, so it can tell which speaker
+  is you. See Your voice.
+- **Your name.** Put it in Preferences and it replaces "Me".
+- **Tidy lines.** Transcript lines drop "um" and "uh" and keep short replies
+  inline, such as "(Them: yeah)". It is on by default; turn it off in Preferences.
+- **Redo.** Redo minutes… and Transcribe again… in the window run a meeting again,
+  with the number of people in it if you know it. Everything a run replaces is
+  kept in `earlier/`.
+- **A choice of minutes writer.** Apple's on device model, or an outside model
+  you add and agree to: the Claude API, or a standard source such as Ollama, LM
+  Studio or the Local CLI Bridge.
+- **The top bar.** The window's top bar holds the recording's controls while one
+  runs, and a player for the selected meeting's audio otherwise.
+
 ## Install
 
 ```bash
@@ -43,21 +67,29 @@ Setup will not replace the app while a recording is running, finishing or being
 recovered: it says so and changes nothing. That includes a recording an older
 meetingbox is still making; setup names its folder and how to stop it.
 
+Coming from 2.0, setup adds two steps: Parakeet and speaker labels (a few
+minutes to build and about 630 MB of models), and outside models, which are
+optional. If either cannot be set up, setup says why and carries on: Apple's
+transcriber and Apple's model are used as before. Meetings already transcribed
+keep their transcripts until you choose Transcribe again.
+
 ### What setup will do
 
 It surveys first and shows you the list before asking for anything:
 
 ```
-meetingbox setup v2.0.0
+meetingbox setup v2.1.0
            ------------------------------------------------
          + macOS 27
          - Xcode Command Line Tools
          - the recorder
+         - Parakeet (more accurate transcripts and speaker labels, about 630 MB)
+         - outside models (optional, needs Node 20 or later)
          - a transcriber
          - a signing certificate
          + fm, licence accepted
            ------------------------------------------------
-meetingbox 4 things to install. I can do all of them from here.
+meetingbox 6 things to install. I can do all of them from here.
            some steps may ask for your Mac password, and Apple may open an installer window.
          ? go ahead? [Y/n]
 ```
@@ -68,6 +100,7 @@ meetingbox 4 things to install. I can do all of them from here.
 | the meetingbox app with its recorder, built from meetingbox's own source (`native/app`, `native/recorder`), plus `mb-transcript` (`native/transcript`) | the app you control recordings from; records you and the far side, and merges the two transcripts | a minute or two to compile |
 | a signing certificate called "meetingbox local signing" | lets macOS recognise the app across rebuilds and updates, so it keeps your permissions | a moment, and macOS may ask for your login password once |
 | Parakeet and speaker labels (on device): `mb-speech` (`native/speech`), built with `swift build` over [FluidAudio](https://github.com/FluidInference/FluidAudio) 0.18.3, and its models at fixed revisions, each file's size and SHA-256 checked | more accurate transcripts and speaker labels. Optional: if it cannot be set up, Apple's transcriber is used | a few minutes to build, about 630 MB of models |
+| Outside models (optional): Node 20 or later, found on your PATH, in Homebrew's folders or in nvm (offered through Homebrew if there is none), and the [AI Execution Router](https://www.npmjs.com/package/ai-execution-router) 1.1.1, installed with `npm ci` from the locked `minutes/package-lock.json` into `~/.local/share/meetingbox/minutes` | lets an outside model you choose write the minutes (see Outside models for the minutes). Nothing else in meetingbox uses Node. If it cannot be set up, Apple's model writes the minutes | a few seconds with Node already there |
 | [speech-analyzer](https://github.com/simonw/speech-analyzer-cli) | Apple's on device transcriber | a few seconds, no model download |
 | or whisper.cpp instead | if you would rather run your own model | 1.6GB download |
 | `sudo fm license` | accepts Apple's model licence, once | your Mac password |
@@ -121,19 +154,28 @@ are ready (on; never while a recording is running), sounds (on), the microphone
 (System default unless you pick one) and the meetings folder (`~/Meetings` unless
 you choose another; it can be changed once nothing is recording or being
 finished). Choosing a new folder moves nothing: meetings already recorded stay
-where they are, and the window lists only the folder chosen here. At the foot it
-says which build you are running.
+where they are, and the window lists only the folder chosen here. Under
+Transcripts: the Transcriber ("Parakeet (more accurate)" or "Apple"; "Applies to
+the next meeting processed."), "Tidy transcript lines (drop 'um' and 'uh', keep
+short replies inline)", Your name, and your voice (see Your voice). Under
+Minutes: who writes the minutes (see Outside models for the minutes). At the foot it says which build you are running.
 
 **The meetingbox window** lists your meetings, newest first, with a search box.
-Pick one for its minutes and transcript, play its audio in QuickTime Player (not
-while a recording is running, which would record it), or show it in Finder. A
-recording that was never processed has a Process button. **Rename** gives a
+Pick one for its minutes and transcript, play its audio from the top bar (see The
+top bar), open it in QuickTime Player, or show it in Finder. A recording that was
+never processed has a Process button. A finished meeting has **Redo minutes…** and
+**Transcribe again…** (see Redo, and earlier versions). The transcript view has a
+picker of the meeting's other versions, read only: "Current", then any other
+transcript in the folder, then "Earlier, <date> <time>" for each version a later
+run replaced, newest first. **Rename** gives a
 meeting a real title, and its folder is renamed to match with the date kept first
 so it still sorts: `2026-10-28 1508 Budget review`. A title ending in something
 like a file extension (`deck.key`) has that dot made a `-`, so the Finder never
 takes the folder for a file. A meeting cannot be renamed while it is recording or
 being processed. A rename that would give two meetings the same folder name is
-refused.
+refused. A folder you named by hand with an underscore and a title,
+`2026-11-16_2330 Budget review`, is listed too, under that title, and keeps its
+name until you rename it.
 
 Quitting while a recording is running asks first: Stop and quit, Keep recording
 and quit (the recording carries on, and meetingbox picks it up when it opens
@@ -141,10 +183,30 @@ again), or Cancel.
 
 **Which build is this?** About meetingbox, the foot of Preferences and the last
 line of the menu bar item's menu all say, for example
-`meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)`: the version, when
+`meetingbox 2.1.0 (build 2026-11-19 14:30, 1a2b3c4, 9602459)`: the version, when
 it was built, the start of a hash of the source it was built from, and the commit
 when it was built from a git checkout. `meetingbox version` prints the same, and
 says when the app and the command differ.
+
+### The top bar
+
+The bar beside New meeting at the top of the window does one of two things.
+
+- **While a recording runs or is paused**, it shows the timer, Pause (Resume
+  when paused) and Stop. They control that recording whichever meeting is
+  selected, exactly as the menu bar item's do.
+- **When nothing is recording**, it is a player for the selected meeting's
+  audio: Play or Pause, Stop (back to the start), the position as
+  `12:34 / 1:05:00`, and a slider to move. It plays the meeting's `audio.m4a`
+  (or a 1.2 meeting's single recording) inside the app. A file it cannot play
+  says "This recording cannot be played".
+
+Playback and recording never overlap, because the call side records the Mac's
+sound. Starting a recording by any route (New meeting, the menu bar, the floating
+button, the hotkey or the command) stops playback first, and the player is not
+available while a recording or a voice sample is being made. Selecting another
+meeting stops playback too. To play a recording elsewhere, the meeting page has
+"Open in QuickTime Player".
 
 ## Use it
 
@@ -247,24 +309,52 @@ and bind a hotkey.
   mic.words.json    your words, with timings
   call.words.json   their words, with timings
   transcript.txt    full text, your source of truth
-  notes.md          the minutes
-  notes-raw.md      per slice notes, before the final pass
+  notes.md          the minutes, ending with who wrote them
+  notes-raw.md      per slice notes, before the final pass (an outside model's reply as received)
   brief.json        {summary, decisions, actions, open_questions, numbers_and_dates}
-  meeting.json      the title and state the app keeps; do not delete it
+  meeting.json      the title and state the app keeps, and the minutes writer and people
+                    counts last chosen in a sheet for this meeting; do not delete it
   capture.log       what the recorder reported while recording and saving
+  .process-log      meetingbox's log of each run: the transcriber, speakers, your voice
+  earlier/          what a later run replaced, kept byte for byte (see Redo)
 ```
 
-Each side is transcribed on its own and the two are merged by time, so the
-transcript says who spoke:
+Each side is transcribed on its own, its speakers are told apart, and the two are
+merged by time, so the transcript says who spoke:
 
 ```
 [00:03:12] Me: Can you send me the numbers after this?
-[00:03:15] Them: Yes, I will email them this afternoon.
+[00:03:15] Them 1: Yes, I will email them this afternoon. (Them 2: yeah)
+[00:03:21] Room 1: And the slides too, please.
 ```
 
+The labels:
+
+- **Me** is you: the microphone speaker whose voice matches the voice meetingbox
+  has learnt (see Your voice), or on a call, the one who holds 80% or more of the
+  microphone's words.
+- **Room 1**, **Room 2** are other people at your end, on your microphone, in the
+  order they first spoke.
+- **Them**, or **Them 1**, **Them 2**, are people on the other end of the call. A
+  plain "Them" beside numbered ones is someone on the call who could not be told
+  apart.
+- **Unknown** is speech that could not be put to anyone.
+
 Your microphone also picks up the far side coming out of your speakers. That echo
-is dropped, so nothing is counted twice. The minutes name Me or Them as the owner
-of an action where no name was said.
+is dropped, so nothing is counted twice, and so is your own voice coming back on
+the call side. Without Parakeet set up, speakers are not told apart, and the
+transcript says Me and Them as before. The minutes are told what the labels mean,
+keep them as written, and never guess a real name for one: an action's owner is
+the name said, else the label as written.
+
+**Tidy lines**, on by default, drops "um", "uh" and the like, joins a speaker's
+sentences into one line, and writes a short reply such as "yeah" inline in
+brackets where it was said. Turned off (in Preferences, or for one meeting in
+Transcribe again), a new line starts at every change of speaker and every word
+stays.
+
+**Parakeet** transcribes English meetings. A meeting set to another language
+(`--locale`) uses Apple's transcriber, and the log says so.
 
 ### A recording kept as one file
 
@@ -284,8 +374,10 @@ so on, in the order they first spoke, and "Unknown" marks words no speaker could
 be matched to (every line, when speakers cannot be found). The words, with their
 times, go in `words.json` beside the transcript, and a later run keeps the one it
 replaces in `earlier/`. A recording kept as one file never teaches meetingbox your
-voice. Transcribe again asks for the number of people in the recording, you
-included, or works it out; on the command line that is `--people N`, 1 to 6.
+voice. Transcribe again asks for "People in the recording", you included, from
+"Work it out" or 1 to 6; on the command line that is `--people N`, and without it
+the number is worked out. Without Parakeet set up, every line says Unknown, with
+its time.
 
 ### Your name in place of Me
 
@@ -293,12 +385,125 @@ Put your name in Preferences, under Your name, and the lines the voice print say
 are yours carry it instead of "Me", in the transcript and in the minutes. Empty, the
 default, keeps "Me". A name is letters (any script), spaces, hyphens and
 apostrophes, up to 40 characters, starting with a letter, and it cannot be one of
-the labels: Me, Them, Unknown, Room N, Them N or Speaker N. On the command line
-that is `--name NAME`, for `process` and `redo`. The name is saved when you press
-Return or leave the field. Transcripts already written keep "Me" until you
-transcribe them again. Redo minutes (`notes`) also takes `--name`, so the minutes
-name you as the person who recorded, but it never changes a transcript's labels.
-Nothing about the voice print changes.
+the labels: Me, Them, Unknown, Room N, Them N or Speaker N. A name that breaks the
+rule says "Use letters, spaces, hyphens and apostrophes, up to 40 characters.",
+and a label says "That name is used as a label. Choose another."; neither is
+saved. On the command line that is `--name NAME`, for `process` and `redo`. The
+name is saved when you press Return or leave the field. Transcripts already
+written keep "Me" until you transcribe them again. Redo minutes (`notes`) also
+takes `--name`, so the minutes name you as the person who recorded, but it never
+changes a transcript's labels. Nothing about the voice print changes.
+
+### Known limits
+
+- In a recording kept as one file, quick exchanges can blur where one turn ends
+  and the next begins: a short reply can land inside the other person's line, or
+  two lines can come out swapped. A two-sided recording does not have this,
+  because each side is its own file.
+- In a recording kept as one file, a new voice that is heard only later in the
+  recording can be merged into an existing Speaker number.
+- "Unknown" in a recording kept as one file is a voice heard too little to be
+  given a number.
+
+## Your voice
+
+To tell which speaker is you, meetingbox keeps a print of your voice, made by the
+speaker model on the Mac. It is a list of numbers, not a recording, and it never
+leaves the Mac: `~/.meetingbox/voice.json`, readable by you only. It is used once
+it holds a minute or more of your speech, from two or more calls or from a voice
+sample.
+
+**From your video calls.** The first processing of a call adds to it, never a
+redo, and only when the call makes it plain which voice is yours: one microphone
+speaker holds 80% or more of the microphone's words, sounds unlike everyone on
+the call side, and, once the print holds any speech, matches it. A meeting adds
+to it once. While the print is not yet usable, two calls in a row that do not
+match it discard it, so a first call dominated by someone else cannot lock you
+out. The meeting's `.process-log` says what happened: "Learnt N s of your voice
+from this call", or "This call's microphone voice did not match the voice learnt
+so far, so it was not learnt". A recording kept as one file never adds to it.
+
+**From a voice sample.** In Preferences, "Record a voice sample…" records your
+microphone alone, inside the app, while you read aloud for 90 seconds ("Read
+aloud for 90 seconds. 0:42 left"); Stop ends it early. "Finding your voice in the
+sample…" follows, then one of:
+
+- "Your voice is learnt from this sample (M minutes of speech)." The sample
+  replaces any print learnt so far, and is usable on its own.
+- "Not enough speech: N seconds of the 60 needed. Record again and read for the
+  whole 90 seconds."
+- "More than one voice was heard. Record again with only you speaking."
+- "meetingbox is not allowed to use the microphone. Allow it in System Settings,
+  under Privacy & Security, Microphone."
+- "Parakeet is not set up, so a voice sample cannot be used. Run meetingbox
+  setup."
+- "The microphone stopped working, so the voice sample was not used. Record
+  again.", "The voice sample could not be recorded: no microphone was found.",
+  "The voice sample could not be recorded: meetingbox could not make a folder
+  for it." or "Finding your voice in the sample took too long, so it was not
+  used."
+
+A sample can be recorded only while nothing is recording. A meeting always wins:
+starting a recording by any route stops the sample ("Stopped because a meeting
+started recording.") and deletes its audio, and the player stops while a sample
+records. The sample's audio is kept in a private folder under `~/.meetingbox`
+only until its print is made, and any left by a crash goes at the next launch.
+
+**What Preferences says.** "Your voice: learnt from N calls (M minutes of
+speech)", "Your voice: from a recorded sample (M minutes of speech)", "Your
+voice: from a recorded sample and N calls (M minutes of speech)", or "Not learnt
+yet: meetingbox learns it from your video calls, or record a sample". "Forget my
+voice" deletes the print; a meeting being processed then does not write it back.
+`meetingbox doctor` and `meetingbox engines` say the same, and from the terminal
+`meetingbox voice add <audio>` makes the print from a recording of you alone and
+`meetingbox voice forget` deletes it. `meetingbox reset --tools` and `meetingbox
+uninstall` remove it too.
+
+## Redo, and earlier versions
+
+A finished meeting has two actions in the window, also on the command line:
+
+- **Redo minutes…** (`meetingbox notes <folder>`) writes the minutes again from
+  the current `transcript.txt`, with the writer you choose in its sheet. It is
+  offered on a failed meeting that has a transcript too.
+- **Transcribe again…** (`meetingbox redo <folder>`) transcribes again, finds the
+  speakers again and writes the minutes again. Its sheet has the Transcriber,
+  the number of people ("People in the room, including you", from "Work it out",
+  "1 (just you)" or 2 to 6, and "People on the other end of the call", "Work it
+  out" or 1 to 6; or "People in the recording" for a recording kept as one file),
+  Tidy transcript lines, and Write the minutes with. A count of 1 labels that
+  whole side Me (or Them); a count of 2 or more asks for that many speakers. The
+  counts and the writer are kept in the meeting's `meeting.json` and used by its
+  later runs. From the terminal: `--room N`, `--call N` and `--people N`.
+
+Neither is offered for a meeting being recorded, saved, queued or processed,
+including by a `meetingbox` run in the terminal ("That meeting is busy"). A redo
+waits behind another meeting's processing, and may run while another meeting
+records. A redo never removes audio.
+
+**Nothing is lost.** Every run (a first processing, Redo minutes or Transcribe
+again) builds its new files in a private staging folder inside the meeting folder,
+named `.stage.` and six characters. Only once every file it needs is there and
+well formed does it copy each file it will replace into
+`earlier/<YYYY-MM-DD HHMM>/` (`-2` and so on when that minute is taken), check the
+copy byte for byte, and then move the new files in. A `notes.md` you edited by hand
+is also kept beside it as `notes-edited-<YYYY-MM-DD HHMM>.md`. Nothing else in the
+folder is touched. Files someone else wrote there, such as `transcript-original.txt`
+or `transcript-parakeet.txt`, are never changed.
+
+**If it does not finish.** The window says why on the meeting: "The redo did not
+finish: <reason>. Nothing was changed." or, when it was stopped while moving the
+new files in, "The redo stopped part way: <reason>. Choose it again to finish it."
+The menu bar says "Redo did not finish". The next run on that meeting finishes the
+part-done move first, from its staging folder. A staging folder left by a run that
+was stopped before then holds only copies; the next run on that meeting removes it,
+and `meetingbox doctor` lists any left in the meetings folder.
+
+**Restoring an earlier version** is by hand for now: copy the files you want back
+from `earlier/<date> <time>/` into the meeting folder (in the Finder, or with
+`cp`). The transcript picker in the window shows each earlier transcript, read
+only, as "Earlier, 19 Nov 2026 14:30" for the folder `earlier/2026-11-19 1430/`,
+so you can see which one you want first.
 
 ## How it captures both sides without a virtual audio driver
 
@@ -415,8 +620,11 @@ Start it with a window big enough for a long meeting, then add the source
 OLLAMA_CONTEXT_LENGTH=65536 ollama serve
 ```
 
-The picker marks a model whose name ends in `-cloud` or `:cloud` "(runs
-online)": that is meetingbox's own rule. Ollama's cloud models are named that
+The picker lists each model as "<model> at <host>". That is the host alone,
+without a port or path, so two sources on one host (Ollama and LM Studio both on
+`127.0.0.1`, say) read the same there; the list of sources under Minutes shows
+each one's full address. The picker marks a model whose name ends in `-cloud` or
+`:cloud` "(runs online)": that is meetingbox's own rule. Ollama's cloud models are named that
 way, and run on Ollama's servers, not on this Mac.
 
 **A bridge to Claude Code**, such as the Local CLI Bridge, is a Standard source
@@ -444,9 +652,19 @@ meetingbox setup                 install what is missing
 meetingbox                       toggle
 meetingbox start | stop | status
 meetingbox pause | resume
-meetingbox process <audio|txt>   run an existing file through the pipeline
+meetingbox process <file|folder> run a recording or a transcript through the pipeline
+meetingbox notes <folder>        write the minutes again from its transcript (Redo minutes)
+meetingbox redo <folder>         transcribe it again, then the minutes (Transcribe again)
 meetingbox recover <folder>      finish a recording that was interrupted
 meetingbox doctor                what is installed and what is not
+meetingbox engines               which transcribers are ready, your voice, outside models
+meetingbox engines --kind claude|standard --address URL
+                                 also the models that source lists (this contacts it)
+meetingbox key set --address URL     keep a source's key, read from stdin, in the keychain
+meetingbox key remove --address URL  remove it
+meetingbox key status --address URL  set or none, without reading the key
+meetingbox voice add <audio>     learn your voice from a recording of you alone
+meetingbox voice forget          forget your voice
 meetingbox mics                  microphones the recorder can see
 meetingbox reset                 clear a stuck recording, ask for permissions again
 meetingbox reset --tools         also remove what setup built, to start setup afresh
@@ -455,8 +673,14 @@ meetingbox version               this command's version, and which build the app
 meetingbox help
 ```
 
-Options: `--mic "USB"`, `--dir`, `--locale`, `--whisper`, `--native`, `--model`,
-`--no-keep-audio`. Each has an `MB_*` environment equivalent. `--mic` and `--dir`
+Options: `--mic "USB"`, `--dir`, `--locale`, `--parakeet`, `--native`,
+`--whisper`, `--model`, `--no-keep-audio`, each with an `MB_*` environment
+equivalent (`MB_ENGINE` for the transcriber). For a run only: `--tidy` or
+`--no-tidy`; `--room N` and `--call N` (redo), and `--people N` (process and redo,
+for a recording kept as one file), each 1 to 6; `--name NAME`; and `--writer apple`
+or `--writer outside --kind claude|standard --address URL --writer-model NAME`,
+which meetingbox never takes from the environment. `meetingbox help` lists them
+all. `--mic` and `--dir`
 go to the app with each start; without them the app uses its Preferences. The app
 remembers each `--dir` folder: a meeting there is picked up after a crash and
 opens when its minutes are ready, but the window lists only the meetings folder.
@@ -502,6 +726,10 @@ Start with `meetingbox doctor`.
 | `speech-analyzer` fails | Speech Recognition permission, or the first run needs a network fetch for the language model |
 | Minutes feel thin | `MB_CHUNK_WORDS=900 meetingbox process <file>`, more slices and more detail |
 | Want to see the working | `MB_DEBUG=1 meetingbox` keeps the `.work.*` folder |
+| "Parakeet is not set up, so Apple's transcriber is used. Run meetingbox setup." | Parakeet's step in setup did not finish, or its models are missing. Run `meetingbox setup`; `meetingbox doctor` says which part |
+| "Outside models need Node 20 or later. Run meetingbox setup." | The Node setup found has gone (an nvm version removed, say). Run `meetingbox setup` again. Apple's model writes the minutes meanwhile |
+| A minutes file starting "Written on this Mac by Apple's model because ..." | The outside model you chose failed; the note says why and whether the transcript was sent. Choose Redo minutes to try again |
+| `meetingbox doctor` lists "staging left by a stopped run" | A run on that meeting was stopped part way. Its staging folder holds only copies, and the next run on that meeting removes it |
 
 Requires macOS 27 for the summary (`fm` arrived then). Recording and transcribing
 work on macOS 14 and up.
@@ -532,7 +760,13 @@ better position to be in, but it is not a substitute for telling people.
   Core ML conversions of [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
   (CC-BY-4.0, as scoped by that repository's NOTICE.md)
 
+- [AI Execution Router](https://www.npmjs.com/package/ai-execution-router) (MIT), pinned at
+  1.1.1 by `minutes/package-lock.json`, which `minutes/writer.mjs` calls to reach an outside
+  model, and [Node.js](https://nodejs.org) (MIT), which runs it. Neither is part of this
+  repository: setup installs the router with npm, and uses a Node you have or Homebrew's
+
 The models are downloaded by `meetingbox setup` from Hugging Face, at the revisions pinned in
-`native/speech/models.json`. They are not part of this repository.
+`native/speech/models.json`, each file checked by size and SHA-256, and used as published.
+They are not part of this repository. Their licences (CC-BY-4.0) ask for the credit above.
 
 MIT licensed.

@@ -23,9 +23,9 @@ else fail "the old app is named once, to find its recorders and to remove it, an
 
 # --- the version (Task 10) ---
 out="$(bash "$ROOT/meetingbox" --version 2>&1)"
-if [ "$VERSION" = 2.0.0 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = "meetingbox 2.0.0" ]; then
-  pass "VERSION is 2.0.0"
-else fail "VERSION is 2.0.0 ($VERSION: $out)"; fi
+if [ "$VERSION" = 2.1.0 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = "meetingbox 2.1.0" ]; then
+  pass "VERSION is 2.1.0"
+else fail "VERSION is 2.1.0 ($VERSION: $out)"; fi
 
 # The executable starts the app when given no mode, so every call that only
 # wants the recorder must say --record.
@@ -734,24 +734,24 @@ ${4:+<key>MBCommit</key><string>$4</string>}
 PLIST
 }
 HASH=1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809
-writeinfo 2.0.0 202611051430 "$HASH" 9602459
+writeinfo 2.1.0 202611051430 "$HASH" 9602459
 out="$(bash "$ROOT/meetingbox" version 2>&1)"; rc=$?
-want="$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)')"
+want="$(printf 'meetingbox 2.1.0\napp: meetingbox 2.1.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)')"
 if [ "$rc" -eq 0 ] && [ "$out" = "$want" ]; then pass "meetingbox version: the command's version and the app's build line, with its commit"
 else fail "meetingbox version: the command's version and the app's build line, with its commit (rc $rc): $out"; fi
 out2="$(bash "$ROOT/meetingbox" --version 2>&1)"
 if [ "$out2" = "$want" ]; then pass "meetingbox --version says the same"
 else fail "meetingbox --version says the same: $out2"; fi
 
-writeinfo 2.0.0 202611051430 "$HASH"
+writeinfo 2.1.0 202611051430 "$HASH"
 out="$(bash "$ROOT/meetingbox" version 2>&1)"
-if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4)')" ]; then
+if [ "$out" = "$(printf 'meetingbox 2.1.0\napp: meetingbox 2.1.0 (build 2026-11-05 14:30, 1a2b3c4)')" ]; then
   pass "meetingbox version: no commit, no commit in the line"
 else fail "meetingbox version: no commit, no commit in the line: $out"; fi
 
 writeinfo 1.3.1 202611051430 "$HASH"
 out="$(bash "$ROOT/meetingbox" version 2>&1)"
-if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 1.3.1 (build 2026-11-05 14:30, 1a2b3c4)\nThe app and the command differ. Run: meetingbox setup')" ]; then
+if [ "$out" = "$(printf 'meetingbox 2.1.0\napp: meetingbox 1.3.1 (build 2026-11-05 14:30, 1a2b3c4)\nThe app and the command differ. Run: meetingbox setup')" ]; then
   pass "meetingbox version: an app of another version is pointed out"
 else fail "meetingbox version: an app of another version is pointed out: $out"; fi
 
@@ -759,20 +759,20 @@ else fail "meetingbox version: an app of another version is pointed out: $out"; 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>$APP_ID</string>
-<key>CFBundleShortVersionString</key><string>2.0.0</string><key>CFBundleVersion</key><string>2.0.0</string></dict></plist>
+<key>CFBundleShortVersionString</key><string>2.1.0</string><key>CFBundleVersion</key><string>2.1.0</string></dict></plist>
 PLIST
 out="$(bash "$ROOT/meetingbox" version 2>&1)"
-if [ "$out" = "$(printf 'meetingbox 2.0.0\napp: meetingbox 2.0.0')" ]; then
+if [ "$out" = "$(printf 'meetingbox 2.1.0\napp: meetingbox 2.1.0')" ]; then
   pass "meetingbox version: an app with no build stamp gives its version alone"
 else fail "meetingbox version: an app with no build stamp gives its version alone: $out"; fi
 
 mv "$APP_DIR" "$HOME/app-aside"
 out="$(bash "$ROOT/meetingbox" version 2>&1)"
-if [ "$out" = "meetingbox 2.0.0" ]; then pass "meetingbox version with no app installed: the command's version alone"
+if [ "$out" = "meetingbox 2.1.0" ]; then pass "meetingbox version with no app installed: the command's version alone"
 else fail "meetingbox version with no app installed: the command's version alone: $out"; fi
 mv "$HOME/app-aside" "$APP_DIR"
 
-writeinfo 2.0.0 202611051430 "$HASH" 9602459
+writeinfo 2.1.0 202611051430 "$HASH" 9602459
 out="$(bash "$ROOT/meetingbox" status 2>&1)"
 if ! printf '%s\n' "$out" | grep -q 'build\|differ'; then pass "status does not change: no build line"
 else fail "status does not change: no build line: $out"; fi

@@ -10,10 +10,12 @@
 #
 #   meetingbox.app    ->  audio.m4a          ScreenCaptureKit + your mic, one clock
 #                         (+ mic.m4a, call.m4a: each side on its own)
-#   speech-analyzer   ->  transcript.txt     Apple SpeechAnalyzer, on device
-#     or whisper-cli  ->  transcript.txt     whisper.cpp, if you prefer
+#   mb-speech         ->  *.words.json       Parakeet and the speaker finder, on device (FluidAudio)
+#     or speech-analyzer                     Apple SpeechAnalyzer, on device
+#     or whisper-cli                         whisper.cpp, if you prefer
 #   mb-transcript     ->  transcript.txt     each side transcribed alone, labelled by speaker
 #   fm respond        ->  notes.md + brief.json
+#     or writer.mjs   ->  notes.md           an outside model you chose and agreed to, through Node
 #
 # First run: meetingbox setup
 # It checks what is missing and offers to install it. Nothing to do by hand.
@@ -22,7 +24,7 @@
 
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # --------------------------------------------------------------- configuration
 
@@ -4108,7 +4110,7 @@ keys_left() {
 # ----------------------------------------------------------------------- version
 
 # The app's build as the app shows it (About meetingbox, Preferences, its menu: BuildInfo.swift),
-# from its Info.plist: "meetingbox 2.0.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)", the commit
+# from its Info.plist: "meetingbox 2.1.0 (build 2026-11-05 14:30, 1a2b3c4, 9602459)", the commit
 # only when known. An app from before builds were stamped gives its version alone.
 app_build_line() {
   local p="$APP_DIR/Contents/Info.plist" v b h c
