@@ -74,7 +74,8 @@ speech-analyzer() {
 }
 # fm: the new minutes are FM_TEXT and the new brief names itself. fm-empty makes every answer empty,
 # brief-fail fails the structured pass, FM_MAP_FAIL=1 fails every slice of a long transcript, and
-# FM_TOKENS is the count it gives. fm_hook is a test's own step, run inside the engine as fm answers.
+# FM_TOKENS is the count it gives. fm_hook is a test's own step, run inside the engine as fm answers,
+# with FM_IN what that call was given to read.
 FM_TOKENS=100; FM_MAP_FAIL=0
 FM_TEXT="the new minutes"
 # Apple's notes.md: its minutes, a blank line, and the line saying who wrote them (spec 6.5).
@@ -87,7 +88,7 @@ fm() {
   case "$1" in
     count-tokens) cat >/dev/null; echo "$FM_TOKENS" ;;
     respond)
-      cat >/dev/null
+      FM_IN="$(cat)"   # what Apple's model is given to read, for fm_hook
       fm_hook
       case "$3" in "You are taking minutes"*) [ "$FM_MAP_FAIL" != 1 ] || return 1 ;; esac
       [ ! -e "$HOME/fm-empty" ] || return 0
@@ -458,16 +459,22 @@ else fail "process of a single recording keeps the words.json it replaces too, a
 rm -f "$VOICE_FILE" "$INSTALLED"
 
 # --- redo --name NAME: the name reaches mb-transcript, single and two-sided; notes never re-labels (Task 11B) ---
-SAM_SENTENCE='Speaker labels: "Sam" is the person who recorded the meeting. '
+SAM_SENTENCE='Speaker labels: "Sam" (also written "Me" in older transcripts) is the person who recorded the meeting. '
+# I1: with a name, a transcript has no Me line, so the not-recognised clause must name the name too
+SAM_CLAUSE='if no line is labelled "Sam" or "Me", the person who recorded was not recognised'
+ME_CLAUSE='labelled "Me", the person'
+# the label explanation as it was loaded, before any --name: with no name it reaches every prompt unchanged
+PLAIN_LABELS="$LABEL_INSTRUCTIONS"
 ME_SENTENCE='Speaker labels: "Me" is the person who recorded the meeting. '
-told() { printf '%s\n' "$MAP_INSTRUCTIONS" "$REDUCE_INSTRUCTIONS" "$FINAL_INSTRUCTIONS" "$OUTSIDE_INSTRUCTIONS" >> "$HOME/told.txt"; }
+told() { printf '%s\n' "$MAP_INSTRUCTIONS" "$REDUCE_INSTRUCTIONS" "$FINAL_INSTRUCTIONS" "$OUTSIDE_INSTRUCTIONS" "$FM_IN" >> "$HOME/told.txt"; }
 reset_run; single named1; : > "$HOME/told.txt"; fm_hook() { told; }
 engine cli redo "$d" --name Sam
 if [ "$rc" -eq 0 ] && case "$(mbt_args)" in "mb-transcript --one "*" --me-name Sam"*) true ;; *) false ;; esac \
    && [ "$(cat "$d/transcript.txt")" = "$(printf '%s' "$ONE_ME" | sed 's/^\(\[[0-9:]*\]\) Me: /\1 Sam: /')" ]; then
   pass "redo --name Sam on a single recording passes --me-name Sam, and Transcribe again gives Sam's lines where Me was"
 else fail "redo --name Sam on a single recording passes --me-name Sam, and Transcribe again gives Sam's lines where Me was (rc $rc): [$(mbt_args)] $(cat "$d/transcript.txt") $out"; fi
-if [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt"; then
+if [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt" \
+   && [ "$(grep -cF "$SAM_CLAUSE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_CLAUSE" "$HOME/told.txt"; then
   pass "redo --name Sam: every prompt, the outside writer's too, says \"Sam\" is the person who recorded the meeting"
 else fail "redo --name Sam: every prompt, the outside writer's too, says \"Sam\" is the person who recorded the meeting: $(head -c 300 "$HOME/told.txt")"; fi
 reset_run; touch "$HOME/pk-labelled" "$HOME/sp-fixture"; finished nm2
@@ -483,13 +490,19 @@ command cp "$d/transcript.txt" "$HOME/nm2.transcript"
 reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
 engine cli notes "$d" --name Sam
 if [ "$rc" -eq 0 ] && [ "$(calls mb-transcript)" = 0 ] && same "$d/transcript.txt" "$HOME/nm2.transcript" \
-   && [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt"; then
+   && [ "$(grep -cF "$SAM_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_SENTENCE" "$HOME/told.txt" \
+   && [ "$(grep -cF "$SAM_CLAUSE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$ME_CLAUSE" "$HOME/told.txt"; then
   pass "notes --name Sam says \"Sam\" recorded the meeting in every prompt, runs no mb-transcript and keeps the transcript byte for byte"
 else fail "notes --name Sam says \"Sam\" recorded the meeting in every prompt, runs no mb-transcript and keeps the transcript byte for byte (rc $rc): $out"; fi
+# M1: what the writer reads is the transcript as it is: still Me, never relabelled to Sam
+if grep -qF 'Me: an older transcript' "$HOME/told.txt" && ! grep -qF 'Sam: an older' "$HOME/told.txt"; then
+  pass "notes --name Sam: the minutes are written from the transcript as it is, its Me lines unrelabelled"
+else fail "notes --name Sam: the minutes are written from the transcript as it is, its Me lines unrelabelled: $(head -c 400 "$HOME/told.txt")"; fi
 # with no name the prompts are word for word as before
 reset_run; : > "$HOME/told.txt"; fm_hook() { told; }
 engine cli notes "$d"
-if [ "$rc" -eq 0 ] && [ "$(grep -cF "$ME_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$SAM_SENTENCE" "$HOME/told.txt"; then
+if [ "$rc" -eq 0 ] && [ "$(grep -cF "$ME_SENTENCE" "$HOME/told.txt")" -ge 4 ] && ! grep -qF "$SAM_SENTENCE" "$HOME/told.txt" \
+   && [ "$(grep -cF "$PLAIN_LABELS" "$HOME/told.txt")" -ge 4 ] && ! grep -qF '"Sam"' "$HOME/told.txt"; then
   pass "with no --name, every prompt still says \"Me\" is the person who recorded the meeting"
 else fail "with no --name, every prompt still says \"Me\" is the person who recorded the meeting: $out"; fi
 fm_hook() { :; }

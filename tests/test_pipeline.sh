@@ -1420,7 +1420,7 @@ else fail "a two-sided meeting whose finder found nobody is Me and Them, word fo
 
 # --- process --name NAME: the name reaches mb-transcript, two-sided and single, and the prompts (Task 11B) ---
 ME_SENTENCE='Speaker labels: "Me" is the person who recorded the meeting. '
-SAM_SENTENCE='Speaker labels: "Sam" is the person who recorded the meeting. '
+SAM_SENTENCE='Speaker labels: "Sam" (also written "Me" in older transcripts) is the person who recorded the meeting. '
 one_reset; one_meeting named1; one_print; : > "$HOME/fm-input.txt"; : > "$HOME/fm-instr-named.txt"
 # fm as above, also keeping the instructions of each minutes call
 fm_told() {
@@ -1440,7 +1440,9 @@ if [ "$rc" -eq 0 ] && case "$args" in "mb-transcript --one "*" --me-name Sam"|"m
    && [ "$(cat "$d/transcript.txt")" = "$(printf '%s' "$ONE_ME" | sed 's/^\(\[[0-9:]*\]\) Me: /\1 Sam: /')" ] && grep -q '^Sam: Right, so the plan' "$HOME/fm-input.txt"; then
   pass "process --name Sam of a single recording passes --me-name Sam, and the lines and the minutes' input say Sam"
 else fail "process --name Sam of a single recording passes --me-name Sam, and the lines and the minutes' input say Sam (rc $rc): [$args] $out $(cat "$d/transcript.txt" 2>/dev/null)"; fi
-if grep -qF "$SAM_SENTENCE" "$HOME/fm-instr-named.txt" && ! grep -qF "$ME_SENTENCE" "$HOME/fm-instr-named.txt"; then
+if grep -qF "$SAM_SENTENCE" "$HOME/fm-instr-named.txt" && ! grep -qF "$ME_SENTENCE" "$HOME/fm-instr-named.txt" \
+   && grep -qF 'if no line is labelled "Sam" or "Me", the person' "$HOME/fm-instr-named.txt" \
+   && ! grep -qF 'labelled "Me", the person' "$HOME/fm-instr-named.txt"; then
   pass "with --name Sam, Apple's model is told \"Sam\" is the person who recorded the meeting"
 else fail "with --name Sam, Apple's model is told \"Sam\" is the person who recorded the meeting: $(head -c 300 "$HOME/fm-instr-named.txt")"; fi
 one_reset; touch "$HOME/pk-labelled" "$HOME/sp-fixture"

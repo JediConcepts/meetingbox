@@ -1480,7 +1480,7 @@ The user added this task at Gate B, on 16 November 2026. When the voice print id
 - **mb-transcript.**
   - `--me-name NAME` replaces the label `Me` with NAME on every line that would say Me. Nothing else changes: the voice-print rules and the other labels stay as they are.
   - `--voice-sample` refuses `--me-name`.
-- **`LABEL_INSTRUCTIONS`.** When a name is set, the first sentence reads `"<NAME>" is the person who recorded the meeting.` in place of `"Me" is the person who recorded the meeting.`. Everything after it is unchanged. Without a name, the text is unchanged.
+- **`LABEL_INSTRUCTIONS`.** When a name is set, the first sentence reads `"<NAME>" (also written "Me" in older transcripts) is the person who recorded the meeting.` in place of `"Me" is the person who recorded the meeting.`, and `if no line is labelled "Me"` becomes `if no line is labelled "<NAME>" or "Me"`, since a named transcript has no Me line (final review I1). Everything else is unchanged. Without a name, the text is unchanged. An outside writer is sent the named text only when the transcript it is sent has a line labelled with the name or Me; otherwise it is sent the unnamed text (final review M2).
 - **Unchanged.**
   - Existing transcripts change only when they are redone.
   - The voice print and its learning are unchanged.
