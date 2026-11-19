@@ -119,7 +119,7 @@ New:
   - Every SwiftPM cache, clone and configuration lives in setup's temporary folder, so nothing lands in the user's shared Swift folders. The one exception is the fetched dependency source (FluidAudio), kept in meetingbox's own build cache, `~/.local/share/meetingbox/swiftpm-cache`, so a rebuild with the same pinned version does not fetch it again. (User decision, 12 November.)
   - If the build fails on any Mac, setup says so and carries on with Apple's transcriber, keeping any working helper it had **(my call)**.
 - **Pinned versions:**
-  - FluidAudio exactly v0.18.3 (Apache 2.0), with only the features ASR and offline speaker labelling need (no text-to-speech, no downloaded text normaliser), and its resolved commit checked in;
+  - FluidAudio exactly v0.18.3 (Apache 2.0), with only the features ASR and offline speaker labelling need (no text-to-speech; its text normaliser is not linked), and its resolved commit checked in;
   - each model at a fixed Hugging Face revision, with every file's size and SHA-256 checked in and verified after download.
 - **Licences:** Parakeet Ultra is CC-BY-4.0, so the README credits it. The README names the licence of every model and of FluidAudio.
 - **Models live under `~/.local/share/meetingbox/models`,** recorded before download.
@@ -238,7 +238,7 @@ New:
     - the print is at `~/.meetingbox/voice.json` (0600), with the seconds, the meetings that made it and the speaker model;
     - setup records the path; if the file exists but is not on the record, nothing is learnt and the log says why;
     - the engine writes it only if it is unchanged since it read it, so "Forget my voice" during processing holds. It writes through `voice.json.tmp` beside it, which forgetting, reset and uninstall also remove;
-    - while the print is not yet usable, two refused calls in a row discard it, so a first call dominated by someone else cannot lock the user out. The log says so.
+    - while the print is not yet usable, two refused calls in a row discard it, so a first call dominated by someone else cannot lock the user out. The log says so. `voice.json` keeps the count (`refusals`) and the refused meetings' ids (`refused`), so the same meeting processed again is not counted twice; a learnt call empties both.
   - **The meeting's log says** "Learnt N s of your voice from this call", or "This call's microphone voice did not match the voice learnt so far, so it was not learnt".
   - **In Preferences:**
     - "Your voice: learnt from N calls (M minutes of speech)", with singular forms, or "Your voice: from a recorded sample (M minutes of speech)", or, once calls have added to a sample, "Your voice: from a recorded sample and N calls (M minutes of speech)";
