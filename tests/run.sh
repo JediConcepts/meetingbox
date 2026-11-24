@@ -1,6 +1,8 @@
 #!/bin/bash
-# Runs the native tests (if present), then every tests/test_*.sh, then the node --test suite for
-# minutes/writer.mjs.
+# Runs the native tests (if present), every tests/test_*.sh and the node --test suite for
+# minutes/writer.mjs. Each test file has its own scratch HOME (tests/lib.sh), and each native test
+# builds in its own folder, so they all run side by side; each one's output is printed whole, in
+# order, once all are done. MB_TEST_SERIAL=1 runs everything one at a time, as before.
 here="$(cd "$(dirname "$0")" && pwd)"
 # Native test binaries (mb-transcript) go in MB_TEST_BIN; remove it only if we made it.
 made_bin=0
@@ -10,13 +12,33 @@ if [ -z "${MB_TEST_BIN:-}" ]; then
 fi
 export MB_TEST_BIN
 rc=0
-if [ -f "$here/../native/tests/run.sh" ]; then
-  bash "$here/../native/tests/run.sh" || rc=1
+logs="$(mktemp -d)" || exit 1
+native="$here/../native/tests/run.sh"
+
+# start <log name> <command...>: output in $logs/<name>.out, exit status in $logs/<name>.rc;
+# in the background unless MB_TEST_SERIAL=1.
+start() {
+  local name="$1"; shift
+  if [ "${MB_TEST_SERIAL:-}" = 1 ]; then
+    "$@" > "$logs/$name.out" 2>&1; echo $? > "$logs/$name.rc"
+  else
+    { "$@" < /dev/null > "$logs/$name.out" 2>&1; echo $? > "$logs/$name.rc"; } &
+  fi
+}
+
+if [ -f "$native" ]; then
+  # The bash tests use the real mb-transcript, so it is built before they start.
+  echo "== build mb-transcript"
+  if ! swiftc -suppress-warnings -o "$MB_TEST_BIN/mb-transcript" "$here"/../native/transcript/*.swift; then
+    echo "FAIL mb-transcript: does not compile"
+    rc=1
+  fi
+  # MB_TEST_BIN is left out so the native step does not build mb-transcript a second time.
+  start 0-native env -u MB_TEST_BIN bash "$native"
 fi
 for t in "$here"/test_*.sh; do
   [ -e "$t" ] || continue
-  echo "== $(basename "$t")"
-  bash "$t" || rc=1
+  start "1-$(basename "$t")" bash "$t"
 done
 
 # writer.mjs's own suite, against the real router: the script, its package files, its tests and the
@@ -57,7 +79,16 @@ node_tests() {
   rm -rf "$tmp"
   return "$status"
 }
-node_tests || rc=1
+start 2-node node_tests
 
+wait
+for f in "$logs"/*.out; do
+  [ -e "$f" ] || continue
+  name="$(basename "${f%.out}")"
+  case "$name" in 1-*) echo "== ${name#1-}" ;; esac
+  cat "$f"
+  [ "$(cat "${f%.out}.rc" 2>/dev/null)" = 0 ] || rc=1
+done
+rm -rf "$logs"
 [ "$made_bin" -eq 1 ] && rm -rf "$MB_TEST_BIN"
 exit $rc
